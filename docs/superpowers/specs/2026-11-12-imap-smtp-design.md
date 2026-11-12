@@ -116,7 +116,7 @@ test proves no other command can be produced.
   `f3-1700000000-4211`. A UIDVALIDITY change makes old ids resolve to `not_found`, which is honest.
 - Thread ids for IMAP are derived, not provider-native: the root of the `References`/`In-Reply-To` chain (or the
   message's own `Message-ID`) together with the normalised subject (reply/forward prefixes removed), hashed and
-  encoded (PLAN A46). `get_thread` on an IMAP account resolves members from the index; if
+  encoded (PLAN A47). `get_thread` on an IMAP account resolves members from the index; if
   the account is not indexed it returns the single message with an explicit `thread_incomplete` marker.
 - Flags map to the existing filter booleans: unread = no `\Seen`, starred = `\Flagged`, draft = `\Draft` or in the
   Drafts folder. `list_labels` returns the account's folders (and keywords, if any) as labels with a type field.
