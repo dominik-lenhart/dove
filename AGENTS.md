@@ -159,3 +159,18 @@ cargo fmt
   items (the `get_attachment` resource) go in `ToolOutput.extra`; `Remote::call_tool` keeps them in `ToolResult.content`.
   IMAP `get_thread` takes `message_id` until the index can resolve derived thread ids. `tests/support/fake_imap.rs`
   takes UTF-8 folder names while `imap_folders.name` stores the wire name (modified UTF-7).
+- 2026-11-12: IMAP index sync lives in `src/index/imap_sync.rs`; `sync::sync_steps` dispatches on `accounts.provider` (one
+  scan per job, then pending batches, then publish). Rows key on the agent id `f<folder>-<uidvalidity>-<uid>`, so a
+  folder is the key range `[f3-, f3.)` of `messages(gen, gmail_id)` (`-` sorts right before `.`; folder 31 is outside).
+  Per-folder checkpoints are `imap_checkpoints` (index V4, WITHOUT ROWID: its `sqlite_stat1` row names the table itself
+  as `idx`); `drop_generation_step` deletes them with the generation. Tests: connect enables indexing but creates no
+  sync state and the harness runs no scheduler, so call `IndexEnable` and then `dove::index::imap_sync::sync_steps`.
+- 2026-11-12: Without CONDSTORE (Strato) flags come from a bounded flags-only refresh per folder and scan (newest
+  `RECENT_FLAGS` plus a rotating `ROTATE_FLAGS` window); deletions are detected by count (known UIDs below UIDNEXT vs
+  `EXISTS` minus new) and only a mismatch costs a `UID SEARCH ALL`. Tests assert the command log for both paths.
+- 2026-11-12: `imap::account::with_session` closures are higher-ranked over the session lifetime, so captures must be
+  owned (`Arc<App>`, cloned ids). To keep partial results when the session fails (and is dropped), write them to an
+  `Arc<Mutex<..>>` captured by the closure (see `imap_sync::hydrate`). IMAP folder names sit in plaintext in the state
+  store (`imap_folders`), not in the index.
+- 2026-11-12: `source:"gmail"` naming an IMAP mailbox is `invalid_argument`; without an account list IMAP mailboxes show
+  up in `account_errors`. Index text operators are `terms`, `phrase`, `prefix` (there is no `contains`).

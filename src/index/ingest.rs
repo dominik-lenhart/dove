@@ -91,6 +91,24 @@ impl Doc {
         Doc { meta, has_attachment: None, body_complete: false, meta_complete: false, ..Default::default() }
     }
 
+    /// A message read over IMAP: `raw` is `None` when it is over the size limit (only its size was fetched). Thread
+    /// id and snippet are derived from the MIME as `mail::fetch_message` derives them; an oversize or unparsable
+    /// message is indexed from IMAP metadata only, in a thread of its own.
+    pub fn from_imap(mut meta: GmailMeta, raw: Option<&[u8]>, max_message_bytes: usize, max_body_chars: usize) -> Self {
+        let limits = mime::Limits { max_raw_bytes: max_message_bytes, ..Default::default() };
+        match raw.map(|r| mime::parse(r, &limits)) {
+            Some(Ok(p)) => {
+                meta.thread_id = crate::mail::imap_thread_id(&p, &meta.id);
+                meta.snippet = Some(crate::mail::imap_snippet(&p));
+                Self::from_parsed(meta, &p, max_body_chars)
+            }
+            _ => {
+                meta.thread_id = crate::mail::imap_own_thread_id(&meta.id);
+                Self::metadata_only(meta)
+            }
+        }
+    }
+
     /// Parses raw bytes within limits; failures degrade to a metadata-only doc.
     pub fn from_raw(meta: GmailMeta, raw: &[u8], max_message_bytes: usize, max_body_chars: usize) -> Self {
         let limits = mime::Limits { max_raw_bytes: max_message_bytes, ..Default::default() };

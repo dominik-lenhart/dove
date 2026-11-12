@@ -553,8 +553,12 @@ async fn imap_thread(
     message_id: Option<&str>,
     opts: &ShapeOpts,
 ) -> Result<ToolOutput, ToolError> {
+    if mb.index_enabled
+        && let Some(out) = imap_indexed_thread(cx, mb, tid, message_id, opts).await?
+    {
+        return Ok(out);
+    }
     let Some(id) = message_id else {
-        let _ = tid;
         return Err(ToolError::invalid(
             "threads of this mailbox are not indexed yet; pass message_id to read a message with its thread",
         ));
@@ -578,6 +582,99 @@ async fn imap_thread(
             ..Default::default()
         },
     })
+}
+
+/// `get_thread` on an indexed IMAP mailbox: members come from the index (derived thread ids), bodies are read live
+/// in thread order under the aggregate budget. `None` when the mailbox has no indexed data yet. A message the
+/// index does not hold yet is read live and joins its thread; the thread is then reported incomplete.
+async fn imap_indexed_thread(
+    cx: &ToolCx,
+    mb: &Mailbox,
+    tid: Option<&str>,
+    message_id: Option<&str>,
+    opts: &ShapeOpts,
+) -> Result<Option<ToolOutput>, ToolError> {
+    use crate::index::imap_sync;
+    let app = &cx.app;
+    let mut first: Option<Fetched> = None;
+    let tid = match (tid, message_id) {
+        (Some(t), _) => t.to_string(),
+        (None, Some(m)) => match imap_sync::indexed_thread_of(app, &mb.account_id, m, cx.deadline).await? {
+            Some(t) => t,
+            None => {
+                let f = fetch_message(cx, mb, m, Priority::Interactive).await?;
+                let t = f.meta.thread_id.clone();
+                first = Some(f);
+                t
+            }
+        },
+        (None, None) => return Err(ToolError::invalid("pass either thread_id or message_id")),
+    };
+    let Some((mut ids, mut complete)) = imap_sync::thread_members(app, &mb.account_id, &tid, cx.deadline).await? else {
+        return Ok(None);
+    };
+    if let Some(f) = &first
+        && !ids.contains(&f.meta.id)
+    {
+        ids.push(f.meta.id.clone());
+        complete = false;
+    }
+    if ids.is_empty() {
+        // An unknown thread id: the same answer as any unknown object.
+        return Err(ToolError::not_found());
+    }
+    let mut messages = Vec::new();
+    let mut budget = THREAD_BODY_BUDGET;
+    let mut remaining = Vec::new();
+    let mut text = String::new();
+    for id in &ids {
+        if budget == 0 {
+            remaining.push(id.clone());
+            continue;
+        }
+        let f = match first.take_if(|f| f.meta.id == *id) {
+            Some(f) => f,
+            None => match fetch_message(cx, mb, id, Priority::Interactive).await {
+                Ok(f) => f,
+                // Expunged since the last sync: skipped, as for Gmail.
+                Err(e) if e.code == crate::error::ErrorCode::NotFound => continue,
+                Err(e) => return Err(e),
+            },
+        };
+        let o = ShapeOpts {
+            max_body_chars: opts.max_body_chars.min(budget),
+            include_headers: opts.include_headers.clone(),
+            select: opts.select.clone(),
+        };
+        let (msg, used) = shape(mb, &f, &o);
+        budget = budget.saturating_sub(used);
+        text.push_str(&render(&msg));
+        text.push('\n');
+        messages.push(msg);
+    }
+    if messages.is_empty() && remaining.is_empty() {
+        return Err(ToolError::not_found());
+    }
+    let truncated = !remaining.is_empty();
+    if truncated {
+        text.push_str(&format!("[thread truncated: {} more messages; read them with get_message]\n", remaining.len()));
+    }
+    if !complete {
+        text.push_str("[thread incomplete: the mailbox index is not complete, more messages may belong here]\n");
+    }
+    let n = messages.len() as i64;
+    Ok(Some(ToolOutput {
+        extra: Vec::new(),
+        structured: json!({ "account": mb.alias, "thread_id": tid, "messages": messages, "truncated": truncated,
+                            "remaining_message_ids": remaining, "thread_incomplete": !complete }),
+        text,
+        audit: AuditInfo {
+            account: Some(mb.alias.clone()),
+            object_ids: vec![tid],
+            result_count: Some(n),
+            ..Default::default()
+        },
+    }))
 }
 
 /// Owned draft ids of this project for one mailbox.
