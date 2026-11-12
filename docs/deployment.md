@@ -153,7 +153,8 @@ The file holds no secrets. Unknown keys are rejected. Settings and defaults (fro
 `limits` defaults: `body_bytes` 1 MiB, `client_requests_per_minute` 120, `client_burst` 40,
 `client_sends_per_hour` 20, `upstream_total_inflight` 16, `upstream_per_mailbox` 4, `upstream_search_mailboxes` 8,
 `upstream_request_timeout_secs` 10, `tool_call_timeout_secs` 30. `index` defaults: `poll_interval_secs` 60,
-`sql_heap_limit_mib` 96, `page_cache_kib` 8192, `reader_connections` 3, `body_jobs` 2, `max_message_bytes` 25 MiB,
+`sql_heap_limit_mib` 96, `page_cache_kib` 8192, `reader_connections` 3, `body_jobs` 2, `max_message_bytes` 22 MiB (larger messages are indexed
+from metadata only),
 `max_body_chars` 200000.
 
 The service refuses to start when: a secret file is readable by group or others, a secret file is missing (including

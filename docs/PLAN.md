@@ -172,3 +172,18 @@ hosts or reference hardware.
   the scheduler collects leftovers of interrupted drops. Purge no longer runs FTS 'optimize': the postings go with
   the dropped table (secure_delete zeroes the freed pages). Searches never take the writer lock (the schema is
   migrated once on its own connection), so long writes delay other writers only.
+- A41. Gmail response bodies are streamed with a byte cap (gateway `read_capped`): a declared length over the cap
+  is refused unread, a streamed body stops at the cap. Over the cap is `TooLarge` for reads (`budget_exceeded` to
+  agents, never retried, never partially parsed) and `outcome_unknown` for writes. General cap 40 MiB (a 25 MiB
+  message for the read tools); index body jobs cap at `4/3 * index.max_message_bytes + 64 KiB`. A message over it
+  is indexed from a `format=minimal` answer only (`meta_complete = body_complete = 0`). The size is not checked
+  before the raw fetch: messages.list carries no sizes and a minimal pre-fetch would cost the same quota as the raw
+  fetch for every message. The raw text is decoded in place in the downloaded buffer, so a job holds about 4/3 of
+  the message: measured peak heap of the parse path (counting allocator, `tests/ingest_memory.rs`, attachment-heavy
+  messages) 11.5 MiB for 8.6 MB, 22.4 MiB for 17.2 MB and 29.3 MiB for 22.6 MB raw. `index.max_message_bytes`
+  therefore defaults to 22 MiB (was 25) to keep a body job within the 32 MiB of spec 8.1a; RSS was not measured.
+- A42. Cursors: at most 100 live cursors per client inside the global 1,000 / 8 MiB caps; a client at its share
+  evicts its own oldest cursor. batch_read charges a resumed cursor the page limit stored with it.
+- A43. Sync: a job takes its cancel token before the account lock, so a disable that lands while it waits cancels
+  it. A history pass checkpoints at the history id of its first history.list page; later pages may report a newer
+  mailbox id than the records they list, and records past the first page's id are replayed next pass (idempotent).

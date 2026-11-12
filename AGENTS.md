@@ -122,3 +122,7 @@ cargo fmt
   `index::new_generation` and dropped only through `index::drop_generation` (bounded steps). Tests that count
   postings must iterate the `fts5` tables in `sqlite_schema`. Never build an FTS table name from anything but the
   integer generation id.
+- 2026-11-12: serde never borrows through `Option<Cow<'a, str>>` (it copies even with `#[serde(borrow)]`); use a
+  plain `Cow<'a, str>` with `#[serde(default)]` or `&'a str`. Memory claims are checked with the counting global
+  allocator in `tests/ingest_memory.rs` (one test per binary, the counter is process-wide); its measurement test is
+  `--ignored`. Do not build `--release` ad hoc: it is a full build and belongs under `heavy`.

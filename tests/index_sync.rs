@@ -308,6 +308,52 @@ async fn history_expiry_rebuilds_into_new_generation() {
     assert_eq!(gens, 1);
 }
 
+/// An oversized message is never read whole (spec 8.1a): its raw answer is refused at the byte cap, and it is
+/// indexed from Gmail metadata only with incomplete coverage for queries that need its body or MIME fields.
+#[tokio::test]
+async fn oversized_message_is_indexed_from_metadata_without_reading_it() {
+    let h = Harness::start_with(|c| c.index.max_message_bytes = 4096).await;
+    let info = h.mailbox("info", "info@acme.test");
+    h.project("acme", &["info"]).await;
+    let token = h.token("acme", "agent", vec![g("info", "read")]).await;
+    let mb = "info@acme.test";
+    h.google.add_message(mb, msg("small@example.com", "Small one", "needle small", 1));
+    let mut big = msg("big@example.com", "Huge one", "needle huge", 2);
+    big.labels.push("STARRED".into());
+    big.attachments = vec![("video.bin".into(), "application/octet-stream".into(), vec![7u8; 2 * 1024 * 1024])];
+    let big_id = h.google.add_message(mb, big);
+    let big_size = h.google.message_raw(mb, &big_id).unwrap().len();
+    enable(&h).await;
+    let before = h.app().google.gateway().bytes_read.load(std::sync::atomic::Ordering::Relaxed);
+    let r = sync_account(h.app(), &info).await.unwrap();
+    assert_eq!((r.indexed, r.failed, r.error.as_deref()), (2, 0, None), "{r:?}");
+    let read = h.app().google.gateway().bytes_read.load(std::sync::atomic::Ordering::Relaxed) - before;
+    assert!(read < 256 * 1024, "read {read} bytes while syncing a {big_size}-byte message");
+    // The oversized raw answer was requested once and then only its metadata.
+    let gets: Vec<String> = h
+        .google
+        .requests()
+        .into_iter()
+        .filter(|q| q.path.ends_with(&format!("/messages/{big_id}")))
+        .map(|q| q.query)
+        .collect();
+    assert_eq!(gets, vec!["format=raw".to_string(), "format=minimal".to_string()]);
+
+    let fx = Fx { h, token, info, ids: vec![] };
+    // Metadata (labels, date) answers completely and finds it.
+    let v = search(&fx, json!({"where": {"field": "label", "op": "eq", "value": "STARRED"}, "select": ["message_id"]}))
+        .await;
+    assert_eq!(col(&v, "message_id"), vec![json!(big_id)]);
+    assert_eq!(v["coverage"], "complete");
+    // A body query cannot claim to have searched it.
+    let v =
+        search(&fx, json!({"where": {"field": "body_text", "op": "terms", "value": "needle"}, "select": ["subject"]}))
+            .await;
+    assert_eq!(subjects(&v), vec!["Small one"]);
+    assert_eq!(v["coverage"], "partial");
+    fx.h.google.assert_no_violations();
+}
+
 /// A message that arrives while history.list is paginating is not on the later (snapshotted) pages; the checkpoint
 /// must not move past it, so the next pass picks it up.
 #[tokio::test]

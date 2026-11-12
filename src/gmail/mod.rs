@@ -73,6 +73,34 @@ impl Google {
     }
 }
 
+impl Google {
+    /// Like [`Self::call`] for reads whose raw body the caller parses itself, at most `max_bytes` long. An over-limit
+    /// response is `budget_exceeded`; reading stops at the limit.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn call_bytes<'a>(
+        &self,
+        account_id: &str,
+        op: impl Fn() -> GmailOp<'a>,
+        query: &[(&str, String)],
+        prio: Priority,
+        deadline: Instant,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, ToolError> {
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let token = self.tokens.access_token(account_id).await?;
+            match self.gateway.gmail_bytes(account_id, &token, op(), query, None, prio, deadline, max_bytes).await {
+                Err(e) if e.is_auth() && attempt == 1 => {
+                    self.tokens.evict(account_id);
+                    continue;
+                }
+                other => return other.map_err(map_err),
+            }
+        }
+    }
+}
+
 /// A failed Gmail write and whether Google may have received it (spec 6.3, 7.7).
 #[derive(Debug)]
 pub struct WriteError {
@@ -112,10 +140,12 @@ fn classify_write(e: GatewayError) -> WriteError {
             WriteError { error: map_err(e), dispatched: false }
         }
         GatewayError::Status { status, .. } if status < 500 => WriteError { error: map_err(e), dispatched: true },
-        GatewayError::Status { .. } | GatewayError::Unknown | GatewayError::BadResponse => WriteError {
-            error: ToolError::new(ErrorCode::OutcomeUnknown, "the Gmail write may or may not have been applied"),
-            dispatched: true,
-        },
+        GatewayError::Status { .. } | GatewayError::Unknown | GatewayError::BadResponse | GatewayError::TooLarge => {
+            WriteError {
+                error: ToolError::new(ErrorCode::OutcomeUnknown, "the Gmail write may or may not have been applied"),
+                dispatched: true,
+            }
+        }
     }
 }
 
@@ -131,6 +161,9 @@ pub fn map_err(e: GatewayError) -> ToolError {
         GatewayError::NotDispatched => ToolError::upstream("Gmail is unreachable"),
         GatewayError::Deadline => ToolError::upstream("Gmail did not answer in time"),
         GatewayError::BadResponse => ToolError::upstream("unexpected Gmail response"),
+        GatewayError::TooLarge => {
+            ToolError::new(ErrorCode::BudgetExceeded, "the Gmail response exceeds the size limit")
+        }
         GatewayError::Unknown => {
             ToolError::new(ErrorCode::OutcomeUnknown, "the Gmail request may or may not have been applied")
         }

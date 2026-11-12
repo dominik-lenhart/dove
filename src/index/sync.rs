@@ -466,30 +466,112 @@ enum Fetched {
     Failed(String),
 }
 
-/// Fetches and parses one message under the body-job admission limit.
+/// Most bytes a `format=raw` answer may have for a message of `max_message_bytes`: base64url (4/3) plus the JSON
+/// envelope (ids, labels, snippet).
+pub fn raw_response_cap(max_message_bytes: usize) -> usize {
+    max_message_bytes.div_ceil(3) * 4 + 64 * 1024
+}
+
+/// The fields of a `format=raw` answer. `raw` borrows from the response body (base64url needs no JSON escapes), so
+/// the encoded message exists once in memory, not twice.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawAnswer<'a> {
+    #[serde(default)]
+    id: Value,
+    #[serde(default)]
+    thread_id: Value,
+    #[serde(default)]
+    label_ids: Value,
+    #[serde(default)]
+    internal_date: Value,
+    #[serde(default)]
+    size_estimate: Value,
+    #[serde(default)]
+    snippet: Value,
+    /// Empty when absent. Not `Option<Cow<..>>`: serde never borrows through an Option, it would copy.
+    #[serde(borrow, default)]
+    raw: std::borrow::Cow<'a, str>,
+}
+
+/// Parses a raw answer within the per-job memory budget (spec 8.1a): the response body was read with a byte cap,
+/// and the encoded message is decoded in place inside that buffer, so it is held once (about 4/3 of the message)
+/// plus the MIME parser's working set.
+pub fn doc_from_raw_answer(body: Vec<u8>, max_bytes: usize, max_chars: usize) -> Option<Doc> {
+    enum Raw {
+        Missing,
+        At(std::ops::Range<usize>),
+        Escaped(Vec<u8>),
+    }
+    let (meta, raw) = {
+        let a: RawAnswer<'_> = serde_json::from_slice(&body).ok()?;
+        let meta = GmailMeta::from_json(&serde_json::json!({
+            "id": a.id, "threadId": a.thread_id, "labelIds": a.label_ids, "internalDate": a.internal_date,
+            "sizeEstimate": a.size_estimate, "snippet": a.snippet,
+        }))?;
+        let raw = match &a.raw {
+            r if r.is_empty() => Raw::Missing,
+            std::borrow::Cow::Borrowed(r) => {
+                let start = r.as_ptr() as usize - body.as_ptr() as usize;
+                Raw::At(start..start + r.len())
+            }
+            // JSON escapes inside base64url are not expected from Gmail; decode the unescaped copy.
+            std::borrow::Cow::Owned(r) => Raw::Escaped(util::b64url_decode(r)?),
+        };
+        (meta, raw)
+    };
+    let raw = match raw {
+        Raw::Missing => None,
+        Raw::At(range) => Some(util::b64url_decode_in_place(body, range)?),
+        Raw::Escaped(r) => {
+            drop(body);
+            Some(r)
+        }
+    };
+    Some(match raw {
+        Some(raw) => Doc::from_raw(meta, &raw, max_bytes, max_chars),
+        None => Doc::metadata_only(meta),
+    })
+}
+
+/// Fetches and parses one message under the body-job admission limit. A message whose raw answer exceeds the
+/// byte cap is not read further: it is indexed from Gmail metadata only, with incomplete body and MIME coverage.
 async fn fetch_full(job: &Job, id: &str) -> Result<Fetched, ToolError> {
     let _permit = job.app.index.body_jobs.clone().acquire_owned().await.map_err(|_| ToolError::internal())?;
-    let v = match job.gmail_get(id, "raw").await {
-        Ok(v) => v,
+    let max_bytes = job.app.cfg.index.max_message_bytes;
+    let max_chars = job.app.cfg.index.max_body_chars;
+    let owned = id.to_string();
+    let fetched = job
+        .app
+        .google
+        .call_bytes(
+            &job.account_id,
+            || GmailOp::GetMessage(&owned),
+            &[("format", "raw".to_string())],
+            Priority::Background,
+            Job::deadline(),
+            raw_response_cap(max_bytes),
+        )
+        .await;
+    let body = match fetched {
+        Ok(b) => b,
+        Err(e) if e.code == ErrorCode::BudgetExceeded => {
+            return Ok(match fetch_labels(job, id).await? {
+                Fetched::Labels(meta) => Fetched::Doc(Box::new(Doc::metadata_only(meta))),
+                other => other,
+            });
+        }
         Err(e) if e.code == ErrorCode::NotFound => return Ok(Fetched::Gone),
         Err(e) if matches!(e.code, ErrorCode::RateLimited | ErrorCode::AccountUnavailable) => return Err(e),
         Err(e) => return Ok(Fetched::Failed(e.code.as_str().into())),
     };
-    let Some(meta) = GmailMeta::from_json(&v) else {
-        return Ok(Fetched::Failed("upstream_error".into()));
-    };
-    let max_bytes = job.app.cfg.index.max_message_bytes;
-    let max_chars = job.app.cfg.index.max_body_chars;
-    let doc = tokio::task::spawn_blocking(move || {
-        let raw = v["raw"].as_str().and_then(util::b64url_decode);
-        match raw {
-            Some(raw) => Doc::from_raw(meta, &raw, max_bytes, max_chars),
-            None => Doc::metadata_only(meta),
-        }
+    let doc = tokio::task::spawn_blocking(move || doc_from_raw_answer(body, max_bytes, max_chars))
+        .await
+        .map_err(|_| ToolError::internal())?;
+    Ok(match doc {
+        Some(d) => Fetched::Doc(Box::new(d)),
+        None => Fetched::Failed("upstream_error".into()),
     })
-    .await
-    .map_err(|_| ToolError::internal())?;
-    Ok(Fetched::Doc(Box::new(doc)))
 }
 
 async fn fetch_labels(job: &Job, id: &str) -> Result<Fetched, ToolError> {

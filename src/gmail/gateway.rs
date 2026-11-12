@@ -15,6 +15,12 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use crate::config::Limits;
 use crate::util;
 
+/// Upper bound for any Gmail response body: a 25 MiB raw message (the MIME parser's limit) base64url-encoded, plus
+/// its JSON envelope. Bodies are streamed and counted; a larger one is an error, never a partial parse.
+pub const MAX_RESPONSE_BYTES: usize = 40 * 1024 * 1024;
+/// Upper bound for error bodies (only the reason is read) and for token/certificate responses.
+const MAX_SMALL_RESPONSE_BYTES: usize = 1024 * 1024;
+
 /// Fixed upstream origins. Production uses [`Upstream::google`]; tests point all of them at a fake server.
 #[derive(Debug, Clone)]
 pub struct Upstream {
@@ -127,6 +133,9 @@ pub enum GatewayError {
     Deadline,
     #[error("invalid upstream response")]
     BadResponse,
+    /// The response body exceeds the caller's byte limit; reading stopped at the limit.
+    #[error("upstream response too large")]
+    TooLarge,
 }
 
 impl GatewayError {
@@ -155,6 +164,34 @@ pub struct Gateway {
     request_timeout: Duration,
     /// Upstream calls made, including retries (for quota accounting and tests).
     pub calls: std::sync::atomic::AtomicU64,
+    /// Response body bytes read from Google (tests check that size limits stop reading early).
+    pub bytes_read: Arc<std::sync::atomic::AtomicU64>,
+}
+
+enum ReadError {
+    TooLarge,
+    Io,
+}
+
+/// Reads a response body of at most `cap` bytes. A declared length over the cap is refused before reading; otherwise
+/// the body is streamed and counted, and reading stops as soon as the cap would be exceeded.
+async fn read_capped(
+    mut resp: reqwest::Response,
+    cap: usize,
+    counter: &std::sync::atomic::AtomicU64,
+) -> Result<Vec<u8>, ReadError> {
+    if resp.content_length().is_some_and(|n| n > cap as u64) {
+        return Err(ReadError::TooLarge);
+    }
+    let mut buf = Vec::with_capacity(resp.content_length().map_or(0, |n| n as usize));
+    while let Some(chunk) = resp.chunk().await.map_err(|_| ReadError::Io)? {
+        counter.fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        if buf.len() + chunk.len() > cap {
+            return Err(ReadError::TooLarge);
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
 }
 
 struct Permits {
@@ -183,6 +220,7 @@ impl Gateway {
             per_mailbox_limit: limits.upstream_per_mailbox.max(1),
             request_timeout: Duration::from_secs(limits.upstream_request_timeout_secs),
             calls: Default::default(),
+            bytes_read: Default::default(),
         }
     }
 
@@ -211,7 +249,8 @@ impl Gateway {
         }
     }
 
-    /// Calls an allowlisted Gmail operation for one mailbox.
+    /// Calls an allowlisted Gmail operation for one mailbox and parses the JSON answer (at most
+    /// [`MAX_RESPONSE_BYTES`]).
     #[allow(clippy::too_many_arguments)]
     pub async fn gmail(
         &self,
@@ -223,6 +262,27 @@ impl Gateway {
         prio: Priority,
         deadline: Instant,
     ) -> Result<Value, GatewayError> {
+        let idempotent = op.method_path()?.0 == Method::GET;
+        let bytes =
+            self.gmail_bytes(account_id, access_token, op, query, body, prio, deadline, MAX_RESPONSE_BYTES).await?;
+        serde_json::from_slice(&bytes)
+            .map_err(|_| if idempotent { GatewayError::BadResponse } else { GatewayError::Unknown })
+    }
+
+    /// Like [`Self::gmail`] but returns the raw body of at most `max_bytes` (callers parse it without an extra copy).
+    /// An over-limit body is [`GatewayError::TooLarge`] for reads and `Unknown` for writes (the write was applied).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn gmail_bytes(
+        &self,
+        account_id: &str,
+        access_token: &str,
+        op: GmailOp<'_>,
+        query: &[(&str, String)],
+        body: Option<&Value>,
+        prio: Priority,
+        deadline: Instant,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, GatewayError> {
         let (method, path) = op.method_path()?;
         let url = format!("{}{}", self.upstream.gmail_base, path);
         let idempotent = method == Method::GET;
@@ -247,10 +307,12 @@ impl Gateway {
             let result = req.send().await;
             let err = match result {
                 Ok(resp) if resp.status().is_success() => {
-                    return resp
-                        .json::<Value>()
-                        .await
-                        .map_err(|_| if idempotent { GatewayError::BadResponse } else { GatewayError::Unknown });
+                    return match read_capped(resp, max_bytes.min(MAX_RESPONSE_BYTES), &self.bytes_read).await {
+                        Ok(b) => Ok(b),
+                        Err(_) if !idempotent => Err(GatewayError::Unknown),
+                        Err(ReadError::TooLarge) => Err(GatewayError::TooLarge),
+                        Err(ReadError::Io) => Err(GatewayError::BadResponse),
+                    };
                 }
                 Ok(resp) => {
                     let status = resp.status().as_u16();
@@ -259,7 +321,11 @@ impl Gateway {
                         .get(reqwest::header::RETRY_AFTER)
                         .and_then(|v| v.to_str().ok())
                         .and_then(|v| v.parse::<u64>().ok());
-                    let reason = resp.json::<Value>().await.ok().and_then(|v| error_reason(&v));
+                    let reason = read_capped(resp, MAX_SMALL_RESPONSE_BYTES, &self.bytes_read)
+                        .await
+                        .ok()
+                        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+                        .and_then(|v| error_reason(&v));
                     GatewayError::Status { status, reason, retry_after }
                 }
                 Err(e) if e.is_connect() => GatewayError::NotDispatched,
@@ -306,7 +372,10 @@ impl Gateway {
             .await
             .map_err(|e| if e.is_connect() { GatewayError::NotDispatched } else { GatewayError::Unknown })?;
         let status = resp.status().as_u16();
-        let v: Value = resp.json().await.map_err(|_| GatewayError::BadResponse)?;
+        let b = read_capped(resp, MAX_SMALL_RESPONSE_BYTES, &self.bytes_read)
+            .await
+            .map_err(|_| GatewayError::BadResponse)?;
+        let v: Value = serde_json::from_slice(&b).map_err(|_| GatewayError::BadResponse)?;
         if (200..300).contains(&status) {
             Ok(v)
         } else {
@@ -342,7 +411,10 @@ impl Gateway {
         if !resp.status().is_success() {
             return Err(GatewayError::Status { status: resp.status().as_u16(), reason: None, retry_after: None });
         }
-        resp.json().await.map_err(|_| GatewayError::BadResponse)
+        let b = read_capped(resp, MAX_SMALL_RESPONSE_BYTES, &self.bytes_read)
+            .await
+            .map_err(|_| GatewayError::BadResponse)?;
+        serde_json::from_slice(&b).map_err(|_| GatewayError::BadResponse)
     }
 }
 
@@ -354,6 +426,47 @@ fn error_reason(v: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serves a 1 MiB body in 8 KiB chunks, optionally without a Content-Length (streamed).
+    async fn big_body_server(declare_length: bool) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().fallback(move || async move {
+            let chunks = (0..128).map(|_| Ok::<_, std::io::Error>(axum::body::Bytes::from(vec![b'a'; 8192])));
+            let body = if declare_length {
+                axum::body::Body::from(vec![b'a'; 128 * 8192])
+            } else {
+                axum::body::Body::from_stream(futures::stream::iter(chunks))
+            };
+            axum::response::Response::builder().status(200).body(body).unwrap()
+        });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        base
+    }
+
+    #[tokio::test]
+    async fn response_bodies_are_capped_while_reading() {
+        for declare_length in [true, false] {
+            let gw = Gateway::new(Upstream::single_origin(&big_body_server(declare_length).await), &Limits::default());
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let get = |cap| {
+                gw.gmail_bytes("a", "t", GmailOp::GetMessage("m1"), &[], None, Priority::Interactive, deadline, cap)
+            };
+            let err = get(20_000).await.unwrap_err();
+            assert!(matches!(err, GatewayError::TooLarge), "{err:?}");
+            let read = gw.bytes_read.load(std::sync::atomic::Ordering::Relaxed);
+            // A declared length is refused unread; a streamed body stops within one chunk of the cap.
+            assert!(read <= 20_000 + 64 * 1024, "read {read} bytes of a 1 MiB body");
+            if declare_length {
+                assert_eq!(read, 0);
+            }
+            // Within the cap the whole body arrives; a too-large body is never retried.
+            assert_eq!(get(2 * 1024 * 1024).await.unwrap().len(), 128 * 8192);
+            assert_eq!(gw.calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+        }
+    }
 
     #[test]
     fn ids_and_paths_are_strict() {
