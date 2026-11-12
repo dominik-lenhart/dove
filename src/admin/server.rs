@@ -417,6 +417,15 @@ async fn doctor(app: &Arc<App>) -> Value {
     let sock_mode = std::fs::metadata(&app.cfg.admin.socket_path).map(|m| m.permissions().mode() & 0o777).unwrap_or(0);
     add("admin_socket_mode", sock_mode & 0o007 == 0, format!("{sock_mode:o}"));
     add("allow_send", true, app.cfg.allow_send.to_string());
+    add(
+        "proxy_secret",
+        app.proxy_secret.is_some(),
+        if app.proxy_secret.is_some() {
+            "X-Forwarded-For is trusted only with X-Dove-Proxy-Auth".into()
+        } else {
+            "secrets.proxy_secret_file is not set; local processes can forge X-Forwarded-For".into()
+        },
+    );
     let google = app.google.jwks(true).await;
     add("google_reachable", google.is_ok(), google.err().map(|e| e.to_string()).unwrap_or_default());
     let (_, key) = app.index_key.current();

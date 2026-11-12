@@ -22,6 +22,8 @@ pub struct App {
     pub pepper: Pepper,
     pub notifier: Notifier,
     pub google_client_secret: Zeroizing<String>,
+    /// Secret the reverse proxy sends in `X-Dove-Proxy-Auth` (see [`crate::http::client_ip`]).
+    pub proxy_secret: Option<Zeroizing<String>>,
     pub index_key: Arc<KeyRing>,
     pub google: Google,
     pub started_at: std::time::Instant,
@@ -45,6 +47,10 @@ impl App {
         let pepper = KeyRing::load(&cfg.secrets.pepper_file).context("loading pepper")?;
         let index_key = Arc::new(KeyRing::load(&cfg.secrets.index_key_file).context("loading index key")?);
         let google_client_secret = secrets::read_secret_string(&cfg.google.client_secret_file)?;
+        let proxy_secret = match &cfg.secrets.proxy_secret_file {
+            Some(p) => Some(secrets::read_proxy_secret(p).context("loading proxy secret")?),
+            None => None,
+        };
         let store = Store::open(&cfg.state_db_path())?;
         let notifier = Notifier::new(cfg.notifier.webhook_url.clone(), store.clone());
         let vault = Vault::new(kek);
@@ -70,6 +76,7 @@ impl App {
             index_key,
             notifier,
             google_client_secret,
+            proxy_secret,
             store,
             cfg,
         }))

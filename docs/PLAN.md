@@ -156,6 +156,13 @@ hosts or reference hardware.
   `dove doctor` stays the operator check.
 - A29. `tools/list` declares `securitySchemes: [{type: oauth2, scopes: [mail]}]` per tool for hosts that read it
   (ChatGPT apps); unverified.
+- A30. The reverse proxy proves itself with a shared secret (`secrets.proxy_secret_file`, sent as
+  `X-Dove-Proxy-Auth`, constant-time compare, exactly one header value). Only then is the last `X-Forwarded-For`
+  entry of a loopback request believed; otherwise the client IP is the peer address, so a local process cannot pick
+  its address for `--allow-ip` checks, per-IP limits or audit records. The HTTP guard resolves the address once and
+  strips the header before any handler. The secret is optional for compatibility: unset means the old behaviour
+  plus a startup warning and a failing `dove doctor` check. Caddy reads it with `{file.*}` (unverified with a real
+  Caddy), nginx from a root-only included snippet (unverified with `nginx -t`).
 - A7. Licence is a placeholder (Apache-2.0) until the owner decides (spec 13.7).
 - A16. batch_read: budgets are assigned in input order (deterministic). Items that do not fit return
   `budget_exceeded` with a smaller-request hint instead of a continuation token. The wire budget counts the

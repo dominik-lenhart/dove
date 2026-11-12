@@ -11,13 +11,13 @@
 //! Hand-rolled: see docs/PLAN.md A17 for why no OAuth server crate is used.
 
 use std::collections::{BTreeMap, HashMap};
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{ConnectInfo, Request, State};
+use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -173,8 +173,7 @@ fn parse_params(raw: &[u8]) -> Option<HashMap<String, String>> {
 }
 
 fn peer_ip(req: &Request) -> Option<IpAddr> {
-    let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0);
-    crate::http::client_ip(req.headers(), peer)
+    crate::http::request_ip(req)
 }
 
 #[allow(clippy::result_large_err)] // the error is the finished HTTP response

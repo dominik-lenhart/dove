@@ -30,6 +30,12 @@ pub async fn run(config_path: &Path) -> anyhow::Result<()> {
     if uid == app.cfg.admin.operator_uid {
         tracing::warn!("the service runs as the operator uid; run it as a dedicated service user (spec FR-C1)");
     }
+    if app.proxy_secret.is_none() {
+        tracing::warn!(
+            "secrets.proxy_secret_file is not set: any local process can forge X-Forwarded-For and bypass allow_ip \
+             lists and per-IP rate limits (docs/deployment.md, reverse proxy)"
+        );
+    }
     let admin = crate::admin::server::bind(&app.cfg.admin.socket_path)?;
     tokio::spawn(crate::admin::server::serve(app.clone(), admin));
     crate::index::start(app.clone());

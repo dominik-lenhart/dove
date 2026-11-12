@@ -107,6 +107,10 @@ pub struct SecretPaths {
     pub kek_file: PathBuf,
     pub pepper_file: PathBuf,
     pub index_key_file: PathBuf,
+    /// Shared secret the reverse proxy sends in `X-Dove-Proxy-Auth`. When set, `X-Forwarded-For` is trusted only on
+    /// loopback requests that carry it; any other local process is seen as the loopback address (spec 6.6).
+    #[serde(default)]
+    pub proxy_secret_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -240,6 +244,9 @@ impl Config {
         ] {
             secrets::check_secret_file_mode(p)?;
         }
+        if let Some(p) = &self.secrets.proxy_secret_file {
+            secrets::check_secret_file_mode(p)?;
+        }
         Ok(())
     }
 
@@ -317,6 +324,9 @@ client_secret_file = "/run/credentials/dove.service/google_client_secret"
 kek_file = "/run/credentials/dove.service/kek"
 pepper_file = "/run/credentials/dove.service/pepper"
 index_key_file = "/run/credentials/dove.service/index_key"
+# Shared with the reverse proxy, which sends it as X-Dove-Proxy-Auth (docs/deployment.md). Without it, any local
+# process can forge X-Forwarded-For and bypass allow_ip lists and per-IP limits.
+proxy_secret_file = "/run/credentials/dove.service/proxy_secret"
 
 [audit]
 retention_days = 180
@@ -364,6 +374,10 @@ mod tests {
             .replace(
                 "/run/credentials/dove.service/google_client_secret",
                 write_secret(dir, "gcs", "secret", 0o400).to_str().unwrap(),
+            )
+            .replace(
+                "/run/credentials/dove.service/proxy_secret",
+                write_secret(dir, "proxy_secret", &"p".repeat(64), 0o400).to_str().unwrap(),
             );
         toml::from_str(&text).unwrap()
     }

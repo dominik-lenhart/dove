@@ -49,6 +49,18 @@ pub fn read_secret_string(path: &Path) -> anyhow::Result<Zeroizing<String>> {
     Ok(Zeroizing::new(s))
 }
 
+/// Reads the reverse-proxy secret: at least 32 visible ASCII characters, so it fits an HTTP header unchanged.
+pub fn read_proxy_secret(path: &Path) -> anyhow::Result<Zeroizing<String>> {
+    let s = read_secret_string(path)?;
+    if s.len() < 32 || !s.bytes().all(|b| b.is_ascii_graphic()) {
+        bail!(
+            "proxy secret file {} must hold at least 32 visible ASCII characters (for example openssl rand -hex 32)",
+            path.display()
+        );
+    }
+    Ok(s)
+}
+
 /// A set of versioned 256-bit keys loaded from one file.
 pub struct KeyRing {
     keys: BTreeMap<u32, Key32>,
@@ -131,6 +143,18 @@ mod tests {
         assert!(KeyRing::load(&p).is_err());
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o400)).unwrap();
         assert!(KeyRing::load(&p).is_ok());
+    }
+
+    #[test]
+    fn proxy_secret_must_be_long_and_header_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("proxy");
+        for (content, ok) in [("short", false), (&*"a b".repeat(20), false), (&*format!("{}\n", "x".repeat(40)), true)]
+        {
+            std::fs::write(&p, content).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+            assert_eq!(read_proxy_secret(&p).is_ok(), ok, "{content:?}");
+        }
     }
 
     #[test]

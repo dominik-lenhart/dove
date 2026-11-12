@@ -5,13 +5,12 @@
 //! on at least one granted mailbox, and every call re-checks the grant.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{ConnectInfo, Request, State};
+use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -115,14 +114,13 @@ fn rpc_result(id: Value, result: Value) -> Value {
 }
 
 async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
-    let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0);
+    let ip = crate::http::request_ip(&req);
     let (parts, body) = req.into_parts();
     let headers: HeaderMap = parts.headers;
     let body: Bytes = match axum::body::to_bytes(body, app.cfg.limits.body_bytes).await {
         Ok(b) => b,
         Err(_) => return (StatusCode::PAYLOAD_TOO_LARGE, "request too large").into_response(),
     };
-    let ip = crate::http::client_ip(&headers, peer);
     let bearer = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())

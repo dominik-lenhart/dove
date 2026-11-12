@@ -101,12 +101,14 @@ without any group or other permission bits (0400 or 0600), or the service refuse
 | `pepper` | Keyed-hash secret for client tokens | Losing or changing it invalidates every client token (they are stored as keyed hashes only). |
 | `index_key` | Key of the encrypted search index | The index is rebuildable; losing the key means a rebuild. |
 | `google_client_secret` | The OAuth client secret from Google | Plain text, surrounding whitespace is trimmed. |
+| `proxy_secret` | Shared secret of Dove and the reverse proxy, at least 32 visible ASCII characters | Optional but part of the documented setup (`secrets.proxy_secret_file`). See [Reverse proxy](#reverse-proxy). |
 
 Generate the three keys locally (the command prints a line and talks to nothing):
 
 ```sh
 sudo sh -c 'umask 077; for n in kek pepper index_key; do dove keys generate > /etc/dove/credentials/$n; done'
 sudo sh -c 'umask 077; cat > /etc/dove/credentials/google_client_secret'    # paste the secret, then Ctrl-D
+sudo sh -c "umask 077; openssl rand -hex 32 | tr -d '\\n' > /etc/dove/credentials/proxy_secret"
 sudo chmod 0400 /etc/dove/credentials/*
 ```
 
@@ -183,8 +185,9 @@ Container:
 
 ```sh
 cp deploy/config.container.toml deploy/config.toml    # edit public_url, google.client_id, admin.operator_uid
-mkdir -p deploy/secrets                               # create the four secret files here, then:
+mkdir -p deploy/secrets                               # create the five secret files here, then:
 sudo chown 65532:65532 deploy/secrets/* && sudo chmod 0400 deploy/secrets/*
+sudo install -o 0 -g 0 -m 0400 deploy/secrets/proxy_secret deploy/secrets/proxy_secret.caddy   # Caddy's copy
 $EDITOR deploy/Caddyfile                              # replace dove.example.com with your hostname
 docker compose -f deploy/compose.yaml up -d
 ```
@@ -192,7 +195,7 @@ docker compose -f deploy/compose.yaml up -d
 Then run the checks below with `docker compose exec` (see the header of the compose file).
 
 Check the installation with `dove doctor`. It reports: configuration, service user versus operator uid, data
-directory mode, admin socket mode, `allow_send`, Google reachability, index encryption, audit chain and the TLS
+directory mode, admin socket mode, `allow_send`, whether a proxy secret is set, Google reachability, index encryption, audit chain and the TLS
 reachability of the public URL. Fix every `ok: false` before connecting mailboxes.
 
 ## Reverse proxy
@@ -223,8 +226,28 @@ address instead. The admin interface is a Unix socket and is not reachable over 
   method and path pairs. nginx does not obtain certificates itself.
 
 Both configurations set `X-Forwarded-For` to the client address (replacing, not appending) and drop `X-Real-IP` and
-`Forwarded`. Dove reads the last `X-Forwarded-For` entry when the connecting peer is loopback. If your proxy appends
-instead of replacing, a client can forge its address, and IP-bound tokens and audit source IPs become meaningless.
+`Forwarded`. If your proxy appends instead of replacing, a client can forge its address, and IP-bound tokens and
+audit source IPs become meaningless.
+
+The proxy also proves itself with the shared proxy secret in the `X-Dove-Proxy-Auth` header. Dove reads the last
+`X-Forwarded-For` entry only when the connecting peer is loopback and that header matches
+`secrets.proxy_secret_file` (constant-time compare). Every other request counts as its peer address. Without this,
+any local process (an agent shell on the same host, for example) could connect to `127.0.0.1:8787` directly with
+the public Host header and a forged `X-Forwarded-For`, and get past `--allow-ip` lists and every per-IP rate limit.
+Dove removes the header before any handler runs and never logs it. When `proxy_secret_file` is not set, Dove keeps
+trusting every loopback peer, logs a warning at startup, and `dove doctor` reports `proxy_secret` as not ok.
+
+- **Caddy** reads the secret per request from its own copy:
+  `sudo install -o caddy -g caddy -m 0400 /etc/dove/credentials/proxy_secret /etc/caddy/dove_proxy_secret`.
+- **nginx** cannot read a header value from a file. Put it into a root-only snippet that `dove.conf` includes:
+
+  ```sh
+  sudo sh -c 'umask 077; printf "proxy_set_header X-Dove-Proxy-Auth \"%s\";\n" \
+    "$(cat /etc/dove/credentials/proxy_secret)" > /etc/nginx/dove_proxy_auth.conf'
+  ```
+
+To rotate the secret, write a new value to every copy, then restart Dove and reload the proxy. Requests in between
+count as `127.0.0.1` (IP-bound tokens fail, per-IP limits are shared), nothing else breaks.
 
 Caddy's `path` matcher ignores case, so `/MCP` is forwarded; Dove matches routes exactly and answers 404. The nginx
 file matches case-sensitively and answers 404 itself.
@@ -392,8 +415,8 @@ Checked in this repository's work, with the tool named; "not verified" means nob
 | Artifact | Verified | Not verified |
 | --- | --- | --- |
 | `deploy/systemd/dove.service` | `systemd-analyze verify` (only warning: the binary was not installed on the check machine); `systemd-analyze security --offline` exposure 1.4 OK; the binary started with `LoadCredential`, `StateDirectory`, `RuntimeDirectory`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, `ProtectProc`, `MemoryDenyWriteExecute`, `SystemCallFilter`, `RestrictAddressFamilies`, `NoNewPrivileges` and memory/task/file limits as a transient `systemd-run --user` unit: served `/healthz`, accepted `dove doctor` over the socket (Google reachable), stopped cleanly | Running as a system service with `User=dove`; `PrivateDevices`, `ProtectKernelTunables/Modules/Logs`, `ProtectClock`, `ProtectHostname`, `CapabilityBoundingSet=` (the user manager cannot apply them); sysusers and tmpfiles snippets |
-| `deploy/Containerfile`, `compose.yaml` | Built with Docker 29; 66 MB image; `--version` and `config-example` run read-only with all capabilities dropped; the compose stack started read-only with `cap_drop: ALL`, `no-new-privileges`, 512 MiB limit, secrets from files, tmpfs socket directory; Caddy shared Dove's network namespace and proxied to the loopback listener; `dove doctor` worked via `exec --user <uid>:65532`, another uid was refused; `stop` exited 0 | Podman; a real TLS certificate; the 1 GiB profile; memory behaviour under load |
-| `deploy/Caddyfile` | `caddy validate` (Caddy 2.11); every allowlisted method/path pair forwarded, other methods and paths 404 (including `/healthz`, `GET /mcp`, `/mcp/`, `//healthz`, `/mcp/%2e%2e/healthz`); forged `X-Forwarded-For`, `X-Real-IP`, `Forwarded` replaced or dropped; a 2 MB body got 413 | Automatic certificate issuance; chunked uploads at the proxy |
-| `deploy/nginx/dove.conf` | `nginx -t` (1.30) with a throwaway certificate; same route matrix as Caddy, `/MCP` and `//mcp` get 404; 2 MB body got 413 | Certificate handling |
+| `deploy/Containerfile`, `compose.yaml` | Built with Docker 29; 66 MB image; `--version` and `config-example` run read-only with all capabilities dropped; the compose stack started read-only with `cap_drop: ALL`, `no-new-privileges`, 512 MiB limit, secrets from files, tmpfs socket directory; Caddy shared Dove's network namespace and proxied to the loopback listener; `dove doctor` worked via `exec --user <uid>:65532`, another uid was refused; `stop` exited 0 | Podman; a real TLS certificate; the 1 GiB profile; memory behaviour under load; the `proxy_secret` secret and Caddy's root-owned copy (added later) |
+| `deploy/Caddyfile` | `caddy validate` (Caddy 2.11); every allowlisted method/path pair forwarded, other methods and paths 404 (including `/healthz`, `GET /mcp`, `/mcp/`, `//healthz`, `/mcp/%2e%2e/healthz`); forged `X-Forwarded-For`, `X-Real-IP`, `Forwarded` replaced or dropped; a 2 MB body got 413 | Automatic certificate issuance; chunked uploads at the proxy; the `X-Dove-Proxy-Auth` line (`{file.*}` placeholder) was added after this check and has not been run through `caddy validate` |
+| `deploy/nginx/dove.conf` | `nginx -t` (1.30) with a throwaway certificate; same route matrix as Caddy, `/MCP` and `//mcp` get 404; 2 MB body got 413 | Certificate handling; the `include` of `dove_proxy_auth.conf` was added after this check and has not been run through `nginx -t` |
 | `.github/workflows/ci.yml` | `actionlint`; YAML parse; the gitleaks container step run locally, clean on this repository and failing on a planted key; `cargo deny check` (0.20.2) passes | The workflow has not run on GitHub |
 | Backup | `sqlite3 .backup` of a running, freshly initialised store gave an intact copy (`PRAGMA integrity_check` ok) | `age` encryption step, off-host transfer, a full restore drill |

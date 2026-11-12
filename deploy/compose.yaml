@@ -3,7 +3,9 @@
 #   mkdir -p secrets
 #   docker run --rm dove-mcp:local keys generate > secrets/kek            # repeat for pepper and index_key
 #   (put the Google OAuth client secret into secrets/google_client_secret)
+#   openssl rand -hex 32 | tr -d '\n' > secrets/proxy_secret
 #   sudo chown 65532:65532 secrets/* && sudo chmod 0400 secrets/*
+#   sudo install -o 0 -g 0 -m 0400 secrets/proxy_secret secrets/proxy_secret.caddy   # Caddy's copy, see below
 #   cp config.container.toml config.toml   # edit public_url, google.client_id, admin.operator_uid
 #   $EDITOR Caddyfile                      # replace dove.example.com with your hostname
 #   docker compose up -d
@@ -11,6 +13,10 @@
 # Why the secret files must be owned by 65532 with mode 0400: Compose bind-mounts file secrets as they are on the
 # host and ignores the uid/gid/mode keys outside Swarm. Dove refuses to start when a secret file is accessible to
 # group or others.
+#
+# Proxy secret: Caddy sends it as X-Dove-Proxy-Auth, and Dove believes X-Forwarded-For only when it matches, so no
+# other process in the shared network namespace can forge its client address. Caddy runs as root without
+# capabilities, so it can read only a root-owned copy (secrets/proxy_secret.caddy, same content, 0400).
 #
 # Network layout: Dove listens on 127.0.0.1:8787 and refuses any other address (spec 6.6). Inside a container that
 # address is only reachable from the same network namespace, so Caddy joins Dove's namespace
@@ -55,6 +61,8 @@ services:
         target: index_key
       - source: google_client_secret
         target: google_client_secret
+      - source: proxy_secret
+        target: proxy_secret
     ports:                       # published on behalf of Caddy, which shares this network namespace
       - "80:80"
       - "443:443"
@@ -75,6 +83,7 @@ services:
     pids_limit: 128
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./secrets/proxy_secret.caddy:/etc/caddy/dove_proxy_secret:ro
       - caddy-data:/data         # certificates and ACME account: keep it, or Let's Encrypt rate limits bite
       - caddy-config:/config
     tmpfs:
@@ -99,3 +108,5 @@ secrets:
     file: ./secrets/index_key
   google_client_secret:
     file: ./secrets/google_client_secret
+  proxy_secret:
+    file: ./secrets/proxy_secret

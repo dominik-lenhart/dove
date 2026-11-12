@@ -7,12 +7,11 @@
 //! an OAuth connection). Redemption can only keep or narrow the invited rights.
 
 use std::collections::BTreeMap;
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail};
 use axum::body::Bytes;
-use axum::extract::{ConnectInfo, Request, State};
+use axum::extract::{Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -303,8 +302,7 @@ fn json_no_store(status: StatusCode, v: Value) -> Response {
 /// POST `/connect/redeem` with `{"invitation": "dovei_..."}`. Issues one connection token. The invitation travels
 /// only in the request body. Any failure is the same generic `invalid_invitation`.
 pub async fn redeem(State(app): State<Arc<App>>, req: Request) -> Response {
-    let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0);
-    let ip = crate::http::client_ip(req.headers(), peer);
+    let ip = crate::http::request_ip(&req);
     let limit = app.cfg.oauth.redeem_per_minute;
     let key = format!("redeem:{}", crate::oauth::ip_bucket(ip));
     if let Some(wait) = app.rate_limiter.check(&key, limit, limit) {

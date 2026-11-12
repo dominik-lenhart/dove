@@ -19,6 +19,7 @@ AssertPathExists=/etc/dove/credentials/kek
 AssertPathExists=/etc/dove/credentials/pepper
 AssertPathExists=/etc/dove/credentials/index_key
 AssertPathExists=/etc/dove/credentials/google_client_secret
+AssertPathExists=/etc/dove/credentials/proxy_secret
 
 [Service]
 Type=simple
@@ -33,6 +34,8 @@ LoadCredential=kek:/etc/dove/credentials/kek
 LoadCredential=pepper:/etc/dove/credentials/pepper
 LoadCredential=index_key:/etc/dove/credentials/index_key
 LoadCredential=google_client_secret:/etc/dove/credentials/google_client_secret
+# Shared with the reverse proxy (X-Dove-Proxy-Auth); see docs/deployment.md, "Reverse proxy".
+LoadCredential=proxy_secret:/etc/dove/credentials/proxy_secret
 
 # Directories. StateDirectory creates /var/lib/dove (state.db, index.db and their WAL files) with mode 0700.
 # RuntimeDirectory creates /run/dove for the admin socket. Mode 0750 plus group dove means: only members of the
