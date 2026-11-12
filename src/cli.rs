@@ -164,20 +164,22 @@ pub struct ConnectImapArgs {
     admin: AdminOpts,
 }
 
-/// Builds an endpoint from `--<which>-host/-port/-tls`; `None` when no host is given (preset or error later).
+/// Builds an endpoint from `--<which>-host/-port/-tls`; `None` when nothing is given (the preset applies). A port or
+/// TLS override without a host uses the preset's host (`preset_host`).
 fn endpoint(
     which: &str,
     host: Option<String>,
     port: Option<u16>,
     tls: Option<String>,
     ports: (u16, u16),
+    preset_host: Option<&str>,
 ) -> anyhow::Result<Option<crate::imap::ServerEndpoint>> {
     use crate::imap::{ServerEndpoint, TlsMode};
-    let Some(host) = host else {
-        if port.is_some() || tls.is_some() {
-            anyhow::bail!("--{which}-port and --{which}-tls need --{which}-host");
-        }
-        return Ok(None);
+    let host = match (host, preset_host) {
+        (Some(h), _) => h,
+        (None, _) if port.is_none() && tls.is_none() => return Ok(None),
+        (None, Some(h)) => h.to_string(),
+        (None, None) => anyhow::bail!("--{which}-port and --{which}-tls need --{which}-host or a known --preset"),
     };
     let tls = match tls.as_deref() {
         Some(t) => TlsMode::parse(t).ok_or_else(|| anyhow::anyhow!("--{which}-tls must be implicit or starttls"))?,
@@ -420,8 +422,16 @@ fn admin_request(cmd: Command) -> anyhow::Result<(AdminOpts, AdminRequest)> {
             AccountsCmd::Connect { alias, email, admin } => (admin, R::AccountsConnect { alias, email }),
             AccountsCmd::ConnectImap(a) => {
                 let a = *a;
-                let imap = endpoint("imap", a.imap_host, a.imap_port, a.imap_tls, (993, 143))?;
-                let smtp = endpoint("smtp", a.smtp_host, a.smtp_port, a.smtp_tls, (465, 587))?;
+                let preset = match a.preset.as_deref() {
+                    Some(name) => crate::imap::presets::by_name(name),
+                    None => crate::imap::presets::for_email(&a.email),
+                };
+                let (imap_default, smtp_default) = match &preset {
+                    Some(p) => (Some(p.imap.host.as_str()), Some(p.smtp.host.as_str())),
+                    None => (None, None),
+                };
+                let imap = endpoint("imap", a.imap_host, a.imap_port, a.imap_tls, (993, 143), imap_default)?;
+                let smtp = endpoint("smtp", a.smtp_host, a.smtp_port, a.smtp_tls, (465, 587), smtp_default)?;
                 let password = read_password(&format!("Password for {}: ", a.email), a.password_stdin)?;
                 (
                     a.admin,
@@ -584,5 +594,21 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             print(&v, opts.json);
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::imap::TlsMode;
+
+    #[test]
+    fn port_override_uses_the_preset_host() {
+        let ep = endpoint("smtp", None, Some(587), Some("starttls".into()), (465, 587), Some("smtp.strato.de"))
+            .unwrap()
+            .unwrap();
+        assert_eq!((ep.host.as_str(), ep.port, ep.tls), ("smtp.strato.de", 587, TlsMode::StartTls));
+        assert!(endpoint("smtp", None, None, None, (465, 587), Some("smtp.strato.de")).unwrap().is_none());
+        assert!(endpoint("smtp", None, Some(587), None, (465, 587), None).is_err(), "no host and no preset");
     }
 }
