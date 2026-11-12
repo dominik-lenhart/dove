@@ -469,7 +469,8 @@ impl Done {
 /// Where a failed command stopped: needed to classify writes.
 struct ExecError {
     err: ImapError,
-    /// True when every byte of the command (including literals) was written.
+    /// True when the command may have taken effect: all of it was written, or a whole literal may have reached the
+    /// server (which can act on an APPEND before reading the final CRLF).
     sent_all: bool,
 }
 
@@ -833,15 +834,23 @@ impl ImapSession {
     // ------------------------------------------------------------------ wire
 
     async fn write(&mut self, bytes: &[u8]) -> Result<(), ImapError> {
+        self.write_staged(bytes).await.map_err(|(e, _)| e)
+    }
+
+    /// Writes and flushes. On failure, also whether every byte had been handed to the stream (only the flush failed):
+    /// the peer may then have received all of them.
+    async fn write_staged(&mut self, bytes: &[u8]) -> Result<(), (ImapError, bool)> {
         let w = self.io.get_mut();
-        match tokio::time::timeout(self.timeout, async {
+        let mut handed_over = false;
+        let r = tokio::time::timeout(self.timeout, async {
             w.write_all(bytes).await?;
+            handed_over = true;
             w.flush().await
         })
-        .await
-        {
+        .await;
+        match r {
             Ok(Ok(())) => Ok(()),
-            _ => Err(ImapError::Network),
+            _ => Err((ImapError::Network, handed_over)),
         }
     }
 
@@ -892,6 +901,7 @@ impl ImapSession {
             _ => (MAX_LINE, false),
         };
         let fail = |err| ExecError { err, sent_all: false };
+        let mut literal_sent = false;
         if self.idle.is_some() {
             // Only DONE may follow IDLE (`idle_done`); anything else would be read as the end of IDLE.
             return Err(fail(ImapError::Protocol("session is idling")));
@@ -918,13 +928,16 @@ impl ImapSession {
                     {
                         return Ok(col.done(st, code));
                     }
-                    self.write(&bytes).await.map_err(fail)?;
+                    // Once a literal may have arrived in full, a server can commit the command (an APPEND) before
+                    // it reads the final CRLF: any later failure leaves the outcome unknown.
+                    self.write_staged(&bytes).await.map_err(|(err, all)| ExecError { err, sent_all: all })?;
+                    literal_sent = true;
                 }
                 Part::Sasl(line) => sasl = Some(line),
             }
         }
         buf.extend_from_slice(b"\r\n");
-        self.write(&buf).await.map_err(fail)?;
+        self.write(&buf).await.map_err(|err| ExecError { err, sent_all: literal_sent })?;
         if let Some(line) = sasl {
             if let Some((st, code)) = self.await_continuation(&tag, &mut col, &mut budget).await.map_err(fail)? {
                 return Ok(col.done(st, code));
@@ -1469,7 +1482,7 @@ mod tests {
         assert_eq!(t[4], Tok::Str(b"a\"b".to_vec()));
     }
 
-    fn over_stream(io: tokio::io::DuplexStream) -> ImapSession {
+    fn over_stream(io: impl Io + 'static) -> ImapSession {
         ImapSession {
             io: BufReader::new(Box::new(io)),
             tag: 0,
@@ -1683,6 +1696,62 @@ mod tests {
         assert_eq!(ch.changed.len(), n as usize);
         assert_eq!(ch.changed[n as usize - 1].flags, vec!["\\Seen".to_string()]);
         assert_eq!(ch.changed[0].modseq, Some(5));
+    }
+
+    /// A stream that fails any write of exactly `fail_on` (reads come from the duplex peer).
+    struct FailWrite {
+        inner: tokio::io::DuplexStream,
+        fail_on: &'static [u8],
+    }
+
+    impl tokio::io::AsyncRead for FailWrite {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for FailWrite {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let me = self.get_mut();
+            if buf == me.fail_on {
+                return std::task::Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
+            }
+            std::pin::Pin::new(&mut me.inner).poll_write(cx, buf)
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        }
+    }
+
+    /// The final CRLF of an APPEND comes after the whole message: a server may already have stored it, so failing to
+    /// write the CRLF is `OutcomeUnknown`. Failing inside the message itself is still `NotDispatched`.
+    #[tokio::test]
+    async fn append_failing_after_the_literal_is_outcome_unknown() {
+        for (fail_on, want) in [(&b"\r\n"[..], ImapError::OutcomeUnknown), (&b"hello"[..], ImapError::NotDispatched)] {
+            let (client, server) = tokio::io::duplex(1 << 16);
+            let mut s = over_stream(FailWrite { inner: client, fail_on });
+            s.set_append_targets(Some("Drafts".into()), None);
+            let (_sr, mut sw) = tokio::io::split(server);
+            sw.write_all(b"+ go ahead\r\n").await.unwrap();
+            assert_eq!(s.append(AppendTarget::Drafts, &[], b"hello").await.unwrap_err(), want, "{fail_on:?}");
+        }
     }
 
     #[test]
