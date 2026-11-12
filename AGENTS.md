@@ -187,3 +187,12 @@ cargo fmt
   draft's bytes (Bcc kept) in Sent with `\Seen` unless `save_sent_copy` is false, then deletes its draft; both are best
   effort and reported once. SMTP framing always ends DATA with CRLF, so compare submitted bytes with that in mind.
   Test SMTP-only auth failures with `smtp_fail_next("AUTH", SmtpFault::Reply(535))` (IMAP keeps working).
+- 2026-11-12: Draft attachments (`src/tools/compose.rs`, `mime::build_draft`): attachment leaves are written base64
+  with an explicit `Content-Transfer-Encoding`, because mail-builder sends `text/*` bodies as 7bit/QP and turns bare
+  LF into CRLF (a test needs a plain-ASCII LF-only text attachment to catch that). `ParsedMessage::is_draft_shape`
+  (text/plain, or `multipart/mixed` = body + attachment leaves) is what update and `editable_by_dove` accept.
+  Grants enforce `draft` ⇒ `read`, so "source without read" tests must use a mailbox the token is not granted.
+  Sources are authorized in `compose::parse_attachments` / `readable_message` before the send-as lookup; tests check
+  `google.requests()` and `imap.commands()` are empty right after the refused calls (clearing the log later hides a
+  regression). `/mcp` authenticates before reading the body (`Limits::draft_body_bytes` for clients with draft).
+  To scan audit rows as text, read cells as `rusqlite::types::Value` (`get_ref` Debug prints bytes).

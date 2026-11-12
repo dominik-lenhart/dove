@@ -39,7 +39,8 @@ so no operator's grants ever pass through anyone else's infrastructure.
 - N1. Raw message sending, scheduled sending and bulk sending are outside v1. Standard tokens have no send permission.
 - N2. Deleting, trashing, archiving, labelling or marking messages read. Dove does not change existing mail.
 - N3. Gmail settings: filters, forwarding, send-as aliases, vacation replies.
-- N4. Permanent raw MIME archives, attachment bytes and attachment text extraction are outside v1. Selected mailboxes can persist encrypted searchable message text and metadata (§7.9).
+- N4. Permanent raw MIME archives, attachment bytes and attachment text extraction are outside v1 (attachment reads
+  and draft attachments were added later, see `docs/superpowers/specs/2026-11-12-imap-smtp-design.md`). Selected mailboxes can persist encrypted searchable message text and metadata (§7.9).
 - N5. Arbitrary SQL, vector search and a separate search service are outside v1.
 - N6. Multi-user or multi-tenant operation. There is one owner, one administrator, one server.
 - N7. General web administration. Operator administration remains local CLI; the minimal connection approval/OAuth page in §5.6 is part of v1.
@@ -117,8 +118,8 @@ is always delivered in the untrusted-content envelope from section 6.5.
 | `list_labels` | read | Labels of an account (system and user), for building queries. |
 | `list_drafts` | read | Drafts of an account. `own_only` (default true) limits it to drafts this project created. |
 | `get_draft` | read | Draft content and current revision in the specified mailbox. |
-| `create_draft` | draft | Create a new message or threaded reply. |
-| `update_draft` | draft | Edit an owned draft, conditional on the expected revision (§5.3). |
+| `create_draft` | draft | Create a new message, a threaded reply (quoting the original) or a forward, with attachments. |
+| `update_draft` | draft | Edit an owned draft, conditional on the expected revision (§5.3); attachments kept unless replaced. |
 | `send_draft` | send | Optional. Submit one existing, owned draft under §6.3. |
 
 Read tools set `readOnlyHint: true`. Update and send set `destructiveHint: true`. Annotations describe tools; the server enforces authorization. Draft deletion remains a human mailbox action in v1.
@@ -178,7 +179,21 @@ The default source is `index`. A search returns messages at the authorized index
 #### `create_draft`
 
 - Input: `account`, `request_key` (client-generated UUID), `to[]`, `cc[]`, `bcc[]`, `subject`, `body_text`, `reply_to_message_id`
-  (optional), `from_address` (optional, MUST be one of the account's send-as addresses).
+  (optional), `from_address` (optional, MUST be one of the account's send-as addresses), `attachments[]` (optional),
+  `forward_message_id` or `forward_ref` (optional), `include_attachments` (forwards, default true), `quote_original`
+  (replies, default true).
+- Attachments: each is either a reference `{ref | account + message_id, attachment_id}` to an attachment of a message
+  the caller may read, fetched server-side (the bytes never pass through the agent), or inline `{filename,
+  mime_type, content_base64}`. At most 10 per draft and `limits.draft_attachment_bytes` (default 10 MiB) decoded in
+  total; exceeding either is `invalid_argument` (count) or `too_large` (bytes), never a silent drop. A referenced
+  mailbox without `read` is the identical `not_found`, decided before any upstream call. Filenames are sanitized as
+  in `get_attachment`; MIME types must be a plain `type/subtype`.
+- Forward mode: subject `Fwd: <original subject>` unless given, the agent's text, then a forwarded-message block
+  (From, Date, Subject, To, Cc) and the original plain text, and the original's attachments unless
+  `include_attachments` is false. Needs `read` on the source mailbox; source and target may differ.
+- Reply quoting: below the agent's text, `On <date>, <sender> wrote:` and the original plain text with `> ` prefixes,
+  at most 100 KiB of original text and never beyond the body limit. Quoted and forwarded text is untrusted content
+  and goes into the body only; the only header derived from the original is the subject, reduced to one clean line.
 - Reply mode (`reply_to_message_id` set): the draft is placed in that message's thread, `In-Reply-To` is set to the
   original `Message-ID`, `References` to the original `References` plus its `Message-ID`, and the subject defaults to
   the original subject, preserving the threading subject. A caller requesting a different subject creates a new conversation, with no claim that threadId can force Gmail grouping. Add a real-account test covering an unchanged subject and a changed subject. Recipients are never inferred; the agent passes them.
@@ -190,7 +205,9 @@ The default source is `index`. A search returns messages at the authorized index
 #### Revising drafts and handing over to Apple Mail
 
 - `update_draft(account, draft_id, expected_revision, changes)` patches an owned draft. Omitted fields are preserved. Return a new revision after each confirmed update. A prompt such as “shorten the last paragraph” must leave recipients, subject, reply headers, threading and sender intact.
-- Start with text/plain Dove-created drafts. For externally added MIME parts, HTML or attachments that the writer cannot preserve, return `draft_conflict` before mutation. Build the replacement from the current server message; never replace missing fields with defaults.
+- Dove-created drafts are text/plain, optionally `multipart/mixed` with the body first and one attachment leaf per
+  file. Update keeps those attachments unless `changes.attachments` replaces the list (`[]` removes all). For
+  externally added MIME parts, HTML or inline parts that the writer cannot preserve, return `draft_conflict` before mutation. Build the replacement from the current server message; never replace missing fields with defaults.
 - Serialize Dove operations per (account, draft_id), then read Gmail fresh, bypassing caches. Compare its message ID to the last Dove-written revision and to the caller's expected revision. A mismatch returns `draft_conflict`; a missing draft returns `not_found`. Never recreate, adopt or reassociate a missing draft by subject or thread.
 - Human handoff uses Apple's server-side Drafts mailbox. A message that is only “On My Mac” is outside Dove. Treat external changes as human-owned; on conflict show the latest content and let the owner finish it or explicitly ask for a separate proposed draft. An unsaved Apple Mail editor is invisible to Gmail. Without a documented atomic provider precondition, the fresh check detects previously saved edits but cannot protect against a simultaneous save between GET and PUT. Support sequential editing, with this limitation documented.
 - `send_draft(account, draft_id, expected_revision)` uses the same scope, ownership, fresh-read and conflict checks. It accepts no recipients, content or arbitrary raw MIME. See §6.3.
@@ -200,7 +217,7 @@ The default source is `index`. A search returns messages at the authorized index
 Tool failures return an MCP tool result with `isError: true` and structured content with a stable `code`, a short
 human message and, where useful, `retry_after_seconds`. Codes: `not_found`, `forbidden` (capability missing),
 `invalid_argument`, `account_unavailable` (disabled or `reauth_required`), `rate_limited`, `upstream_error`,
-`internal`, `draft_conflict`, `outcome_unknown`, `cursor_invalid`, `query_too_broad`, `index_incomplete`, `budget_exceeded`, `too_large` (an attachment above `limits.attachment_bytes`, with its size). Errors disclose no tokens, mail content, stack traces or unauthorized account data.
+`internal`, `draft_conflict`, `outcome_unknown`, `cursor_invalid`, `query_too_broad`, `index_incomplete`, `budget_exceeded`, `too_large` (an attachment above `limits.attachment_bytes`, or a draft's attachments above `limits.draft_attachment_bytes`, with the size and limit). Errors disclose no tokens, mail content, stack traces or unauthorized account data.
 
 ### 5.5 Administration CLI
 
@@ -490,8 +507,13 @@ MCP batching (§5.3) combines independent agent reads. V1 executes authorized up
   `In-Reply-To` and `References`.
 - Agent-authored drafts use `text/plain; charset=utf-8`. Reading HTML mail remains supported (§6.5).
 - Encode as base64url in the `raw` field. Pass `threadId` for replies.
-- Limits: at most 50 recipients in total, subject at most 998 bytes encoded, body at most 500 KB. Attachments are not
-  supported in version 1.
+- Limits: at most 50 recipients in total, subject at most 998 bytes encoded, body at most 500 KB, at most 10
+  attachments and `limits.draft_attachment_bytes` (default 10 MiB, at most 16 MiB) decoded attachment bytes. With
+  attachments the draft is `multipart/mixed`: the text/plain body, then one base64 leaf per attachment with
+  `Content-Disposition: attachment` and an RFC 2231 filename. No HTML authoring.
+- Request bodies: `limits.body_bytes` (default 1 MiB) for every request, except `/mcp` requests of an authenticated
+  client with `draft` on some mailbox, which get `draft_attachment_bytes` × 4/3 + 2 MiB for inline attachments. The
+  `/mcp` body is read only after authentication.
 - Gmail does not add the account's signature to drafts created through the API. Version 1 leaves the signature to the
   agent's text. Phase 2 MAY append the send-as signature when it can be read with the granted scopes.
 

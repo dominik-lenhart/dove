@@ -50,9 +50,11 @@ dove.example.com {
 		-Server
 	}
 
-	# Request size limit (spec 6.6). Dove enforces the same limit (limits.body_bytes, default 1 MiB).
+	# Request size limit (spec 6.6). Dove enforces its own, smaller limits: limits.body_bytes (1 MiB) for everyone,
+	# and up to limits.draft_attachment_bytes * 4/3 + 2 MiB (about 15.3 MiB) for authenticated clients that create
+	# drafts with inline attachments. This must stay at least that large.
 	request_body {
-		max_size 1MB
+		max_size 20MB
 	}
 
 	# --- Allowed routes -----------------------------------------------------------------------------------------

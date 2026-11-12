@@ -441,6 +441,14 @@ mod tests {
         let mut cfg = config(dir4.path(), "https://dove.example.com", 0o400);
         cfg.listen = "0.0.0.0:8787".parse().unwrap();
         assert!(cfg.validate().is_err());
+        // Draft attachments must stay below the MIME parse limit once encoded.
+        let dir5 = tempfile::tempdir().unwrap();
+        let mut cfg = config(dir5.path(), "https://dove.example.com", 0o400);
+        cfg.limits.draft_attachment_bytes = MAX_DRAFT_ATTACHMENT_BYTES;
+        cfg.validate().unwrap();
+        assert!(cfg.limits.draft_body_bytes() > MAX_DRAFT_ATTACHMENT_BYTES / 3 * 4);
+        cfg.limits.draft_attachment_bytes = MAX_DRAFT_ATTACHMENT_BYTES + 1;
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

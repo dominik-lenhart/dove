@@ -156,7 +156,12 @@ The file holds no secrets. Unknown keys are rejected. Settings and defaults (fro
 
 `limits` defaults: `body_bytes` 1 MiB, `client_requests_per_minute` 120, `client_burst` 40,
 `client_sends_per_hour` 20, `upstream_total_inflight` 16, `upstream_per_mailbox` 4, `upstream_search_mailboxes` 8,
-`upstream_request_timeout_secs` 10, `tool_call_timeout_secs` 30. `index` defaults: `poll_interval_secs` 60,
+`upstream_request_timeout_secs` 10, `tool_call_timeout_secs` 30, `attachment_bytes` 10 MiB (largest attachment
+`get_attachment` returns), `draft_attachment_bytes` 10 MiB (all attachments of one draft, decoded; at most 16 MiB).
+`body_bytes` caps every request except `/mcp` requests from an authenticated client with `draft` on some mailbox:
+those may carry inline attachments and get `draft_attachment_bytes` × 4/3 + 2 MiB (about 15.3 MiB by default). Dove
+reads an `/mcp` body only after the token checked out, so unauthenticated requests never get the larger limit. The
+proxy limit must be at least that large (the shipped Caddy and nginx files use 20 MB). `index` defaults: `poll_interval_secs` 60,
 `sql_heap_limit_mib` 96, `page_cache_kib` 8192, `reader_connections` 3, `body_jobs` 2, `max_message_bytes` 22 MiB (larger messages are indexed
 from metadata only),
 `max_body_chars` 200000.
@@ -219,7 +224,8 @@ Dove serves publicly (spec 5.6, 6.6):
 `/healthz` is deliberately not forwarded: it reveals whether any mailbox needs re-authorization. Probe the loopback
 address instead. The admin interface is a Unix socket and is not reachable over HTTP at all.
 
-- **Caddy:** [`deploy/Caddyfile`](../deploy/Caddyfile). Automatic TLS (TLS 1.2 and newer), HSTS, a 1 MB body limit,
+- **Caddy:** [`deploy/Caddyfile`](../deploy/Caddyfile). Automatic TLS (TLS 1.2 and newer), HSTS, a 20 MB body limit (room for draft attachments;
+  Dove enforces the smaller per-caller limits itself),
   404 for everything else. Install Caddy, copy the file to `/etc/caddy/Caddyfile`, change the hostname, `systemctl
   reload caddy`.
 - **nginx:** [`deploy/nginx/dove.conf`](../deploy/nginx/dove.conf), the same allowlist as exact, case-sensitive
@@ -419,7 +425,7 @@ Checked in this repository's work, with the tool named; "not verified" means nob
 | --- | --- | --- |
 | `deploy/systemd/dove.service` | `systemd-analyze verify` (only warning: the binary was not installed on the check machine); `systemd-analyze security --offline` exposure 1.4 OK; the binary started with `LoadCredential`, `StateDirectory`, `RuntimeDirectory`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, `ProtectProc`, `MemoryDenyWriteExecute`, `SystemCallFilter`, `RestrictAddressFamilies`, `NoNewPrivileges` and memory/task/file limits as a transient `systemd-run --user` unit: served `/healthz`, accepted `dove doctor` over the socket (Google reachable), stopped cleanly | Running as a system service with `User=dove`; `PrivateDevices`, `ProtectKernelTunables/Modules/Logs`, `ProtectClock`, `ProtectHostname`, `CapabilityBoundingSet=` (the user manager cannot apply them); sysusers and tmpfiles snippets |
 | `deploy/Containerfile`, `compose.yaml` | Built with Docker 29; 66 MB image; `--version` and `config-example` run read-only with all capabilities dropped; the compose stack started read-only with `cap_drop: ALL`, `no-new-privileges`, 512 MiB limit, secrets from files, tmpfs socket directory; Caddy shared Dove's network namespace and proxied to the loopback listener; `dove doctor` worked via `exec --user <uid>:65532`, another uid was refused; `stop` exited 0 | Podman; a real TLS certificate; the 1 GiB profile; memory behaviour under load; the `proxy_secret` secret and Caddy's root-owned copy (added later) |
-| `deploy/Caddyfile` | `caddy validate` (Caddy 2.11); every allowlisted method/path pair forwarded, other methods and paths 404 (including `/healthz`, `GET /mcp`, `/mcp/`, `//healthz`, `/mcp/%2e%2e/healthz`); forged `X-Forwarded-For`, `X-Real-IP`, `Forwarded` replaced or dropped; a 2 MB body got 413; after the `X-Dove-Proxy-Auth` line was added, `caddy validate` (2.11) again, and a probe showed `{file.*}` strips a trailing newline (a secret file with or without final newline yields the same header value) | Automatic certificate issuance; chunked uploads at the proxy; the proxy-secret header end to end against a running Dove behind Caddy |
-| `deploy/nginx/dove.conf` | `nginx -t` (1.30) with a throwaway certificate; same route matrix as Caddy, `/MCP` and `//mcp` get 404; 2 MB body got 413; `nginx -t` (1.30) again with the `dove_proxy_auth.conf` include | Certificate handling; the proxy-secret header end to end against a running Dove behind nginx |
+| `deploy/Caddyfile` | `caddy validate` (Caddy 2.11); every allowlisted method/path pair forwarded, other methods and paths 404 (including `/healthz`, `GET /mcp`, `/mcp/`, `//healthz`, `/mcp/%2e%2e/healthz`); forged `X-Forwarded-For`, `X-Real-IP`, `Forwarded` replaced or dropped; a 2 MB body got 413 (with the former 1 MB limit; the 20 MB limit for draft attachments is not re-tested); after the `X-Dove-Proxy-Auth` line was added, `caddy validate` (2.11) again, and a probe showed `{file.*}` strips a trailing newline (a secret file with or without final newline yields the same header value) | Automatic certificate issuance; chunked uploads at the proxy; the proxy-secret header end to end against a running Dove behind Caddy |
+| `deploy/nginx/dove.conf` | `nginx -t` (1.30) with a throwaway certificate; same route matrix as Caddy, `/MCP` and `//mcp` get 404; 2 MB body got 413 (former 1 MB limit; the 20 MB limit is not re-tested); `nginx -t` (1.30) again with the `dove_proxy_auth.conf` include | Certificate handling; the proxy-secret header end to end against a running Dove behind nginx |
 | `.github/workflows/ci.yml` | `actionlint`; YAML parse; the gitleaks container step run locally, clean on this repository and failing on a planted key; `cargo deny check` (0.20.2) passes | The workflow has not run on GitHub |
 | Backup | `sqlite3 .backup` of a running, freshly initialised store gave an intact copy (`PRAGMA integrity_check` ok) | `age` encryption step, off-host transfer, a full restore drill |
