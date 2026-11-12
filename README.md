@@ -146,10 +146,11 @@ server in `tests/support/`, not against real services.
 | Foundation: config and startup checks, vault, state store, audit chain, admin socket, client tokens | done |
 | Google connect flow, token manager, outbound allowlist gateway | done (fake Google) |
 | MCP transport and read tools, untrusted-content envelope | done (fake Google) |
-| `create_draft`, `update_draft`, `send_draft` behind both gates, `batch_read` | done (fake Google); `batch_read` search items wait for search |
-| Encrypted search index, sync engine, typed `search_messages` | **not implemented** |
-| Client onboarding (`dove login`, `mcp install`, `mcp stdio`) and downstream OAuth for ChatGPT and Claude | **not implemented** (the proxy allowlist already contains the routes) |
-| Restart and crash recovery tests, log canary test, benchmarks | open |
+| `create_draft`, `update_draft`, `send_draft` behind both gates, `batch_read` | done (fake Google) |
+| Encrypted search index, sync engine, typed `search_messages` | done (fake Google) |
+| Client onboarding (`dove login`, `mcp install`, `mcp stdio`) and downstream OAuth for ChatGPT and Claude | done (fake Google, no real MCP host tried) |
+| Restart and crash recovery tests, log canary test | done |
+| Benchmarks on reference hardware | open |
 | Deployment files, CI, docs | present, partially verified ([deployment guide](docs/deployment.md#what-has-been-verified)) |
 
 ### Not yet verified

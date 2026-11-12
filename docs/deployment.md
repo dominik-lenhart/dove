@@ -21,7 +21,7 @@ Contents: [Requirements](#requirements) · [Install](#install) · [Google Cloud]
   reachable for the proxy. Dove itself listens on `127.0.0.1` only.
 - Memory: the reference profile is a 512 MiB limit for the service (spec 8.1a). The goal of under 256 MiB resident
   memory at steady state is provisional and not measured yet. A 1 GiB profile exists for larger workloads. Disk: the
-  state store is small; the search index (not implemented yet, see the README status) will grow with mail volume.
+  state store is small; the search index will grow with mail volume.
 - A Google account that owns a Google Cloud project, and 2-step verification on every mailbox you connect.
 - For building: Rust 1.90 or newer, a C compiler, `perl` and `make` (SQLCipher and OpenSSL are vendored and built
   from source). Running needs none of them.
@@ -150,7 +150,7 @@ The file holds no secrets. Unknown keys are rejected. Settings and defaults (fro
 | `limits.*` | see below | Request and upstream limits. |
 | `audit.retention_days` | `180` | Audit retention. Prune with `dove audit prune`. |
 | `notifier.webhook_url` | unset | HTTPS webhook (for example ntfy) for "mailbox needs re-authorization". Messages carry no mail content. |
-| `index.*` | see below | Search index tuning (index not implemented yet). |
+| `index.*` | see below | Search index tuning. |
 
 `limits` defaults: `body_bytes` 1 MiB, `client_requests_per_minute` 120, `client_burst` 40,
 `client_sends_per_hour` 20, `upstream_total_inflight` 16, `upstream_per_mailbox` 4, `upstream_search_mailboxes` 8,
@@ -213,9 +213,6 @@ Dove serves publicly (spec 5.6, 6.6):
 | `GET`, `POST /oauth/dove/authorize` | Approval page |
 | `POST /oauth/dove/token`, `/oauth/dove/register`, `/oauth/dove/revoke` | OAuth token, registration, revocation |
 | `POST /connect/redeem` | Invitation redemption for `dove login` |
-
-The downstream OAuth routes and `/connect/redeem` are in the allowlist already, but Dove does not implement them yet
-(README status); it answers 404 until step 4 of the plan lands.
 
 `/healthz` is deliberately not forwarded: it reveals whether any mailbox needs re-authorization. Probe the loopback
 address instead. The admin interface is a Unix socket and is not reachable over HTTP at all.
@@ -302,8 +299,11 @@ host):
 claude mcp add --transport http dove https://dove.example.com/mcp --header "Authorization: Bearer dove_..."
 ```
 
-`dove clients invite` exists for the future `dove login` and OAuth approval flow (README status). Until that lands,
-use `clients create` tokens.
+Instead of handing out a token, the operator can create a one-time invitation with `dove clients invite <name>
+--project acme --accounts info --capabilities read,draft`. The user redeems it on their own machine with
+`dove login --server https://dove.example.com --profile acme` (it prompts for the invitation) and then runs
+`dove mcp install --client claude-code --profile acme`, or enters it on the OAuth approval page of ChatGPT or Claude.
+`dove login --token-stdin` stores an existing `clients create` token instead.
 
 A `send` grant is refused unless `allow_send = true` is set in `config.toml`; that file is deployment-owner
 configuration, and neither MCP calls nor the CLI can change it. See the README before enabling it.
