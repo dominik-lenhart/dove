@@ -699,7 +699,21 @@ fn compile_pred(q: &mut Sql, p: &Pred, scope: &Scope<'_>) -> Result<(), ToolErro
         }
         Subject | BodyText | Text => {
             let Val::Str(s) = &p.value else { unreachable!() };
-            q.s("m.id IN (SELECT rowid FROM fts WHERE fts MATCH ").p(SqlValue::Text(fts_expr(p.field, p.op, s))).s(")");
+            // MATCH runs only on the FTS tables of the eligible generations (spec 7.9), never on other accounts'.
+            if t.is_empty() {
+                q.s("0");
+            } else {
+                let expr = fts_expr(p.field, p.op, s);
+                q.s("m.id IN (");
+                for (i, target) in t.iter().enumerate() {
+                    if i > 0 {
+                        q.s(" UNION ALL ");
+                    }
+                    let fts = super::schema::fts_table(target.gen_id);
+                    q.s(&format!("SELECT rowid FROM {fts} WHERE {fts} MATCH ")).p(SqlValue::Text(expr.clone()));
+                }
+                q.s(")");
+            }
         }
         AttachmentName | AttachmentMime => {
             let vals = str_list(&p.value).into_iter().map(|s| s.to_lowercase());

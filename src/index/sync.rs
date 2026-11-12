@@ -230,6 +230,9 @@ pub async fn sync_account(app: &Arc<App>, account_id: &str) -> anyhow::Result<Sy
 /// Like [`sync_account`] but stops after `max_steps` units of work (capture, one list page, one fetch batch,
 /// reconcile + publish, one incremental pass). Lets tests observe a backfill or rebuild in progress.
 pub async fn sync_steps(app: &Arc<App>, account_id: &str, max_steps: usize) -> anyhow::Result<SyncReport> {
+    // The cancel token is taken before the lock: a disable or rebuild that lands while this job waits for the lock
+    // or checks readiness cancels this token, never a fresh one the job would only pick up afterwards.
+    let cancel = app.index.cancel_token(account_id);
     let lock = app.index.lock_for(account_id);
     let _guard = lock.lock().await;
     let mut report = SyncReport::default();
@@ -237,7 +240,6 @@ pub async fn sync_steps(app: &Arc<App>, account_id: &str, max_steps: usize) -> a
         report.skipped_inactive = true;
         return Ok(report);
     }
-    let cancel = app.index.cancel_token(account_id);
     let aid = account_id.to_string();
     let Some(st) = app.index.write(move |c| load_state(c, &aid)).await? else {
         return Ok(report);
@@ -386,14 +388,13 @@ async fn backfill_step(job: &Job, st: &SyncState, gen_id: i64, report: &mut Sync
 async fn restart_generation(job: &Job, old_gen: i64) -> anyhow::Result<()> {
     let aid = job.account_id.clone();
     job.tx(move |tx| {
-        super::drop_generation(tx, old_gen)?;
         let g = new_generation(tx, &aid)?;
         tx.execute("UPDATE sync_state SET building_gen = ?1 WHERE account_id = ?2", params![g, aid])?;
         Ok(())
     })
     .await?;
     job.app.index.cursors.invalidate_account(&job.account_id);
-    Ok(())
+    super::drop_generation(&job.app.index, old_gen).await
 }
 
 fn history_id_of(v: &Value) -> Option<String> {
@@ -465,30 +466,112 @@ enum Fetched {
     Failed(String),
 }
 
-/// Fetches and parses one message under the body-job admission limit.
+/// Most bytes a `format=raw` answer may have for a message of `max_message_bytes`: base64url (4/3) plus the JSON
+/// envelope (ids, labels, snippet).
+pub fn raw_response_cap(max_message_bytes: usize) -> usize {
+    max_message_bytes.div_ceil(3) * 4 + 64 * 1024
+}
+
+/// The fields of a `format=raw` answer. `raw` borrows from the response body (base64url needs no JSON escapes), so
+/// the encoded message exists once in memory, not twice.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawAnswer<'a> {
+    #[serde(default)]
+    id: Value,
+    #[serde(default)]
+    thread_id: Value,
+    #[serde(default)]
+    label_ids: Value,
+    #[serde(default)]
+    internal_date: Value,
+    #[serde(default)]
+    size_estimate: Value,
+    #[serde(default)]
+    snippet: Value,
+    /// Empty when absent. Not `Option<Cow<..>>`: serde never borrows through an Option, it would copy.
+    #[serde(borrow, default)]
+    raw: std::borrow::Cow<'a, str>,
+}
+
+/// Parses a raw answer within the per-job memory budget (spec 8.1a): the response body was read with a byte cap,
+/// and the encoded message is decoded in place inside that buffer, so it is held once (about 4/3 of the message)
+/// plus the MIME parser's working set.
+pub fn doc_from_raw_answer(body: Vec<u8>, max_bytes: usize, max_chars: usize) -> Option<Doc> {
+    enum Raw {
+        Missing,
+        At(std::ops::Range<usize>),
+        Escaped(Vec<u8>),
+    }
+    let (meta, raw) = {
+        let a: RawAnswer<'_> = serde_json::from_slice(&body).ok()?;
+        let meta = GmailMeta::from_json(&serde_json::json!({
+            "id": a.id, "threadId": a.thread_id, "labelIds": a.label_ids, "internalDate": a.internal_date,
+            "sizeEstimate": a.size_estimate, "snippet": a.snippet,
+        }))?;
+        let raw = match &a.raw {
+            r if r.is_empty() => Raw::Missing,
+            std::borrow::Cow::Borrowed(r) => {
+                let start = r.as_ptr() as usize - body.as_ptr() as usize;
+                Raw::At(start..start + r.len())
+            }
+            // JSON escapes inside base64url are not expected from Gmail; decode the unescaped copy.
+            std::borrow::Cow::Owned(r) => Raw::Escaped(util::b64url_decode(r)?),
+        };
+        (meta, raw)
+    };
+    let raw = match raw {
+        Raw::Missing => None,
+        Raw::At(range) => Some(util::b64url_decode_in_place(body, range)?),
+        Raw::Escaped(r) => {
+            drop(body);
+            Some(r)
+        }
+    };
+    Some(match raw {
+        Some(raw) => Doc::from_raw(meta, &raw, max_bytes, max_chars),
+        None => Doc::metadata_only(meta),
+    })
+}
+
+/// Fetches and parses one message under the body-job admission limit. A message whose raw answer exceeds the
+/// byte cap is not read further: it is indexed from Gmail metadata only, with incomplete body and MIME coverage.
 async fn fetch_full(job: &Job, id: &str) -> Result<Fetched, ToolError> {
     let _permit = job.app.index.body_jobs.clone().acquire_owned().await.map_err(|_| ToolError::internal())?;
-    let v = match job.gmail_get(id, "raw").await {
-        Ok(v) => v,
+    let max_bytes = job.app.cfg.index.max_message_bytes;
+    let max_chars = job.app.cfg.index.max_body_chars;
+    let owned = id.to_string();
+    let fetched = job
+        .app
+        .google
+        .call_bytes(
+            &job.account_id,
+            || GmailOp::GetMessage(&owned),
+            &[("format", "raw".to_string())],
+            Priority::Background,
+            Job::deadline(),
+            raw_response_cap(max_bytes),
+        )
+        .await;
+    let body = match fetched {
+        Ok(b) => b,
+        Err(e) if e.code == ErrorCode::BudgetExceeded => {
+            return Ok(match fetch_labels(job, id).await? {
+                Fetched::Labels(meta) => Fetched::Doc(Box::new(Doc::metadata_only(meta))),
+                other => other,
+            });
+        }
         Err(e) if e.code == ErrorCode::NotFound => return Ok(Fetched::Gone),
         Err(e) if matches!(e.code, ErrorCode::RateLimited | ErrorCode::AccountUnavailable) => return Err(e),
         Err(e) => return Ok(Fetched::Failed(e.code.as_str().into())),
     };
-    let Some(meta) = GmailMeta::from_json(&v) else {
-        return Ok(Fetched::Failed("upstream_error".into()));
-    };
-    let max_bytes = job.app.cfg.index.max_message_bytes;
-    let max_chars = job.app.cfg.index.max_body_chars;
-    let doc = tokio::task::spawn_blocking(move || {
-        let raw = v["raw"].as_str().and_then(util::b64url_decode);
-        match raw {
-            Some(raw) => Doc::from_raw(meta, &raw, max_bytes, max_chars),
-            None => Doc::metadata_only(meta),
-        }
+    let doc = tokio::task::spawn_blocking(move || doc_from_raw_answer(body, max_bytes, max_chars))
+        .await
+        .map_err(|_| ToolError::internal())?;
+    Ok(match doc {
+        Some(d) => Fetched::Doc(Box::new(d)),
+        None => Fetched::Failed("upstream_error".into()),
     })
-    .await
-    .map_err(|_| ToolError::internal())?;
-    Ok(Fetched::Doc(Box::new(doc)))
 }
 
 async fn fetch_labels(job: &Job, id: &str) -> Result<Fetched, ToolError> {
@@ -626,11 +709,14 @@ fn ids_in(rec: &Value, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Reads every history page from `start`, coalescing repeated message ids. Returns the newest history id seen.
+/// Reads every history page from `start`, coalescing repeated message ids. Returns the history id of the first page
+/// response: everything up to it is covered by this pass. Later pages may report a newer mailbox id while records
+/// appended during pagination are not on them; taking that id would let the checkpoint pass unseen records.
+/// Records newer than the first page's id that did show up are applied now and replayed next pass (idempotent).
 async fn collect_history(job: &Job, start: &str) -> anyhow::Result<History> {
     let mut changes: BTreeMap<String, Change> = BTreeMap::new();
     let mut token: Option<String> = None;
-    let mut latest = start.to_string();
+    let mut covered: Option<String> = None;
     loop {
         let mut q: Vec<(&str, String)> = vec![("startHistoryId", start.to_string()), ("maxResults", "500".into())];
         if let Some(t) = &token {
@@ -641,8 +727,9 @@ async fn collect_history(job: &Job, start: &str) -> anyhow::Result<History> {
             Err(e) if e.code == ErrorCode::NotFound => return Ok(History::Expired),
             Err(e) => return Err(e.into()),
         };
-        if let Some(h) = history_id_of(&resp) {
-            latest = h;
+        if token.is_none() {
+            // First page.
+            covered = history_id_of(&resp);
         }
         for rec in resp["history"].as_array().into_iter().flatten() {
             for id in ids_in(rec, "messagesAdded") {
@@ -665,7 +752,7 @@ async fn collect_history(job: &Job, start: &str) -> anyhow::Result<History> {
         }
     }
     changes.retain(|id, _| crate::gmail::gateway::valid_id(id));
-    Ok(History::Changes(changes, latest))
+    Ok(History::Changes(changes, covered.unwrap_or_else(|| start.to_string())))
 }
 
 /// Fetches canonical state for changed messages and writes it in fenced chunks.
@@ -748,18 +835,7 @@ async fn publish(job: &Job, st: &SyncState, gen_id: i64, latest: String) -> anyh
     job.app.index.cursors.invalidate_account(&job.account_id);
     if let Some(o) = old {
         // Delete the retired generation in bounded chunks so the writer is never held for long.
-        loop {
-            let n = job.tx(move |tx| super::delete_gen_chunk(tx, o, 2000)).await?;
-            if n == 0 {
-                break;
-            }
-        }
-        job.tx(move |tx| {
-            tx.execute("DELETE FROM pending WHERE gen = ?1", [o])?;
-            tx.execute("DELETE FROM generations WHERE id = ?1", [o])?;
-            Ok(())
-        })
-        .await?;
+        super::drop_generation(&job.app.index, o).await?;
     }
     Ok(())
 }
@@ -831,9 +907,21 @@ async fn incremental(job: &Job, st: &SyncState, gen_id: i64, report: &mut SyncRe
 pub async fn scheduler(app: Arc<App>) {
     let sem = Arc::new(Semaphore::new(MAX_JOBS));
     let running: Arc<std::sync::Mutex<HashSet<String>>> = Default::default();
+    let collecting = Arc::new(std::sync::atomic::AtomicBool::new(false));
     loop {
         if let Err(e) = tick(&app, &sem, &running).await {
             tracing::warn!(error = %e, "index scheduler tick failed");
+        }
+        // Unreferenced generations (interrupted purge or drop, abandoned by the V3 migration) are collected in the
+        // background in bounded transactions; one collector at a time.
+        if !collecting.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            let (app, collecting) = (app.clone(), collecting.clone());
+            tokio::spawn(async move {
+                if let Err(e) = super::collect_garbage(&app.index, None).await {
+                    tracing::warn!(error = %e, "index garbage collection failed");
+                }
+                collecting.store(false, std::sync::atomic::Ordering::Release);
+            });
         }
         tokio::select! {
             _ = app.index.wake.notified() => {}
@@ -911,6 +999,32 @@ mod tests {
 
     async fn rows(env: &TestEnv) -> i64 {
         env.app.index.write(|c| Ok(c.query_row("SELECT count(*) FROM messages", [], |r| r.get(0))?)).await.unwrap()
+    }
+
+    /// A disable that lands after a job passed its readiness check (here: while it waits for the account lock) cancels
+    /// that job: it stops without a Gmail call instead of backfilling a mailbox that is being purged.
+    #[tokio::test]
+    async fn cancel_while_waiting_for_the_lock_stops_the_job() {
+        // Nothing listens on the discard port, so a job that wrongly runs fails fast instead of reaching Google.
+        let env = TestEnv::with_upstream(crate::gmail::gateway::Upstream::single_origin("http://127.0.0.1:9"), |_| {});
+        let aid = enabled_account(&env, "info").await;
+        let lock = env.app.index.lock_for(&aid);
+        let guard = lock.lock().await;
+        let (app, a) = (env.app.clone(), aid.clone());
+        let job = tokio::spawn(async move { sync_steps(&app, &a, usize::MAX).await });
+        // Wait until the job holds its cancel token and blocks on the lock.
+        for _ in 0..10_000 {
+            if env.app.index.cancels.lock().unwrap().contains_key(&aid) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        env.app.index.cancel(&aid);
+        drop(guard);
+        let r = job.await.unwrap().unwrap();
+        assert!(r.fenced, "{r:?}");
+        assert_eq!(r.steps, 0, "{r:?}");
+        assert_eq!(env.app.google.gateway().calls.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
     /// The fence alone (without cancellation or the account lock) stops a job that outlived a rebuild or purge.

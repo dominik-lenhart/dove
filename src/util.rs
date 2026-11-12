@@ -18,6 +18,25 @@ pub fn b64url_decode(s: &str) -> Option<Vec<u8>> {
     URL_SAFE_NO_PAD.decode(s.trim_end_matches('=')).ok()
 }
 
+/// Decodes the base64url text at `buf[range]` (padding optional) into the start of `buf` itself and truncates `buf`
+/// to the decoded bytes, so a large encoded payload is never held twice. Decoded output (3 bytes per 4) always
+/// stays behind the unread input, and each input chunk is copied out before its space can be overwritten.
+pub fn b64url_decode_in_place(mut buf: Vec<u8>, range: std::ops::Range<usize>) -> Option<Vec<u8>> {
+    const CHUNK: usize = 4096; // a multiple of 4: only the last chunk can be a partial quad
+    let text = buf.get(range.clone())?;
+    let end = range.start + text.iter().rposition(|&b| b != b'=').map_or(0, |p| p + 1);
+    let (mut pos, mut out) = (range.start, 0usize);
+    let mut tmp = [0u8; CHUNK];
+    while pos < end {
+        let n = (end - pos).min(CHUNK);
+        tmp[..n].copy_from_slice(&buf[pos..pos + n]);
+        out += URL_SAFE_NO_PAD.decode_slice(&tmp[..n], &mut buf[out..]).ok()?;
+        pos += n;
+    }
+    buf.truncate(out);
+    Some(buf)
+}
+
 /// Accepts standard or URL-safe base64, with or without padding.
 pub fn b64_decode_any(s: &str) -> Option<Vec<u8>> {
     let s = s.trim();
@@ -86,6 +105,23 @@ pub fn parse_duration_secs(s: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn in_place_base64url_matches_the_plain_decoder() {
+        for len in [0usize, 1, 2, 3, 4, 3071, 3072, 3073, 10_000, 50_001] {
+            let data: Vec<u8> = (0..len).map(|i| (i * 7919 % 251) as u8).collect();
+            let unpadded = b64url(&data);
+            let padded = format!("{unpadded}{}", "=".repeat((4 - unpadded.len() % 4) % 4));
+            for text in [unpadded, padded] {
+                let body = format!("{{\"raw\":\"{text}\",\"x\":1}}").into_bytes();
+                let start = 8;
+                let got = b64url_decode_in_place(body, start..start + text.len()).unwrap();
+                assert_eq!(got, data, "len {len}");
+            }
+        }
+        assert!(b64url_decode_in_place(b"ab*d".to_vec(), 0..4).is_none());
+        assert!(b64url_decode_in_place(b"abcd".to_vec(), 2..9).is_none());
+    }
 
     #[test]
     fn durations() {

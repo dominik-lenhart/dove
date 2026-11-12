@@ -171,6 +171,8 @@ pub struct IndexConfig {
     pub page_cache_kib: i64,
     pub reader_connections: usize,
     pub body_jobs: usize,
+    /// Largest raw message whose body is indexed; larger ones are indexed from metadata only. 22 MiB keeps one
+    /// body job within the 32 MiB budget of spec 8.1a (the download is about 4/3 of the message).
     pub max_message_bytes: usize,
     pub max_body_chars: usize,
     /// Message ids per messages.list page during backfill (Gmail allows up to 500).
@@ -185,7 +187,7 @@ impl Default for IndexConfig {
             page_cache_kib: 8 * 1024,
             reader_connections: 3,
             body_jobs: 2,
-            max_message_bytes: 25 * 1024 * 1024,
+            max_message_bytes: 22 * 1024 * 1024,
             max_body_chars: 200_000,
             list_page_size: 500,
         }

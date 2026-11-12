@@ -554,6 +554,38 @@ async fn indexed_search_makes_no_gmail_calls_and_uses_indexes() {
     assert!(!full_scan(&meta), "{meta:?}");
     let text = plan(json!({"where": pred("text", "terms", json!("fox")), "select": ["subject"]})).await;
     assert!(text.iter().any(|l| l.contains("VIRTUAL TABLE INDEX")), "{text:?}");
+
+    // Text predicates evaluate MATCH only on the eligible generations' own FTS tables (spec 7.9): the other indexed
+    // mailboxes (ops, secret) have postings, but their tables appear neither in the SQL nor in the plan.
+    let fts_names = |text: &str| -> std::collections::BTreeSet<String> {
+        text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|w| w.starts_with("fts_g") && w[5..].chars().all(|c| c.is_ascii_digit()) && w.len() > 5)
+            .map(str::to_string)
+            .collect()
+    };
+    let all_tables: Vec<String> =
+        fx.h.app()
+            .index
+            .write(|c| {
+                let mut st = c.prepare("SELECT name FROM sqlite_schema WHERE sql LIKE 'CREATE VIRTUAL TABLE%fts5%'")?;
+                Ok(st.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?)
+            })
+            .await
+            .unwrap();
+    assert_eq!(all_tables.len(), 4, "one FTS table per indexed mailbox: {all_tables:?}");
+    assert!(!all_tables.iter().any(|t| t == "fts"), "the shared table is gone");
+    let mine =
+        |n: usize| targets[..n].iter().map(|t| format!("fts_g{}", t.gen_id)).collect::<std::collections::BTreeSet<_>>();
+    for n in [1, 2] {
+        let args = json!({"where": {"any": [pred("text", "terms", json!("fox")),
+            {"not": pred("subject", "phrase", json!("quick brown"))}]}, "select": ["subject"]});
+        let req = dove::tools::search::parse_index_req(&args).unwrap();
+        let known = HashMap::new();
+        let (sql, _) = query::page_sql(&req, &Scope { targets: &targets[..n], known: &known }, &[]).unwrap();
+        assert_eq!(fts_names(&sql), mine(n), "{sql}");
+        let lines = plan_n(args, n).await;
+        assert_eq!(fts_names(&lines.join("\n")), mine(n), "{lines:?}");
+    }
 }
 
 #[tokio::test]

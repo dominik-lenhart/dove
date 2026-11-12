@@ -71,7 +71,8 @@ pub async fn start_rebuild(app: &Arc<App>, account_id: &str) -> anyhow::Result<(
     let lock = app.index.lock_for(account_id);
     let _guard = lock.lock().await;
     let aid = account_id.to_string();
-    app.index
+    let replaced = app
+        .index
         .write(move |c| {
             let tx = c.transaction()?;
             let old_fence: i64 =
@@ -81,9 +82,6 @@ pub async fn start_rebuild(app: &Arc<App>, account_id: &str) -> anyhow::Result<(
                 .query_row("SELECT building_gen FROM sync_state WHERE account_id = ?1", [&aid], |r| r.get(0))
                 .optional()?
                 .flatten();
-            if let Some(b) = building {
-                super::drop_generation(&tx, b)?;
-            }
             let fence = next_fence(&tx)?;
             let g = new_generation(&tx, &aid)?;
             tx.execute(
@@ -93,10 +91,14 @@ pub async fn start_rebuild(app: &Arc<App>, account_id: &str) -> anyhow::Result<(
                 params![fence, g, aid],
             )?;
             tx.commit()?;
-            Ok(())
+            Ok(building)
         })
         .await?;
     app.index.cursors.invalidate_account(account_id);
+    // A half-built generation is replaced and now unreferenced; drop it in bounded transactions.
+    if let Some(b) = replaced {
+        super::drop_generation(&app.index, b).await?;
+    }
     Ok(())
 }
 

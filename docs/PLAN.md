@@ -195,3 +195,29 @@ hosts or reference hardware.
   `budget_exceeded` with a smaller-request hint instead of a continuation token. The wire budget counts the
   structured result plus the text rendering. Legacy text-only clients get the structured result serialized as
   compact JSON (spec 5.3); mail content stays in its own JSON fields there instead of the text envelope.
+- A40. Full-text postings live in one contentless FTS5 table per generation (`fts_g<id>`, name derived only from
+  the integer id). A text predicate is a `UNION ALL` of MATCH over the eligible generations' tables only, so its
+  work never depends on other accounts' postings (spec 7.9). Generation ids come from `meta.gen_seq` and are never
+  reused. Index migration V3 cannot move the old shared table's postings (contentless), so it starts a rebuild for
+  every account: an active generation keeps serving metadata while the stage is `rebuilding` (coverage partial),
+  a half-built one is abandoned. Generations that no sync state references (retired, replaced, purged, abandoned)
+  are dropped in bounded transactions: derived rows and retry records in chunks of 2,000, then the FTS `_data`
+  blocks in chunks of 256, then the near-empty FTS table. Each step re-checks that the generation is unreferenced;
+  the scheduler collects leftovers of interrupted drops. Purge no longer runs FTS 'optimize': the postings go with
+  the dropped table (secure_delete zeroes the freed pages). Searches never take the writer lock (the schema is
+  migrated once on its own connection), so long writes delay other writers only.
+- A41. Gmail response bodies are streamed with a byte cap (gateway `read_capped`): a declared length over the cap
+  is refused unread, a streamed body stops at the cap. Over the cap is `TooLarge` for reads (`budget_exceeded` to
+  agents, never retried, never partially parsed) and `outcome_unknown` for writes. General cap 40 MiB (a 25 MiB
+  message for the read tools); index body jobs cap at `4/3 * index.max_message_bytes + 64 KiB`. A message over it
+  is indexed from a `format=minimal` answer only (`meta_complete = body_complete = 0`). The size is not checked
+  before the raw fetch: messages.list carries no sizes and a minimal pre-fetch would cost the same quota as the raw
+  fetch for every message. The raw text is decoded in place in the downloaded buffer, so a job holds about 4/3 of
+  the message: measured peak heap of the parse path (counting allocator, `tests/ingest_memory.rs`, attachment-heavy
+  messages) 11.5 MiB for 8.6 MB, 22.4 MiB for 17.2 MB and 29.3 MiB for 22.6 MB raw. `index.max_message_bytes`
+  therefore defaults to 22 MiB (was 25) to keep a body job within the 32 MiB of spec 8.1a; RSS was not measured.
+- A42. Cursors: at most 100 live cursors per client inside the global 1,000 / 8 MiB caps; a client at its share
+  evicts its own oldest cursor. batch_read charges a resumed cursor the page limit stored with it.
+- A43. Sync: a job takes its cancel token before the account lock, so a disable that lands while it waits cancels
+  it. A history pass checkpoints at the history id of its first history.list page; later pages may report a newer
+  mailbox id than the records they list, and records past the first page's id are replayed next pass (idempotent).

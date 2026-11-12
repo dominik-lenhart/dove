@@ -134,9 +134,15 @@ fn spam_trash(labels: &[String]) -> bool {
     has(labels, "SPAM") || has(labels, "TRASH")
 }
 
-/// Deletes one derived row with its FTS postings, addresses, labels and attachments.
-pub fn delete_row(tx: &Connection, id: i64) -> anyhow::Result<()> {
-    tx.execute("DELETE FROM fts WHERE rowid = ?1", [id])?;
+/// Deletes one derived row of a generation with its FTS postings, addresses, labels and attachments.
+pub fn delete_row(tx: &Connection, gen_id: i64, id: i64) -> anyhow::Result<()> {
+    let fts = super::schema::fts_table(gen_id);
+    tx.prepare_cached(&format!("DELETE FROM {fts} WHERE rowid = ?1"))?.execute([id])?;
+    delete_row_meta(tx, id)
+}
+
+/// Deletes one derived row without touching FTS: only for dropping a whole generation, whose FTS table goes with it.
+pub fn delete_row_meta(tx: &Connection, id: i64) -> anyhow::Result<()> {
     tx.execute("DELETE FROM addrs WHERE msg = ?1", [id])?;
     tx.execute("DELETE FROM labels WHERE msg = ?1", [id])?;
     tx.execute("DELETE FROM atts WHERE msg = ?1", [id])?;
@@ -154,7 +160,7 @@ pub fn row_id(tx: &Connection, gen_id: i64, gmail_id: &str) -> anyhow::Result<Op
 pub fn remove(tx: &Connection, gen_id: i64, gmail_id: &str) -> anyhow::Result<bool> {
     match row_id(tx, gen_id, gmail_id)? {
         Some(id) => {
-            delete_row(tx, id)?;
+            delete_row(tx, gen_id, id)?;
             Ok(true)
         }
         None => Ok(false),
@@ -207,10 +213,12 @@ pub fn upsert(tx: &Connection, gen_id: i64, account_id: &str, d: &Doc) -> anyhow
         ],
     )?;
     let id = tx.last_insert_rowid();
-    tx.execute(
-        "INSERT INTO fts(rowid, subject, body) VALUES (?1, ?2, ?3)",
-        params![id, d.subject.as_deref().unwrap_or(""), d.body],
-    )?;
+    let fts = super::schema::fts_table(gen_id);
+    tx.prepare_cached(&format!("INSERT INTO {fts}(rowid, subject, body) VALUES (?1, ?2, ?3)"))?.execute(params![
+        id,
+        d.subject.as_deref().unwrap_or(""),
+        d.body
+    ])?;
     {
         let mut st =
             tx.prepare_cached("INSERT INTO addrs(msg, gen, role, addr, domain) VALUES (?1, ?2, ?3, ?4, ?5)")?;
