@@ -41,11 +41,13 @@ hosts or reference hardware.
      AC16, AC18 in `tests/mcp_e2e.rs`, `tests/connect_e2e.rs`)
    - [ ] Restart/crash recovery tests, log canary test
    - [ ] Benchmarks (8.1) with synthetic 250k corpus, RSS measurement
-   - [~] Deployment: systemd unit, container, Caddy allowlist, backup docs, SECURITY.md, README (done: systemd unit,
-     sysusers/tmpfiles, Containerfile, compose, Caddyfile, nginx snippet,
-     CI workflow with deny.toml and secret scan; the unit is verified only as a transient
-     user unit, the container only on a local Docker host, the proxy configs against stock images. None of it has run
-     on a production host with real TLS or Google)
+   - [~] Deployment: systemd unit, container, Caddy allowlist, backup docs, SECURITY.md, README (files written:
+     `deploy/` (systemd, Containerfile, compose, Caddyfile, nginx), `docs/deployment.md`, `README.md`, `SECURITY.md`,
+     CI workflow with `deny.toml` and secret scan. Verified: syntax and sandbox start of the unit as a user unit,
+     local container build and compose run, Caddy and nginx route matrices on stock images, actionlint, gitleaks,
+     cargo-deny. Unverified: system-level unit with `User=dove`, a production host with real TLS and Google, Podman,
+     the `age` backup step and a restore drill, the CI run on GitHub. Open for the owner: `SECURITY.md` contact
+     placeholder, licence file (A7))
 
 ## Assumptions and decisions
 
