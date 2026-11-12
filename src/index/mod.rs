@@ -352,3 +352,39 @@ pub fn wake(app: &App, account_id: &str) {
 pub fn start(app: Arc<App>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(sync::scheduler(app))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::TestEnv;
+
+    #[tokio::test]
+    async fn deadline_interrupts_query_as_too_broad() {
+        let env = TestEnv::new();
+        let deadline = Instant::now() + std::time::Duration::from_millis(100);
+        let err = env
+            .app
+            .index
+            .read(deadline, |c| {
+                let n: i64 = c.query_row(
+                    "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT count(*) FROM c",
+                    [],
+                    |r| r.get(0),
+                )?;
+                Ok(n)
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::QueryTooBroad);
+        // The pooled connection is usable afterwards.
+        let n = env
+            .app
+            .index
+            .read(Instant::now() + std::time::Duration::from_secs(5), |c| {
+                Ok(c.query_row("SELECT count(*) FROM messages", [], |r| r.get::<_, i64>(0))?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+}

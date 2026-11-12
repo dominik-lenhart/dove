@@ -457,3 +457,40 @@ async fn vanished_candidate_is_dropped_not_retried() {
     let v = search(&fx, json!({"select": ["subject"], "coverage_policy": "require_complete"})).await;
     assert_eq!(subjects(&v), vec!["Message 0", "Message 2"]);
 }
+
+/// The background scheduler started by `dove serve`: enabling starts a backfill, a Dove draft write wakes sync.
+#[tokio::test]
+async fn scheduler_backfills_on_enable_and_wakes_after_writes() {
+    let h = Harness::start().await;
+    h.mailbox("info", "info@acme.test");
+    h.project("acme", &["info"]).await;
+    let token = h.token("acme", "agent", vec![g("info", "read,draft")]).await;
+    h.google.add_message("info@acme.test", msg("a@example.com", "Hello", "hi", 1));
+    let engine = dove::index::start(h.app().clone());
+    enable(&h).await;
+    let until = |cond: Value| {
+        let (h, token) = (&h, &token);
+        async move {
+            for _ in 0..100 {
+                let v = h.ok(token, "search_messages", json!({"select": ["subject", "is_draft"], "where": cond})).await;
+                if v["coverage"] == "complete" && !v["rows"].as_array().unwrap().is_empty() {
+                    return v;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            panic!("scheduler did not sync in time");
+        }
+    };
+    let v = until(json!({})).await;
+    assert_eq!(v["rows"], json!([["Hello", false]]));
+    // Poll interval is 60 s; only the wake from create_draft makes the draft appear this fast.
+    h.ok(
+        &token,
+        "create_draft",
+        json!({"account": "info", "request_key": uuid::Uuid::new_v4().to_string(), "to": ["bob@example.org"], "subject": "Draft one", "body_text": "x"}),
+    )
+    .await;
+    let v = until(json!({"field": "is_draft", "op": "eq", "value": true})).await;
+    assert_eq!(v["rows"], json!([["Draft one", true]]));
+    engine.abort();
+}
