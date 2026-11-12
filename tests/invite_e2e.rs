@@ -158,13 +158,14 @@ async fn all_expands_once_and_invitation_rules() {
 }
 
 #[tokio::test]
-async fn removed_account_is_dropped_from_open_invitation() {
+async fn removing_an_account_cancels_open_invitations_listing_it() {
     let h = setup(|_| {}).await;
     let inv = invite(&h, "rm", &["all"], "read").await.unwrap()["invitation"].as_str().unwrap().to_string();
-    h.admin(AdminRequest::AccountsRemove { alias: "billing".into() }).await.unwrap();
+    let v = h.admin(AdminRequest::AccountsRemove { alias: "billing".into() }).await.unwrap();
+    assert_eq!(v["pending_invitations_cancelled"], 1);
+    // The invitation no longer matches what the operator issued, so it is not redeemed with a shorter list.
     let (s, r) = redeem(&h, json!({ "invitation": inv })).await;
-    assert_eq!(s, 200, "{r}");
-    assert_eq!(r["mailboxes"], json!([{ "account": "info", "email": "info@acme.test", "actions": "read" }]));
+    assert_eq!(s, 400, "{r}");
 }
 
 #[tokio::test]

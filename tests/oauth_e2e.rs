@@ -49,6 +49,18 @@ fn field_name(html: &str, prefix: &str) -> String {
     html[start..].split('"').next().unwrap().to_string()
 }
 
+/// Translates a positional check such as `read.0` (the n-th mailbox on the approval page) into the real field
+/// name, which carries the account id. Anything else is passed through unchanged.
+fn check_name(html: &str, check: &str) -> String {
+    let ids: Vec<&str> = html.split("name=\"read.").skip(1).filter_map(|s| s.split('"').next()).collect();
+    match check.split_once('.') {
+        Some((kind, n)) if n.parse::<usize>().is_ok_and(|n| n < ids.len()) => {
+            format!("{kind}.{}", ids[n.parse::<usize>().unwrap()])
+        }
+        _ => check.to_string(),
+    }
+}
+
 fn query_of(location: &str) -> HashMap<String, String> {
     url::Url::parse(location).unwrap().query_pairs().into_owned().collect()
 }
@@ -165,9 +177,10 @@ impl Oauth {
     async fn approve(&self, client_id: &str, chal: &str, invitation: &str, checks: &[&str]) -> String {
         let (cookie, rid, csrf, html) = self.enter_invitation(client_id, chal, invitation).await;
         assert!(html.contains("Approve"), "{html}");
+        let names: Vec<String> = checks.iter().map(|c| check_name(&html, c)).collect();
         let mut form: Vec<(&str, &str)> =
             vec![("rid", &rid), ("csrf", &csrf), ("step", "approve"), ("action", "approve")];
-        form.extend(checks.iter().map(|c| (*c, "on")));
+        form.extend(names.iter().map(|c| (c.as_str(), "on")));
         let r = self.post_form(&cookie, &form).await;
         assert_eq!(r.status(), 303);
         let q = query_of(r.headers()["location"].to_str().unwrap());
@@ -667,6 +680,72 @@ async fn approval_for_an_evicted_registration_keeps_the_invitation() {
     let v = verifier();
     let code = o.approve(&client_id, &challenge(&v), &inv, &["read.0"]).await;
     assert_eq!(o.exchange(&client_id, &code, &v).await.0, 200);
+}
+
+#[tokio::test]
+async fn approval_is_refused_when_the_invited_mailboxes_changed() {
+    let o = Oauth::new().await;
+    let inv = o.invite("changed-host", &["all"], "read").await;
+    let client_id = o.register(REDIRECT).await;
+    let (cookie, rid, csrf, html) = o.enter_invitation(&client_id, &challenge(&verifier()), &inv).await;
+    // The page lists billing first, then info. The user keeps billing and deselects info.
+    let billing = check_name(&html, "read.0");
+    let info = check_name(&html, "read.1");
+    assert!(html.find(">billing<").unwrap() < html.find(">info<").unwrap());
+    assert!(!billing.ends_with(".0") && billing != info, "fields carry account ids: {billing}");
+    // Meanwhile billing leaves the project without cancelling the invitation (only this guard can fire here:
+    // the admin paths cancel the invitation as well).
+    o.h.app()
+        .store
+        .call(|c| {
+            Ok(c.execute(
+                "DELETE FROM project_accounts WHERE account_id = (SELECT id FROM accounts WHERE alias = 'billing')",
+                [],
+            )?)
+        })
+        .await
+        .unwrap();
+    let r = o
+        .post_form(
+            &cookie,
+            &[("rid", &rid), ("csrf", &csrf), ("step", "approve"), ("action", "approve"), (&billing, "on")],
+        )
+        .await;
+    assert_eq!(r.status(), 409);
+    let connections: i64 =
+        o.h.app()
+            .store
+            .call(|c| Ok(c.query_row("SELECT COUNT(*) FROM clients WHERE name = 'changed-host'", [], |r| r.get(0))?))
+            .await
+            .unwrap();
+    assert_eq!(connections, 0, "the deselected mailbox was not granted");
+}
+
+#[tokio::test]
+async fn removing_an_account_cancels_open_invitations_that_list_it() {
+    let o = Oauth::new().await;
+    let with_info = o.invite("has-info", &["info"], "read").await;
+    let without =
+        o.h.admin(AdminRequest::ClientsInvite {
+            name: "no-info".into(),
+            project: "other".into(),
+            accounts: vec!["secret".into()],
+            capabilities: "read".into(),
+            expires: None,
+            allow_ip: vec![],
+        })
+        .await
+        .unwrap()["invitation"]
+            .as_str()
+            .unwrap()
+            .to_string();
+    let v = o.h.admin(AdminRequest::AccountsRemove { alias: "info".into() }).await.unwrap();
+    assert_eq!(v["pending_invitations_cancelled"], 1);
+    let redeem = |inv: String| {
+        o.web.post(o.url("/connect/redeem")).header("host", HOST).json(&json!({ "invitation": inv })).send()
+    };
+    assert_eq!(redeem(with_info).await.unwrap().status(), 400);
+    assert_eq!(redeem(without).await.unwrap().status(), 200);
 }
 
 #[tokio::test]

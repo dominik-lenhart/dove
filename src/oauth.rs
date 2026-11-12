@@ -87,6 +87,8 @@ struct Pending {
     csrf: String,
     binding: String,
     invitation_id: Option<String>,
+    /// The grants listed on the approval page; approval is refused if the invitation no longer matches them.
+    shown: Vec<invite::InviteGrant>,
     attempts: u32,
     created: Instant,
     ip_bucket: String,
@@ -415,20 +417,23 @@ fn invitation_page(p: &Pending, rid: &str, error: Option<&str>) -> Response {
 fn approval_page(p: &Pending, rid: &str, inv: &invite::Invitation, error: Option<&str>) -> Response {
     let err = error.map(|e| format!("<p role=\"alert\"><b>{}</b></p>", html_escape(e))).unwrap_or_default();
     let mut rows = String::new();
-    for (i, g) in inv.grants.iter().enumerate() {
+    // Fields are named by the immutable account id, never by position: the list can change between render and
+    // approval, and a position would then point at another mailbox.
+    for g in &inv.grants {
         let a = Actions::parse(&g.actions).unwrap_or_default();
+        let id = html_escape(&g.account_id);
         rows.push_str(&format!(
-            "<li><label><input type=\"checkbox\" name=\"read.{i}\" checked> <b>{}</b>: read</label>",
+            "<li><label><input type=\"checkbox\" name=\"read.{id}\" checked> <b>{}</b>: read</label>",
             html_escape(&g.alias)
         ));
         if a.draft {
             rows.push_str(&format!(
-                " <label><input type=\"checkbox\" name=\"draft.{i}\" checked> create and edit drafts</label>"
+                " <label><input type=\"checkbox\" name=\"draft.{id}\" checked> create and edit drafts</label>"
             ));
         }
         if a.send {
             rows.push_str(&format!(
-                " <label><input type=\"checkbox\" name=\"send.{i}\" checked> send own drafts</label>"
+                " <label><input type=\"checkbox\" name=\"send.{id}\" checked> send own drafts</label>"
             ));
         }
         rows.push_str("</li>");
@@ -508,6 +513,7 @@ async fn authorize_get(State(app): State<Arc<App>>, req: Request) -> Response {
         csrf: util::new_id(),
         binding: binding.clone(),
         invitation_id: None,
+        shown: Vec::new(),
         attempts: 0,
         created: Instant::now(),
         ip_bucket: ip_bucket(ip),
@@ -615,6 +621,7 @@ async fn authorize_post(State(app): State<Arc<App>>, req: Request) -> Response {
             match found {
                 Ok(Some(inv)) if !inv.grants.is_empty() => {
                     p.invitation_id = Some(inv.id.clone());
+                    p.shown = inv.grants.clone();
                     let r = approval_page(&p, &rid, &inv, None);
                     put_back(p);
                     r
@@ -645,6 +652,7 @@ enum Approval {
     Done { code: String },
     InvitationGone,
     AppGone,
+    Changed,
     NothingSelected(invite::Invitation),
 }
 
@@ -660,6 +668,7 @@ async fn approve(
     let (app_client_id, redirect_uri, challenge, resource) =
         (p.app.client_id.clone(), p.redirect_uri.clone(), p.code_challenge.clone(), p.resource.clone());
     let dynamic = p.app.dynamic;
+    let shown = p.shown.clone();
     let code_ttl = app.cfg.oauth.code_ttl_secs;
     let form = form.clone();
     let result = app
@@ -681,12 +690,18 @@ async fn approve(
             let Some(inv) = invite::load(&tx, &inv_id)? else {
                 return Ok(Approval::InvitationGone);
             };
+            // A mailbox left the project (or was removed) since the page was rendered: the user decided on a
+            // different list, so the decision is not applied to this one.
+            if inv.grants != shown {
+                return Ok(Approval::Changed);
+            }
             let mut selected = BTreeMap::new();
-            for (i, g) in inv.grants.iter().enumerate() {
+            for g in &inv.grants {
+                let id = &g.account_id;
                 let a = Actions {
-                    read: checked(format!("read.{i}")),
-                    draft: checked(format!("draft.{i}")),
-                    send: checked(format!("send.{i}")),
+                    read: checked(format!("read.{id}")),
+                    draft: checked(format!("draft.{id}")),
+                    send: checked(format!("send.{id}")),
                 };
                 selected.insert(g.account_id.clone(), a);
             }
@@ -739,6 +754,11 @@ async fn approve(
             app.oauth.pending.lock().expect("lock").insert(rid, p);
             r
         }
+        Ok(Approval::Changed) => error_page(
+            StatusCode::CONFLICT,
+            "The mailboxes in this invitation changed while this page was open, so nothing was approved. Start \
+             again from the application.",
+        ),
         Ok(Approval::AppGone) => error_page(
             StatusCode::BAD_REQUEST,
             "This application's registration has expired. Start again from the application; your invitation is \
@@ -1401,6 +1421,7 @@ mod tests {
             csrf: String::new(),
             binding: String::new(),
             invitation_id: None,
+            shown: Vec::new(),
             attempts: 0,
             created: Instant::now() - Duration::from_secs(age_secs),
             ip_bucket: ip_bucket(ip),

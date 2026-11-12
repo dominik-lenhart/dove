@@ -137,7 +137,8 @@ hosts or reference hardware.
   Registrations are capped (`oauth.max_dynamic_clients`, unused ones pruned after 24 h) and limited per IP per
   hour. Pre-registered (optionally confidential) clients are configured in `[[oauth.clients]]` with a secret file.
 - A23. Removing a mailbox from a project cancels the project's open invitations, so a re-add cannot resurrect
-  rights through an old invitation. Accounts deleted before redemption are dropped from the invitation.
+  rights through an old invitation. `accounts remove` cancels every open invitation that lists the account (A35);
+  an account missing at redemption for any other reason is still dropped from the invitation.
 - A24. Client profiles live in `$DOVE_CONFIG_DIR`, else `$XDG_CONFIG_HOME/dove`, else `~/.config/dove`
   (`%APPDATA%\dove` on Windows) as `profiles.toml` (0600): server origin, connection name, credential reference
   (`keyring` or `file:<path>`). Server URLs must be HTTPS; plain HTTP is accepted only for loopback hosts.
@@ -181,6 +182,11 @@ hosts or reference hardware.
   An approval re-checks in its own transaction that a dynamic registration still exists, because a request being
   approved is out of the pending map (and so not protected from eviction) while it is processed; if it is gone the
   invitation stays unused and the user starts again.
+- A35. Approval-page checkboxes are named by account id (`read.<account_id>`), never by position. The page stores the
+  grant list it showed; if the invitation reloaded at approval differs (a mailbox left the project or was deleted
+  meanwhile), nothing is approved (409, start again) and the invitation stays unused. `accounts remove` cancels open
+  invitations that list the account (matched in the grants JSON with `json_each`) and reports
+  `pending_invitations_cancelled`.
 - A34. The token endpoint applies the connection's `--allow-ip` list (from the invitation) to both grants before
   anything is consumed: from another address a code or refresh token gets `invalid_grant` and stays usable, and a
   replayed rotated refresh token does not trigger reuse revocation. The approval page itself is not IP-bound.
