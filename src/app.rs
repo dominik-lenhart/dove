@@ -28,6 +28,7 @@ pub struct App {
     pub rate_limiter: crate::mcp::RateLimiter,
     pub denials: crate::mcp::DenialTracker,
     pub draft_locks: crate::tools::drafts::DraftLocks,
+    pub index: crate::index::Index,
 }
 
 impl App {
@@ -41,7 +42,7 @@ impl App {
         cfg.validate()?;
         let kek = KeyRing::load(&cfg.secrets.kek_file).context("loading KEK")?;
         let pepper = KeyRing::load(&cfg.secrets.pepper_file).context("loading pepper")?;
-        let index_key = KeyRing::load(&cfg.secrets.index_key_file).context("loading index key")?;
+        let index_key = Arc::new(KeyRing::load(&cfg.secrets.index_key_file).context("loading index key")?);
         let google_client_secret = secrets::read_secret_string(&cfg.google.client_secret_file)?;
         let store = Store::open(&cfg.state_db_path())?;
         let notifier = Notifier::new(cfg.notifier.webhook_url.clone(), store.clone());
@@ -63,7 +64,8 @@ impl App {
             draft_locks: Default::default(),
             vault,
             pepper: Pepper::new(pepper),
-            index_key: Arc::new(index_key),
+            index: crate::index::Index::new(cfg.index_db_path(), index_key.clone(), cfg.index.clone()),
+            index_key,
             notifier,
             google_client_secret,
             store,

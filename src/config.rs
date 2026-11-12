@@ -121,6 +121,8 @@ pub struct IndexConfig {
     pub body_jobs: usize,
     pub max_message_bytes: usize,
     pub max_body_chars: usize,
+    /// Message ids per messages.list page during backfill (Gmail allows up to 500).
+    pub list_page_size: u32,
 }
 
 impl Default for IndexConfig {
@@ -133,6 +135,7 @@ impl Default for IndexConfig {
             body_jobs: 2,
             max_message_bytes: 25 * 1024 * 1024,
             max_body_chars: 200_000,
+            list_page_size: 500,
         }
     }
 }

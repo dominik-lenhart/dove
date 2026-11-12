@@ -27,9 +27,11 @@ hosts or reference hardware.
    - Unverified: real Google consent screen, real Gmail draft round-trips, Apple Mail editing a Dove draft. All
      step-2 evidence is against the fake Google server in `tests/support/fake_google.rs`.
 3. Index + sync
-   - [ ] Encrypted index DB, generations, backfill with durable progress, history polling, expiry rebuild (7.9)
-   - [ ] `dove index enable|disable|status|rebuild`, purge + cursor invalidation
-   - [ ] Typed query compiler -> parameterized SQL, coverage reporting (5.3, AC17, AC20)
+   - [x] Encrypted index DB, generations, backfill with durable progress, history polling, expiry rebuild (7.9)
+     (`src/index/`, `tests/index_sync.rs`: arrival/label/deletion during backfill, history expiry, interrupted pass
+     before checkpoint, retry records, rate-limit backoff, disk full)
+   - [x] `dove index enable|disable|status|rebuild`, purge + cursor invalidation, fenced jobs
+   - [~] Typed query compiler -> parameterized SQL, coverage reporting (5.3, AC17, AC20)
 4. Contracts
    - [ ] Projections, keyset cursors (15 min TTL, bounded), count_only, live Gmail route
    - [ ] batch_read with budgets (AC21)
@@ -62,4 +64,15 @@ hosts or reference hardware.
   under the newest version, then deletes the old line. `keys rotate` reports which versions are still referenced.
 - A9. Admin actions are audited in the same transaction as their state change; failed actions get a separate
   `error` record, so every admin request yields exactly one record.
+- A10. Index sync state (generations, checkpoints, retry records) lives in the index DB, not the state store: it is
+  derived and rebuildable. The operator's choice (`accounts.index_enabled`) stays in the state store and is
+  authoritative; the scheduler reconciles the two (creates missing state, purges state of disabled accounts).
+- A11. Backfill lists `messages` newest-first and indexes each page before listing the next, so the first page is the
+  bounded recent-mail priority pass. A generation is published once enumeration is done, every candidate was tried
+  once and history since the captured id is reconciled; messages that still fail stay as retry records and keep
+  coverage `partial` until indexed.
+- A12. Addresses are normalized by trimming and lowercasing the whole address (local part included), at ingest and
+  lookup. `received_at` is stored as Gmail internalDate in milliseconds (wire format keeps ms precision).
+- A13. Unparseable or oversized MIME is indexed from Gmail metadata only (labels, dates, size, snippet) with
+  `meta_complete = 0`; queries that filter/project/order on MIME-derived fields then report partial coverage.
 - A7. Licence is a placeholder (Apache-2.0) until the owner decides (spec 13.7).

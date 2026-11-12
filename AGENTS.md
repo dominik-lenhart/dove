@@ -68,3 +68,10 @@ cargo fmt
   human-owned draft, single-use state vs alias-exists) needs a test where only that guard can fire.
 - 2026-11-12: `pkill -f <pattern>` inside a Bash tool call matches the tool's own shell; use `pgrep -af` and kill
   by PID.
+- 2026-11-12: Edition 2024 reserves `gen`; name generation variables `gen_id`/`generation` (SQL column names are fine).
+- 2026-11-12: Disk-full can be simulated on the index with `PRAGMA max_page_count = <current page_count>` on the
+  writer connection (after `wal_checkpoint(TRUNCATE)`); writes then fail with SQLITE_FULL.
+- 2026-11-12: The fake Google's page tokens are offsets. Deleting several already-listed messages between pages
+  shifts later pages and makes enumeration skip messages (real Gmail tokens do not); avoid that in sync tests.
+- 2026-11-12: Index jobs, purge, rebuild and sync-state creation serialize on a per-account lock; every write also
+  re-checks the job's fence. Tests: `dove::index::sync::{sync_account, sync_steps}` run passes deterministically.

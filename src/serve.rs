@@ -32,6 +32,7 @@ pub async fn run(config_path: &Path) -> anyhow::Result<()> {
     }
     let admin = crate::admin::server::bind(&app.cfg.admin.socket_path)?;
     tokio::spawn(crate::admin::server::serve(app.clone(), admin));
+    crate::index::start(app.clone());
     tracing::info!(listen = %app.cfg.listen, "dove started");
     run_until_shutdown(app).await
 }
