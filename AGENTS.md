@@ -108,3 +108,13 @@ cargo fmt
   mailbox partition; the fixed `sqlite_stat1` rows in index migration V2 fix that. If you add an index, add a stat row
   and extend the EXPLAIN QUERY PLAN assertions in `tests/search_contract.rs`.
 - 2026-11-12: Timestamp ties are ordered by random fake message ids; tests must not assume which tied row comes first.
+- 2026-11-12: The state store is one mutex-guarded connection, so concurrent HTTP requests serialize at the DB.
+  An atomic guard (e.g. `UPDATE ... WHERE used_at IS NULL`) is then shadowed by the earlier read in the same
+  transaction; test it directly with a stale view (see `invite::tests`) or the mutation survives.
+- 2026-11-12: `cargo test --test a --lib foo::` applies the `foo::` filter to every target; run filtered lib
+  tests and integration files in separate invocations when mutation-checking.
+- 2026-11-12: The shared `CARGO_TARGET_DIR` holds one `target/debug/dove` for all worktrees; another agent's build
+  can replace it between your build and test run. Tests that exec `CARGO_BIN_EXE_dove` (`tests/client_e2e.rs`)
+  need a private target dir, e.g. `CARGO_TARGET_DIR=/home/dominik/projects/.dove-worktrees/target-onboarding`.
+- 2026-11-12: Client tests run the binary with `env_clear()`, a temp HOME and
+  `DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent/...` so the real keychain and config are never touched.

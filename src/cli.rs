@@ -56,8 +56,11 @@ pub enum Command {
     /// Unknown-outcome draft operations (admin).
     #[command(subcommand)]
     Operations(OperationsCmd),
-    /// Check configuration, permissions and reachability (admin).
+    /// Check configuration, permissions and reachability (admin). With --profile: check a remote profile instead.
     Doctor {
+        /// Check this remote client profile (config, credential, network, grants). Never uses the admin socket.
+        #[arg(long)]
+        profile: Option<String>,
         #[command(flatten)]
         admin: AdminOpts,
     },
@@ -66,6 +69,9 @@ pub enum Command {
         #[command(flatten)]
         admin: AdminOpts,
     },
+    /// Remote client commands (login, search, mcp install, ...). They use only a connection token over HTTPS.
+    #[command(flatten)]
+    Remote(Box<crate::client::RemoteCmd>),
 }
 
 #[derive(Subcommand)]
@@ -361,9 +367,12 @@ fn admin_request(cmd: Command) -> anyhow::Result<(AdminOpts, AdminRequest)> {
                 (admin, R::OperationsRemove { client, account, request_key })
             }
         },
-        Command::Doctor { admin } => (admin, R::Doctor),
+        Command::Doctor { admin, .. } => (admin, R::Doctor),
         Command::Export { admin } => (admin, R::Export),
-        Command::Serve { .. } | Command::ConfigExample | Command::Keys(KeysCmd::Generate { .. }) => {
+        Command::Serve { .. }
+        | Command::ConfigExample
+        | Command::Remote(_)
+        | Command::Keys(KeysCmd::Generate { .. }) => {
             unreachable!("not an admin command")
         }
     })
@@ -433,6 +442,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             println!("{}", crate::secrets::generate_key_line(version));
             Ok(())
         }
+        // Remote commands never reach the admin socket (spec 5.6).
+        Command::Remote(cmd) => crate::client::run(*cmd).await,
+        Command::Doctor { profile: Some(p), admin } => crate::client::doctor(Some(&p), admin.json).await,
         other => {
             let (opts, req) = admin_request(other)?;
             let v = admin_client::send(&opts.socket, &req).await?;

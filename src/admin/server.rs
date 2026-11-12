@@ -226,6 +226,22 @@ async fn execute(call: &mut AdminCall<'_>, req: AdminRequest) -> anyhow::Result<
             .await
         }
         ClientsRevoke { name } => call.tx(move |tx| ops::client_revoke(tx, &name)).await,
+        ClientsInvite { name, project, accounts, capabilities, expires, allow_ip } => {
+            let expires_in = parse_expiry(expires.as_deref())?;
+            let pepper = app.pepper.clone();
+            call.tx(move |tx| {
+                let ni = crate::invite::NewInvite {
+                    name: &name,
+                    project: &project,
+                    accounts: &accounts,
+                    capabilities: &capabilities,
+                    expires_in_secs: expires_in,
+                    allow_ip: &allow_ip,
+                };
+                crate::invite::create(tx, &pepper, allow_send, &ni)
+            })
+            .await
+        }
         ClientsShow { name } => call.read(move |c| ops::client_show(c, &name)).await,
         ClientsList => call.read(ops::client_list).await,
         AuditTail { limit } => {

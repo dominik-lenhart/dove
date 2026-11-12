@@ -89,6 +89,8 @@ pub fn list(ctx: &ClientCtx, structured: bool) -> Vec<Value> {
                     "idempotentHint": t.read_only,
                     "openWorldHint": false,
                 },
+                // Declared auth requirement for hosts that read it (ChatGPT apps); unverified against real hosts.
+                "securitySchemes": [{ "type": "oauth2", "scopes": [crate::oauth::SCOPE] }],
             });
             if structured {
                 d["outputSchema"] = (t.output_schema)();
