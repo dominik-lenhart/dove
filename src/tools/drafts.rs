@@ -16,6 +16,7 @@ use super::{
     only_keys, opt_str,
 };
 use crate::error::{ErrorCode, ToolError};
+use crate::gmail::WriteError;
 use crate::gmail::gateway::{GmailOp, Priority, SendPermit};
 use crate::mime::{self, Addr, DraftFields};
 use crate::policy::{Capability, Mailbox};
@@ -455,13 +456,9 @@ async fn dispatch_create(
     let v = cx
         .app
         .google
-        .call(&mb.account_id, || GmailOp::CreateDraft, &[], Some(&body), Priority::Interactive, cx.deadline)
+        .write(&mb.account_id, || GmailOp::CreateDraft, &body, cx.deadline)
         .await
-        .map_err(|e| {
-            let dispatched = !matches!(e.code, ErrorCode::AccountUnavailable | ErrorCode::NotFound)
-                && e.message != "Gmail is unreachable";
-            (e, dispatched)
-        })?;
+        .map_err(|e| (e.error, e.dispatched))?;
     let draft_id = v["id"]
         .as_str()
         .ok_or_else(|| (ToolError::new(ErrorCode::OutcomeUnknown, "unexpected Gmail response"), true))?;
@@ -597,8 +594,9 @@ async fn update_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError>
     let res = cx
         .app
         .google
-        .call(&mb.account_id, || GmailOp::UpdateDraft(&did), &[], Some(&body), Priority::Interactive, cx.deadline)
-        .await;
+        .write(&mb.account_id, || GmailOp::UpdateDraft(&did), &body, cx.deadline)
+        .await
+        .map_err(|e| e.error);
     let (aid, d2) = (mb.account_id.clone(), draft_id.clone());
     match res {
         Ok(v) => {
@@ -656,14 +654,6 @@ async fn send_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
     let mb = account_arg(cx, &args, Capability::Send)?.clone();
     let draft_id = gmail_id_arg(&args, "draft_id")?.to_string();
     let expected = arg_str(&args, "expected_revision")?.to_string();
-    let per_minute = cx.app.cfg.limits.client_sends_per_hour.div_ceil(60).max(1);
-    if let Some(wait) = cx.app.rate_limiter.check(
-        &format!("send:{}", cx.client.client_id),
-        per_minute,
-        cx.app.cfg.limits.client_sends_per_hour.clamp(1, 10),
-    ) {
-        return Err(ToolError::rate_limited(Some(wait)));
-    }
     let own = own_row(cx, &mb, &draft_id).await?;
     match own.state.as_str() {
         "active" => {}
@@ -703,6 +693,13 @@ async fn send_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
     if !still_allowed {
         return Err(ToolError::forbidden("send permission is no longer granted"));
     }
+    // Separate budget from reads (spec 6.3), charged only for submissions: `client_sends_per_hour`, bursts ≤5.
+    let per_hour = cx.app.cfg.limits.client_sends_per_hour;
+    if let Some(wait) =
+        cx.app.rate_limiter.check_hourly(&format!("send:{}", cx.client.client_id), per_hour, per_hour.clamp(1, 5))
+    {
+        return Err(ToolError::rate_limited(Some(wait)));
+    }
     // Persist the in-flight state atomically before dispatch: at most one submission (spec 6.3).
     let (aid, did, rev) = (mb.account_id.clone(), draft_id.clone(), own.message_id.clone());
     let claimed = cx
@@ -719,25 +716,7 @@ async fn send_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
         return Err(ToolError::new(ErrorCode::DraftConflict, "the draft changed while preparing to send"));
     }
     let body = json!({ "id": draft_id });
-    let token = cx.app.google.tokens().access_token(&mb.account_id).await;
-    let res = match token {
-        Ok(t) => cx
-            .app
-            .google
-            .gateway()
-            .gmail(
-                &mb.account_id,
-                &t,
-                GmailOp::SendDraft(SendPermit(())),
-                &[],
-                Some(&body),
-                Priority::Interactive,
-                cx.deadline,
-            )
-            .await
-            .map_err(crate::gmail::map_err),
-        Err(e) => Err(e),
-    };
+    let res = cx.app.google.write(&mb.account_id, || GmailOp::SendDraft(SendPermit(())), &body, cx.deadline).await;
     let (aid, did) = (mb.account_id.clone(), draft_id.clone());
     match res {
         Ok(v) => {
@@ -765,10 +744,9 @@ async fn send_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
                 },
             })
         }
-        Err(e) => {
-            // Definitive failures before or at Google are safe to retry; anything uncertain blocks resubmission.
-            let definitive = !matches!(e.code, ErrorCode::OutcomeUnknown)
-                && !(e.code == ErrorCode::UpstreamError && e.message.contains("time"));
+        Err(WriteError { error: e, .. }) => {
+            // Not dispatched or definitively rejected (4xx): safe to retry. Anything uncertain blocks resubmission.
+            let definitive = e.code != ErrorCode::OutcomeUnknown;
             let state = if definitive { "active" } else { "send_unknown" };
             let _ = cx
                 .app

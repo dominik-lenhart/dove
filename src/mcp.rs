@@ -52,6 +52,9 @@ fn unauthorized(app: &App) -> Response {
 }
 
 /// Simple per-client token bucket (spec 7.7).
+/// Upper bound on messages in one legacy JSON-RPC batch.
+const MAX_JSONRPC_BATCH: usize = 20;
+
 #[derive(Default)]
 pub struct RateLimiter {
     buckets: Mutex<HashMap<String, (f64, Instant)>>,
@@ -60,7 +63,15 @@ pub struct RateLimiter {
 impl RateLimiter {
     /// Returns `None` when allowed, or the seconds to wait.
     pub fn check(&self, key: &str, per_minute: u32, burst: u32) -> Option<u64> {
-        let rate = f64::from(per_minute.max(1)) / 60.0;
+        self.check_rate(key, f64::from(per_minute.max(1)) / 60.0, burst)
+    }
+
+    /// Token bucket refilling `per_hour` tokens per hour, holding at most `burst`.
+    pub fn check_hourly(&self, key: &str, per_hour: u32, burst: u32) -> Option<u64> {
+        self.check_rate(key, f64::from(per_hour.max(1)) / 3600.0, burst)
+    }
+
+    fn check_rate(&self, key: &str, rate: f64, burst: u32) -> Option<u64> {
         let cap = f64::from(burst.max(1));
         let mut map = self.buckets.lock().expect("lock");
         let now = Instant::now();
@@ -167,8 +178,22 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
     };
     match msg {
         Value::Array(items) if version.as_str() < "2025-06-18" => {
+            if items.is_empty() || items.len() > MAX_JSONRPC_BATCH {
+                return json_response(rpc_error(Value::Null, -32600, "batch must contain 1 to 20 messages"));
+            }
             let mut out = Vec::new();
-            for item in items {
+            for (i, item) in items.into_iter().enumerate() {
+                // The request itself paid for the first message; every further one is charged too.
+                if i > 0
+                    && app
+                        .rate_limiter
+                        .check(&ctx.client_id, limits.client_requests_per_minute, limits.client_burst)
+                        .is_some()
+                {
+                    let id = item.get("id").cloned().unwrap_or(Value::Null);
+                    out.push(rpc_error(id, -32000, "rate limited"));
+                    continue;
+                }
                 if let Some(r) = dispatch(&app, &ctx, &version, item).await {
                     out.push(r);
                 }

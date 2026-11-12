@@ -58,8 +58,16 @@ impl Harness {
 
     /// Restarts the HTTP server on a new App over the same data directory.
     pub async fn restart(&mut self) {
+        self.restart_with(|_| {}).await;
+    }
+
+    /// Restarts with a changed configuration (same data directory and secrets).
+    #[allow(dead_code)]
+    pub async fn restart_with(&mut self, customize: impl FnOnce(&mut Config)) {
         self.server.abort();
-        let app = self.env.restart(Upstream::single_origin(&self.google.base_url));
+        let mut cfg = self.env.app.cfg.clone();
+        customize(&mut cfg);
+        let app = dove::app::App::from_config_with(cfg, Upstream::single_origin(&self.google.base_url)).unwrap();
         app.store.call(|c| dove::tools::drafts::recover_after_restart(c).map(|_| ())).await.unwrap();
         self.env.app = app;
         let (base, server) = serve(self.env.app.clone()).await;

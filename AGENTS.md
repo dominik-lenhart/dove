@@ -68,3 +68,6 @@ cargo fmt
   human-owned draft, single-use state vs alias-exists) needs a test where only that guard can fire.
 - 2026-11-12: `pkill -f <pattern>` inside a Bash tool call matches the tool's own shell; use `pgrep -af` and kill
   by PID.
+- 2026-11-12: Gmail writes go through `Google::write`, which classifies failures once: not dispatched or 4xx is
+  definitive (safe to retry), 5xx / lost response / unreadable body is `outcome_unknown`. Never classify by
+  matching error message text.

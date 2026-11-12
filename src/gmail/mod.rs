@@ -73,6 +73,52 @@ impl Google {
     }
 }
 
+/// A failed Gmail write and whether Google may have received it (spec 6.3, 7.7).
+#[derive(Debug)]
+pub struct WriteError {
+    pub error: ToolError,
+    /// False only when the request certainly never reached Google; then a retry is safe.
+    pub dispatched: bool,
+}
+
+impl Google {
+    /// Performs a Gmail write. Server errors, lost responses and unreadable success bodies become
+    /// `outcome_unknown`: Google may have applied the write, so it must not be repeated automatically.
+    pub async fn write<'a>(
+        &self,
+        account_id: &str,
+        op: impl Fn() -> GmailOp<'a>,
+        body: &Value,
+        deadline: Instant,
+    ) -> Result<Value, WriteError> {
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let token =
+                self.tokens.access_token(account_id).await.map_err(|error| WriteError { error, dispatched: false })?;
+            match self.gateway.gmail(account_id, &token, op(), &[], Some(body), Priority::Interactive, deadline).await {
+                Ok(v) => return Ok(v),
+                // A 401 is a definitive rejection before the write was applied.
+                Err(e) if e.is_auth() && attempt == 1 => self.tokens.evict(account_id),
+                Err(e) => return Err(classify_write(e)),
+            }
+        }
+    }
+}
+
+fn classify_write(e: GatewayError) -> WriteError {
+    match e {
+        GatewayError::NotDispatched | GatewayError::Deadline | GatewayError::InvalidId => {
+            WriteError { error: map_err(e), dispatched: false }
+        }
+        GatewayError::Status { status, .. } if status < 500 => WriteError { error: map_err(e), dispatched: true },
+        GatewayError::Status { .. } | GatewayError::Unknown | GatewayError::BadResponse => WriteError {
+            error: ToolError::new(ErrorCode::OutcomeUnknown, "the Gmail write may or may not have been applied"),
+            dispatched: true,
+        },
+    }
+}
+
 /// Maps gateway failures to stable agent error codes. Never includes upstream bodies.
 pub fn map_err(e: GatewayError) -> ToolError {
     match e {

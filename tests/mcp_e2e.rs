@@ -448,3 +448,25 @@ async fn every_tool_call_writes_one_audit_record_without_content() {
     }
     assert!(dove::audit::verify(&rusqlite::Connection::open(h.app().cfg.state_db_path()).unwrap()).unwrap().ok);
 }
+
+#[tokio::test]
+async fn legacy_batches_are_bounded_and_charged_per_message() {
+    let h = Harness::start_with(|c| {
+        c.limits.client_requests_per_minute = 1;
+        c.limits.client_burst = 3;
+    })
+    .await;
+    h.mailbox("info", "info@acme.test");
+    h.project("acme", &["info"]).await;
+    let token = h.token("acme", "agent", vec![g("info", "read")]).await;
+    let legacy = [("mcp-protocol-version", "2025-03-26")];
+    let ping = |i: usize| json!({"jsonrpc":"2.0","id":i,"method":"ping"});
+    let too_many: Vec<Value> = (0..21).map(ping).collect();
+    let v: Value = h.post_mcp(Some(&token), Value::Array(too_many), &legacy).await.json().await.unwrap();
+    assert_eq!(v["error"]["code"], -32600);
+    // Burst 3 was charged once by the request above; a batch of 3 gets only 2 messages through.
+    let v: Value =
+        h.post_mcp(Some(&token), Value::Array((0..3).map(ping).collect()), &legacy).await.json().await.unwrap();
+    let limited = v.as_array().unwrap().iter().filter(|r| r["error"]["message"] == "rate limited").count();
+    assert_eq!(limited, 1, "{v}");
+}

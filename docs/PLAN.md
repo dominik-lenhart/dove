@@ -33,7 +33,7 @@ hosts or reference hardware.
 4. Contracts
    - [ ] Projections, keyset cursors (15 min TTL, bounded), count_only, live Gmail route
    - [ ] batch_read with budgets (AC21)
-   - [ ] send_draft behind instance gate + send grant + ownership, at-most-once (6.3, AC3)
+   - [x] send_draft behind instance gate + send grant + ownership, at-most-once (6.3, AC3; `tests/send_e2e.rs`)
    - [ ] Client onboarding: invitations, `dove login`, remote CLI commands, `mcp install`, `mcp stdio` (5.6, AC22)
    - [ ] Downstream OAuth AS for ChatGPT/Claude (5.6, AC23)
 5. Hardening
