@@ -12,8 +12,8 @@ use serde_json::{Value, json};
 
 use super::read::{fmt_addrs, from_meta};
 use super::{
-    AuditInfo, ToolCx, ToolDef, ToolOutput, account_arg, account_schema, arg_str, compose, gmail_id_arg, object_schema,
-    only_keys, opt_bool, opt_str,
+    AuditInfo, ToolCx, ToolDef, ToolOutput, account_arg, account_schema, arg_str, compose, detached, gmail_id_arg,
+    object_schema, only_keys, opt_bool, opt_str,
 };
 use crate::error::{ErrorCode, ToolError};
 use crate::gmail::WriteError;
@@ -89,7 +89,7 @@ pub fn defs() -> Vec<ToolDef> {
                     json!({ "account": {"type":"string"}, "draft_id": {"type":"string"}, "message_id": {"type":"string"}, "thread_id": {"type":"string"}, "revision": {"type":"string"} }),
                 )
             },
-            handler: |cx, args| Box::pin(create_draft(cx, args)),
+            handler: |cx, args| detached(cx, args, |cx, args| Box::pin(create_draft(cx, args))),
         },
         ToolDef {
             name: "update_draft",
@@ -115,7 +115,7 @@ pub fn defs() -> Vec<ToolDef> {
                 }, "required": ["account", "draft_id", "expected_revision", "changes"], "additionalProperties": false })
             },
             output_schema: || object_schema(json!({ "draft_id": {"type":"string"}, "revision": {"type":"string"} })),
-            handler: |cx, args| Box::pin(update_draft(cx, args)),
+            handler: |cx, args| detached(cx, args, |cx, args| Box::pin(update_draft(cx, args))),
         },
         ToolDef {
             name: "send_draft",
@@ -137,7 +137,7 @@ pub fn defs() -> Vec<ToolDef> {
                     json!({ "sent_message_id": {"type":["string","null"]}, "thread_id": {"type":["string","null"]} }),
                 )
             },
-            handler: |cx, args| Box::pin(send_draft(cx, args)),
+            handler: |cx, args| detached(cx, args, |cx, args| Box::pin(send_draft(cx, args))),
         },
     ]
 }
@@ -610,6 +610,8 @@ async fn dispatch_create(
     };
     let raw = mime::build_draft(&fields).map_err(|e| pre(mime_err(e)))?;
     drop(fields);
+    // From here on the draft may reach the provider: the rest runs to completion even if the call times out.
+    cx.commit().map_err(pre)?;
     if mb.provider == Provider::Imap {
         return super::drafts_imap::append_new(cx, mb, raw).await.map(|c| (c, stats));
     }
@@ -621,7 +623,7 @@ async fn dispatch_create(
     let v = cx
         .app
         .google
-        .write(&mb.account_id, || GmailOp::CreateDraft, &body, cx.deadline)
+        .write(&mb.account_id, || GmailOp::CreateDraft, &body, cx.write_deadline())
         .await
         .map_err(|e| (e.error, e.dispatched))?;
     let draft_id = v["id"]
@@ -786,6 +788,7 @@ async fn update_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError>
     }
     fields.date = util::now_unix();
     let raw = mime::build_draft(&fields).map_err(mime_err)?;
+    cx.commit()?;
     let res = match imap_id {
         None => gmail_update(cx, &mb, &draft_id, &f, raw).await,
         Some(old) => super::drafts_imap::replace(cx, &mb, &draft_id, old, raw).await.map(|(r, t)| (r, json!(t))),
@@ -839,7 +842,7 @@ async fn gmail_update(
     let v = cx
         .app
         .google
-        .write(&mb.account_id, || GmailOp::UpdateDraft(draft_id), &body, cx.deadline)
+        .write(&mb.account_id, || GmailOp::UpdateDraft(draft_id), &body, cx.write_deadline())
         .await
         .map_err(|e| e.error)?;
     let new_rev = v["message"]["id"].as_str().unwrap_or_default().to_string();
@@ -916,6 +919,9 @@ async fn send_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
     if !still_allowed {
         return Err(ToolError::forbidden("send permission is no longer granted"));
     }
+    // From here on the send runs to completion even if the call times out (`tools::detached`); too late to start
+    // means nothing is charged or claimed.
+    cx.commit()?;
     // Separate budget from reads (spec 6.3), charged only for submissions: `client_sends_per_hour`, bursts ≤5.
     let per_hour = cx.app.cfg.limits.client_sends_per_hour;
     if let Some(wait) =
@@ -943,7 +949,7 @@ async fn send_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
             let body = json!({ "id": draft_id });
             cx.app
                 .google
-                .write(&mb.account_id, || GmailOp::SendDraft(SendPermit(())), &body, cx.deadline)
+                .write(&mb.account_id, || GmailOp::SendDraft(SendPermit(())), &body, cx.write_deadline())
                 .await
                 .map(|v| (v["id"].as_str().map(str::to_string), v["threadId"].clone()))
                 .map_err(|WriteError { error, .. }| error)

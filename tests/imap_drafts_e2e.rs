@@ -4,6 +4,8 @@
 
 mod support;
 
+use std::time::{Duration, Instant};
+
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use support::fake_imap::{Fault, encode_utf7, verb_of};
@@ -539,4 +541,113 @@ fn only_drafts_tools_construct_own_draft_uid() {
     }
     users.sort();
     assert_eq!(users, vec!["src/imap/session.rs", "src/tools/drafts_imap.rs"]);
+}
+
+/// A 4 s call budget (writes dispatch by 3 s) and a 10 s IMAP command timeout, so one delayed command can outlive
+/// the call.
+async fn short_budget() -> Setup {
+    let h = Harness::start_with(|c| {
+        c.limits.tool_call_timeout_secs = 4;
+        c.limits.upstream_request_timeout_secs = 10;
+    })
+    .await;
+    let u = h.imap_mailbox("info", MB).await;
+    h.project("p", &["info"]).await;
+    let token = h.token("p", "agent", vec![g("info", "read,draft")]).await;
+    Setup { h, u, token }
+}
+
+async fn wait_for<F: std::future::Future<Output = bool>>(mut f: impl FnMut() -> F) {
+    let until = Instant::now() + Duration::from_secs(10);
+    while !f().await && Instant::now() < until {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[tokio::test]
+async fn create_whose_append_outlives_the_call_is_still_recorded() {
+    let Setup { h, u, token } = short_budget().await;
+    let args = json!({ "account": "info", "request_key": key(), "to": ["zoe@example.net"], "subject": "Spät",
+                       "body_text": "late" });
+    h.imap.fail_next("APPEND", Fault::Delay(Duration::from_secs(5)));
+    let started = Instant::now();
+    let (is_err, v) = h.call(&token, "create_draft", args.clone()).await;
+    assert!(is_err);
+    assert_eq!(v["error"]["code"], "outcome_unknown", "{v}");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    // The APPEND lands after the call ended; the detached write reads it back and records it.
+    let app = h.app().clone();
+    wait_for(|| {
+        let app = app.clone();
+        async move {
+            app.store
+                .call(|c| {
+                    Ok(c.query_row("SELECT count(*) FROM create_operations WHERE state = 'succeeded'", [], |r| {
+                        r.get::<_, i64>(0)
+                    })?)
+                })
+                .await
+                .unwrap()
+                == 1
+        }
+    })
+    .await;
+    // Retrying the same request_key returns that draft instead of an unknown outcome or a second copy.
+    let r = h.ok(&token, "create_draft", args).await;
+    let uids = h.imap.uids(&u.user, "Drafts");
+    assert_eq!(uids.len(), 1);
+    assert_eq!(uid_of(r["revision"].as_str().unwrap()), uids[0]);
+    let (rev, hash, state) = own(&h, r["draft_id"].as_str().unwrap()).await;
+    assert_eq!((rev.as_str(), state.as_str()), (r["revision"].as_str().unwrap(), "active"));
+    assert_eq!(hash, Some(sha(&h.imap.message_raw(&u.user, "Drafts", uids[0]).unwrap())));
+}
+
+#[tokio::test]
+async fn update_whose_append_outlives_the_call_moves_the_record_and_removes_the_old_copy() {
+    let Setup { h, u, token } = short_budget().await;
+    let c = create(&h, &token, "v1").await;
+    let (d, old) = (c["draft_id"].as_str().unwrap().to_string(), c["revision"].as_str().unwrap().to_string());
+    h.imap.clear_commands();
+    h.imap.fail_next("APPEND", Fault::Delay(Duration::from_secs(5)));
+    let up = json!({ "account": "info", "draft_id": d, "expected_revision": old, "changes": { "body_text": "v2" } });
+    let (is_err, v) = h.call(&token, "update_draft", up).await;
+    assert!(is_err);
+    assert_eq!(v["error"]["code"], "outcome_unknown", "{v}");
+    wait_for(|| async { own(&h, &d).await.0 != old }).await;
+    let (new, _, state) = own(&h, &d).await;
+    assert_ne!(new, old, "the new revision was recorded");
+    assert_eq!(state, "active");
+    wait_for(|| async { h.imap.uids(&u.user, "Drafts") == vec![uid_of(&new)] }).await;
+    assert_eq!(h.imap.uids(&u.user, "Drafts"), vec![uid_of(&new)], "exactly one copy, the new one");
+    let o = uid_of(&old).to_string();
+    assert_eq!(deletions(&h), vec![("UID STORE".into(), o.clone()), ("UID EXPUNGE".into(), o)]);
+    let up = json!({ "account": "info", "draft_id": d, "expected_revision": new, "changes": { "body_text": "v3" } });
+    h.ok(&token, "update_draft", up).await;
+}
+
+#[tokio::test]
+async fn update_that_runs_out_of_time_before_its_append_writes_nothing() {
+    let Setup { h, u, token } = short_budget().await;
+    let c = create(&h, &token, "v1").await;
+    let (d, old) = (c["draft_id"].as_str().unwrap().to_string(), c["revision"].as_str().unwrap().to_string());
+    h.imap.clear_commands();
+    // The fresh read before the write takes longer than the whole call.
+    h.imap.fail_next("UID FETCH", Fault::Delay(Duration::from_secs(5)));
+    let up = json!({ "account": "info", "draft_id": d, "expected_revision": old, "changes": { "body_text": "v2" } });
+    let (is_err, v) = h.call(&token, "update_draft", up).await;
+    assert!(is_err);
+    assert_eq!(v["error"]["code"], "upstream_error", "{v}");
+    // The detached task finishes its read after the call ended and must stop at the commit gate.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(h.imap.commands().iter().any(|c| verb_of(c) == "UID FETCH"), "{:?}", h.imap.commands());
+    assert!(!h.imap.commands().iter().any(|c| verb_of(c) == "APPEND"), "{:?}", h.imap.commands());
+    let (rev, _, state) = own(&h, &d).await;
+    assert_eq!((rev.as_str(), state.as_str()), (old.as_str(), "active"));
+    assert_eq!(h.imap.uids(&u.user, "Drafts"), vec![uid_of(&old)]);
+    // Done reading at ~3.3 s, inside the 4 s budget but past the 3 s write deadline: too late to start a write.
+    h.imap.fail_next("UID FETCH", Fault::Delay(Duration::from_millis(3300)));
+    let up = json!({ "account": "info", "draft_id": d, "expected_revision": old, "changes": { "body_text": "v2" } });
+    assert_eq!(h.err(&token, "update_draft", up).await, "upstream_error");
+    assert!(!h.imap.commands().iter().any(|c| verb_of(c) == "APPEND"), "{:?}", h.imap.commands());
+    assert_eq!(own(&h, &d).await.0, old);
 }

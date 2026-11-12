@@ -2,6 +2,8 @@
 
 mod support;
 
+use std::time::{Duration, Instant};
+
 use serde_json::{Value, json};
 use support::fake_google::Fault;
 use support::harness::{Harness, g};
@@ -173,4 +175,55 @@ async fn sends_have_their_own_hourly_budget() {
     // Reads are unaffected.
     h.ok(&sender, "list_accounts", json!({})).await;
     assert_eq!(h.google.sent_messages(MB).len(), 3);
+}
+
+async fn own_state(h: &Harness, draft_id: &Value) -> String {
+    let d = draft_id.as_str().unwrap().to_string();
+    h.app()
+        .store
+        .call(move |c| Ok(c.query_row("SELECT state FROM own_drafts WHERE draft_id = ?1", [d], |r| r.get(0))?))
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn gmail_writes_give_up_before_the_call_deadline() {
+    // Gmail never answers: each write stops at its own deadline (2 s before the 8 s budget), records the unknown
+    // outcome and answers in time, instead of being cut off by the call timeout.
+    let h = Harness::start_with(|c| {
+        c.allow_send = true;
+        c.limits.client_sends_per_hour = 20;
+        c.limits.upstream_request_timeout_secs = 60;
+    })
+    .await;
+    h.mailbox("info", MB);
+    h.project("acme", &["info"]).await;
+    let sender = h.token("acme", "sender", vec![g("info", "read,draft,send")]).await;
+    let hang = || Fault::Delay(Duration::from_secs(60));
+    let in_time = |started: Instant| {
+        let took = started.elapsed();
+        assert!(took < Duration::from_millis(7500), "{took:?}");
+    };
+
+    h.google.fail_next("POST", "/drafts", hang());
+    let started = Instant::now();
+    let args =
+        json!({"account":"info","request_key":uuid::Uuid::new_v4().to_string(),"to":["c@example.org"],"body_text":"b"});
+    assert_eq!(h.err(&sender, "create_draft", args).await, "outcome_unknown");
+    in_time(started);
+
+    let (d, rev) = draft(&h, &sender, "info").await;
+    h.google.fail_next("PUT", "/drafts/", hang());
+    let started = Instant::now();
+    let up = json!({"account":"info","draft_id":d,"expected_revision":rev,"changes":{"body_text":"x"}});
+    assert_eq!(h.err(&sender, "update_draft", up).await, "outcome_unknown");
+    in_time(started);
+    assert_eq!(own_state(&h, &d).await, "update_unknown");
+
+    let (d, rev) = draft(&h, &sender, "info").await;
+    h.google.fail_next("POST", "/drafts/send", hang());
+    let started = Instant::now();
+    assert_eq!(h.err(&sender, "send_draft", send_args(&d, &rev)).await, "outcome_unknown");
+    in_time(started);
+    assert_eq!(own_state(&h, &d).await, "send_unknown");
 }

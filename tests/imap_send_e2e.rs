@@ -4,6 +4,8 @@
 
 mod support;
 
+use std::time::{Duration, Instant};
+
 use serde_json::{Value, json};
 use support::fake_imap::{Fault, SmtpFault, encode_utf7, verb_of};
 use support::harness::{FakeImapUser, Harness, g};
@@ -311,4 +313,79 @@ async fn externally_changed_draft_is_not_sent() {
     assert_eq!(state(&h, &d2).await.0, "sent");
     let notes = h.app().notifier.sent.lock().unwrap().clone();
     assert_eq!(notes.iter().filter(|m| m.contains(d2.as_str().unwrap())).count(), 1, "{notes:?}");
+}
+
+async fn audit_rows(h: &Harness, tool: &str) -> i64 {
+    let t = tool.to_string();
+    h.app()
+        .store
+        .call(move |c| Ok(c.query_row("SELECT count(*) FROM audit WHERE tool_or_action = ?1", [t], |r| r.get(0))?))
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn late_smtp_accept_still_records_files_and_removes_after_the_call_ends() {
+    // Budget 8 s, so SMTP must finish by 6 s. It accepts at ~4.6 s; the Sent copy (2.5 s) and the draft's removal
+    // (2.5 s) run past the call's deadline and must still happen.
+    let Setup { h, u, sender, .. } = setup().await;
+    let (d, rev) = draft(&h, &sender).await;
+    let stored = h.imap.message_raw(&u.user, "Drafts", uid_of(&rev)).unwrap();
+    h.imap.clear_commands();
+    h.imap.smtp_fail_next("DATA", SmtpFault::Delay(Duration::from_millis(4500)));
+    h.imap.fail_next_containing(
+        "APPEND",
+        &format!("\"{}\"", encode_utf7("Sent")),
+        Fault::Delay(Duration::from_millis(2500)),
+    );
+    h.imap.fail_next("UID STORE", Fault::Delay(Duration::from_millis(2500)));
+    let (is_err, v) = h.call(&sender, "send_draft", send_args(&d, &rev)).await;
+    // The mail went out but the call ran out of time: unknown to the agent, never a retryable error.
+    assert!(is_err);
+    assert_eq!(v["error"]["code"], "outcome_unknown", "{v}");
+    assert_eq!(h.imap.sent_mails().len(), 1);
+    // The detached send finishes on its own: recorded as sent, Sent copy filed, exactly Dove's draft removed.
+    let until = Instant::now() + Duration::from_secs(10);
+    while (state(&h, &d).await.1.is_none() || !h.imap.uids(&u.user, "Drafts").is_empty()) && Instant::now() < until {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let sent_uids = h.imap.uids(&u.user, "Sent");
+    assert_eq!(sent_uids.len(), 1);
+    assert_eq!(h.imap.message_raw(&u.user, "Sent", sent_uids[0]).unwrap(), stored);
+    let (st, sent_id) = state(&h, &d).await;
+    assert_eq!(st, "sent");
+    assert!(sent_id.unwrap().ends_with(&format!("-{}", sent_uids[0])));
+    assert!(h.imap.uids(&u.user, "Drafts").is_empty());
+    let uid = uid_of(&rev).to_string();
+    assert_eq!(deletions(&h), vec![("UID STORE".into(), uid.clone()), ("UID EXPUNGE".into(), uid)]);
+    // A retry never submits again, and each call left exactly one audit record.
+    assert_eq!(h.err(&sender, "send_draft", send_args(&d, &rev)).await, "not_found");
+    assert_eq!(h.imap.sent_mails().len(), 1);
+    assert_eq!(data_count(&h), 1);
+    assert_eq!(audit_rows(&h, "send_draft").await, 2);
+    h.imap.assert_only_allowlisted();
+}
+
+#[tokio::test]
+async fn smtp_gets_less_time_than_the_call() {
+    // SMTP never answers the final `.`: Dove gives up at its own SMTP deadline, records `send_unknown` and answers
+    // before the call's deadline (8 s), not by running into it.
+    let Setup { h, u, sender, .. } = setup().await;
+    let (d, rev) = draft(&h, &sender).await;
+    h.imap.clear_commands();
+    h.imap.smtp_fail_next("DATA", SmtpFault::Delay(Duration::from_secs(60)));
+    let started = Instant::now();
+    let (is_err, v) = h.call(&sender, "send_draft", send_args(&d, &rev)).await;
+    let took = started.elapsed();
+    assert!(is_err);
+    assert_eq!(v["error"]["code"], "outcome_unknown", "{v}");
+    assert!(took < Duration::from_millis(7500), "{took:?}");
+    assert_eq!(state(&h, &d).await.0, "send_unknown");
+    let smtp = h.imap.smtp_connections();
+    assert_eq!(h.err(&sender, "send_draft", send_args(&d, &rev)).await, "outcome_unknown");
+    assert_eq!(h.imap.smtp_connections(), smtp, "no second SMTP connection");
+    assert_eq!(h.imap.sent_mails().len(), 1);
+    assert_eq!(h.imap.uids(&u.user, "Drafts"), vec![uid_of(&rev)]);
+    assert!(h.imap.uids(&u.user, "Sent").is_empty());
+    assert!(deletions(&h).is_empty());
 }

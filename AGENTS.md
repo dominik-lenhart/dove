@@ -227,3 +227,9 @@ cargo fmt
 - 2026-11-12: A shell wait loop `until ! pgrep -f "<cmd>"` matches its own command line and never ends; wait on cargo
   in the foreground instead. `cargo test --test a --test b` stops at the first failing binary, so a mutation run
   over several files can skip the test meant to catch it: run that file alone (or `--no-fail-fast`).
+- 2026-11-12: Write tools (create/update/send draft) run detached (`tools::detached`) and must call `cx.commit()` right
+  before their first side effect (send claim, APPEND, Gmail write); upstream writes use `cx.write_deadline()`, never
+  `cx.deadline`. A new write tool needs both, or a call timeout can drop a dispatched write's record. Tests shrink the
+  budget (`tool_call_timeout_secs = 4`) and raise `upstream_request_timeout_secs` so one `Fault::Delay` /
+  `SmtpFault::Delay` outlives the call; Gmail write tests must raise the request timeout too, or the 3 s harness
+  request timeout ends the write before any deadline does.

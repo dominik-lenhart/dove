@@ -324,11 +324,12 @@ pub async fn call_tool(app: &Arc<App>, ctx: &ClientCtx, version: &str, name: &st
     let started = Instant::now();
     let request_id = util::new_id();
     let structured = version >= STRUCTURED_SINCE;
-    let deadline = started + Duration::from_secs(app.cfg.limits.tool_call_timeout_secs);
-    let cx = ToolCx { app: app.clone(), client: ctx.clone(), request_id: request_id.clone(), deadline };
+    let cx = ToolCx::new(app.clone(), ctx.clone(), request_id.clone(), started);
     let fut = tools::call(&cx, name, args);
-    let result = match tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), fut).await {
+    let result = match tokio::time::timeout(cx.deadline.saturating_duration_since(Instant::now()), fut).await {
         Ok(r) => r,
+        // A write that already started finishes in its own task; its result is unknown to the caller (spec 7.7).
+        Err(_) if cx.abandon() => Err(tools::unfinished_write()),
         Err(_) => Err(ToolError::upstream("the tool call exceeded its time budget")),
     };
     let mut rec = AuditRecord {

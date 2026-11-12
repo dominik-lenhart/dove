@@ -68,6 +68,9 @@ pub enum SmtpFault {
     Drop,
     /// For DATA: read the message and terminator, record it, close without the final reply.
     DropAfterTerminator,
+    /// Wait, then handle normally. For DATA the wait is after the terminator, before the final reply (the message
+    /// is recorded as sent before the wait).
+    Delay(Duration),
 }
 
 #[derive(Debug, Clone)]
@@ -1309,6 +1312,7 @@ async fn smtp_conn(st: Arc<Mutex<State>>, mut r: BufReader<OwnedReadHalf>, mut w
                 continue;
             }
             Some(SmtpFault::Drop) => return,
+            Some(SmtpFault::Delay(d)) if verb != "DATA" => tokio::time::sleep(*d).await,
             _ => {}
         }
         let check = |u: &str, p: &str| st.lock().unwrap().users.get(u).is_some_and(|x| x.password == p);
@@ -1398,6 +1402,9 @@ async fn smtp_conn(st: Arc<Mutex<State>>, mut r: BufReader<OwnedReadHalf>, mut w
                 });
                 if matches!(fault, Some(SmtpFault::DropAfterTerminator)) {
                     return;
+                }
+                if let Some(SmtpFault::Delay(d)) = &fault {
+                    tokio::time::sleep(*d).await;
                 }
                 "250 queued".into()
             }

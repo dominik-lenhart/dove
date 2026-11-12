@@ -256,3 +256,11 @@ hosts or reference hardware.
   `Content` (owned strings, not wiped) before `Password` takes its own `Zeroizing` copy, and serde's scratch buffer
   for escaped strings is not wiped either. Avoiding them would need a hand-written request parser; the process is
   the service itself, so this only matters for memory disclosure after the fact (core dumps are disabled by the unit).
+- A49. Writes outlive the call deadline (security review 2026-11-12): create_draft, update_draft and send_draft run in
+  their own task (`tools::detached`). Each passes a commit gate (`ToolCx::commit`) right before it claims a send or
+  dispatches a write; from then on the call timeout no longer cancels it, so the result is recorded and the follow-up
+  steps (Sent copy, removal of the old or sent draft) run, and a timed-out call answers `outcome_unknown`. Before the
+  gate a timed-out call stays a retryable `upstream_error` and the task stops at the gate. Upstream writes (SMTP,
+  Gmail) get `ToolCx::write_deadline`, a reserve of a quarter of the budget (1 to 5 s) before the call deadline, so a
+  late answer is normally still recorded and reported in time. A panic inside a claimed send leaves `sending` until
+  the next restart turns it into `send_unknown`; a shutdown that ends the process mid-write does the same.

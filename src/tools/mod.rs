@@ -11,20 +11,86 @@ pub mod search;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Instant;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
 use crate::app::App;
-use crate::error::ToolError;
+use crate::error::{ErrorCode, ToolError};
 use crate::policy::{Capability, ClientCtx, Mailbox};
 use crate::util;
 
+#[derive(Clone)]
 pub struct ToolCx {
     pub app: Arc<App>,
     pub client: ClientCtx,
     pub request_id: String,
     pub deadline: Instant,
+    /// Dispatch deadline for writes, `deadline` minus [`write_reserve`].
+    write_deadline: Instant,
+    gate: Arc<CommitGate>,
+}
+
+/// Time a write keeps after its upstream dispatch, to record the result, run the follow-up steps and answer
+/// within the call's budget: a quarter of the budget, between 1 and 5 seconds.
+pub fn write_reserve(budget: Duration) -> Duration {
+    (budget / 4).clamp(Duration::from_secs(1), Duration::from_secs(5))
+}
+
+/// Whether a call has started its side effect. Exactly one of [`ToolCx::commit`] (by the tool, right before its
+/// first upstream write) and [`ToolCx::abandon`] (by `mcp::call_tool` when the budget runs out) wins.
+#[derive(Default)]
+struct CommitGate(AtomicU8);
+
+const OPEN: u8 = 0;
+const COMMITTED: u8 = 1;
+const ABANDONED: u8 = 2;
+
+impl ToolCx {
+    pub fn new(app: Arc<App>, client: ClientCtx, request_id: String, started: Instant) -> Self {
+        let budget = Duration::from_secs(app.cfg.limits.tool_call_timeout_secs);
+        let deadline = started + budget;
+        let write_deadline = deadline.checked_sub(write_reserve(budget)).unwrap_or(started);
+        Self { app, client, request_id, deadline, write_deadline, gate: Arc::default() }
+    }
+
+    /// Deadline for the upstream part of a write (SMTP submission, Gmail write): earlier than `deadline`, so a
+    /// late success is still recorded, followed up and reported before the call times out.
+    pub fn write_deadline(&self) -> Instant {
+        self.write_deadline
+    }
+
+    /// Marks the call as having started its side effect; call it before claiming or dispatching a write. Fails
+    /// (nothing dispatched) once the call was abandoned or no time is left for the write.
+    pub fn commit(&self) -> Result<(), ToolError> {
+        let late = || ToolError::upstream("the tool call exceeded its time budget");
+        if Instant::now() >= self.write_deadline {
+            return Err(late());
+        }
+        match self.gate.0.compare_exchange(OPEN, COMMITTED, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) | Err(COMMITTED) => Ok(()),
+            Err(_) => Err(late()),
+        }
+    }
+
+    /// Called when the budget ran out. Returns true if the side effect had already started: the result is then
+    /// unknown to the caller, and the detached write finishes and records it on its own.
+    pub fn abandon(&self) -> bool {
+        self.gate.0.compare_exchange(OPEN, ABANDONED, Ordering::SeqCst, Ordering::SeqCst) == Err(COMMITTED)
+    }
+
+    fn committed(&self) -> bool {
+        self.gate.0.load(Ordering::SeqCst) == COMMITTED
+    }
+}
+
+/// The error for a call whose write started but whose result the caller will not see.
+pub fn unfinished_write() -> ToolError {
+    ToolError::new(
+        ErrorCode::OutcomeUnknown,
+        "the operation started but did not finish within the time budget; check the mailbox (get_draft) before retrying",
+    )
 }
 
 /// What the audit record of a successful call contains (no content, spec 6.7).
@@ -45,8 +111,24 @@ pub struct ToolOutput {
     pub extra: Vec<Value>,
 }
 
-type Handler =
-    for<'a> fn(&'a ToolCx, Value) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + 'a>>;
+type ToolFuture<'a> = Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + 'a>>;
+type Handler = for<'a> fn(&'a ToolCx, Value) -> ToolFuture<'a>;
+
+/// Runs a write tool in its own task. When `mcp::call_tool` drops the call at its deadline, the task goes on: a
+/// claimed send or a dispatched write still records its result and runs its follow-up steps, and the caller gets
+/// `outcome_unknown` (see [`ToolCx::abandon`]). Before [`ToolCx::commit`] the task only reads and stops at the
+/// commit gate.
+pub fn detached(cx: &ToolCx, args: Value, f: Handler) -> ToolFuture<'_> {
+    let owned = cx.clone();
+    let task = tokio::spawn(async move { f(&owned, args).await });
+    Box::pin(async move {
+        match task.await {
+            Ok(r) => r,
+            Err(_) if cx.committed() => Err(unfinished_write()),
+            Err(_) => Err(ToolError::new(ErrorCode::Internal, "the tool call failed")),
+        }
+    })
+}
 
 pub struct ToolDef {
     pub name: &'static str,

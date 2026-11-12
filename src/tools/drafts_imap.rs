@@ -329,7 +329,8 @@ pub(super) async fn prepare_send(
 pub(super) async fn submit(cx: &ToolCx, mb: &Mailbox, p: &PreparedSend) -> Result<(), ToolError> {
     let s = &p.conn.settings;
     let creds = s.smtp_credentials(&p.conn.creds);
-    let r = smtp::submit(cx.app.imap.connector(), &s.smtp, &creds, &s.email, &p.rcpts, &p.submit, cx.deadline).await;
+    let r = smtp::submit(cx.app.imap.connector(), &s.smtp, &creds, &s.email, &p.rcpts, &p.submit, cx.write_deadline())
+        .await;
     match r {
         Ok(()) => Ok(()),
         Err(e) if e.kind == ImapError::OutcomeUnknown => Err(ToolError::from(ImapError::OutcomeUnknown)),
