@@ -14,6 +14,11 @@ pub fn b64url(data: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(data)
 }
 
+/// Standard base64 with padding (SASL, MCP resource blobs).
+pub fn b64std(data: &[u8]) -> String {
+    STANDARD.encode(data)
+}
+
 pub fn b64url_decode(s: &str) -> Option<Vec<u8>> {
     URL_SAFE_NO_PAD.decode(s.trim_end_matches('=')).ok()
 }

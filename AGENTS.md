@@ -32,6 +32,7 @@ cargo fmt
 - `src/admin/`: Unix socket admin protocol (server + CLI client)
 - `src/policy.rs`: the single authorization decision point
 - `src/gmail/`: outbound gateway (allowlist), token manager, typed Gmail operations, MIME/HTML handling
+- `src/imap/`: IMAP/SMTP provider; `ops.rs` is the command allowlist and the only place that builds command strings
 - `src/mcp/`: JSON-RPC / Streamable HTTP protocol layer; `src/tools/`: tool handlers
 - `src/index/`: SQLCipher FTS5 index, sync engine, query compiler
 - `src/client/`: remote client commands (login, search, mcp install, stdio bridge)
@@ -140,3 +141,9 @@ cargo fmt
   service user, so a strict "no group bits" secret check rejects them; `secrets::secret_mode_ok` allows that one case
   (A44). Test unit directives with `sudo systemd-run --wait --pipe -p User=dove -p LoadCredential=...` before
   documenting them. Globs over root-only directories in docs must run inside `sudo sh -c '...'`.
+- 2026-11-12: The IMAP/SMTP client is hand-written (`src/imap/`), not `async-imap`: it is small, uses the rustls,
+  aws-lc-rs provider and platform verifier already in the tree through reqwest (no new crates), and lets outcome
+  classification follow exactly where a write stopped (`ExecError::sent_all`, SMTP `data_terminator_sent`).
+  Plaintext exists only as `ImapConnector::plaintext_for_tests()` (cfg `test`/`testing`). Tests use
+  `tests/support/fake_imap.rs`: non-PEEK fetches set `\Seen` there, `fail_next_containing` targets one command
+  (for example the body fetch), and `assert_only_allowlisted()` checks the command log.
