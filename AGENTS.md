@@ -115,6 +115,6 @@ cargo fmt
   tests and integration files in separate invocations when mutation-checking.
 - 2026-11-12: The shared `CARGO_TARGET_DIR` holds one `target/debug/dove` for all worktrees; another agent's build
   can replace it between your build and test run. Tests that exec `CARGO_BIN_EXE_dove` (`tests/client_e2e.rs`)
-  need a private target dir, e.g. `CARGO_TARGET_DIR=/home/dominik/projects/.dove-worktrees/target-onboarding`.
+  need a private target dir per worktree (the default `<worktree>/target` is private).
 - 2026-11-12: Client tests run the binary with `env_clear()`, a temp HOME and
   `DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent/...` so the real keychain and config are never touched.
