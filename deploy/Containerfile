@@ -1,0 +1,42 @@
+# syntax=docker/dockerfile:1
+#
+# Dove MCP server image. Build from the repository root:
+#   docker build -f deploy/Containerfile -t dove-mcp:local .
+#
+# Base images are pinned by digest. To update them, pull the new tag, read its digest
+# (docker inspect --format '{{index .RepoDigests 0}}' <image>) and replace both lines below.
+
+# ---- build stage -------------------------------------------------------------------------------------------
+# rust:1-bookworm (glibc 2.36) matches the runtime image below. SQLCipher and OpenSSL are vendored and compiled
+# here, so the runtime image needs no libssl and no libsqlite.
+FROM rust:1-bookworm@sha256:e6f2cff35d0f309acf8433b4f05878ed77092602c5065cc81801177da0bb3a9c AS build
+WORKDIR /src
+COPY Cargo.toml Cargo.lock rustfmt.toml ./
+COPY src ./src
+# Cargo needs the [dev-dependencies] self reference to resolve; the tests directory is not part of a release build.
+RUN cargo build --release --locked --bin dove \
+ && install -D -m 0755 target/release/dove /out/usr/local/bin/dove \
+ # Empty directories for the volumes, owned by the runtime user, so that a fresh named volume inherits that
+ # ownership. The data directory must be 0700: the service refuses any other mode.
+ && install -d -m 0700 -o 65532 -g 65532 /out/var/lib/dove \
+ && install -d -m 0750 -o 65532 -g 65532 /out/run/dove \
+ && install -d -m 0755 /out/etc/dove
+
+# ---- runtime stage -----------------------------------------------------------------------------------------
+# Distroless: glibc and libgcc only. No shell, no package manager, no curl. UID/GID 65532 is the "nonroot" user.
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f AS runtime
+LABEL org.opencontainers.image.title="dove-mcp" \
+      org.opencontainers.image.description="Self-hosted MCP server giving AI agents token-scoped read/draft access to Gmail" \
+      org.opencontainers.image.source="https://github.com/dove-mcp/dove-mcp" \
+      org.opencontainers.image.licenses="Apache-2.0"
+COPY --from=build /out/ /
+USER 65532:65532
+WORKDIR /var/lib/dove
+# State store and index (SQLite files). Mount a volume here; the root filesystem can stay read-only.
+# Admin Unix socket. Mount a tmpfs or volume here (see compose.yaml).
+VOLUME ["/var/lib/dove", "/run/dove"]
+# The service listens on 127.0.0.1:8787 inside the container's network namespace (spec 6.6). Nothing is published
+# by the image; a reverse proxy must share the namespace (see compose.yaml) or run on the host with host networking.
+# Secrets are files, never environment variables: mount them read-only and point config.toml at them.
+ENTRYPOINT ["/usr/local/bin/dove"]
+CMD ["serve", "--config", "/etc/dove/config.toml"]

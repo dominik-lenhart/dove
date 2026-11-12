@@ -75,3 +75,24 @@ cargo fmt
   `sudo -n -u nobody`). On this dev host agent sessions run as uid 1000 with passwordless sudo, so a deployment
   here would give agents admin rights (operator uid or root). Production needs an agent uid that is neither the
   operator uid nor able to sudo.
+- 2026-11-12: Do not set `PrivateUsers=` in the systemd unit: inside a user namespace `SO_PEERCRED` reports the
+  operator uid as unmapped, and the admin socket's peer check rejects the operator. `systemd-analyze verify` only
+  checks syntax; to test sandbox directives run the binary as `systemd-run --user` (the user manager cannot apply
+  capability-dropping directives such as `PrivateDevices=`, so those stay untested there). `StateDirectoryMode=0700`
+  is required, the service refuses any other data dir mode.
+- 2026-11-12: Caddyfile named matchers with several conditions need the block form (`@x { method POST; path /mcp }`
+  on separate lines). `@x method POST path /mcp` parses as extra method names and forwards every GET. Caddy `path`
+  is case-insensitive and nginx `map` keys are too unless prefixed with `~`; always test the allowlist with a real
+  proxy (docker `caddy:2`, `nginx:stable-alpine`), see docs/deployment.md.
+- 2026-11-12: Compose ignores `uid`/`gid`/`mode` of file secrets outside Swarm; the host file itself must be owned by
+  65532 with mode 0400, or Dove refuses to start. The distroless image has no shell: run admin commands with
+  `docker compose exec --user <operator_uid>:65532 dove /usr/local/bin/dove ...`. Dove listens on loopback only, so
+  Caddy joins its network namespace (`network_mode: service:dove`) and the ports are published on the dove service.
+- 2026-11-12: The docker host is shared with production. For container tests use unique names (`dove-t-*`), never
+  `docker system prune`, and remove only your own images and volumes.
+- 2026-11-12: `cargo deny check` (deny.toml) passes only with two documented advisory ignores: RUSTSEC-2023-0071 (rsa)
+  and RUSTSEC-2026-0387 (crypto-bigint), both pulled in by jsonwebtoken's `rust_crypto` backend. Dove only verifies
+  RS256 signatures, so they do not apply; drop the ignores once jsonwebtoken updates. MPL-2.0 (the scraper/cssparser
+  stack) and sqlcipher-src (WTFPL, blessing) are allowed explicitly. CI scans secrets with the gitleaks container
+  image (no licence key needed), pinned by digest; locally: `docker run --rm -v $PWD:/repo ghcr.io/gitleaks/gitleaks:v8.30.1 dir /repo`.
+

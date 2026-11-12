@@ -42,7 +42,13 @@ hosts or reference hardware.
    - [~] Restart/crash recovery tests, log canary test (AC8, AC9 in `tests/hygiene_e2e.rs`; restart cases in
      `send_e2e`, `connect_e2e`, `mcp_e2e`; index restart cases pending)
    - [ ] Benchmarks (8.1) with synthetic 250k corpus, RSS measurement
-   - [ ] Deployment: systemd unit, container, Caddy allowlist, backup docs, SECURITY.md, README
+   - [~] Deployment: systemd unit, container, Caddy allowlist, backup docs, SECURITY.md, README (files written:
+     `deploy/` (systemd, Containerfile, compose, Caddyfile, nginx), `docs/deployment.md`, `README.md`, `SECURITY.md`,
+     CI workflow with `deny.toml` and secret scan. Verified: syntax and sandbox start of the unit as a user unit,
+     local container build and compose run, Caddy and nginx route matrices on stock images, actionlint, gitleaks,
+     cargo-deny. Unverified: system-level unit with `User=dove`, a production host with real TLS and Google, Podman,
+     the `age` backup step and a restore drill, the CI run on GitHub. Open for the owner: `SECURITY.md` contact
+     placeholder, licence file (A7))
 
 ## Assumptions and decisions
 

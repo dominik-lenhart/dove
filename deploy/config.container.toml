@@ -1,0 +1,26 @@
+# Dove configuration for the container deployment (deploy/compose.yaml). Copy to config.toml and edit the three
+# marked values. Secrets are files mounted by Compose under /run/secrets; this file contains no secret.
+public_url = "https://dove.example.com"          # EDIT: your hostname, same as in the Caddyfile
+listen = "127.0.0.1:8787"                        # must stay loopback; Caddy shares this network namespace
+data_dir = "/var/lib/dove"
+allowed_origins = []
+allow_send = false                               # instance gate for sending (README, docs/deployment.md)
+
+[admin]
+socket_path = "/run/dove/admin.sock"
+operator_uid = 1000                              # EDIT: the uid you run `docker compose exec --user` with
+
+[google]
+client_id = "000000000000-example.apps.googleusercontent.com"   # EDIT: from Google Cloud, docs/deployment.md
+client_secret_file = "/run/secrets/google_client_secret"
+
+[secrets]
+kek_file = "/run/secrets/kek"
+pepper_file = "/run/secrets/pepper"
+index_key_file = "/run/secrets/index_key"
+
+[audit]
+retention_days = 180
+
+[notifier]
+# webhook_url = "https://ntfy.example.com/dove-alerts"

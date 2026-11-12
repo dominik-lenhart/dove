@@ -1,0 +1,101 @@
+# Example Compose deployment: Dove plus Caddy (automatic TLS). Reference profile, single instance.
+#
+#   mkdir -p secrets
+#   docker run --rm dove-mcp:local keys generate > secrets/kek            # repeat for pepper and index_key
+#   (put the Google OAuth client secret into secrets/google_client_secret)
+#   sudo chown 65532:65532 secrets/* && sudo chmod 0400 secrets/*
+#   cp config.container.toml config.toml   # edit public_url, google.client_id, admin.operator_uid
+#   $EDITOR Caddyfile                      # replace dove.example.com with your hostname
+#   docker compose up -d
+#
+# Why the secret files must be owned by 65532 with mode 0400: Compose bind-mounts file secrets as they are on the
+# host and ignores the uid/gid/mode keys outside Swarm. Dove refuses to start when a secret file is accessible to
+# group or others.
+#
+# Network layout: Dove listens on 127.0.0.1:8787 and refuses any other address (spec 6.6). Inside a container that
+# address is only reachable from the same network namespace, so Caddy joins Dove's namespace
+# (network_mode: service:dove) and the published ports belong to the dove service. Nothing else can reach 8787.
+#
+# Administration: the admin socket lives in the dove container at /run/dove/admin.sock (mode 0660, group 65532).
+# Run admin commands as the operator uid (the one in admin.operator_uid) with the service group, for example:
+#   docker compose exec --user 1000:65532 dove /usr/local/bin/dove accounts list
+# Whoever can run `docker` can do this, so keep access to the Docker socket away from agents (spec FR-C1).
+
+name: dove
+
+services:
+  dove:
+    image: dove-mcp:local        # build with: docker build -f deploy/Containerfile -t dove-mcp:local .
+    restart: unless-stopped
+    user: "65532:65532"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 512m              # reference profile (spec 8.1a). For the 1 GiB profile set 1g here and below.
+    memswap_limit: 512m          # same value: no swap
+    cpus: 2.0
+    pids_limit: 256
+    ulimits:
+      nofile: 4096
+      core: 0
+    stop_grace_period: 15s       # the service drains in-flight requests for up to 10 s after SIGTERM
+    volumes:
+      - dove-data:/var/lib/dove  # state.db, index.db and WAL files. Back up state.db only (docs/deployment.md).
+      - ./config.toml:/etc/dove/config.toml:ro
+    tmpfs:
+      - /run/dove:uid=65532,gid=65532,mode=0750,noexec,nosuid,size=1m   # admin socket
+      - /tmp:noexec,nosuid,size=16m
+    secrets:
+      - source: kek
+        target: kek
+      - source: pepper
+        target: pepper
+      - source: index_key
+        target: index_key
+      - source: google_client_secret
+        target: google_client_secret
+    ports:                       # published on behalf of Caddy, which shares this network namespace
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+
+  caddy:
+    image: caddy:2.11            # pin a digest in production: docker inspect --format '{{index .RepoDigests 0}}' caddy:2.11
+    restart: unless-stopped
+    network_mode: "service:dove"
+    depends_on:
+      - dove
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]  # to bind 80/443
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 128m
+    pids_limit: 128
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data         # certificates and ACME account: keep it, or Let's Encrypt rate limits bite
+      - caddy-config:/config
+    tmpfs:
+      - /tmp:noexec,nosuid,size=16m
+    healthcheck:                 # the distroless Dove image has no shell or curl, so Caddy probes Dove's loopback
+      test: ["CMD", "wget", "-q", "-T", "3", "-O", "/dev/null", "http://127.0.0.1:8787/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  dove-data:
+  caddy-data:
+  caddy-config:
+
+secrets:
+  kek:
+    file: ./secrets/kek
+  pepper:
+    file: ./secrets/pepper
+  index_key:
+    file: ./secrets/index_key
+  google_client_secret:
+    file: ./secrets/google_client_secret
