@@ -34,8 +34,14 @@ hosts or reference hardware.
    - [ ] Projections, keyset cursors (15 min TTL, bounded), count_only, live Gmail route
    - [ ] batch_read with budgets (AC21)
    - [ ] send_draft behind instance gate + send grant + ownership, at-most-once (6.3, AC3)
-   - [ ] Client onboarding: invitations, `dove login`, remote CLI commands, `mcp install`, `mcp stdio` (5.6, AC22)
-   - [ ] Downstream OAuth AS for ChatGPT/Claude (5.6, AC23)
+   - [~] Client onboarding: invitations, `dove login`, remote CLI commands, `mcp install`, `mcp stdio` (5.6, AC22)
+     - [x] `dove clients invite` (admin socket): 256-bit `dovei_` secret, hash only, single use, 10 min, `all`
+       expanded once, POST `/connect/redeem` rate-limited and atomic (`tests/invite_e2e.rs`)
+   - [x] Downstream OAuth AS for ChatGPT/Claude (5.6, AC23 server side): PRM (both paths), RFC 8414 metadata,
+     approval page with invitation + narrowing + CSRF, S256 PKCE, exact redirect, resource binding, single-use codes,
+     rotating refresh with reuse detection, DCR (bounded, rate-limited, no authority), RFC 7009 revocation,
+     pre-registered clients in config (`tests/oauth_e2e.rs`). Unverified: real ChatGPT and Claude hosts (AC23);
+     host versions/settings are not recorded because no real host was available.
 5. Hardening
    - [~] Fake Google server integration suite covering AC1-AC21 (done: AC1, AC2, AC4, AC6, AC7, AC10, AC12, AC13,
      AC16, AC18 in `tests/mcp_e2e.rs`, `tests/connect_e2e.rs`)
@@ -62,4 +68,27 @@ hosts or reference hardware.
   under the newest version, then deletes the old line. `keys rotate` reports which versions are still referenced.
 - A9. Admin actions are audited in the same transaction as their state change; failed actions get a separate
   `error` record, so every admin request yields exactly one record.
+- A10. The OAuth authorization server is hand-written in `src/oauth.rs` on reviewed primitives (sha2 for PKCE,
+  HMAC-pepper token hashes, `subtle` constant-time compares, `url` parsing, OS RNG). `oxide-auth` 0.6 (with an
+  axum 0.8 frontend) was considered: it has no resource indicators (RFC 8707), dynamic registration (RFC 7591),
+  revocation (RFC 7009) or refresh-family reuse detection, and its registrar/authorizer/issuer traits are exactly
+  where Dove's security logic lives (invitation consumption, connection-bound families, SQLite transactions), so
+  it would add a dependency without removing the code that needs review. Every guard has a mutation-checked test.
+- A11. Authority comes only from invitations. One approval creates one `kind = 'oauth'` connection; its code and
+  token family point at that connection (`family_id = connection_id`), so no migration was needed. Tokens carry
+  no grants, which is why refresh cannot broaden the intersection. Scope is a single informational `mail`;
+  unknown requested scopes are ignored, never granted.
+- A12. A missing `resource` parameter at authorize binds to `<public_url>/mcp` (the only resource); any other
+  value is `invalid_target`. Access tokens are accepted on `/mcp` only for that resource.
+- A13. Refresh rotation is strict: reuse of a rotated refresh token, or of a used code, revokes the connection
+  and all its tokens (and bumps `auth_epoch`). There is no grace window, so a host that refreshes twice in
+  parallel loses the connection and needs a new invitation. Rotation also retires older access tokens.
+- A14. Approval-page state (pending requests, CSRF token, browser-binding cookie `__Host-dove_authz`) lives in
+  memory, bounded to 1000 requests for 10 minutes. A restart only makes the user start the sign-in again.
+- A15. Dynamic registration accepts public clients only (`token_endpoint_auth_method = none`), 1-5 redirect URIs,
+  HTTPS or loopback HTTP; custom schemes and Client ID Metadata Documents are unsupported and fail explicitly.
+  Registrations are capped (`oauth.max_dynamic_clients`, unused ones pruned after 24 h) and limited per IP per
+  hour. Pre-registered (optionally confidential) clients are configured in `[[oauth.clients]]` with a secret file.
+- A16. Removing a mailbox from a project cancels the project's open invitations, so a re-add cannot resurrect
+  rights through an old invitation. Accounts deleted before redemption are dropped from the invitation.
 - A7. Licence is a placeholder (Apache-2.0) until the owner decides (spec 13.7).

@@ -10,6 +10,7 @@ pub mod error;
 pub mod gmail;
 pub mod http;
 pub mod index;
+pub mod invite;
 pub mod logging;
 pub mod mcp;
 pub mod mime;

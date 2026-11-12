@@ -111,7 +111,10 @@ pub fn project_remove_account(tx: &Transaction, project: &str, alias: &str) -> a
         params![aid, pid],
     )?;
     tx.execute("UPDATE clients SET auth_epoch = auth_epoch + 1 WHERE project_id = ?1", [&pid])?;
-    Ok(json!({ "project": project, "account": alias, "removed": removed == 1, "client_grants_deleted": grants }))
+    // Outstanding invitations of the project could otherwise resurrect access after a re-add.
+    let invitations = tx.execute("DELETE FROM invitations WHERE project_id = ?1 AND used_at IS NULL", [&pid])?;
+    Ok(json!({ "project": project, "account": alias, "removed": removed == 1, "client_grants_deleted": grants,
+               "pending_invitations_cancelled": invitations }))
 }
 
 pub fn project_list(conn: &Connection) -> anyhow::Result<Value> {
@@ -200,7 +203,7 @@ pub fn parse_grant_args(args: &[String]) -> anyhow::Result<Vec<GrantSpec>> {
 }
 
 /// Resolves aliases to immutable account ids and validates them against the project ceiling and send gate.
-fn resolve_grants(
+pub fn resolve_grants(
     conn: &Connection,
     project_id: &str,
     grants: &[GrantSpec],
@@ -231,7 +234,11 @@ fn resolve_grants(
     Ok(out)
 }
 
-fn write_grants(tx: &Transaction, client_id: &str, grants: &BTreeMap<String, (String, Actions)>) -> anyhow::Result<()> {
+pub fn write_grants(
+    tx: &Transaction,
+    client_id: &str,
+    grants: &BTreeMap<String, (String, Actions)>,
+) -> anyhow::Result<()> {
     tx.execute("DELETE FROM client_mailboxes WHERE client_id = ?1", [client_id])?;
     for (aid, (_, actions)) in grants {
         tx.execute(
@@ -252,7 +259,7 @@ pub struct NewClient<'a> {
     pub created_via: &'a str,
 }
 
-fn validate_cidrs(cidrs: &[String]) -> anyhow::Result<String> {
+pub fn validate_cidrs(cidrs: &[String]) -> anyhow::Result<String> {
     for c in cidrs {
         c.parse::<ipnet::IpNet>().with_context(|| format!("invalid CIDR '{c}'"))?;
     }

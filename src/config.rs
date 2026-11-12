@@ -35,6 +35,54 @@ pub struct Config {
     pub notifier: NotifierConfig,
     #[serde(default)]
     pub index: IndexConfig,
+    /// Downstream OAuth for MCP hosts and invitation redemption (spec 5.6).
+    #[serde(default)]
+    pub oauth: OAuthConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct OAuthConfig {
+    pub access_token_ttl_secs: i64,
+    pub refresh_token_ttl_secs: i64,
+    pub code_ttl_secs: i64,
+    /// Upper bound on dynamically registered applications (spec 5.6: bounded registration).
+    pub max_dynamic_clients: usize,
+    /// Per source IP.
+    pub registrations_per_hour: u32,
+    /// Per source IP, for `/connect/redeem` and invitation checks on the approval page.
+    pub redeem_per_minute: u32,
+    /// Per source IP, for the token and revocation endpoints.
+    pub token_requests_per_minute: u32,
+    /// Pre-registered applications (alternative to dynamic registration).
+    pub clients: Vec<PreregisteredClient>,
+}
+
+impl Default for OAuthConfig {
+    fn default() -> Self {
+        Self {
+            access_token_ttl_secs: 3600,
+            refresh_token_ttl_secs: 30 * 86_400,
+            code_ttl_secs: 60,
+            max_dynamic_clients: 200,
+            registrations_per_hour: 20,
+            redeem_per_minute: 10,
+            token_requests_per_minute: 60,
+            clients: Vec::new(),
+        }
+    }
+}
+
+/// An application registered by the operator. Confidential when `secret_file` is set (client_secret_basic or
+/// client_secret_post), otherwise public with PKCE only. Registration grants no mailbox access by itself.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreregisteredClient {
+    pub client_id: String,
+    pub client_name: String,
+    pub redirect_uris: Vec<String>,
+    #[serde(default)]
+    pub secret_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -180,6 +228,7 @@ impl Config {
         if self.google.client_id.trim().is_empty() {
             bail!("google.client_id is empty");
         }
+        self.validate_oauth()?;
         for p in [
             &self.secrets.kek_file,
             &self.secrets.pepper_file,
@@ -198,6 +247,38 @@ impl Config {
             Some(p) => format!("{}:{p}", url.host_str().unwrap_or_default()),
             None => url.host_str().unwrap_or_default().to_string(),
         }
+    }
+
+    fn validate_oauth(&self) -> anyhow::Result<()> {
+        let o = &self.oauth;
+        if o.access_token_ttl_secs < 60 || o.refresh_token_ttl_secs < o.access_token_ttl_secs {
+            bail!("oauth: access_token_ttl_secs must be >= 60 and refresh_token_ttl_secs >= access_token_ttl_secs");
+        }
+        if !(10..=600).contains(&o.code_ttl_secs) {
+            bail!("oauth.code_ttl_secs must be between 10 and 600");
+        }
+        let mut seen = std::collections::HashSet::new();
+        for c in &o.clients {
+            let id_ok = (3..=64).contains(&c.client_id.len())
+                && c.client_id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
+            if !id_ok || c.client_id.starts_with("dcr-") {
+                bail!("oauth client id '{}' must be 3-64 of [A-Za-z0-9._-] and not start with dcr-", c.client_id);
+            }
+            if !seen.insert(c.client_id.clone()) {
+                bail!("oauth client id '{}' is listed twice", c.client_id);
+            }
+            if c.redirect_uris.is_empty() {
+                bail!("oauth client '{}' needs at least one redirect URI", c.client_id);
+            }
+            for u in &c.redirect_uris {
+                crate::oauth::validate_redirect_uri(u)
+                    .map_err(|e| anyhow::anyhow!("oauth client '{}': {e}", c.client_id))?;
+            }
+            if let Some(f) = &c.secret_file {
+                secrets::check_secret_file_mode(f)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn public_base(&self) -> String {
@@ -239,6 +320,17 @@ retention_days = 180
 
 [notifier]
 # webhook_url = "https://ntfy.example.com/dove-alerts"
+
+[oauth]
+# Downstream OAuth for MCP hosts (ChatGPT, Claude). Defaults shown.
+# access_token_ttl_secs = 3600
+# refresh_token_ttl_secs = 2592000
+# Optional pre-registered application instead of dynamic registration:
+# [[oauth.clients]]
+# client_id = "claude-web"
+# client_name = "Claude"
+# redirect_uris = ["https://claude.ai/api/mcp/auth_callback"]
+# secret_file = "/run/credentials/dove.service/oauth_claude_secret"
 "#;
 
 #[cfg(test)]

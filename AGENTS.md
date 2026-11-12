@@ -68,3 +68,8 @@ cargo fmt
   human-owned draft, single-use state vs alias-exists) needs a test where only that guard can fire.
 - 2026-11-12: `pkill -f <pattern>` inside a Bash tool call matches the tool's own shell; use `pgrep -af` and kill
   by PID.
+- 2026-11-12: The state store is one mutex-guarded connection, so concurrent HTTP requests serialize at the DB.
+  An atomic guard (e.g. `UPDATE ... WHERE used_at IS NULL`) is then shadowed by the earlier read in the same
+  transaction; test it directly with a stale view (see `invite::tests`) or the mutation survives.
+- 2026-11-12: `cargo test --test a --lib foo::` applies the `foo::` filter to every target; run filtered lib
+  tests and integration files in separate invocations when mutation-checking.

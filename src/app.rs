@@ -28,6 +28,7 @@ pub struct App {
     pub rate_limiter: crate::mcp::RateLimiter,
     pub denials: crate::mcp::DenialTracker,
     pub draft_locks: crate::tools::drafts::DraftLocks,
+    pub oauth: crate::oauth::OAuthState,
 }
 
 impl App {
@@ -61,6 +62,7 @@ impl App {
             rate_limiter: Default::default(),
             denials: Default::default(),
             draft_locks: Default::default(),
+            oauth: crate::oauth::OAuthState::load(&cfg.oauth)?,
             vault,
             pepper: Pepper::new(pepper),
             index_key: Arc::new(index_key),
