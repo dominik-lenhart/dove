@@ -96,3 +96,14 @@ cargo fmt
   stack) and sqlcipher-src (WTFPL, blessing) are allowed explicitly. CI scans secrets with the gitleaks container
   image (no licence key needed), pinned by digest; locally: `docker run --rm -v $PWD:/repo ghcr.io/gitleaks/gitleaks:v8.30.1 dir /repo`.
 
+- 2026-11-12: Edition 2024 reserves `gen`; name generation variables `gen_id`/`generation` (SQL column names are fine).
+- 2026-11-12: Disk-full can be simulated on the index with `PRAGMA max_page_count = <current page_count>` on the
+  writer connection (after `wal_checkpoint(TRUNCATE)`); writes then fail with SQLITE_FULL.
+- 2026-11-12: The fake Google's page tokens are offsets. Deleting several already-listed messages between pages
+  shifts later pages and makes enumeration skip messages (real Gmail tokens do not); avoid that in sync tests.
+- 2026-11-12: Index jobs, purge, rebuild and sync-state creation serialize on a per-account lock; every write also
+  re-checks the job's fence. Tests: `dove::index::sync::{sync_account, sync_steps}` run passes deterministically.
+- 2026-11-12: Without ANALYZE data SQLite planned `m.id IN (SELECT msg FROM addrs ...)` as a scan of the whole
+  mailbox partition; the fixed `sqlite_stat1` rows in index migration V2 fix that. If you add an index, add a stat row
+  and extend the EXPLAIN QUERY PLAN assertions in `tests/search_contract.rs`.
+- 2026-11-12: Timestamp ties are ordered by random fake message ids; tests must not assume which tied row comes first.

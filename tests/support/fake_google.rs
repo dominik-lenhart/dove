@@ -222,6 +222,29 @@ fn snippet(raw: &[u8]) -> String {
     flat.join(" ").chars().take(100).collect()
 }
 
+/// All values of a header with continuation lines unfolded.
+fn header_unfolded(raw: &[u8], name: &str) -> Vec<String> {
+    let text = String::from_utf8_lossy(raw);
+    let head = text.split("\r\n\r\n").next().unwrap_or("");
+    let mut lines: Vec<String> = vec![];
+    for line in head.lines() {
+        if line.starts_with([' ', '\t']) {
+            if let Some(last) = lines.last_mut() {
+                last.push(' ');
+                last.push_str(line.trim());
+            }
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    lines
+        .iter()
+        .filter_map(|l| l.split_once(':'))
+        .filter(|(n, _)| n.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.trim().to_string())
+        .collect()
+}
+
 fn header_value(raw: &[u8], name: &str) -> String {
     let text = String::from_utf8_lossy(raw);
     let head = text.split("\r\n\r\n").next().unwrap_or("");
@@ -728,7 +751,21 @@ fn gmail(mb: &mut Mailbox, c: &mut u64, method: &str, segs: &[&str], q: &Query, 
             (200, out)
         }
         ("GET", ["messages", id]) => match mb.find(id) {
-            Some(m) => (200, msg_json(m, full_raw(q.get("format")))),
+            Some(m) => {
+                let mut v = msg_json(m, full_raw(q.get("format")));
+                if q.get("format") == Some("metadata") {
+                    // Gmail's metadata format: only the requested headers, raw (possibly RFC 2047 encoded).
+                    let hs: Vec<Value> = q
+                        .all("metadataHeaders")
+                        .iter()
+                        .flat_map(|h| {
+                            header_unfolded(&m.raw, h).into_iter().map(move |v| json!({"name": h, "value": v}))
+                        })
+                        .collect();
+                    v["payload"] = json!({ "headers": hs });
+                }
+                (200, v)
+            }
             None => not_found(),
         },
         ("GET", ["threads", id]) => {

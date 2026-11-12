@@ -255,6 +255,10 @@ async fn execute(call: &mut AdminCall<'_>, req: AdminRequest) -> anyhow::Result<
         AccountsCheck { alias } => accounts_check(&app, alias).await,
         KeysRotate => keys_rotate(call).await,
         Doctor => Ok(doctor(&app).await),
+        IndexEnable { alias } => crate::index::admin::enable(call, alias).await,
+        IndexDisable { alias } => crate::index::admin::disable(call, alias).await,
+        IndexStatus { alias } => crate::index::admin::status(&app, alias).await,
+        IndexRebuild { alias } => crate::index::admin::rebuild(call, alias).await,
         other => Err(anyhow!("'{}' is not available in this build yet", other.audit_fields().0)),
     }
 }
