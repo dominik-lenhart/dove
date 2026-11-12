@@ -5,6 +5,7 @@ pub mod app;
 pub mod audit;
 pub mod cli;
 pub mod config;
+pub mod content;
 pub mod error;
 pub mod gmail;
 pub mod index;
