@@ -113,7 +113,9 @@ pub fn defs() -> Vec<ToolDef> {
                 }, "required": ["account", "draft_id", "expected_revision"], "additionalProperties": false })
             },
             output_schema: || {
-                object_schema(json!({ "sent_message_id": {"type":"string"}, "thread_id": {"type":"string"} }))
+                object_schema(
+                    json!({ "sent_message_id": {"type":["string","null"]}, "thread_id": {"type":["string","null"]} }),
+                )
             },
             handler: |cx, args| Box::pin(send_draft(cx, args)),
         },
@@ -719,7 +721,14 @@ async fn send_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
             "this draft is already being sent or has an unknown outcome",
         ));
     }
-    let _f = fresh_checked(cx, &mb, &draft_id, &own, &expected).await?;
+    // IMAP: fresh check, envelope and credentials are prepared before the send is claimed.
+    let imap = match mb.provider {
+        Provider::Gmail => {
+            fresh_checked(cx, &mb, &draft_id, &own, &expected).await?;
+            None
+        }
+        Provider::Imap => Some(super::drafts_imap::prepare_send(cx, &mb, &own, &expected).await?),
+    };
 
     // Recheck policy immediately before dispatch from the durable store (spec 6.3).
     let (cid, aid) = (cx.client.client_id.clone(), mb.account_id.clone());
@@ -760,12 +769,21 @@ async fn send_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
     if claimed != 1 {
         return Err(ToolError::new(ErrorCode::DraftConflict, "the draft changed while preparing to send"));
     }
-    let body = json!({ "id": draft_id });
-    let res = cx.app.google.write(&mb.account_id, || GmailOp::SendDraft(SendPermit(())), &body, cx.deadline).await;
+    let res: Result<(Option<String>, Value), ToolError> = match &imap {
+        None => {
+            let body = json!({ "id": draft_id });
+            cx.app
+                .google
+                .write(&mb.account_id, || GmailOp::SendDraft(SendPermit(())), &body, cx.deadline)
+                .await
+                .map(|v| (v["id"].as_str().map(str::to_string), v["threadId"].clone()))
+                .map_err(|WriteError { error, .. }| error)
+        }
+        Some(p) => super::drafts_imap::submit(cx, &mb, p).await.map(|()| (None, json!(p.thread_id))),
+    };
     let (aid, did) = (mb.account_id.clone(), draft_id.clone());
     match res {
-        Ok(v) => {
-            let sent_id = v["id"].as_str().unwrap_or_default().to_string();
+        Ok((sent_id, thread_id)) => {
             let s2 = sent_id.clone();
             let _ = cx
                 .app
@@ -777,21 +795,31 @@ async fn send_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
                     )?)
                 })
                 .await;
+            // IMAP: the Sent copy and the draft's removal happen only after the send is recorded.
+            let sent_id = match imap {
+                Some(p) => super::drafts_imap::after_send(cx, &mb, &draft_id, p).await,
+                None => sent_id,
+            };
             crate::index::wake(&cx.app, &mb.account_id);
+            let mut ids = vec![draft_id.clone()];
+            ids.extend(sent_id.clone());
             Ok(ToolOutput {
                 extra: Vec::new(),
-                text: format!("Sent draft {draft_id} as message {sent_id}."),
-                structured: json!({ "account": mb.alias, "draft_id": draft_id, "sent_message_id": sent_id, "thread_id": v["threadId"] }),
+                text: match &sent_id {
+                    Some(s) => format!("Sent draft {draft_id} as message {s}."),
+                    None => format!("Sent draft {draft_id}."),
+                },
+                structured: json!({ "account": mb.alias, "draft_id": draft_id, "sent_message_id": sent_id, "thread_id": thread_id }),
                 audit: AuditInfo {
                     account: Some(mb.alias.clone()),
-                    object_ids: vec![draft_id, sent_id],
+                    object_ids: ids,
                     result_count: Some(1),
                     ..Default::default()
                 },
             })
         }
-        Err(WriteError { error: e, .. }) => {
-            // Not dispatched or definitively rejected (4xx): safe to retry. Anything uncertain blocks resubmission.
+        Err(e) => {
+            // Not dispatched or definitively rejected: safe to retry. Anything uncertain blocks resubmission.
             let definitive = e.code != ErrorCode::OutcomeUnknown;
             let state = if definitive { "active" } else { "send_unknown" };
             let _ = cx

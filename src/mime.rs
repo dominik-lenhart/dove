@@ -286,6 +286,33 @@ pub fn header_values(raw: &[u8], name: &str) -> Vec<String> {
         .collect()
 }
 
+/// `raw` without every field named `name` (case-insensitive, folded continuation lines included) in the header
+/// section. The body is copied unchanged, so a `Bcc:` line in the body stays.
+pub fn without_header(raw: &[u8], name: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len());
+    let mut skipping = false;
+    let mut i = 0;
+    while i < raw.len() {
+        let end = raw[i..].iter().position(|b| *b == b'\n').map_or(raw.len(), |p| i + p + 1);
+        let line = &raw[i..end];
+        if matches!(line, b"\r\n" | b"\n") {
+            out.extend_from_slice(&raw[i..]);
+            return out;
+        }
+        if !matches!(line[0], b' ' | b'\t') {
+            skipping = line
+                .iter()
+                .position(|b| *b == b':')
+                .is_some_and(|c| line[..c].trim_ascii_end().eq_ignore_ascii_case(name.as_bytes()));
+        }
+        if !skipping {
+            out.extend_from_slice(line);
+        }
+        i = end;
+    }
+    out
+}
+
 /// Rejects CR, LF and NUL in any header-bound text.
 pub fn validate_header_text(s: &str) -> Result<(), MimeError> {
     if s.chars().any(|c| matches!(c, '\r' | '\n' | '\0')) {
@@ -488,6 +515,21 @@ mod tests {
             references: vec!["<root@example.org>".into(), "<orig@example.org>".into()],
             date: 1_700_000_000,
         }
+    }
+
+    #[test]
+    fn without_header_strips_folded_fields_only_in_the_header() {
+        let raw = b"From: a@x.org\r\nBcc: one@x.org,\r\n two@x.org\r\nTo: b@x.org\r\nBCC : three@x.org\r\n\
+Subject: Bcc: kept\r\n\r\nBcc: body line stays\r\n";
+        let out = without_header(raw, "Bcc");
+        assert_eq!(out, b"From: a@x.org\r\nTo: b@x.org\r\nSubject: Bcc: kept\r\n\r\nBcc: body line stays\r\n".to_vec());
+        assert_eq!(without_header(b"Bcc: x\nTo: y\n\nbody", "bcc"), b"To: y\n\nbody".to_vec());
+        // A Dove-built draft loses its Bcc and keeps everything else.
+        let built = build_draft(&fields()).unwrap();
+        let p = parse(&without_header(&built, "Bcc"), &Limits::default()).unwrap();
+        assert!(p.bcc.is_empty());
+        assert_eq!(p.to.len() + p.cc.len(), 2);
+        assert_eq!(p.message_id_header.as_deref(), Some("<new123@example.com>"));
     }
 
     #[test]

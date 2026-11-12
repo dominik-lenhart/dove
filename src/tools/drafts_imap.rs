@@ -27,7 +27,7 @@ use crate::gmail::gateway::Priority;
 use crate::imap::account::{self, Folder, ImapSettings};
 use crate::imap::pool::SessionFuture;
 use crate::imap::{
-    AppendFlag, AppendTarget, AppendUid, Credentials, ImapError, ImapMsgId, ImapSession, OwnDraftUid, Special,
+    AppendFlag, AppendTarget, AppendUid, Credentials, ImapError, ImapMsgId, ImapSession, OwnDraftUid, Special, smtp,
 };
 use crate::mail;
 use crate::mime;
@@ -35,6 +35,7 @@ use crate::policy::Mailbox;
 use crate::util;
 
 const DRAFT_FLAGS: &[AppendFlag] = &[AppendFlag::Draft, AppendFlag::Seen];
+const SENT_FLAGS: &[AppendFlag] = &[AppendFlag::Seen];
 
 fn hash(bytes: &[u8]) -> Vec<u8> {
     Sha256::digest(bytes).to_vec()
@@ -284,6 +285,107 @@ pub(super) async fn replace(
     // Only now, with the replacement recorded, the previous revision goes.
     delete_own_draft(cx, &conn, mb, draft_id, old).await;
     Ok((new_id, thread_id))
+}
+
+// ------------------------------------------------------------------ send
+
+pub(super) struct PreparedSend {
+    conn: Conn,
+    /// The draft's bytes on the server (filed as the Sent copy).
+    raw: Vec<u8>,
+    /// What goes over SMTP: the same bytes without `Bcc`.
+    submit: Vec<u8>,
+    rcpts: Vec<String>,
+    id: ImapMsgId,
+    pub thread_id: String,
+}
+
+/// Fresh check, envelope recipients from To/Cc/Bcc, the submission bytes without `Bcc`, and credentials, all before
+/// the send is claimed.
+pub(super) async fn prepare_send(
+    cx: &ToolCx,
+    mb: &Mailbox,
+    own: &OwnRow,
+    expected: &str,
+) -> Result<PreparedSend, ToolError> {
+    let Checked { fetched, id } = fresh_checked(cx, mb, own, expected).await?;
+    let p = &fetched.parsed;
+    let mut rcpts: Vec<String> = Vec::new();
+    for a in p.to.iter().chain(&p.cc).chain(&p.bcc) {
+        if !rcpts.iter().any(|r| r.eq_ignore_ascii_case(&a.email)) {
+            rcpts.push(a.email.clone());
+        }
+    }
+    if rcpts.is_empty() {
+        return Err(ToolError::invalid("the draft has no recipients"));
+    }
+    let submit = mime::without_header(&fetched.raw, "Bcc");
+    let conn = Conn::load(cx, mb).await?;
+    Ok(PreparedSend { conn, submit, rcpts, id, thread_id: fetched.meta.thread_id, raw: fetched.raw })
+}
+
+/// SMTP submission. `outcome_unknown` only when the server may have accepted the message (connection lost after the
+/// final `.` of `DATA`); every other error is definitive and leaves nothing sent.
+pub(super) async fn submit(cx: &ToolCx, mb: &Mailbox, p: &PreparedSend) -> Result<(), ToolError> {
+    let s = &p.conn.settings;
+    let creds = s.smtp_credentials(&p.conn.creds);
+    let r = smtp::submit(cx.app.imap.connector(), &s.smtp, &creds, &s.email, &p.rcpts, &p.submit, cx.deadline).await;
+    match r {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind == ImapError::OutcomeUnknown => Err(ToolError::from(ImapError::OutcomeUnknown)),
+        Err(e) if e.kind == ImapError::Auth => {
+            account::mark_auth_failure(&cx.app, &mb.account_id, s.generation, &s.alias).await;
+            Err(ToolError::unavailable())
+        }
+        Err(e) => {
+            match e.code {
+                Some(code) => Err(ToolError::upstream("the mail server refused the message")
+                    .with_details(json!({ "smtp_code": code }))),
+                None => Err(ToolError::from(e.kind)),
+            }
+        }
+    }
+}
+
+/// After a confirmed send: file the Sent copy (unless the provider does it itself) and delete the draft. Both are
+/// best effort; failures go to the operator and nothing is sent again. Returns the Sent copy's id.
+pub(super) async fn after_send(cx: &ToolCx, mb: &Mailbox, draft_id: &str, p: PreparedSend) -> Option<String> {
+    let mut sent_id = None;
+    if p.conn.settings.save_sent_copy {
+        let sent = special_folder(cx, &mb.account_id, Special::Sent).await.ok().flatten();
+        let filed = match sent {
+            Some(f) => append(&p.conn, cx, AppendTarget::Sent, SENT_FLAGS, p.raw.clone())
+                .await
+                .ok()
+                .map(|au| ImapMsgId { folder_id: f.folder_id, uidvalidity: au.uidvalidity, uid: au.uid }.encode()),
+            None => None,
+        };
+        if filed.is_none() {
+            report(
+                cx,
+                mb,
+                format!("sent-copy:{}:{draft_id}", mb.account_id),
+                format!("Mailbox '{}': draft {draft_id} was sent, but Dove could not file a copy in Sent.", mb.alias),
+            )
+            .await;
+        }
+        sent_id = filed;
+    }
+    delete_own_draft(cx, &p.conn, mb, draft_id, p.id).await;
+    if let Some(sid) = sent_id.clone() {
+        let (aid, did) = (mb.account_id.clone(), draft_id.to_string());
+        let _ = cx
+            .app
+            .store
+            .call(move |c| {
+                Ok(c.execute(
+                    "UPDATE own_drafts SET sent_message_id = ?1 WHERE account_id = ?2 AND draft_id = ?3",
+                    params![sid, aid, did],
+                )?)
+            })
+            .await;
+    }
+    sent_id
 }
 
 // ------------------------------------------------------------------ list / get
