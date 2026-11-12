@@ -136,3 +136,7 @@ cargo fmt
   plain `Cow<'a, str>` with `#[serde(default)]` or `&'a str`. Memory claims are checked with the counting global
   allocator in `tests/ingest_memory.rs` (one test per binary, the counter is process-wide); its measurement test is
   `--ignored`. Do not build `--release` ad hoc: it is a full build and belongs under `heavy`.
+- 2026-11-12: First real systemd install (systemd 259): `LoadCredential=` copies are 0440 root:root with an ACL for the
+  service user, so a strict "no group bits" secret check rejects them; `secrets::secret_mode_ok` allows that one case
+  (A44). Test unit directives with `sudo systemd-run --wait --pipe -p User=dove -p LoadCredential=...` before
+  documenting them. Globs over root-only directories in docs must run inside `sudo sh -c '...'`.

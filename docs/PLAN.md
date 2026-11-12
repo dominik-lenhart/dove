@@ -227,3 +227,6 @@ hosts or reference hardware.
 - A43. Sync: a job takes its cancel token before the account lock, so a disable that lands while it waits cancels
   it. A history pass checkpoints at the history id of its first history.list page; later pages may report a newer
   mailbox id than the records they list, and records past the first page's id are replayed next pass (idempotent).
+- A44. Secret files may be group-readable only when owned by root:root (group read, nothing else). systemd 259 copies
+  `LoadCredential=` files as 0440 root:root into a 0550 root:root directory and grants the service user read through
+  an ACL; the strict 0400/0600 rule made the documented unit fail to start (found on the first real install).

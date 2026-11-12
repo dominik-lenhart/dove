@@ -1,6 +1,8 @@
 //! Secret files (spec 6.4, 8.4).
 //!
-//! Secrets are only ever read from files whose mode grants nothing to group or others. Key files use one line per
+//! Secrets are only ever read from files whose mode grants nothing to group or others, with one exception: a file
+//! owned by root:root may be group-readable (systemd 259 `LoadCredential=` copies are 0440 root:root and reach the
+//! service user through an ACL; PLAN A44). Key files use one line per
 //! key version: `<version> <base64 32-byte key>`. Lines starting with `#` are ignored. A single bare base64 line is
 //! accepted as version 1.
 
@@ -15,14 +17,21 @@ use crate::util;
 
 pub type Key32 = Zeroizing<[u8; 32]>;
 
-/// Fails unless `path` is a regular file with no group/other permission bits.
+/// Whether a secret file's permission bits are acceptable: nothing for group or others, or, for a file owned by
+/// root:root, group read only (the group is root, so this grants no unprivileged user anything).
+pub fn secret_mode_ok(mode: u32, uid: u32, gid: u32) -> bool {
+    let mode = mode & 0o777;
+    mode & 0o077 == 0 || (uid == 0 && gid == 0 && mode & 0o037 == 0)
+}
+
+/// Fails unless `path` is a regular file whose mode passes [`secret_mode_ok`].
 pub fn check_secret_file_mode(path: &Path) -> anyhow::Result<()> {
     let meta = std::fs::metadata(path).with_context(|| format!("secret file {} is missing", path.display()))?;
     if !meta.is_file() {
         bail!("secret file {} is not a regular file", path.display());
     }
     let mode = meta.mode() & 0o777;
-    if mode & 0o077 != 0 {
+    if !secret_mode_ok(mode, meta.uid(), meta.gid()) {
         bail!(
             "secret file {} has mode {:o}; it must not be readable or writable by group or others (use 0400 or 0600)",
             path.display(),
@@ -143,6 +152,19 @@ mod tests {
         assert!(KeyRing::load(&p).is_err());
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o400)).unwrap();
         assert!(KeyRing::load(&p).is_ok());
+    }
+
+    #[test]
+    fn only_root_owned_files_may_be_group_readable() {
+        // systemd 259 credential copies: 0440 root:root plus an ACL for the service user.
+        assert!(secret_mode_ok(0o440, 0, 0));
+        assert!(secret_mode_ok(0o400, 981, 981));
+        assert!(secret_mode_ok(0o600, 981, 981));
+        assert!(!secret_mode_ok(0o440, 981, 981), "group-readable files of other owners stay rejected");
+        assert!(!secret_mode_ok(0o440, 0, 981), "a non-root group could read it");
+        assert!(!secret_mode_ok(0o460, 0, 0), "group write stays rejected");
+        assert!(!secret_mode_ok(0o444, 0, 0), "world read stays rejected");
+        assert!(!secret_mode_ok(0o404, 981, 981));
     }
 
     #[test]

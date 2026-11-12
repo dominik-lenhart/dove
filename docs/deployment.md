@@ -93,7 +93,9 @@ tools return `account_unavailable` until you run `dove accounts reconnect <alias
 ## Secrets
 
 Dove reads secrets only from files, never from environment variables. Each secret file must be a regular file
-without any group or other permission bits (0400 or 0600), or the service refuses to start.
+without any group or other permission bits (0400 or 0600), or the service refuses to start. The one exception is a
+file owned by root:root with group read only (0440): that is how systemd 259 hands `LoadCredential=` copies to the
+service, readable by the service user through an ACL.
 
 | File | Content | Notes |
 | --- | --- | --- |
@@ -109,7 +111,7 @@ Generate the three keys locally (the command prints a line and talks to nothing)
 sudo sh -c 'umask 077; for n in kek pepper index_key; do dove keys generate > /etc/dove/credentials/$n; done'
 sudo sh -c 'umask 077; cat > /etc/dove/credentials/google_client_secret'    # paste the secret, then Ctrl-D
 sudo sh -c "umask 077; openssl rand -hex 32 | tr -d '\\n' > /etc/dove/credentials/proxy_secret"
-sudo chmod 0400 /etc/dove/credentials/*
+sudo sh -c 'chmod 0400 /etc/dove/credentials/*'    # the glob must expand as root
 ```
 
 `dove keys generate` prints a line such as `1 <44 base64 characters>`; `--version N` sets the version number (used for
