@@ -42,27 +42,42 @@ async fn run_until_shutdown(app: Arc<App>) -> anyhow::Result<()> {
         tracing::warn!(count = recovered, "sends interrupted by a restart are marked outcome-unknown");
     }
     let listener = tokio::net::TcpListener::bind(app.cfg.listen).await.context("cannot bind listen address")?;
-    let shutdown = async {
+    let signal = async {
         let mut term =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("signal handler");
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {},
             _ = term.recv() => {},
         }
-        tracing::info!("shutting down, finishing in-flight requests");
     };
     // Graceful shutdown finishes in-flight requests for up to 10 seconds (spec 8.2).
-    let server = crate::http::serve(app.clone(), listener, shutdown);
-    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-    let handle = tokio::spawn(async move {
-        let r = server.await;
-        let _ = tx.send(());
-        r
-    });
-    let _ = rx.await;
-    match tokio::time::timeout(std::time::Duration::from_secs(10), handle).await {
-        Ok(r) => r??,
-        Err(_) => tracing::warn!("shutdown timed out"),
+    serve_until(app.clone(), listener, signal, std::time::Duration::from_secs(10)).await
+}
+
+/// Serves HTTP until `signal` resolves, then stops accepting and gives in-flight requests at most `grace` to finish.
+/// Returns early with the error if the server fails on its own.
+pub async fn serve_until(
+    app: Arc<App>,
+    listener: tokio::net::TcpListener,
+    signal: impl std::future::Future<Output = ()>,
+    grace: std::time::Duration,
+) -> anyhow::Result<()> {
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let mut handle = tokio::spawn(crate::http::serve(app, listener, async {
+        let _ = stop_rx.await;
+    }));
+    tokio::select! {
+        r = &mut handle => return r?,
+        () = signal => {}
     }
-    Ok(())
+    tracing::info!("shutting down, finishing in-flight requests");
+    let _ = stop_tx.send(());
+    match tokio::time::timeout(grace, &mut handle).await {
+        Ok(r) => r?,
+        Err(_) => {
+            tracing::warn!("shutdown grace period elapsed; dropping unfinished requests");
+            handle.abort();
+            Ok(())
+        }
+    }
 }
