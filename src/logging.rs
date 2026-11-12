@@ -96,13 +96,20 @@ impl<'a, W: Write + Send + 'static> MakeWriter<'a> for RedactingWriter<W> {
 /// Installs JSON logging to stderr. `RUST_LOG` style filtering via `DOVE_LOG`.
 pub fn init_service_logging() {
     let filter = EnvFilter::try_from_env("DOVE_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt()
+    install_service_logging(std::io::stderr(), filter);
+}
+
+/// Installs the service log format (JSON, redacted) writing to `writer`. Returns false if a global subscriber
+/// already exists. Tests use it to inspect exactly what the service would log.
+pub fn install_service_logging<W: Write + Send + 'static>(writer: W, filter: EnvFilter) -> bool {
+    tracing_subscriber::fmt()
         .json()
         .with_current_span(false)
         .with_span_list(false)
         .with_env_filter(filter)
-        .with_writer(RedactingWriter::new(std::io::stderr()))
-        .try_init();
+        .with_writer(RedactingWriter::new(writer))
+        .try_init()
+        .is_ok()
 }
 
 /// Plain stderr logging for CLI commands (warnings only by default).

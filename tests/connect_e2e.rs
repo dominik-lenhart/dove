@@ -144,7 +144,7 @@ async fn callback_rejections_leave_no_account_and_revoke_nothing() {
 
 #[tokio::test]
 async fn reauth_then_reconnect_restores_access_and_notifies_per_generation() {
-    let h = Harness::start().await;
+    let mut h = Harness::start().await;
     h.mailbox("info", "info@acme.test");
     h.project("p", &["info"]).await;
     let token = h.token("p", "agent", vec![g("info", "read")]).await;
@@ -184,6 +184,10 @@ async fn reauth_then_reconnect_restores_access_and_notifies_per_generation() {
     assert_eq!(status, "active");
     assert!(gen2 > gen1);
     h.ok(&token, "get_message", json!({"account":"info","message_id":id})).await;
+    // The reconnected grant survives a restart (fresh token manager, refresh from the stored grant).
+    h.restart().await;
+    h.ok(&token, "get_message", json!({"account":"info","message_id":id})).await;
+    assert!(h.google.revoked_tokens().is_empty(), "a successful reconnect revokes nothing");
 
     // A later revocation of the new grant notifies again, once.
     h.google.invalidate_refresh_tokens("info@acme.test");
@@ -200,5 +204,27 @@ async fn reauth_then_reconnect_restores_access_and_notifies_per_generation() {
             "account_unavailable"
         );
     }
-    assert_eq!(notes(&h), 2);
+    // This process (restarted after the first notification) sent exactly one; durable keys show one per generation.
+    assert_eq!(notes(&h), 1);
+    let keys: i64 = h
+        .app()
+        .store
+        .call(|c| Ok(c.query_row("SELECT count(*) FROM notifications WHERE key LIKE 'reauth:%'", [], |r| r.get(0))?))
+        .await
+        .unwrap();
+    assert_eq!(keys, 2);
+}
+
+#[tokio::test]
+async fn expired_state_is_rejected_without_storing_anything() {
+    let h = Harness::start().await;
+    h.google.add_mailbox("sales@acme.test", "sub-sales");
+    let (state, challenge) =
+        begin(&h, AdminRequest::AccountsConnect { alias: "sales".into(), email: "sales@acme.test".into() }).await;
+    h.app().store.call(|c| Ok(c.execute("UPDATE pending_connects SET expires_at = 1", [])?)).await.unwrap();
+    h.google.register_code("late", spec("sales@acme.test", "sub-sales", &challenge));
+    let (status, page) = callback(&h, &[("code", "late"), ("state", &state)]).await;
+    assert_eq!(status, 400, "{page}");
+    assert!(account_row(&h, "sales").await.is_none());
+    assert_eq!(h.google.count("POST", "token"), 0, "an expired state never reaches the code exchange");
 }

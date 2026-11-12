@@ -39,7 +39,8 @@ hosts or reference hardware.
 5. Hardening
    - [~] Fake Google server integration suite covering AC1-AC21 (done: AC1, AC2, AC4, AC6, AC7, AC10, AC12, AC13,
      AC16, AC18 in `tests/mcp_e2e.rs`, `tests/connect_e2e.rs`)
-   - [ ] Restart/crash recovery tests, log canary test
+   - [~] Restart/crash recovery tests, log canary test (AC8, AC9 in `tests/hygiene_e2e.rs`; restart cases in
+     `send_e2e`, `connect_e2e`, `mcp_e2e`; index restart cases pending)
    - [ ] Benchmarks (8.1) with synthetic 250k corpus, RSS measurement
    - [ ] Deployment: systemd unit, container, Caddy allowlist, backup docs, SECURITY.md, README
 
