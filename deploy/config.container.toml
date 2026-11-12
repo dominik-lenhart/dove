@@ -18,6 +18,7 @@ client_secret_file = "/run/secrets/google_client_secret"
 kek_file = "/run/secrets/kek"
 pepper_file = "/run/secrets/pepper"
 index_key_file = "/run/secrets/index_key"
+proxy_secret_file = "/run/secrets/proxy_secret"   # Caddy sends it as X-Dove-Proxy-Auth (compose.yaml)
 
 [audit]
 retention_days = 180

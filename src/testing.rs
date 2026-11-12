@@ -45,6 +45,10 @@ pub fn test_config(dir: &Path, operator_uid: u32) -> Config {
         .replace(
             "/run/credentials/dove.service/google_client_secret",
             write_secret(&sdir, "google_client_secret", "test-client-secret").to_str().unwrap(),
+        )
+        .replace(
+            "/run/credentials/dove.service/proxy_secret",
+            write_secret(&sdir, "proxy_secret", "test-proxy-secret-0123456789abcdef0123456789").to_str().unwrap(),
         );
     toml::from_str(&text).unwrap()
 }

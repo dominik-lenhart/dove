@@ -11,13 +11,13 @@
 //! Hand-rolled: see docs/PLAN.md A17 for why no OAuth server crate is used.
 
 use std::collections::{BTreeMap, HashMap};
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{ConnectInfo, Request, State};
+use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -44,6 +44,14 @@ const MAX_PENDING: usize = 10_000;
 const MAX_PENDING_PER_IP: usize = 20;
 const MAX_INVITATION_ATTEMPTS: u32 = 5;
 const DCR_STALE_SECS: i64 = 86_400;
+/// Unused dynamic registrations (no code ever issued) older than this may be evicted to make room for new ones.
+const DCR_EVICTABLE_SECS: i64 = 900;
+/// Unused dynamic registrations one source bucket may hold at a time.
+const MAX_UNUSED_DCR_PER_BUCKET: usize = 5;
+/// Dynamic registrations that have never led to an authorization code or token.
+const DCR_UNUSED: &str = "registered_via = 'dynamic' \
+     AND client_id NOT IN (SELECT app_client_id FROM oauth_codes) \
+     AND client_id NOT IN (SELECT app_client_id FROM oauth_tokens)";
 
 pub fn routes() -> Router<Arc<App>> {
     Router::new()
@@ -79,9 +87,13 @@ struct Pending {
     csrf: String,
     binding: String,
     invitation_id: Option<String>,
+    /// The grants listed on the approval page; approval is refused if the invitation no longer matches them.
+    shown: Vec<invite::InviteGrant>,
     attempts: u32,
     created: Instant,
     ip_bucket: String,
+    /// Coarser network of the source ([`evict_group`]), used to pick whom to evict when the map is full.
+    evict_group: String,
 }
 
 pub struct OAuthState {
@@ -92,6 +104,12 @@ pub struct OAuthState {
 
 impl OAuthState {
     /// Loads pre-registered applications and their secret files (strict modes, spec 6.4).
+    /// Client ids with an open sign-in request; their registrations are never evicted.
+    fn in_flight_clients(&self) -> std::collections::HashSet<String> {
+        let map = self.pending.lock().expect("lock");
+        map.values().filter(|p| p.created.elapsed() < PENDING_TTL).map(|p| p.app.client_id.clone()).collect()
+    }
+
     pub fn load(cfg: &OAuthConfig) -> anyhow::Result<Self> {
         let mut preregistered = Vec::new();
         for c in &cfg.clients {
@@ -173,8 +191,7 @@ fn parse_params(raw: &[u8]) -> Option<HashMap<String, String>> {
 }
 
 fn peer_ip(req: &Request) -> Option<IpAddr> {
-    let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0);
-    crate::http::client_ip(req.headers(), peer)
+    crate::http::request_ip(req)
 }
 
 #[allow(clippy::result_large_err)] // the error is the finished HTTP response
@@ -213,6 +230,26 @@ pub fn ip_bucket(ip: Option<IpAddr>) -> String {
         }
         Some(IpAddr::V6(v6)) => v6.to_ipv4_mapped().map(|v4| v4.to_string()).unwrap_or_default(),
         Some(IpAddr::V4(v4)) => v4.to_string(),
+        None => String::new(),
+    }
+}
+
+/// Eviction group of a source address: IPv6 by its /48, IPv4 by its /24. Rotating /64s within one allocation stays
+/// in one group, so a flood competes with itself first.
+fn evict_group(ip: Option<IpAddr>) -> String {
+    let v4 = |v4: std::net::Ipv4Addr| {
+        let o = v4.octets();
+        format!("{}.{}.{}.0/24", o[0], o[1], o[2])
+    };
+    match ip {
+        Some(IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {
+            Some(m) => v4(m),
+            None => {
+                let s = v6.segments();
+                format!("{:x}:{:x}:{:x}::/48", s[0], s[1], s[2])
+            }
+        },
+        Some(IpAddr::V4(a)) => v4(a),
         None => String::new(),
     }
 }
@@ -380,20 +417,23 @@ fn invitation_page(p: &Pending, rid: &str, error: Option<&str>) -> Response {
 fn approval_page(p: &Pending, rid: &str, inv: &invite::Invitation, error: Option<&str>) -> Response {
     let err = error.map(|e| format!("<p role=\"alert\"><b>{}</b></p>", html_escape(e))).unwrap_or_default();
     let mut rows = String::new();
-    for (i, g) in inv.grants.iter().enumerate() {
+    // Fields are named by the immutable account id, never by position: the list can change between render and
+    // approval, and a position would then point at another mailbox.
+    for g in &inv.grants {
         let a = Actions::parse(&g.actions).unwrap_or_default();
+        let id = html_escape(&g.account_id);
         rows.push_str(&format!(
-            "<li><label><input type=\"checkbox\" name=\"read.{i}\" checked> <b>{}</b>: read</label>",
+            "<li><label><input type=\"checkbox\" name=\"read.{id}\" checked> <b>{}</b>: read</label>",
             html_escape(&g.alias)
         ));
         if a.draft {
             rows.push_str(&format!(
-                " <label><input type=\"checkbox\" name=\"draft.{i}\" checked> create and edit drafts</label>"
+                " <label><input type=\"checkbox\" name=\"draft.{id}\" checked> create and edit drafts</label>"
             ));
         }
         if a.send {
             rows.push_str(&format!(
-                " <label><input type=\"checkbox\" name=\"send.{i}\" checked> send own drafts</label>"
+                " <label><input type=\"checkbox\" name=\"send.{id}\" checked> send own drafts</label>"
             ));
         }
         rows.push_str("</li>");
@@ -473,28 +513,57 @@ async fn authorize_get(State(app): State<Arc<App>>, req: Request) -> Response {
         csrf: util::new_id(),
         binding: binding.clone(),
         invitation_id: None,
+        shown: Vec::new(),
         attempts: 0,
         created: Instant::now(),
         ip_bucket: ip_bucket(ip),
+        evict_group: evict_group(ip),
     };
     let mut resp = invitation_page(&pending, &rid, None);
     {
         let mut map = app.oauth.pending.lock().expect("lock");
-        map.retain(|_, p| p.created.elapsed() < PENDING_TTL);
-        let bucket = ip_bucket(ip);
-        if map.values().filter(|p| p.ip_bucket == bucket).count() >= MAX_PENDING_PER_IP {
+        if !insert_pending(&mut map, rid, pending, MAX_PENDING, MAX_PENDING_PER_IP) {
             return error_page(StatusCode::TOO_MANY_REQUESTS, "Too many open sign-in requests. Try again later.");
         }
-        if map.len() >= MAX_PENDING {
-            return error_page(StatusCode::SERVICE_UNAVAILABLE, "Too many open sign-in requests. Try again later.");
-        }
-        map.insert(rid, pending);
     }
     let cookie = format!("{CSRF_COOKIE}={binding}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=600");
     if let Ok(v) = HeaderValue::from_str(&cookie) {
         resp.headers_mut().insert(header::SET_COOKIE, v);
     }
     resp
+}
+
+/// Stores a new pending request: at most `per_bucket` per source bucket (false when that is reached). When the map
+/// holds `max` requests, the oldest request of the fullest eviction group (/48 or /24) makes room, so a flood from
+/// rotating addresses evicts its own requests before a normal user's single one, and nobody gets a global refusal.
+fn insert_pending(
+    map: &mut HashMap<String, Pending>,
+    rid: String,
+    pending: Pending,
+    max: usize,
+    per_bucket: usize,
+) -> bool {
+    map.retain(|_, p| p.created.elapsed() < PENDING_TTL);
+    if map.values().filter(|p| p.ip_bucket == pending.ip_bucket).count() >= per_bucket {
+        return false;
+    }
+    if map.len() >= max {
+        let mut groups: HashMap<&str, usize> = HashMap::new();
+        for p in map.values() {
+            *groups.entry(p.evict_group.as_str()).or_default() += 1;
+        }
+        let fullest = groups.values().copied().max().unwrap_or(0);
+        let victim = map
+            .iter()
+            .filter(|(_, p)| groups.get(p.evict_group.as_str()) == Some(&fullest))
+            .min_by_key(|(_, p)| p.created)
+            .map(|(rid, _)| rid.clone());
+        if let Some(v) = victim {
+            map.remove(&v);
+        }
+    }
+    map.insert(rid, pending);
+    true
 }
 
 /// POST `/oauth/dove/authorize`: invitation check (step 1) and approval (step 2). CSRF: the form token must match
@@ -552,6 +621,7 @@ async fn authorize_post(State(app): State<Arc<App>>, req: Request) -> Response {
             match found {
                 Ok(Some(inv)) if !inv.grants.is_empty() => {
                     p.invitation_id = Some(inv.id.clone());
+                    p.shown = inv.grants.clone();
                     let r = approval_page(&p, &rid, &inv, None);
                     put_back(p);
                     r
@@ -581,6 +651,8 @@ async fn authorize_post(State(app): State<Arc<App>>, req: Request) -> Response {
 enum Approval {
     Done { code: String },
     InvitationGone,
+    AppGone,
+    Changed,
     NothingSelected(invite::Invitation),
 }
 
@@ -595,6 +667,8 @@ async fn approve(
     let pepper = app.pepper.clone();
     let (app_client_id, redirect_uri, challenge, resource) =
         (p.app.client_id.clone(), p.redirect_uri.clone(), p.code_challenge.clone(), p.resource.clone());
+    let dynamic = p.app.dynamic;
+    let shown = p.shown.clone();
     let code_ttl = app.cfg.oauth.code_ttl_secs;
     let form = form.clone();
     let result = app
@@ -602,15 +676,32 @@ async fn approve(
         .call(move |c| {
             let checked = |k: String| form.get(&k).is_some_and(|v| v == "on");
             let tx = c.transaction()?;
+            // A dynamic registration may have been evicted while this request was being processed (it is out of the
+            // pending map then). Checked in the same transaction that consumes the invitation.
+            let app_exists: bool = !dynamic
+                || tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM oauth_apps WHERE client_id = ?1 AND registered_via = 'dynamic')",
+                    [&app_client_id],
+                    |r| r.get(0),
+                )?;
+            if !app_exists {
+                return Ok(Approval::AppGone);
+            }
             let Some(inv) = invite::load(&tx, &inv_id)? else {
                 return Ok(Approval::InvitationGone);
             };
+            // A mailbox left the project (or was removed) since the page was rendered: the user decided on a
+            // different list, so the decision is not applied to this one.
+            if inv.grants != shown {
+                return Ok(Approval::Changed);
+            }
             let mut selected = BTreeMap::new();
-            for (i, g) in inv.grants.iter().enumerate() {
+            for g in &inv.grants {
+                let id = &g.account_id;
                 let a = Actions {
-                    read: checked(format!("read.{i}")),
-                    draft: checked(format!("draft.{i}")),
-                    send: checked(format!("send.{i}")),
+                    read: checked(format!("read.{id}")),
+                    draft: checked(format!("draft.{id}")),
+                    send: checked(format!("send.{id}")),
                 };
                 selected.insert(g.account_id.clone(), a);
             }
@@ -663,6 +754,16 @@ async fn approve(
             app.oauth.pending.lock().expect("lock").insert(rid, p);
             r
         }
+        Ok(Approval::Changed) => error_page(
+            StatusCode::CONFLICT,
+            "The mailboxes in this invitation changed while this page was open, so nothing was approved. Start \
+             again from the application.",
+        ),
+        Ok(Approval::AppGone) => error_page(
+            StatusCode::BAD_REQUEST,
+            "This application's registration has expired. Start again from the application; your invitation is \
+             still valid.",
+        ),
         Ok(Approval::InvitationGone) => error_page(
             StatusCode::BAD_REQUEST,
             "The invitation is no longer valid (expired or already used). Ask the operator for a new one.",
@@ -751,6 +852,14 @@ fn connection_info(conn: &Connection, connection_id: &str) -> anyhow::Result<(St
         params![connection_id, now],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?)
+}
+
+/// Whether `ip` may use the connection's grant (its `--allow-ip` list; empty allows any address). Checked before a
+/// code or refresh token is consumed, so a stolen token used from elsewhere neither works nor burns the family.
+fn connection_ip_allowed(conn: &Connection, connection_id: &str, ip: Option<IpAddr>) -> anyhow::Result<bool> {
+    let cidrs: String =
+        conn.query_row("SELECT allowed_cidrs FROM clients WHERE id = ?1", [connection_id], |r| r.get(0))?;
+    Ok(crate::policy::ip_allowed(&cidrs, ip))
 }
 
 struct Issued {
@@ -898,6 +1007,10 @@ fn exchange_code(
     let audit = |code: &str| {
         audit_auth(tx, "oauth.token", &name, Some(&project), vec![name.clone(), client.client_id.clone()], code, ip)
     };
+    if !connection_ip_allowed(tx, &connection_id, ip)? {
+        audit("ip_not_allowed")?;
+        return Ok(TokenOutcome::Error("invalid_grant", "invalid authorization code"));
+    }
     if used_at.is_some() {
         // A replayed code: revoke everything issued from it (RFC 6749 4.1.2).
         revoke_connection(tx, &connection_id)?;
@@ -970,6 +1083,10 @@ fn refresh(
     let audit = |code: &str| {
         audit_auth(tx, "oauth.refresh", &name, Some(&project), vec![name.clone(), client.client_id.clone()], code, ip)
     };
+    if !connection_ip_allowed(tx, &connection_id, ip)? {
+        audit("ip_not_allowed")?;
+        return Ok(TokenOutcome::Error("invalid_grant", "invalid refresh token"));
+    }
     if app_client_id != client.client_id {
         audit("wrong_client")?;
         return Ok(TokenOutcome::Error("invalid_grant", "invalid refresh token"));
@@ -1154,38 +1271,77 @@ async fn register(State(app): State<Arc<App>>, req: Request) -> Response {
         .collect();
     let cap = app.cfg.oauth.max_dynamic_clients;
     let (uris_json, name2) = (serde_json::to_string(&redirect_uris).unwrap_or_default(), name.clone());
+    let bucket = ip_bucket(ip);
+    let in_flight = app.oauth.in_flight_clients();
     let r = app
         .store
         .call(move |c| {
             let tx = c.transaction()?;
             let now = util::now_unix();
-            // Prune stale registrations that never led to a connection, then enforce the bound.
+            // Prune stale registrations that never led to a connection, then enforce the bounds.
             tx.execute(
-                "DELETE FROM oauth_apps WHERE registered_via = 'dynamic' AND created_at < ?1 \
-                 AND client_id NOT IN (SELECT app_client_id FROM oauth_codes) \
-                 AND client_id NOT IN (SELECT app_client_id FROM oauth_tokens)",
+                &format!("DELETE FROM oauth_apps WHERE {DCR_UNUSED} AND created_at < ?1"),
                 [now - DCR_STALE_SECS],
             )?;
+            // Oldest unused registration (of one bucket, or of all) old enough to evict, skipping open sign-ins.
+            let evictable = |bucket: Option<&str>| -> anyhow::Result<Option<String>> {
+                let mut stmt = tx.prepare(&format!(
+                    "SELECT client_id FROM oauth_apps WHERE {DCR_UNUSED} AND created_at < ?1 \
+                     AND (?2 IS NULL OR registered_from = ?2) ORDER BY created_at, client_id"
+                ))?;
+                let ids = stmt.query_map(params![now - DCR_EVICTABLE_SECS, bucket], |r| r.get::<_, String>(0))?;
+                for id in ids {
+                    let id = id?;
+                    if !in_flight.contains(&id) {
+                        return Ok(Some(id));
+                    }
+                }
+                Ok(None)
+            };
+            let evict = |id: &str| -> anyhow::Result<()> {
+                tx.execute("DELETE FROM oauth_apps WHERE client_id = ?1", [id])?;
+                audit_auth(&tx, "oauth.register", "anonymous", None, vec![id.to_string()], "evicted", ip)
+            };
+            let unused_here: i64 = tx.query_row(
+                &format!("SELECT COUNT(*) FROM oauth_apps WHERE {DCR_UNUSED} AND registered_from = ?1"),
+                [&bucket],
+                |r| r.get(0),
+            )?;
+            if unused_here as usize >= MAX_UNUSED_DCR_PER_BUCKET {
+                match evictable(Some(&bucket))? {
+                    Some(id) => evict(&id)?,
+                    None => {
+                        drop(tx);
+                        audit_auth(c, "oauth.register", "anonymous", None, vec![], "bucket_limit_reached", ip)?;
+                        return Ok(Err(StatusCode::TOO_MANY_REQUESTS));
+                    }
+                }
+            }
             let count: i64 =
                 tx.query_row("SELECT COUNT(*) FROM oauth_apps WHERE registered_via = 'dynamic'", [], |r| r.get(0))?;
             if count as usize >= cap {
-                drop(tx);
-                audit_auth(c, "oauth.register", "anonymous", None, vec![], "limit_reached", ip)?;
-                return Ok(None);
+                match evictable(None)? {
+                    Some(id) => evict(&id)?,
+                    None => {
+                        drop(tx);
+                        audit_auth(c, "oauth.register", "anonymous", None, vec![], "limit_reached", ip)?;
+                        return Ok(Err(StatusCode::SERVICE_UNAVAILABLE));
+                    }
+                }
             }
             let client_id = format!("dcr-{}", util::new_id());
             tx.execute(
-                "INSERT INTO oauth_apps(client_id, client_name, redirect_uris, registered_via, created_at) \
-                 VALUES (?1, ?2, ?3, 'dynamic', ?4)",
-                params![client_id, name2, uris_json, now],
+                "INSERT INTO oauth_apps(client_id, client_name, redirect_uris, registered_via, created_at, \
+                 registered_from) VALUES (?1, ?2, ?3, 'dynamic', ?4, ?5)",
+                params![client_id, name2, uris_json, now, bucket],
             )?;
             audit_auth(&tx, "oauth.register", "anonymous", None, vec![client_id.clone()], "ok", ip)?;
             tx.commit()?;
-            Ok(Some((client_id, now)))
+            Ok(Ok((client_id, now)))
         })
         .await;
     match r {
-        Ok(Some((client_id, now))) => no_store(
+        Ok(Ok((client_id, now))) => no_store(
             (
                 StatusCode::CREATED,
                 axum::Json(json!({
@@ -1200,7 +1356,16 @@ async fn register(State(app): State<Arc<App>>, req: Request) -> Response {
             )
                 .into_response(),
         ),
-        Ok(None) => oauth_error(
+        Ok(Err(StatusCode::TOO_MANY_REQUESTS)) => {
+            let mut r = oauth_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+                "too many unused registrations from this address; finish a sign-in or try again later",
+            );
+            r.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from(DCR_EVICTABLE_SECS as u64));
+            r
+        }
+        Ok(Err(_)) => oauth_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "temporarily_unavailable",
             "registration limit reached; ask the operator",
@@ -1237,6 +1402,69 @@ mod tests {
         assert_ne!(ip_bucket(a), ip_bucket(c));
         assert_eq!(ip_bucket(Some("::ffff:10.0.0.1".parse().unwrap())), "10.0.0.1");
         assert_eq!(ip_bucket(Some("10.0.0.1".parse().unwrap())), "10.0.0.1");
+    }
+
+    fn pending(ip: &str, age_secs: u64) -> Pending {
+        let ip = Some(ip.parse().unwrap());
+        Pending {
+            app: OAuthApp {
+                client_id: "dcr-x".into(),
+                client_name: "x".into(),
+                redirect_uris: vec![],
+                secret: None,
+                dynamic: true,
+            },
+            redirect_uri: String::new(),
+            state: None,
+            code_challenge: String::new(),
+            resource: String::new(),
+            csrf: String::new(),
+            binding: String::new(),
+            invitation_id: None,
+            shown: Vec::new(),
+            attempts: 0,
+            created: Instant::now() - Duration::from_secs(age_secs),
+            ip_bucket: ip_bucket(ip),
+            evict_group: evict_group(ip),
+        }
+    }
+
+    #[test]
+    fn full_pending_map_evicts_from_the_fullest_group() {
+        let mut map = HashMap::new();
+        // The user's request is the oldest of all, so "evict the oldest" would hit it.
+        assert!(insert_pending(&mut map, "user".into(), pending("198.51.100.7", 300), 6, 3));
+        for i in 0..3 {
+            assert!(insert_pending(&mut map, format!("a{i}"), pending("2001:db8:a:1::1", 200 - i), 6, 3));
+        }
+        assert!(!insert_pending(&mut map, "a3".into(), pending("2001:db8:a:1::2", 0), 6, 3), "per-/64 cap");
+        assert!(insert_pending(&mut map, "b0".into(), pending("2001:db8:b:1::1", 100), 6, 3));
+        assert!(insert_pending(&mut map, "b1".into(), pending("2001:db8:b:1::2", 90), 6, 3));
+        assert_eq!(map.len(), 6);
+        // Full: a new address gets in, and the oldest request of the fullest group ("a0") makes room.
+        assert!(insert_pending(&mut map, "c0".into(), pending("2001:db8:c:1::1", 0), 6, 3));
+        assert_eq!(map.len(), 6);
+        assert!(!map.contains_key("a0") && map.contains_key("a1"));
+        // A long flood rotating /64s inside one /48 never reaches the user's single request.
+        for i in 0..50u16 {
+            let ip = format!("2001:db8:f:{i:x}::1");
+            assert!(insert_pending(&mut map, format!("f{i}"), pending(&ip, 0), 6, 3), "{ip}");
+            assert!(map.len() <= 6);
+        }
+        assert!(map.contains_key("user"), "a normal user's request survives the flood");
+        // Expired requests are dropped first.
+        map.insert("old".into(), pending("192.0.2.1", PENDING_TTL.as_secs() + 1));
+        assert!(insert_pending(&mut map, "new".into(), pending("192.0.2.1", 0), 6, 1));
+        assert!(!map.contains_key("old"));
+    }
+
+    #[test]
+    fn eviction_groups() {
+        let g = |s: &str| evict_group(Some(s.parse().unwrap()));
+        assert_eq!(g("2001:db8:1:2::1"), g("2001:db8:1:ffff::9"));
+        assert_ne!(g("2001:db8:1::1"), g("2001:db8:2::1"));
+        assert_eq!(g("198.51.100.7"), "198.51.100.0/24");
+        assert_eq!(g("::ffff:198.51.100.9"), "198.51.100.0/24");
     }
 
     #[test]

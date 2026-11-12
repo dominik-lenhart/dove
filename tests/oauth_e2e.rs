@@ -42,6 +42,25 @@ fn field(html: &str, name: &str) -> String {
     html[start..].split('"').next().unwrap().to_string()
 }
 
+/// The full name of the first form field starting with `prefix` (checkbox names carry account ids).
+fn field_name(html: &str, prefix: &str) -> String {
+    let pat = format!("name=\"{prefix}");
+    let start = html.find(&pat).unwrap_or_else(|| panic!("no field {prefix} in {html}")) + 6;
+    html[start..].split('"').next().unwrap().to_string()
+}
+
+/// Translates a positional check such as `read.0` (the n-th mailbox on the approval page) into the real field
+/// name, which carries the account id. Anything else is passed through unchanged.
+fn check_name(html: &str, check: &str) -> String {
+    let ids: Vec<&str> = html.split("name=\"read.").skip(1).filter_map(|s| s.split('"').next()).collect();
+    match check.split_once('.') {
+        Some((kind, n)) if n.parse::<usize>().is_ok_and(|n| n < ids.len()) => {
+            format!("{kind}.{}", ids[n.parse::<usize>().unwrap()])
+        }
+        _ => check.to_string(),
+    }
+}
+
 fn query_of(location: &str) -> HashMap<String, String> {
     url::Url::parse(location).unwrap().query_pairs().into_owned().collect()
 }
@@ -158,9 +177,10 @@ impl Oauth {
     async fn approve(&self, client_id: &str, chal: &str, invitation: &str, checks: &[&str]) -> String {
         let (cookie, rid, csrf, html) = self.enter_invitation(client_id, chal, invitation).await;
         assert!(html.contains("Approve"), "{html}");
+        let names: Vec<String> = checks.iter().map(|c| check_name(&html, c)).collect();
         let mut form: Vec<(&str, &str)> =
             vec![("rid", &rid), ("csrf", &csrf), ("step", "approve"), ("action", "approve")];
-        form.extend(checks.iter().map(|c| (*c, "on")));
+        form.extend(names.iter().map(|c| (c.as_str(), "on")));
         let r = self.post_form(&cookie, &form).await;
         assert_eq!(r.status(), 303);
         let q = query_of(r.headers()["location"].to_str().unwrap());
@@ -555,6 +575,267 @@ async fn dynamic_registration_has_no_authority_and_is_bounded() {
     assert_eq!(r.status(), 503);
     let r = post(json!({"redirect_uris": [REDIRECT]})).await.unwrap();
     assert_eq!(r.status(), 429);
+}
+
+/// Registers from `ip` as the proxy would forward it. Returns (status, client_id when created).
+async fn register_from(o: &Oauth, ip: &str) -> (u16, Option<String>) {
+    let secret = o.h.app().proxy_secret.as_deref().unwrap().to_string();
+    let r = o
+        .web
+        .post(o.url("/oauth/dove/register"))
+        .header("host", HOST)
+        .header("x-forwarded-for", ip)
+        .header("x-dove-proxy-auth", secret)
+        .json(&json!({ "redirect_uris": [REDIRECT] }))
+        .send()
+        .await
+        .unwrap();
+    let status = r.status().as_u16();
+    let id = r.json::<Value>().await.unwrap()["client_id"].as_str().map(str::to_string);
+    (status, id)
+}
+
+/// Moves a registration `secs` seconds into the past.
+async fn age_registration(o: &Oauth, client_id: &str, secs: i64) {
+    let id = client_id.to_string();
+    o.h.app()
+        .store
+        .call(move |c| {
+            c.execute(
+                "UPDATE oauth_apps SET created_at = created_at - ?1 WHERE client_id = ?2",
+                rusqlite::params![secs, id],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+}
+
+async fn registered(o: &Oauth, client_id: &str) -> bool {
+    let id = client_id.to_string();
+    o.h.app()
+        .store
+        .call(move |c| {
+            Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM oauth_apps WHERE client_id = ?1)", [id], |r| r.get(0))?)
+        })
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn full_registration_table_evicts_old_unused_registrations() {
+    let o = Oauth::with(|c| {
+        c.oauth.max_dynamic_clients = 4;
+        c.oauth.registrations_per_hour = 100;
+    })
+    .await;
+    // One registration that led to a connection, then unused ones from three addresses.
+    let (used, _) = o.connected("used-host", "read", &["read.0"]).await;
+    let (_, a) = register_from(&o, "192.0.2.1").await;
+    let (_, b) = register_from(&o, "192.0.2.2").await;
+    let (_, c) = register_from(&o, "192.0.2.3").await;
+    let (a, b, c) = (a.unwrap(), b.unwrap(), c.unwrap());
+    // Full, and nothing is old enough to evict: refused.
+    assert_eq!(register_from(&o, "192.0.2.4").await.0, 503);
+    // Old enough: the oldest unused one goes. The used registration is older still and stays.
+    age_registration(&o, &used, 5000).await;
+    age_registration(&o, &a, 2000).await;
+    age_registration(&o, &b, 1000).await;
+    let (s, d) = register_from(&o, "192.0.2.4").await;
+    assert_eq!(s, 201);
+    assert!(!registered(&o, &a).await, "oldest unused registration evicted");
+    assert!(registered(&o, &used).await && registered(&o, &b).await && registered(&o, &c).await);
+    // A registration with an open sign-in request is not evicted, even when it is the oldest unused one.
+    let r = o.authorize_get(&Oauth::params(&b, &challenge(&verifier()))).await;
+    assert_eq!(r.status(), 200);
+    age_registration(&o, &c, 1000).await;
+    let (s, _) = register_from(&o, "192.0.2.5").await;
+    assert_eq!(s, 201);
+    assert!(registered(&o, &b).await, "in-flight registration kept");
+    assert!(!registered(&o, &c).await);
+    assert!(registered(&o, &d.unwrap()).await, "fresh registrations are never evicted");
+}
+
+#[tokio::test]
+async fn approval_for_an_evicted_registration_keeps_the_invitation() {
+    let o = Oauth::new().await;
+    let inv = o.invite("evicted-host", &["info"], "read").await;
+    let client_id = o.register(REDIRECT).await;
+    let (cookie, rid, csrf, html) = o.enter_invitation(&client_id, &challenge(&verifier()), &inv).await;
+    assert!(html.contains("Approve"));
+    // The registration disappears between the two steps (eviction or the 24 h prune).
+    let id = client_id.clone();
+    o.h.app().store.call(move |c| Ok(c.execute("DELETE FROM oauth_apps WHERE client_id = ?1", [id])?)).await.unwrap();
+    let read = field_name(&html, "read.");
+    let r = o
+        .post_form(
+            &cookie,
+            &[("rid", &rid), ("csrf", &csrf), ("step", "approve"), ("action", "approve"), (&read, "on")],
+        )
+        .await;
+    assert_eq!(r.status(), 400);
+    assert!(r.text().await.unwrap().contains("registration has expired"));
+    // Nothing was consumed: the invitation still works for a fresh registration.
+    let client_id = o.register(REDIRECT).await;
+    let v = verifier();
+    let code = o.approve(&client_id, &challenge(&v), &inv, &["read.0"]).await;
+    assert_eq!(o.exchange(&client_id, &code, &v).await.0, 200);
+}
+
+#[tokio::test]
+async fn approval_is_refused_when_the_invited_mailboxes_changed() {
+    let o = Oauth::new().await;
+    let inv = o.invite("changed-host", &["all"], "read").await;
+    let client_id = o.register(REDIRECT).await;
+    let (cookie, rid, csrf, html) = o.enter_invitation(&client_id, &challenge(&verifier()), &inv).await;
+    // The page lists billing first, then info. The user keeps billing and deselects info.
+    let billing = check_name(&html, "read.0");
+    let info = check_name(&html, "read.1");
+    assert!(html.find(">billing<").unwrap() < html.find(">info<").unwrap());
+    assert!(!billing.ends_with(".0") && billing != info, "fields carry account ids: {billing}");
+    // Meanwhile billing leaves the project without cancelling the invitation (only this guard can fire here:
+    // the admin paths cancel the invitation as well).
+    o.h.app()
+        .store
+        .call(|c| {
+            Ok(c.execute(
+                "DELETE FROM project_accounts WHERE account_id = (SELECT id FROM accounts WHERE alias = 'billing')",
+                [],
+            )?)
+        })
+        .await
+        .unwrap();
+    let r = o
+        .post_form(
+            &cookie,
+            &[("rid", &rid), ("csrf", &csrf), ("step", "approve"), ("action", "approve"), (&billing, "on")],
+        )
+        .await;
+    assert_eq!(r.status(), 409);
+    let connections: i64 =
+        o.h.app()
+            .store
+            .call(|c| Ok(c.query_row("SELECT COUNT(*) FROM clients WHERE name = 'changed-host'", [], |r| r.get(0))?))
+            .await
+            .unwrap();
+    assert_eq!(connections, 0, "the deselected mailbox was not granted");
+}
+
+#[tokio::test]
+async fn removing_an_account_cancels_open_invitations_that_list_it() {
+    let o = Oauth::new().await;
+    let with_info = o.invite("has-info", &["info"], "read").await;
+    let without =
+        o.h.admin(AdminRequest::ClientsInvite {
+            name: "no-info".into(),
+            project: "other".into(),
+            accounts: vec!["secret".into()],
+            capabilities: "read".into(),
+            expires: None,
+            allow_ip: vec![],
+        })
+        .await
+        .unwrap()["invitation"]
+            .as_str()
+            .unwrap()
+            .to_string();
+    let v = o.h.admin(AdminRequest::AccountsRemove { alias: "info".into() }).await.unwrap();
+    assert_eq!(v["pending_invitations_cancelled"], 1);
+    let redeem = |inv: String| {
+        o.web.post(o.url("/connect/redeem")).header("host", HOST).json(&json!({ "invitation": inv })).send()
+    };
+    assert_eq!(redeem(with_info).await.unwrap().status(), 400);
+    assert_eq!(redeem(without).await.unwrap().status(), 200);
+}
+
+#[tokio::test]
+async fn unused_registrations_are_capped_per_address() {
+    let o = Oauth::with(|c| c.oauth.registrations_per_hour = 100).await;
+    let mut ids = vec![];
+    for _ in 0..5 {
+        let (s, id) = register_from(&o, "2001:db8:1:2::1").await;
+        assert_eq!(s, 201);
+        ids.push(id.unwrap());
+    }
+    // A sixth from the same /64 is refused while the others are fresh; other addresses are not affected.
+    let (s, _) = register_from(&o, "2001:db8:1:2::99").await;
+    assert_eq!(s, 429);
+    assert_eq!(register_from(&o, "2001:db8:1:3::1").await.0, 201);
+    // Once its oldest unused registration is old enough, it makes room.
+    age_registration(&o, &ids[0], 1000).await;
+    assert_eq!(register_from(&o, "2001:db8:1:2::1").await.0, 201);
+    assert!(!registered(&o, &ids[0]).await);
+    assert!(registered(&o, &ids[1]).await);
+}
+
+/// Token request as forwarded by the proxy for client address `ip`.
+async fn token_from(o: &Oauth, ip: &str, form: &[(&str, &str)]) -> (u16, Value) {
+    let secret = o.h.app().proxy_secret.as_deref().unwrap().to_string();
+    let r = o
+        .web
+        .post(o.url("/oauth/dove/token"))
+        .header("host", HOST)
+        .header("x-forwarded-for", ip)
+        .header("x-dove-proxy-auth", secret)
+        .form(form)
+        .send()
+        .await
+        .unwrap();
+    (r.status().as_u16(), r.json().await.unwrap())
+}
+
+#[tokio::test]
+async fn token_endpoint_enforces_the_connection_ip_allowlist() {
+    let o = Oauth::new().await;
+    let inv =
+        o.h.admin(AdminRequest::ClientsInvite {
+            name: "office-host".into(),
+            project: "acme".into(),
+            accounts: vec!["info".into()],
+            capabilities: "read".into(),
+            expires: None,
+            allow_ip: vec!["192.0.2.0/24".into()],
+        })
+        .await
+        .unwrap()["invitation"]
+            .as_str()
+            .unwrap()
+            .to_string();
+    let client_id = o.register(REDIRECT).await;
+    let v = verifier();
+    let code = o.approve(&client_id, &challenge(&v), &inv, &["read.0"]).await;
+    let exchange = [
+        ("grant_type", "authorization_code"),
+        ("code", code.as_str()),
+        ("redirect_uri", REDIRECT),
+        ("client_id", client_id.as_str()),
+        ("code_verifier", v.as_str()),
+    ];
+    // From outside the allowlist: refused, and the code is not used up.
+    let (s, e) = token_from(&o, "198.51.100.1", &exchange).await;
+    assert_eq!((s, e["error"].as_str().unwrap()), (400, "invalid_grant"));
+    let (s, tok) = token_from(&o, "192.0.2.10", &exchange).await;
+    assert_eq!(s, 200, "{tok}");
+    let rt = tok["refresh_token"].as_str().unwrap().to_string();
+    let refresh = [("grant_type", "refresh_token"), ("refresh_token", rt.as_str()), ("client_id", client_id.as_str())];
+    // A stolen refresh token used elsewhere neither rotates nor revokes anything.
+    let (s, e) = token_from(&o, "198.51.100.1", &refresh).await;
+    assert_eq!((s, e["error"].as_str().unwrap()), (400, "invalid_grant"));
+    let (s, tok2) = token_from(&o, "192.0.2.10", &refresh).await;
+    assert_eq!(s, 200, "the refresh token was not consumed: {tok2}");
+    // Replaying the rotated token from outside does not trigger reuse revocation either.
+    let (s, _) = token_from(&o, "198.51.100.1", &refresh).await;
+    assert_eq!(s, 400);
+    let at = tok2["access_token"].as_str().unwrap();
+    let secret = o.h.app().proxy_secret.as_deref().unwrap().to_string();
+    let r =
+        o.h.post_mcp(
+            Some(at),
+            json!({"jsonrpc":"2.0","id":1,"method":"ping"}),
+            &[("x-forwarded-for", "192.0.2.10"), ("x-dove-proxy-auth", &secret)],
+        )
+        .await;
+    assert_eq!(r.status(), 200, "the connection is still alive");
 }
 
 #[tokio::test]

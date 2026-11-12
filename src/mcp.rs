@@ -5,13 +5,12 @@
 //! on at least one granted mailbox, and every call re-checks the grant.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{ConnectInfo, Request, State};
+use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -51,16 +50,49 @@ fn unauthorized(app: &App) -> Response {
     r
 }
 
-/// Simple per-client token bucket (spec 7.7).
 /// Upper bound on messages in one legacy JSON-RPC batch.
 const MAX_JSONRPC_BATCH: usize = 20;
 
-#[derive(Default)]
+/// Buckets kept before idle ones are dropped. Unauthenticated routes key buckets by source address, so without a
+/// bound a caller rotating addresses (IPv6 /64s) would grow the map forever.
+const MAX_RATE_BUCKETS: usize = 50_000;
+
+struct Bucket {
+    tokens: f64,
+    last: Instant,
+    rate: f64,
+    cap: f64,
+}
+
+impl Bucket {
+    fn refilled(&self, now: Instant) -> f64 {
+        (self.tokens + now.duration_since(self.last).as_secs_f64() * self.rate).min(self.cap)
+    }
+}
+
+/// Per-client and per-address token buckets (spec 7.7).
 pub struct RateLimiter {
-    buckets: Mutex<HashMap<String, (f64, Instant)>>,
+    inner: Mutex<Buckets>,
+}
+
+struct Buckets {
+    map: HashMap<String, Bucket>,
+    max: usize,
+    /// Size at which the next prune runs; doubles over what survives a prune, so pruning stays amortized O(1).
+    prune_at: usize,
+}
+
+impl Default for RateLimiter {
+    fn default() -> Self {
+        Self::with_max_buckets(MAX_RATE_BUCKETS)
+    }
 }
 
 impl RateLimiter {
+    pub fn with_max_buckets(max: usize) -> Self {
+        Self { inner: Mutex::new(Buckets { map: HashMap::new(), max, prune_at: max }) }
+    }
+
     /// Returns `None` when allowed, or the seconds to wait.
     pub fn check(&self, key: &str, per_minute: u32, burst: u32) -> Option<u64> {
         self.check_rate(key, f64::from(per_minute.max(1)) / 60.0, burst)
@@ -73,17 +105,29 @@ impl RateLimiter {
 
     fn check_rate(&self, key: &str, rate: f64, burst: u32) -> Option<u64> {
         let cap = f64::from(burst.max(1));
-        let mut map = self.buckets.lock().expect("lock");
+        let mut b = self.inner.lock().expect("lock");
         let now = Instant::now();
-        let (tokens, last) = map.entry(key.to_string()).or_insert((cap, now));
-        *tokens = (*tokens + now.duration_since(*last).as_secs_f64() * rate).min(cap);
-        *last = now;
-        if *tokens >= 1.0 {
-            *tokens -= 1.0;
+        if b.map.len() >= b.prune_at && !b.map.contains_key(key) {
+            // A bucket that has refilled to capacity behaves exactly like a missing one, so dropping it is free.
+            b.map.retain(|_, e| e.refilled(now) < e.cap);
+            b.prune_at = b.max.max(b.map.len() * 2);
+        }
+        let e = b.map.entry(key.to_string()).or_insert(Bucket { tokens: cap, last: now, rate, cap });
+        e.rate = rate;
+        e.cap = cap;
+        e.tokens = e.refilled(now);
+        e.last = now;
+        if e.tokens >= 1.0 {
+            e.tokens -= 1.0;
             None
         } else {
-            Some(((1.0 - *tokens) / rate).ceil() as u64)
+            Some(((1.0 - e.tokens) / rate).ceil() as u64)
         }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.inner.lock().expect("lock").map.len()
     }
 }
 
@@ -115,14 +159,13 @@ fn rpc_result(id: Value, result: Value) -> Value {
 }
 
 async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
-    let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0);
+    let ip = crate::http::request_ip(&req);
     let (parts, body) = req.into_parts();
     let headers: HeaderMap = parts.headers;
     let body: Bytes = match axum::body::to_bytes(body, app.cfg.limits.body_bytes).await {
         Ok(b) => b,
         Err(_) => return (StatusCode::PAYLOAD_TOO_LARGE, "request too large").into_response(),
     };
-    let ip = crate::http::client_ip(&headers, peer);
     let bearer = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -330,4 +373,33 @@ pub async fn call_tool(app: &Arc<App>, ctx: &ClientCtx, version: &str, name: &st
         tracing::error!(error = %e, "audit write failed");
     }
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn idle_rate_buckets_are_pruned_and_active_ones_kept() {
+        let rl = RateLimiter::with_max_buckets(4);
+        // Two exhausted buckets (they must survive pruning, or a caller could reset its limit by flooding keys).
+        for key in ["a", "b"] {
+            assert!(rl.check(key, 1, 1).is_none());
+            assert!(rl.check(key, 1, 1).is_some());
+        }
+        // Two buckets that are still full after their first use (burst 1000).
+        assert!(rl.check("c", 60, 1000).is_none());
+        assert!(rl.check("d", 60, 1000).is_none());
+        assert_eq!(rl.len(), 4);
+        // A fifth key triggers a prune: c and d hold 999 of 1000 tokens, so wait until they refill.
+        std::thread::sleep(Duration::from_millis(1100));
+        assert!(rl.check("e", 1, 1).is_none());
+        assert_eq!(rl.len(), 3, "full buckets dropped, exhausted ones kept, new one added");
+        assert!(rl.check("a", 1, 1).is_some(), "the exhausted bucket was not reset by the prune");
+        // Many fresh keys stay bounded: each prune drops the refilled ones (this rate refills within nanoseconds).
+        for i in 0..1000 {
+            rl.check(&format!("k{i}"), u32::MAX, 1);
+        }
+        assert!(rl.len() < 1000, "{}", rl.len());
+    }
 }

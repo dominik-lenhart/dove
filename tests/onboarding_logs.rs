@@ -112,10 +112,10 @@ async fn no_onboarding_secret_reaches_logs_audit_or_store() {
     let cookie = r.headers()["set-cookie"].to_str().unwrap().split(';').next().unwrap().to_string();
     let html = r.text().await.unwrap();
     let (rid, csrf) = (field(&html, "rid"), field(&html, "csrf"));
-    let post = |form: Vec<(&'static str, String)>| {
+    let post = |form: Vec<(&str, String)>| {
         web.post(url("/oauth/dove/authorize")).header("host", HOST).header("cookie", cookie.clone()).form(&form).send()
     };
-    post(vec![
+    let html = post(vec![
         ("rid", rid.clone()),
         ("csrf", csrf.clone()),
         ("step", "invitation".into()),
@@ -123,13 +123,18 @@ async fn no_onboarding_secret_reaches_logs_audit_or_store() {
         ("invitation", inv.clone()),
     ])
     .await
+    .unwrap()
+    .text()
+    .await
     .unwrap();
+    // The checkbox carries the account id: read.<id>.
+    let read = html.split("name=\"").find(|s| s.starts_with("read.")).unwrap().split('"').next().unwrap().to_string();
     let r = post(vec![
         ("rid", rid),
         ("csrf", csrf.clone()),
         ("step", "approve".into()),
         ("action", "approve".into()),
-        ("read.0", "on".into()),
+        (read.as_str(), "on".into()),
     ])
     .await
     .unwrap();

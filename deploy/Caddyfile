@@ -17,11 +17,16 @@
 }
 
 # One upstream: the loopback listener. Host is passed through unchanged. The client address is set (not
-# appended) as the only X-Forwarded-For entry, so a client cannot forge it. Dove takes the last entry when the
-# peer is loopback (src/http.rs).
+# appended) as the only X-Forwarded-For entry, so a client cannot forge it. Dove believes that entry only when the
+# request comes from loopback AND carries X-Dove-Proxy-Auth with the shared proxy secret (secrets.proxy_secret_file
+# in config.toml); any other local process that connects to 127.0.0.1:8787 directly is treated as 127.0.0.1.
+# The secret file is read per request. Same content as Dove's proxy_secret, readable by the Caddy user only:
+#   install -o caddy -g caddy -m 0400 /etc/dove/credentials/proxy_secret /etc/caddy/dove_proxy_secret
+# header_up replaces any client-sent X-Dove-Proxy-Auth header.
 (upstream) {
 	reverse_proxy 127.0.0.1:8787 {
 		header_up X-Forwarded-For {remote_host}
+		header_up X-Dove-Proxy-Auth {file./etc/caddy/dove_proxy_secret}
 		header_up -X-Real-IP
 		header_up -Forwarded
 		transport http {

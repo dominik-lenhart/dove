@@ -137,7 +137,8 @@ hosts or reference hardware.
   Registrations are capped (`oauth.max_dynamic_clients`, unused ones pruned after 24 h) and limited per IP per
   hour. Pre-registered (optionally confidential) clients are configured in `[[oauth.clients]]` with a secret file.
 - A23. Removing a mailbox from a project cancels the project's open invitations, so a re-add cannot resurrect
-  rights through an old invitation. Accounts deleted before redemption are dropped from the invitation.
+  rights through an old invitation. `accounts remove` cancels every open invitation that lists the account (A35);
+  an account missing at redemption for any other reason is still dropped from the invitation.
 - A24. Client profiles live in `$DOVE_CONFIG_DIR`, else `$XDG_CONFIG_HOME/dove`, else `~/.config/dove`
   (`%APPDATA%\dove` on Windows) as `profiles.toml` (0600): server origin, connection name, credential reference
   (`keyring` or `file:<path>`). Server URLs must be HTTPS; plain HTTP is accepted only for loopback hosts.
@@ -156,6 +157,39 @@ hosts or reference hardware.
   `dove doctor` stays the operator check.
 - A29. `tools/list` declares `securitySchemes: [{type: oauth2, scopes: [mail]}]` per tool for hosts that read it
   (ChatGPT apps); unverified.
+- A30. The reverse proxy proves itself with a shared secret (`secrets.proxy_secret_file`, sent as
+  `X-Dove-Proxy-Auth`, constant-time compare, exactly one header value). Only then is the last `X-Forwarded-For`
+  entry of a loopback request believed; otherwise the client IP is the peer address, so a local process cannot pick
+  its address for `--allow-ip` checks, per-IP limits or audit records. The HTTP guard resolves the address once and
+  strips the header before any handler. The secret is optional for compatibility: unset means the old behaviour
+  plus a startup warning and a failing `dove doctor` check. Caddy reads it with `{file.*}` (unverified with a real
+  Caddy), nginx from a root-only included snippet (unverified with `nginx -t`).
+- A31. The in-memory rate limiter keeps at most 50 000 buckets before pruning. A prune drops only buckets that have
+  refilled to capacity (indistinguishable from a missing bucket), so exhausted callers keep their limit. The next
+  prune runs at twice the surviving size (at least 50 000), which keeps the cost amortized when most buckets are
+  active.
+- A32. A full pending-authorize map (10 000) no longer refuses everyone: the oldest request of the fullest eviction
+  group (IPv6 /48, IPv4 /24) makes room, while the per-/64 cap of 20 stays. A flood rotating /64s inside one /48
+  displaces itself; a flood from more than 10 000 distinct /48s or /24s can still displace other users' sign-ins,
+  which then only have to start again.
+- A33. Dynamic registrations record their source bucket (state migration V2, `oauth_apps.registered_from`). One
+  bucket may hold 5 unused registrations (no code or token ever issued); beyond that its oldest unused one older than
+  15 minutes is evicted, otherwise the request gets 429. At `max_dynamic_clients` the oldest unused registration
+  older than 15 minutes (any bucket) is evicted, otherwise 503. Registrations with an open sign-in request are never
+  evicted; each eviction is audited (`oauth.register`, result `evicted`). A host that cached an evicted client id
+  must register again (host behaviour unverified, as with the 24 h prune). Accepted trade-off: a flood from many
+  sources can evict other sources' unused registrations once they are 15 minutes old; their hosts register again.
+  An approval re-checks in its own transaction that a dynamic registration still exists, because a request being
+  approved is out of the pending map (and so not protected from eviction) while it is processed; if it is gone the
+  invitation stays unused and the user starts again.
+- A35. Approval-page checkboxes are named by account id (`read.<account_id>`), never by position. The page stores the
+  grant list it showed; if the invitation reloaded at approval differs (a mailbox left the project or was deleted
+  meanwhile), nothing is approved (409, start again) and the invitation stays unused. `accounts remove` cancels open
+  invitations that list the account (matched in the grants JSON with `json_each`) and reports
+  `pending_invitations_cancelled`.
+- A34. The token endpoint applies the connection's `--allow-ip` list (from the invitation) to both grants before
+  anything is consumed: from another address a code or refresh token gets `invalid_grant` and stays usable, and a
+  replayed rotated refresh token does not trigger reuse revocation. The approval page itself is not IP-bound.
 - A7. Licence is a placeholder (Apache-2.0) until the owner decides (spec 13.7).
 - A16. batch_read: budgets are assigned in input order (deterministic). Items that do not fit return
   `budget_exceeded` with a smaller-request hint instead of a continuation token. The wire budget counts the

@@ -13,6 +13,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
+use subtle::ConstantTimeEq;
 
 use crate::app::App;
 use crate::gmail::connect::{self, CallbackOutcome, CallbackQuery};
@@ -28,10 +29,34 @@ pub fn router(app: Arc<App>) -> Router {
         .with_state(app)
 }
 
-/// Client IP: the proxy is on loopback and appends the real client address as the last X-Forwarded-For entry.
-pub fn client_ip(headers: &HeaderMap, peer: Option<SocketAddr>) -> Option<IpAddr> {
+/// Header the reverse proxy uses to prove that a loopback request comes from it (`secrets.proxy_secret_file`).
+pub const PROXY_AUTH_HEADER: &str = "x-dove-proxy-auth";
+
+/// The caller's address as decided by [`guard`], stored in the request extensions.
+#[derive(Clone, Copy, Debug)]
+pub struct ClientIp(pub Option<IpAddr>);
+
+/// Client IP. The proxy runs on loopback and sets the real client address as the last X-Forwarded-For entry.
+/// With a proxy secret configured, the header is trusted only on loopback requests whose single
+/// `X-Dove-Proxy-Auth` value equals the secret (constant time); any other local process (an agent shell on the same
+/// host) is seen as its loopback peer address. Without a secret every loopback peer is trusted (legacy behaviour).
+pub fn client_ip(proxy_secret: Option<&str>, headers: &HeaderMap, peer: Option<SocketAddr>) -> Option<IpAddr> {
     let peer_ip = peer.map(|p| p.ip());
+    let proxied = match proxy_secret {
+        None => true,
+        Some(secret) => {
+            let mut values = headers.get_all(PROXY_AUTH_HEADER).iter();
+            match (values.next(), values.next()) {
+                (Some(v), None) => {
+                    let v = v.as_bytes();
+                    v.len() == secret.len() && bool::from(v.ct_eq(secret.as_bytes()))
+                }
+                _ => false,
+            }
+        }
+    };
     if peer_ip.is_none_or(|ip| ip.is_loopback())
+        && proxied
         && let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok())
         && let Some(last) = xff.rsplit(',').next()
         && let Ok(ip) = last.trim().parse::<IpAddr>()
@@ -41,12 +66,25 @@ pub fn client_ip(headers: &HeaderMap, peer: Option<SocketAddr>) -> Option<IpAddr
     peer_ip
 }
 
+/// The client IP of a request that passed [`guard`]. Without the guard's extension only the peer address counts.
+pub fn request_ip(req: &Request) -> Option<IpAddr> {
+    match req.extensions().get::<ClientIp>() {
+        Some(c) => c.0,
+        None => req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip()),
+    }
+}
+
 /// Browser routes that legitimately carry our own Origin (the approval page posts to itself).
 fn browser_route(path: &str) -> bool {
     path.starts_with("/oauth/dove/authorize")
 }
 
-async fn guard(State(app): State<Arc<App>>, req: Request, next: Next) -> Response {
+async fn guard(State(app): State<Arc<App>>, mut req: Request, next: Next) -> Response {
+    let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0);
+    let ip = client_ip(app.proxy_secret.as_deref().map(|s| s.as_str()), req.headers(), peer);
+    // The proxy secret goes no further than this point: handlers, logs and responses never see it.
+    req.headers_mut().remove(PROXY_AUTH_HEADER);
+    req.extensions_mut().insert(ClientIp(ip));
     let path = req.uri().path().to_string();
     let host = req.headers().get(header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("");
     if path != "/healthz" && !host.eq_ignore_ascii_case(&app.cfg.public_host()) {
@@ -135,3 +173,36 @@ pub fn peer(req_ext: Option<&ConnectInfo<SocketAddr>>) -> Option<SocketAddr> {
 
 #[allow(dead_code)]
 fn _assert_body(_: Body) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.append(axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(), v.parse().unwrap());
+        }
+        h
+    }
+
+    #[test]
+    fn forwarded_for_needs_loopback_and_exactly_one_matching_secret() {
+        let lo: Option<SocketAddr> = Some("127.0.0.1:5000".parse().unwrap());
+        let remote: Option<SocketAddr> = Some("198.51.100.9:5000".parse().unwrap());
+        let client: IpAddr = "203.0.113.7".parse().unwrap();
+        let s = "s".repeat(40);
+        let ok = headers(&[("x-forwarded-for", "10.0.0.1, 203.0.113.7"), (PROXY_AUTH_HEADER, &s)]);
+        assert_eq!(client_ip(Some(&s), &ok, lo), Some(client));
+        // Not from loopback: the peer is the client, whatever the headers say.
+        assert_eq!(client_ip(Some(&s), &ok, remote), remote.map(|p| p.ip()));
+        // A second header value (one forged, one from a proxy that appends) is refused.
+        let twice = headers(&[("x-forwarded-for", "203.0.113.7"), (PROXY_AUTH_HEADER, &s), (PROXY_AUTH_HEADER, &s)]);
+        assert_eq!(client_ip(Some(&s), &twice, lo), lo.map(|p| p.ip()));
+        let prefix = headers(&[("x-forwarded-for", "203.0.113.7"), (PROXY_AUTH_HEADER, &s[..39])]);
+        assert_eq!(client_ip(Some(&s), &prefix, lo), lo.map(|p| p.ip()));
+        // Without a configured secret, loopback peers are trusted (legacy behaviour, warned about at startup).
+        let bare = headers(&[("x-forwarded-for", "203.0.113.7")]);
+        assert_eq!(client_ip(None, &bare, lo), Some(client));
+    }
+}

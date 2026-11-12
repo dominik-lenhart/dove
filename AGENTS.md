@@ -118,3 +118,11 @@ cargo fmt
   need a private target dir per worktree (the default `<worktree>/target` is private).
 - 2026-11-12: Client tests run the binary with `env_clear()`, a temp HOME and
   `DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent/...` so the real keychain and config are never touched.
+- 2026-11-12: The client address is resolved once in the HTTP guard (`http::client_ip`, PLAN A30) and read by handlers
+  with `http::request_ip(&req)`; never parse `X-Forwarded-For` in a handler. Tests simulate a client address by
+  sending `X-Forwarded-For` together with `X-Dove-Proxy-Auth: <app.proxy_secret>` (the test config sets a secret;
+  `c.secrets.proxy_secret_file = None` gives the legacy behaviour).
+- 2026-11-12: Approval-page checkboxes are `read.<account_id>`; e2e helpers translate positional `read.0` via
+  `check_name` in `tests/oauth_e2e.rs`. The bundled SQLCipher has JSON1 (`json_each`, `json_extract`).
+- 2026-11-12: When mutation-checking with `sed`, confirm the mutation applied (`grep -c`) before trusting a passing
+  test; quoting `$` or `'` in patterns silently matches nothing.
