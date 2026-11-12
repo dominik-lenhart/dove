@@ -357,24 +357,57 @@ fn is_ident(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
+/// Style sheet bytes examined per document; rules beyond this are ignored (bounded work on hostile mail).
+const MAX_CSS_BYTES: usize = 64 * 1024;
+
+fn truncate_at_boundary(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// Replaces each `/* ... */` comment with a space in one linear pass; an unterminated comment runs to the end.
+fn strip_css_comments(css: &str) -> String {
+    let mut out = String::with_capacity(css.len());
+    let mut rest = css;
+    while let Some(start) = rest.find("/*") {
+        out.push_str(&rest[..start]);
+        out.push(' ');
+        rest = match rest[start + 2..].find("*/") {
+            Some(e) => &rest[start + 2 + e + 2..],
+            None => "",
+        };
+    }
+    out.push_str(rest);
+    out
+}
+
 impl HiddenRules {
     /// Extracts hiding rules from the document's `<style>` elements. Complex selectors and at-rules are ignored.
     fn from_document(doc: &Html) -> Self {
         let mut rules = HiddenRules::default();
+        let mut budget = MAX_CSS_BYTES;
         for node in doc.tree.nodes() {
             if let Some(el) = ElementRef::wrap(node).filter(|e| e.value().name() == "style") {
-                rules.add_css(&el.text().collect::<String>());
+                if budget == 0 {
+                    break;
+                }
+                let text = el.text().collect::<String>();
+                let take = truncate_at_boundary(&text, budget);
+                budget -= take.len();
+                rules.add_css(take);
             }
         }
         rules
     }
 
     fn add_css(&mut self, css: &str) {
-        let mut css = css.to_string();
-        while let Some(start) = css.find("/*") {
-            let end = css[start + 2..].find("*/").map_or(css.len(), |e| start + 2 + e + 2);
-            css.replace_range(start..end, " ");
-        }
+        let css = strip_css_comments(css);
         let mut pos = 0;
         while let Some(open) = css[pos..].find('{').map(|o| pos + o) {
             let mut depth = 1usize;
@@ -853,5 +886,24 @@ mod tests {
     fn deeply_nested_html_does_not_overflow() {
         let html = format!("{}deep{}", "<div>".repeat(5_000), "</div>".repeat(5_000));
         assert_eq!(html_to_text(&html), "deep");
+    }
+
+    #[test]
+    fn css_comments_are_stripped_linearly_and_style_work_is_capped() {
+        assert_eq!(strip_css_comments("a/*x*/b/* y */c/*open"), "a b c ");
+        // Comments inside a hiding rule do not defeat it.
+        let html = "<style>.h{/* c */display:/**/none}</style><p class=h>HIDDEN</p><p>shown</p>";
+        assert_eq!(html_to_text(html), "shown");
+        // Many comments: linear time (the old replace-from-start loop was quadratic).
+        let hostile = "/*a*/".repeat(400_000);
+        let t = std::time::Instant::now();
+        assert_eq!(strip_css_comments(&hostile).len(), 400_000);
+        assert!(t.elapsed() < std::time::Duration::from_secs(2), "{:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        assert_eq!(html_to_text(&format!("<style>{hostile}</style><p>ok</p>")), "ok");
+        assert!(t.elapsed() < std::time::Duration::from_secs(5), "{:?}", t.elapsed());
+        // Rules beyond the per-document budget are ignored rather than processed.
+        let padded = format!("<style>{}.h{{display:none}}</style><p class=h>LATE</p>", " ".repeat(MAX_CSS_BYTES));
+        assert!(html_to_text(&padded).contains("LATE"));
     }
 }
