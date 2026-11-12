@@ -599,6 +599,9 @@ pub async fn owned_drafts(cx: &ToolCx, account_id: &str) -> Result<Vec<(String, 
 async fn list_drafts(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
     only_keys(&args, &["account", "own_only", "limit", "page_token"])?;
     let mb = account_arg(cx, &args, Capability::Read)?;
+    if mb.provider == crate::policy::Provider::Imap {
+        return super::drafts_imap::list_drafts(cx, mb, &args).await;
+    }
     let own_only = opt_bool(&args, "own_only", true)?;
     let limit = opt_u64(&args, "limit", 20, 1, 50)? as usize;
     let owned = owned_drafts(cx, &mb.account_id).await?;
@@ -695,6 +698,9 @@ async fn list_drafts(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> 
 async fn get_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
     only_keys(&args, &["account", "draft_id", "max_body_chars"])?;
     let mb = account_arg(cx, &args, Capability::Read)?;
+    if mb.provider == crate::policy::Provider::Imap {
+        return super::drafts_imap::get_draft(cx, mb, &args).await;
+    }
     let did = gmail_id_arg(&args, "draft_id")?;
     let opts = ShapeOpts {
         max_body_chars: opt_u64(&args, "max_body_chars", DEFAULT_BODY_CHARS, 1, MAX_BODY_CHARS)? as usize,

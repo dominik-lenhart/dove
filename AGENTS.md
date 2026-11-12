@@ -159,3 +159,10 @@ cargo fmt
   items (the `get_attachment` resource) go in `ToolOutput.extra`; `Remote::call_tool` keeps them in `ToolResult.content`.
   IMAP `get_thread` takes `message_id` until the index can resolve derived thread ids. `tests/support/fake_imap.rs`
   takes UTF-8 folder names while `imap_folders.name` stores the wire name (modified UTF-7).
+- 2026-11-12: IMAP drafts (`src/tools/drafts_imap.rs`): `own_drafts.message_id` is the `f<folder>-<uidvalidity>-<uid>`
+  id (also the revision), `content_hash` the SHA-256 of the bytes the server returns after `APPEND` (never Dove's own
+  bytes: servers rewrite). Ownership needs record + same Drafts folder id + UID present + hash match; anything else is
+  `draft_conflict`. The previous UID is deleted only after the new revision is recorded, never after an unknown
+  `APPEND`. `OwnDraftUid::new_for_drafts` has exactly one caller (`drafts_imap.rs`), enforced by a source scan in
+  `tests/imap_drafts_e2e.rs`; its `deletions()` helper checks every `UID STORE`/`UID EXPUNGE` in the fake's log.
+  Non-owned IMAP drafts use their message id as `draft_id`; `list_drafts` pages by UID (`page_token` = next upper bound).
