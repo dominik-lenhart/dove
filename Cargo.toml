@@ -1,0 +1,72 @@
+[package]
+name = "dove-mcp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+description = "Self-hosted mail MCP server for AI agents (Gmail, token-scoped access, encrypted search index)"
+license = "Apache-2.0"
+repository = "https://github.com/dove-mcp/dove-mcp"
+publish = false
+
+[[bin]]
+name = "dove"
+path = "src/main.rs"
+
+[lib]
+name = "dove"
+path = "src/lib.rs"
+
+[dependencies]
+# Runtime and HTTP
+tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal", "fs", "process"] }
+tokio-util = "0.7"
+futures = "0.3"
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "form", "original-uri"] }
+tower = { version = "0.5", features = ["limit", "timeout", "util"] }
+tower-http = { version = "0.7", features = ["limit"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "form", "query", "http2"] }
+
+# Storage. bundled-sqlcipher-vendored-openssl: SQLCipher + FTS5 built in, no system library needed.
+rusqlite = { version = "0.42", features = ["bundled-sqlcipher-vendored-openssl"] }
+
+# Serialization and config
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+
+# Crypto
+chacha20poly1305 = "0.11"
+hmac = "0.13"
+sha2 = "0.11"
+subtle = "2.6"
+getrandom = "0.4"
+zeroize = { version = "1.9", features = ["zeroize_derive"] }
+base64 = "0.23"
+jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
+
+# Mail
+mail-builder = "2"
+mail-parser = "1"
+scraper = "0.29"
+unicode-normalization = "0.1"
+email_address = "0.2"
+
+# CLI, logging, misc
+clap = { version = "4.6", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter", "fmt"] }
+thiserror = "2"
+anyhow = "1"
+uuid = { version = "1", features = ["v4"] }
+time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
+ipnet = "2.12"
+url = "2"
+nix = { version = "0.31", features = ["user", "resource", "fs"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = "symbols"
