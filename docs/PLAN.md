@@ -235,3 +235,10 @@ hosts or reference hardware.
   (2 s, once per 5 s per mailbox) when IDLE is not healthy and the last full sync is older than 5 s. The check never
   advances `last_success_at`, so `as_of` remains the last full sync. A scheduler wake that arrives while the account's
   job runs is kept for the next tick instead of being dropped.
+- A46. IMAP thread ids hash the root Message-ID together with the normalised subject (`mail::thread_subject`: cleaned,
+  `Re:`/`AW:`/`Fwd:`/`Re[2]:` style prefixes removed, whitespace collapsed, lower case), not the root alone (security
+  review 2026-11-12): anyone who has seen a root Message-ID could otherwise put a message into that thread for
+  `get_thread`. Same trade-off as Gmail: a reply with a changed subject starts a new thread, and a stranger who knows
+  both root and subject can still join (the root Message-ID is no secret, so stronger binding would need sender
+  checks, out of scope). Index migration V5 rebuilds every IMAP mailbox with indexed data into a fresh generation so
+  old and new ids never mix; thread ids handed out before become `not_found`.

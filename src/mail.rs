@@ -150,7 +150,14 @@ pub fn label_text(s: &str) -> String {
 }
 
 /// Derived thread id: the root of the `References` chain, else the first `In-Reply-To`, else the message's own
-/// `Message-ID`, else `message_id`; `"t"` + the first 22 characters of base64url(SHA-256).
+/// `Message-ID`, together with the normalised subject ([`thread_subject`]); without any Message-ID, `message_id`
+/// alone. `"t"` + the first 22 characters of base64url(SHA-256).
+///
+/// The subject is part of the key because anyone can send a message whose `References` name a root Message-ID they
+/// have seen (quoted in a forward, a mailing list archive): with the root alone that message would join the thread
+/// and be returned by `get_thread` as part of the conversation. Requiring the same normalised subject as well is what
+/// common clients do (Gmail threads by references and subject too); a reply that changes its subject starts a new
+/// thread, as it does there.
 pub fn imap_thread_id(parsed: &ParsedMessage, message_id: &str) -> String {
     let root = parsed
         .references
@@ -158,9 +165,40 @@ pub fn imap_thread_id(parsed: &ParsedMessage, message_id: &str) -> String {
         .or(parsed.in_reply_to.first())
         .or(parsed.message_id_header.as_ref())
         .map(|s| s.trim().trim_start_matches('<').trim_end_matches('>').to_ascii_lowercase())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| format!("dove:{message_id}"));
-    thread_hash(&root)
+        .filter(|s| !s.is_empty());
+    match root {
+        Some(root) => {
+            thread_hash(&format!("{root}\n{}", thread_subject(parsed.subject.as_deref().unwrap_or_default())))
+        }
+        None => imap_own_thread_id(message_id),
+    }
+}
+
+/// Reply and forward prefixes stripped from a subject before threading (English and the common European ones).
+const SUBJECT_PREFIXES: &[&str] =
+    &["re", "fw", "fwd", "aw", "wg", "sv", "vs", "antw", "doorst", "tr", "rif", "r", "res", "enc"];
+
+/// A subject as threading compares it: cleaned, leading reply/forward prefixes removed (`Re:`, `AW:`, `Fwd:`,
+/// `Re[2]:`, repeated), whitespace collapsed, lower case.
+pub fn thread_subject(subject: &str) -> String {
+    let cleaned = content::clean_text(subject);
+    let mut s = cleaned.trim();
+    while let Some((prefix, rest)) = s.split_once(':') {
+        let p = prefix.trim_end();
+        // `Re[2]` / `Re(2)`: a reply counter some clients add.
+        let p = match p.strip_suffix(']').and_then(|q| q.rsplit_once('[')) {
+            Some((head, n)) if n.chars().all(|c| c.is_ascii_digit()) => head,
+            _ => match p.strip_suffix(')').and_then(|q| q.rsplit_once('(')) {
+                Some((head, n)) if n.chars().all(|c| c.is_ascii_digit()) => head,
+                _ => p,
+            },
+        };
+        if !SUBJECT_PREFIXES.iter().any(|x| p.trim_end().eq_ignore_ascii_case(x)) {
+            break;
+        }
+        s = rest.trim_start();
+    }
+    s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
 }
 
 /// Thread id of an IMAP message whose headers are unknown (indexed from metadata only): a thread of its own, the
@@ -224,6 +262,36 @@ pub async fn list_labels(cx: &ToolCx, mb: &Mailbox) -> Result<Vec<Value>, ToolEr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subjects_normalise_for_threading() {
+        for s in ["Plan", "Re: Plan", "RE:re: plan", "AW: WG:  Plan ", "Fwd: Re[2]: Plan", "Antw:Plan", "re (3): plan"]
+        {
+            assert_eq!(thread_subject(s), "plan", "{s:?}");
+        }
+        assert_eq!(thread_subject("Report: Q3"), "report: q3", "only known prefixes are stripped");
+        assert_eq!(thread_subject(""), "");
+    }
+
+    fn parsed(headers: &str) -> ParsedMessage {
+        let raw = format!("From: a@example.org\r\n{headers}\r\n\r\nbody\r\n");
+        mime::parse(raw.as_bytes(), &mime::Limits::default()).unwrap()
+    }
+
+    /// The thread id needs both the root Message-ID and the normalised subject: a stranger who only knows the root
+    /// cannot join the thread.
+    #[test]
+    fn thread_id_needs_root_and_subject() {
+        let root = parsed("Message-ID: <root@x>\r\nSubject: Plan");
+        let reply = parsed("Message-ID: <r1@x>\r\nIn-Reply-To: <root@x>\r\nReferences: <root@x>\r\nSubject: Re: Plan");
+        let forged = parsed("Message-ID: <f@evil>\r\nReferences: <root@x>\r\nSubject: Urgent: new bank details");
+        let t = imap_thread_id(&root, "f1-1-1");
+        assert_eq!(imap_thread_id(&reply, "f1-1-2"), t);
+        assert_ne!(imap_thread_id(&forged, "f1-1-3"), t);
+        // Without any Message-ID a message is a thread of its own, the id metadata-only rows get.
+        let bare = parsed("Subject: Plan");
+        assert_eq!(imap_thread_id(&bare, "f1-1-4"), imap_own_thread_id("f1-1-4"));
+    }
 
     /// Labels built from server data (folder path, keywords) are one line without control or invisible characters,
     /// in message labels, index rows and `list_labels` alike.

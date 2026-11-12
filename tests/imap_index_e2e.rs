@@ -472,6 +472,14 @@ async fn get_thread_groups_by_references() {
         DAY0 + 120,
     );
     fx.h.imap.add_message_at(u, "INBOX", &simple("unrelated"), &[], DAY0 + 30);
+    // A stranger who knows the root Message-ID but not the subject cannot join the thread.
+    fx.h.imap.add_message_at(
+        u,
+        "INBOX",
+        &mail("Eve <eve@evil.example>", "Urgent: new bank details", "f@evil", "References: <root@x>\r\n", "forged"),
+        &[],
+        DAY0 + 90,
+    );
     fx.sync().await;
     let by_msg =
         fx.h.ok(&fx.token, "get_thread", json!({"account": "info", "message_id": fx.id("INBOX", last).await})).await;
