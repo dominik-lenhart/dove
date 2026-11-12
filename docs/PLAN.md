@@ -167,6 +167,10 @@ hosts or reference hardware.
   refilled to capacity (indistinguishable from a missing bucket), so exhausted callers keep their limit. The next
   prune runs at twice the surviving size (at least 50 000), which keeps the cost amortized when most buckets are
   active.
+- A32. A full pending-authorize map (10 000) no longer refuses everyone: the oldest request of the fullest eviction
+  group (IPv6 /48, IPv4 /24) makes room, while the per-/64 cap of 20 stays. A flood rotating /64s inside one /48
+  displaces itself; a flood from more than 10 000 distinct /48s or /24s can still displace other users' sign-ins,
+  which then only have to start again.
 - A7. Licence is a placeholder (Apache-2.0) until the owner decides (spec 13.7).
 - A16. batch_read: budgets are assigned in input order (deterministic). Items that do not fit return
   `budget_exceeded` with a smaller-request hint instead of a continuation token. The wire budget counts the

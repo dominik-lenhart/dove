@@ -82,6 +82,8 @@ struct Pending {
     attempts: u32,
     created: Instant,
     ip_bucket: String,
+    /// Coarser network of the source ([`evict_group`]), used to pick whom to evict when the map is full.
+    evict_group: String,
 }
 
 pub struct OAuthState {
@@ -212,6 +214,26 @@ pub fn ip_bucket(ip: Option<IpAddr>) -> String {
         }
         Some(IpAddr::V6(v6)) => v6.to_ipv4_mapped().map(|v4| v4.to_string()).unwrap_or_default(),
         Some(IpAddr::V4(v4)) => v4.to_string(),
+        None => String::new(),
+    }
+}
+
+/// Eviction group of a source address: IPv6 by its /48, IPv4 by its /24. Rotating /64s within one allocation stays
+/// in one group, so a flood competes with itself first.
+fn evict_group(ip: Option<IpAddr>) -> String {
+    let v4 = |v4: std::net::Ipv4Addr| {
+        let o = v4.octets();
+        format!("{}.{}.{}.0/24", o[0], o[1], o[2])
+    };
+    match ip {
+        Some(IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {
+            Some(m) => v4(m),
+            None => {
+                let s = v6.segments();
+                format!("{:x}:{:x}:{:x}::/48", s[0], s[1], s[2])
+            }
+        },
+        Some(IpAddr::V4(a)) => v4(a),
         None => String::new(),
     }
 }
@@ -475,25 +497,53 @@ async fn authorize_get(State(app): State<Arc<App>>, req: Request) -> Response {
         attempts: 0,
         created: Instant::now(),
         ip_bucket: ip_bucket(ip),
+        evict_group: evict_group(ip),
     };
     let mut resp = invitation_page(&pending, &rid, None);
     {
         let mut map = app.oauth.pending.lock().expect("lock");
-        map.retain(|_, p| p.created.elapsed() < PENDING_TTL);
-        let bucket = ip_bucket(ip);
-        if map.values().filter(|p| p.ip_bucket == bucket).count() >= MAX_PENDING_PER_IP {
+        if !insert_pending(&mut map, rid, pending, MAX_PENDING, MAX_PENDING_PER_IP) {
             return error_page(StatusCode::TOO_MANY_REQUESTS, "Too many open sign-in requests. Try again later.");
         }
-        if map.len() >= MAX_PENDING {
-            return error_page(StatusCode::SERVICE_UNAVAILABLE, "Too many open sign-in requests. Try again later.");
-        }
-        map.insert(rid, pending);
     }
     let cookie = format!("{CSRF_COOKIE}={binding}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=600");
     if let Ok(v) = HeaderValue::from_str(&cookie) {
         resp.headers_mut().insert(header::SET_COOKIE, v);
     }
     resp
+}
+
+/// Stores a new pending request: at most `per_bucket` per source bucket (false when that is reached). When the map
+/// holds `max` requests, the oldest request of the fullest eviction group (/48 or /24) makes room, so a flood from
+/// rotating addresses evicts its own requests before a normal user's single one, and nobody gets a global refusal.
+fn insert_pending(
+    map: &mut HashMap<String, Pending>,
+    rid: String,
+    pending: Pending,
+    max: usize,
+    per_bucket: usize,
+) -> bool {
+    map.retain(|_, p| p.created.elapsed() < PENDING_TTL);
+    if map.values().filter(|p| p.ip_bucket == pending.ip_bucket).count() >= per_bucket {
+        return false;
+    }
+    if map.len() >= max {
+        let mut groups: HashMap<&str, usize> = HashMap::new();
+        for p in map.values() {
+            *groups.entry(p.evict_group.as_str()).or_default() += 1;
+        }
+        let fullest = groups.values().copied().max().unwrap_or(0);
+        let victim = map
+            .iter()
+            .filter(|(_, p)| groups.get(p.evict_group.as_str()) == Some(&fullest))
+            .min_by_key(|(_, p)| p.created)
+            .map(|(rid, _)| rid.clone());
+        if let Some(v) = victim {
+            map.remove(&v);
+        }
+    }
+    map.insert(rid, pending);
+    true
 }
 
 /// POST `/oauth/dove/authorize`: invitation check (step 1) and approval (step 2). CSRF: the form token must match
@@ -1236,6 +1286,68 @@ mod tests {
         assert_ne!(ip_bucket(a), ip_bucket(c));
         assert_eq!(ip_bucket(Some("::ffff:10.0.0.1".parse().unwrap())), "10.0.0.1");
         assert_eq!(ip_bucket(Some("10.0.0.1".parse().unwrap())), "10.0.0.1");
+    }
+
+    fn pending(ip: &str, age_secs: u64) -> Pending {
+        let ip = Some(ip.parse().unwrap());
+        Pending {
+            app: OAuthApp {
+                client_id: "dcr-x".into(),
+                client_name: "x".into(),
+                redirect_uris: vec![],
+                secret: None,
+                dynamic: true,
+            },
+            redirect_uri: String::new(),
+            state: None,
+            code_challenge: String::new(),
+            resource: String::new(),
+            csrf: String::new(),
+            binding: String::new(),
+            invitation_id: None,
+            attempts: 0,
+            created: Instant::now() - Duration::from_secs(age_secs),
+            ip_bucket: ip_bucket(ip),
+            evict_group: evict_group(ip),
+        }
+    }
+
+    #[test]
+    fn full_pending_map_evicts_from_the_fullest_group() {
+        let mut map = HashMap::new();
+        // The user's request is the oldest of all, so "evict the oldest" would hit it.
+        assert!(insert_pending(&mut map, "user".into(), pending("198.51.100.7", 300), 6, 3));
+        for i in 0..3 {
+            assert!(insert_pending(&mut map, format!("a{i}"), pending("2001:db8:a:1::1", 200 - i), 6, 3));
+        }
+        assert!(!insert_pending(&mut map, "a3".into(), pending("2001:db8:a:1::2", 0), 6, 3), "per-/64 cap");
+        assert!(insert_pending(&mut map, "b0".into(), pending("2001:db8:b:1::1", 100), 6, 3));
+        assert!(insert_pending(&mut map, "b1".into(), pending("2001:db8:b:1::2", 90), 6, 3));
+        assert_eq!(map.len(), 6);
+        // Full: a new address gets in, and the oldest request of the fullest group ("a0") makes room.
+        assert!(insert_pending(&mut map, "c0".into(), pending("2001:db8:c:1::1", 0), 6, 3));
+        assert_eq!(map.len(), 6);
+        assert!(!map.contains_key("a0") && map.contains_key("a1"));
+        // A long flood rotating /64s inside one /48 never reaches the user's single request.
+        for i in 0..50u16 {
+            let ip = format!("2001:db8:f:{i:x}::1");
+            assert!(insert_pending(&mut map, format!("f{i}"), pending(&ip, 0), 6, 3), "{ip}");
+            assert!(map.len() <= 6);
+        }
+        assert!(map.contains_key("user"), "a normal user's request survives the flood");
+        // Expired requests are dropped first.
+        map.insert("old".into(), pending("192.0.2.1", PENDING_TTL.as_secs() + 1));
+        assert!(insert_pending(&mut map, "new".into(), pending("192.0.2.1", 0), 6, 1));
+        assert!(!map.contains_key("old"));
+    }
+
+    #[test]
+    fn eviction_groups() {
+        let g = |s: &str| evict_group(Some(s.parse().unwrap()));
+        assert_eq!(g("2001:db8:1:2::1"), g("2001:db8:1:ffff::9"));
+        assert_ne!(g("2001:db8:1::1"), g("2001:db8:2::1"));
+        assert_eq!(g("198.51.100.7"), "198.51.100.0/24");
+        assert_eq!(g("::ffff:198.51.100.9"), "198.51.100.0/24");
     }
 
     #[test]
