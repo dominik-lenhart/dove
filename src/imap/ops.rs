@@ -32,6 +32,8 @@ pub const IMAP_VERBS: &[&str] = &[
     "NOOP",
     "LOGOUT",
     "ENABLE",
+    "IDLE",
+    "DONE",
 ];
 
 /// Command verbs Dove's SMTP client may send.
@@ -109,6 +111,10 @@ pub(crate) enum ImapOp<'a> {
     Noop,
     Logout,
     EnableQresync,
+    /// `IDLE` (RFC 2177) on the selected folder; only the dedicated push connection sends it.
+    Idle,
+    /// Ends `IDLE`. Sent untagged, as a bare continuation line.
+    Done,
 }
 
 /// A mailbox name as an IMAP astring: quoted when printable ASCII, else a literal.
@@ -233,6 +239,8 @@ impl<'a> ImapOp<'a> {
             ImapOp::Noop => ("NOOP", vec![text("NOOP")]),
             ImapOp::Logout => ("LOGOUT", vec![text("LOGOUT")]),
             ImapOp::EnableQresync => ("ENABLE", vec![text("ENABLE QRESYNC")]),
+            ImapOp::Idle => ("IDLE", vec![text("IDLE")]),
+            ImapOp::Done => ("DONE", vec![text("DONE")]),
         };
         Command { verb, parts }
     }
@@ -336,9 +344,11 @@ mod tests {
             ImapOp::Noop => 16,
             ImapOp::Logout => 17,
             ImapOp::EnableQresync => 18,
+            ImapOp::Idle => 19,
+            ImapOp::Done => 20,
         }
     }
-    const VARIANTS: usize = 19;
+    const VARIANTS: usize = 21;
 
     fn wire(c: &Command<'_>) -> String {
         c.parts
@@ -377,6 +387,8 @@ mod tests {
             ImapOp::Noop,
             ImapOp::Logout,
             ImapOp::EnableQresync,
+            ImapOp::Idle,
+            ImapOp::Done,
         ];
         let mut seen = vec![false; VARIANTS];
         for op in &samples {
@@ -393,6 +405,10 @@ mod tests {
             }
             if c.verb == "UID STORE" {
                 assert!(line.ends_with("+FLAGS.SILENT (\\Deleted)"), "{line}");
+            }
+            if matches!(c.verb, "IDLE" | "DONE") {
+                // Exactly the bare verb: nothing else can ride on the push connection.
+                assert_eq!(line, c.verb);
             }
             // Passwords are never part of the command text.
             assert!(!line.contains("p\"a"), "{line}");

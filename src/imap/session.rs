@@ -374,6 +374,58 @@ pub struct ImapSession {
     sent: Option<String>,
     selected: Option<(String, bool, FolderStatus)>,
     qresync: bool,
+    /// Set while an `IDLE` command is in progress (between [`ImapSession::idle_start`] and its completion).
+    idle: Option<IdleState>,
+}
+
+/// What arrived on an idling connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdleEvent {
+    /// `EXISTS`, `EXPUNGE`, `FETCH` or `VANISHED`: the selected folder changed.
+    Changed,
+    /// Any other untagged response (`RECENT`, `OK` keep-alives, stray continuations).
+    Other,
+    /// The `IDLE` command completed (after `DONE`, or because the server ended it).
+    Ended,
+}
+
+/// Read state of an `IDLE` command, kept across calls so a dropped [`ImapSession::idle_next`] loses nothing.
+struct IdleState {
+    tag: String,
+    /// Bytes of the current, unfinished line.
+    line: Vec<u8>,
+    /// Literal bytes still to skip (a literal inside an untagged response).
+    skip: usize,
+    /// Classification of a response whose first line announced a literal (its continuation lines follow).
+    cont: Option<IdleEvent>,
+}
+
+/// Classifies the first line of one response read while idling.
+fn idle_class(line: &[u8], tag: &str) -> Result<IdleEvent, ImapError> {
+    let up = line.to_ascii_uppercase();
+    let mut w = up.split(|b| *b == b' ').filter(|p| !p.is_empty());
+    let head = w.next().unwrap_or_default();
+    if head == b"*" {
+        let (a, b) = (w.next().unwrap_or_default(), w.next().unwrap_or_default());
+        if a == b"BYE" {
+            return Err(ImapError::Network);
+        }
+        let numbered = !a.is_empty() && a.iter().all(u8::is_ascii_digit);
+        if a == b"VANISHED" || (numbered && matches!(b, b"EXISTS" | b"EXPUNGE" | b"FETCH")) {
+            return Ok(IdleEvent::Changed);
+        }
+        return Ok(IdleEvent::Other);
+    }
+    if head.starts_with(b"+") {
+        return Ok(IdleEvent::Other);
+    }
+    if head == tag.to_ascii_uppercase().as_bytes() {
+        return match w.next().unwrap_or_default() {
+            b"OK" => Ok(IdleEvent::Ended),
+            _ => Err(ImapError::Protocol("IDLE refused")),
+        };
+    }
+    Err(ImapError::Protocol("response for an unknown tag"))
 }
 
 impl std::fmt::Debug for ImapSession {
@@ -470,6 +522,7 @@ impl ImapSession {
             sent: None,
             selected: None,
             qresync: false,
+            idle: None,
         };
         if connector.is_plaintext() || ep.tls == TlsMode::Implicit {
             Self::expect_greeting(&mut s.io, timeout).await?;
@@ -636,6 +689,10 @@ impl ImapSession {
             _ => MAX_LINE,
         };
         let fail = |err| ExecError { err, sent_all: false };
+        if self.idle.is_some() {
+            // Only DONE may follow IDLE (`idle_done`); anything else would be read as the end of IDLE.
+            return Err(fail(ImapError::Protocol("session is idling")));
+        }
         self.tag += 1;
         let tag = format!("d{}", self.tag);
         let cmd = op.render();
@@ -1039,6 +1096,120 @@ impl ImapSession {
         Ok(())
     }
 
+    // ------------------------------------------------------------------ IDLE (RFC 2177)
+
+    /// Starts `IDLE` on the selected folder. Returns whether change notifications arrived before the server accepted
+    /// it. A server without the capability, or one that refuses the command, is [`ImapError::Capability`].
+    pub async fn idle_start(&mut self) -> Result<bool, ImapError> {
+        self.selected()?;
+        if !self.has_cap("IDLE") {
+            return Err(ImapError::Capability("IDLE"));
+        }
+        if self.idle.is_some() {
+            return Err(ImapError::Protocol("session is idling"));
+        }
+        let cmd = ImapOp::Idle.render();
+        if !IMAP_VERBS.contains(&cmd.verb) {
+            return Err(ImapError::Protocol("command not allowlisted"));
+        }
+        self.tag += 1;
+        let tag = format!("d{}", self.tag);
+        self.write(format!("{tag} {}\r\n", cmd.text()).as_bytes()).await?;
+        let mut untagged = Vec::new();
+        let mut budget = SMALL_LITERAL + MAX_LINE + COMMAND_OVERHEAD;
+        if self.await_continuation(&tag, &mut untagged, &mut budget).await?.is_some() {
+            return Err(ImapError::Capability("IDLE"));
+        }
+        let changed = untagged.iter().any(|Untagged(t)| {
+            let a = t.first().and_then(Tok::atom).unwrap_or_default();
+            let b = t.get(1).and_then(Tok::atom).unwrap_or_default();
+            a.eq_ignore_ascii_case("VANISHED")
+                || ["EXISTS", "EXPUNGE", "FETCH"].iter().any(|k| b.eq_ignore_ascii_case(k))
+        });
+        self.idle = Some(IdleState { tag, line: Vec::new(), skip: 0, cont: None });
+        Ok(changed)
+    }
+
+    /// Whether an `IDLE` command is in progress.
+    pub fn is_idling(&self) -> bool {
+        self.idle.is_some()
+    }
+
+    /// Waits for the next response while idling. No timeout: the caller bounds the wait (renewal timer). Cancel-safe:
+    /// a dropped call keeps the partial line, so it can be used in `select!`. [`IdleEvent::Ended`] means the command
+    /// completed (the session is usable again); a `BYE` or a closed connection is [`ImapError::Network`].
+    pub async fn idle_next(&mut self) -> Result<IdleEvent, ImapError> {
+        let Self { io, idle, .. } = self;
+        let st = idle.as_mut().ok_or(ImapError::Protocol("session is not idling"))?;
+        loop {
+            let buf = io.fill_buf().await.map_err(|_| ImapError::Network)?;
+            if buf.is_empty() {
+                return Err(ImapError::Network);
+            }
+            if st.skip > 0 {
+                let n = buf.len().min(st.skip);
+                io.consume(n);
+                st.skip -= n;
+                continue;
+            }
+            let (take, complete) = match buf.iter().position(|b| *b == b'\n') {
+                Some(i) => (i + 1, true),
+                None => (buf.len(), false),
+            };
+            if st.line.len() + take > MAX_LINE {
+                return Err(ImapError::Protocol("response line too long"));
+            }
+            st.line.extend_from_slice(&buf[..take]);
+            io.consume(take);
+            if !complete {
+                continue;
+            }
+            let mut line = std::mem::take(&mut st.line);
+            while line.last().is_some_and(|b| *b == b'\n' || *b == b'\r') {
+                line.pop();
+            }
+            let ev = match st.cont.take() {
+                Some(ev) => ev,
+                None => idle_class(&line, &st.tag)?,
+            };
+            if let Some(n) = literal_len(&line) {
+                if n > SMALL_LITERAL {
+                    return Err(ImapError::Protocol("response literal over the size limit"));
+                }
+                st.skip = n;
+                st.cont = Some(ev);
+                continue;
+            }
+            if ev == IdleEvent::Ended {
+                *idle = None;
+            }
+            return Ok(ev);
+        }
+    }
+
+    /// Ends `IDLE` with `DONE` and reads up to its completion. Returns whether change notifications arrived meanwhile.
+    /// A no-op when the server already ended the command.
+    pub async fn idle_done(&mut self) -> Result<bool, ImapError> {
+        if self.idle.is_none() {
+            return Ok(false);
+        }
+        let cmd = ImapOp::Done.render();
+        if !IMAP_VERBS.contains(&cmd.verb) {
+            return Err(ImapError::Protocol("command not allowlisted"));
+        }
+        self.write(format!("{}\r\n", cmd.text()).as_bytes()).await?;
+        let mut changed = false;
+        loop {
+            match tokio::time::timeout(self.timeout, self.idle_next()).await {
+                Ok(Ok(IdleEvent::Changed)) => changed = true,
+                Ok(Ok(IdleEvent::Other)) => {}
+                Ok(Ok(IdleEvent::Ended)) => return Ok(changed),
+                Ok(Err(e)) => return Err(e),
+                Err(_) => return Err(ImapError::Network),
+            }
+        }
+    }
+
     /// Polite close. Errors are irrelevant: the connection is dropped either way.
     pub async fn logout(mut self) {
         let _ = self.exec(ImapOp::Logout, SMALL_LITERAL).await;
@@ -1108,6 +1279,7 @@ mod tests {
             sent: None,
             selected: None,
             qresync: false,
+            idle: None,
         }
     }
 
@@ -1131,6 +1303,57 @@ mod tests {
         });
         assert_eq!(s.noop().await.unwrap_err(), ImapError::Protocol("response literal over the size limit"));
         feeder.abort();
+    }
+
+    /// IDLE reads survive dropped calls (partial lines are kept), skip literals inside untagged responses, classify
+    /// change notifications, and end on the tagged completion after DONE. Nothing but `IDLE` and `DONE` is sent.
+    #[tokio::test]
+    async fn idle_is_cancel_safe_and_classifies_responses() {
+        let (client, server) = tokio::io::duplex(1 << 16);
+        let mut s = over_stream(client);
+        s.caps = vec!["IMAP4REV1".into(), "IDLE".into()];
+        s.selected = Some(("INBOX".into(), true, FolderStatus { uidvalidity: 1, ..Default::default() }));
+        let (mut sr, mut sw) = tokio::io::split(server);
+        let mut got = Vec::new();
+        let mut buf = [0u8; 64];
+        sw.write_all(b"* 2 RECENT\r\n+ idling\r\n").await.unwrap();
+        assert!(!s.idle_start().await.unwrap());
+        let n = sr.read(&mut buf).await.unwrap();
+        got.extend_from_slice(&buf[..n]);
+        assert!(s.is_idling());
+        // Half a line, then a dropped read: the bytes must not be lost.
+        sw.write_all(b"* 3 EXI").await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(50), s.idle_next()).await.is_err());
+        sw.write_all(b"STS\r\n* OK still here\r\n* 1 FETCH (UID 2 X {5}\r\nab)cd)\r\n* VANISHED 7\r\n").await.unwrap();
+        assert_eq!(s.idle_next().await.unwrap(), IdleEvent::Changed);
+        assert_eq!(s.idle_next().await.unwrap(), IdleEvent::Other);
+        assert_eq!(s.idle_next().await.unwrap(), IdleEvent::Changed);
+        assert_eq!(s.idle_next().await.unwrap(), IdleEvent::Changed);
+        // Other commands are refused while idling.
+        assert_eq!(s.noop().await.unwrap_err(), ImapError::Protocol("session is idling"));
+        sw.write_all(b"* 4 EXISTS\r\nd1 OK idle done\r\n").await.unwrap();
+        assert!(s.idle_done().await.unwrap());
+        assert!(!s.is_idling());
+        let n = sr.read(&mut buf).await.unwrap();
+        got.extend_from_slice(&buf[..n]);
+        assert_eq!(String::from_utf8_lossy(&got), "d1 IDLE\r\nDONE\r\n");
+        // A BYE while idling is a lost connection.
+        sw.write_all(b"+ idling\r\n* BYE shutting down\r\n").await.unwrap();
+        s.idle_start().await.unwrap();
+        assert_eq!(s.idle_next().await.unwrap_err(), ImapError::Network);
+    }
+
+    #[tokio::test]
+    async fn idle_refused_or_missing_is_a_capability_error() {
+        let (client, server) = tokio::io::duplex(1 << 16);
+        let mut s = over_stream(client);
+        s.selected = Some(("INBOX".into(), true, FolderStatus { uidvalidity: 1, ..Default::default() }));
+        assert_eq!(s.idle_start().await.unwrap_err(), ImapError::Capability("IDLE"));
+        s.caps = vec!["IDLE".into()];
+        let (_sr, mut sw) = tokio::io::split(server);
+        sw.write_all(b"d1 BAD unknown command\r\n").await.unwrap();
+        assert_eq!(s.idle_start().await.unwrap_err(), ImapError::Capability("IDLE"));
+        assert!(!s.is_idling());
     }
 
     #[test]

@@ -29,7 +29,8 @@ pub use ids::ImapMsgId;
 pub use ops::AppendFlag;
 pub use pool::ImapPool;
 pub use session::{
-    AppendTarget, AppendUid, Changes, FetchedMeta, FolderInfo, FolderStatus, ImapSession, OwnDraftUid, Special,
+    AppendTarget, AppendUid, Changes, FetchedMeta, FolderInfo, FolderStatus, IdleEvent, ImapSession, OwnDraftUid,
+    Special,
 };
 pub use smtp::SmtpError;
 
