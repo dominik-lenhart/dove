@@ -32,7 +32,7 @@ hosts or reference hardware.
    - [ ] Typed query compiler -> parameterized SQL, coverage reporting (5.3, AC17, AC20)
 4. Contracts
    - [ ] Projections, keyset cursors (15 min TTL, bounded), count_only, live Gmail route
-   - [ ] batch_read with budgets (AC21)
+   - [~] batch_read with budgets (AC21; `tests/batch_e2e.rs`; search items run once search_messages lands)
    - [x] send_draft behind instance gate + send grant + ownership, at-most-once (6.3, AC3; `tests/send_e2e.rs`)
    - [ ] Client onboarding: invitations, `dove login`, remote CLI commands, `mcp install`, `mcp stdio` (5.6, AC22)
    - [ ] Downstream OAuth AS for ChatGPT/Claude (5.6, AC23)
@@ -63,3 +63,7 @@ hosts or reference hardware.
 - A9. Admin actions are audited in the same transaction as their state change; failed actions get a separate
   `error` record, so every admin request yields exactly one record.
 - A7. Licence is a placeholder (Apache-2.0) until the owner decides (spec 13.7).
+- A10. batch_read: budgets are assigned in input order (deterministic). Items that do not fit return
+  `budget_exceeded` with a smaller-request hint instead of a continuation token. The wire budget counts the
+  structured result plus the text rendering. Legacy text-only clients get the structured result serialized as
+  compact JSON (spec 5.3); mail content stays in its own JSON fields there instead of the text envelope.

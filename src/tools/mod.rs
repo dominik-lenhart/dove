@@ -1,5 +1,6 @@
 //! MCP tool registry, shared argument handling and message shaping (spec 5.3, 6.5).
 
+pub mod batch;
 pub mod drafts;
 pub mod read;
 pub mod search;
@@ -61,6 +62,7 @@ pub fn registry() -> Vec<ToolDef> {
     let mut v = Vec::new();
     v.extend(read::defs());
     v.extend(search::defs());
+    v.extend(batch::defs());
     v.extend(drafts::defs());
     v
 }
