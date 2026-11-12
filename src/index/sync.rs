@@ -230,6 +230,9 @@ pub async fn sync_account(app: &Arc<App>, account_id: &str) -> anyhow::Result<Sy
 /// Like [`sync_account`] but stops after `max_steps` units of work (capture, one list page, one fetch batch,
 /// reconcile + publish, one incremental pass). Lets tests observe a backfill or rebuild in progress.
 pub async fn sync_steps(app: &Arc<App>, account_id: &str, max_steps: usize) -> anyhow::Result<SyncReport> {
+    // The cancel token is taken before the lock: a disable or rebuild that lands while this job waits for the lock
+    // or checks readiness cancels this token, never a fresh one the job would only pick up afterwards.
+    let cancel = app.index.cancel_token(account_id);
     let lock = app.index.lock_for(account_id);
     let _guard = lock.lock().await;
     let mut report = SyncReport::default();
@@ -237,7 +240,6 @@ pub async fn sync_steps(app: &Arc<App>, account_id: &str, max_steps: usize) -> a
         report.skipped_inactive = true;
         return Ok(report);
     }
-    let cancel = app.index.cancel_token(account_id);
     let aid = account_id.to_string();
     let Some(st) = app.index.write(move |c| load_state(c, &aid)).await? else {
         return Ok(report);
@@ -911,6 +913,32 @@ mod tests {
 
     async fn rows(env: &TestEnv) -> i64 {
         env.app.index.write(|c| Ok(c.query_row("SELECT count(*) FROM messages", [], |r| r.get(0))?)).await.unwrap()
+    }
+
+    /// A disable that lands after a job passed its readiness check (here: while it waits for the account lock) cancels
+    /// that job: it stops without a Gmail call instead of backfilling a mailbox that is being purged.
+    #[tokio::test]
+    async fn cancel_while_waiting_for_the_lock_stops_the_job() {
+        // Nothing listens on the discard port, so a job that wrongly runs fails fast instead of reaching Google.
+        let env = TestEnv::with_upstream(crate::gmail::gateway::Upstream::single_origin("http://127.0.0.1:9"), |_| {});
+        let aid = enabled_account(&env, "info").await;
+        let lock = env.app.index.lock_for(&aid);
+        let guard = lock.lock().await;
+        let (app, a) = (env.app.clone(), aid.clone());
+        let job = tokio::spawn(async move { sync_steps(&app, &a, usize::MAX).await });
+        // Wait until the job holds its cancel token and blocks on the lock.
+        for _ in 0..10_000 {
+            if env.app.index.cancels.lock().unwrap().contains_key(&aid) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        env.app.index.cancel(&aid);
+        drop(guard);
+        let r = job.await.unwrap().unwrap();
+        assert!(r.fenced, "{r:?}");
+        assert_eq!(r.steps, 0, "{r:?}");
+        assert_eq!(env.app.google.gateway().calls.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
     /// The fence alone (without cancellation or the account lock) stops a job that outlived a rebuild or purge.
