@@ -556,6 +556,26 @@ async fn dynamic_registration_has_no_authority_and_is_bounded() {
 }
 
 #[tokio::test]
+async fn authorize_requests_are_bounded_per_ip() {
+    let o = Oauth::with(|c| c.oauth.token_requests_per_minute = 1000).await;
+    let client_id = o.register(REDIRECT).await;
+    let chal = challenge(&verifier());
+    let mut statuses = vec![];
+    for _ in 0..22 {
+        statuses.push(o.authorize_get(&Oauth::params(&client_id, &chal)).await.status().as_u16());
+    }
+    assert_eq!(&statuses[..20], &[200; 20]);
+    assert_eq!(&statuses[20..], &[429, 429], "open requests per IP are capped");
+    let o = Oauth::with(|c| c.oauth.token_requests_per_minute = 3).await;
+    let client_id = o.register(REDIRECT).await;
+    let mut statuses = vec![];
+    for _ in 0..4 {
+        statuses.push(o.authorize_get(&Oauth::params(&client_id, &chal)).await.status().as_u16());
+    }
+    assert_eq!(statuses, [200, 200, 200, 429], "authorize is rate-limited per IP");
+}
+
+#[tokio::test]
 async fn preregistered_confidential_client() {
     let dir = tempfile::tempdir().unwrap();
     let secret_file = dir.path().join("oauth_secret");

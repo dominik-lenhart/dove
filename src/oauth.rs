@@ -39,7 +39,9 @@ pub const AUTHORIZE_PATH: &str = "/oauth/dove/authorize";
 pub const SCOPE: &str = "mail";
 const CSRF_COOKIE: &str = "__Host-dove_authz";
 const PENDING_TTL: Duration = Duration::from_secs(600);
-const MAX_PENDING: usize = 1000;
+const MAX_PENDING: usize = 10_000;
+/// Open sign-in requests per source IP, so one client cannot crowd out everyone else.
+const MAX_PENDING_PER_IP: usize = 20;
 const MAX_INVITATION_ATTEMPTS: u32 = 5;
 const DCR_STALE_SECS: i64 = 86_400;
 
@@ -79,6 +81,7 @@ struct Pending {
     invitation_id: Option<String>,
     attempts: u32,
     created: Instant,
+    ip: Option<IpAddr>,
 }
 
 pub struct OAuthState {
@@ -397,6 +400,11 @@ fn approval_page(p: &Pending, rid: &str, inv: &invite::Invitation, error: Option
 
 /// GET `/oauth/dove/authorize`: validates the request and shows the invitation form.
 async fn authorize_get(State(app): State<Arc<App>>, req: Request) -> Response {
+    let ip = peer_ip(&req);
+    let limit = app.cfg.oauth.token_requests_per_minute;
+    if app.rate_limiter.check(&ip_key("authorize", ip), limit, limit).is_some() {
+        return error_page(StatusCode::TOO_MANY_REQUESTS, "Too many sign-in requests. Wait a minute and try again.");
+    }
     let headers = req.headers().clone();
     let query = req.uri().query().unwrap_or("").to_string();
     let Some(q) = parse_params(query.as_bytes()) else {
@@ -453,11 +461,15 @@ async fn authorize_get(State(app): State<Arc<App>>, req: Request) -> Response {
         invitation_id: None,
         attempts: 0,
         created: Instant::now(),
+        ip,
     };
     let mut resp = invitation_page(&pending, &rid, None);
     {
         let mut map = app.oauth.pending.lock().expect("lock");
         map.retain(|_, p| p.created.elapsed() < PENDING_TTL);
+        if map.values().filter(|p| p.ip == ip).count() >= MAX_PENDING_PER_IP {
+            return error_page(StatusCode::TOO_MANY_REQUESTS, "Too many open sign-in requests. Try again later.");
+        }
         if map.len() >= MAX_PENDING {
             return error_page(StatusCode::SERVICE_UNAVAILABLE, "Too many open sign-in requests. Try again later.");
         }

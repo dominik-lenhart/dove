@@ -52,7 +52,7 @@ pub struct OAuthConfig {
     pub registrations_per_hour: u32,
     /// Per source IP, for `/connect/redeem` and invitation checks on the approval page.
     pub redeem_per_minute: u32,
-    /// Per source IP, for the token and revocation endpoints.
+    /// Per source IP, for the token, revocation and authorize endpoints.
     pub token_requests_per_minute: u32,
     /// Pre-registered applications (alternative to dynamic registration).
     pub clients: Vec<PreregisteredClient>,

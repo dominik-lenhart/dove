@@ -84,7 +84,8 @@ hosts or reference hardware.
   and all its tokens (and bumps `auth_epoch`). There is no grace window, so a host that refreshes twice in
   parallel loses the connection and needs a new invitation. Rotation also retires older access tokens.
 - A14. Approval-page state (pending requests, CSRF token, browser-binding cookie `__Host-dove_authz`) lives in
-  memory, bounded to 1000 requests for 10 minutes. A restart only makes the user start the sign-in again.
+  memory, bounded to 10 000 requests (20 per source IP, GET rate-limited per IP) for 10 minutes. A restart only
+  makes the user start the sign-in again.
 - A15. Dynamic registration accepts public clients only (`token_endpoint_auth_method = none`), 1-5 redirect URIs,
   HTTPS or loopback HTTP; custom schemes and Client ID Metadata Documents are unsupported and fail explicitly.
   Registrations are capped (`oauth.max_dynamic_clients`, unused ones pruned after 24 h) and limited per IP per
