@@ -1,7 +1,8 @@
 //! Bounded in-memory search cursors (spec 5.3, 8.1a).
 //!
 //! A cursor is an opaque random id; its state never leaves the process. Limits: 15 minute TTL, at most 1,000 live
-//! cursors and 8 MiB of payload together. Expired, evicted, foreign or invalidated cursors all yield
+//! cursors and 8 MiB of payload together, and at most 100 live cursors per client (a client over its share evicts its
+//! own oldest cursor, never another client's). Expired, evicted, foreign or invalidated cursors all yield
 //! `cursor_invalid`. Purge, rebuild and generation cutover invalidate every cursor that covers the account.
 
 use std::collections::{HashMap, VecDeque};
@@ -14,6 +15,7 @@ use crate::util;
 pub const TTL: Duration = Duration::from_secs(15 * 60);
 pub const MAX_CURSORS: usize = 1000;
 pub const MAX_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_PER_CLIENT: usize = 100;
 
 #[derive(Debug, Clone)]
 pub struct Cursor {
@@ -103,12 +105,15 @@ struct Limits {
     ttl: Duration,
     max_count: usize,
     max_bytes: usize,
+    per_client: usize,
 }
 
 struct Inner {
     map: HashMap<String, Entry>,
     order: VecDeque<String>,
     bytes: usize,
+    /// Live cursors per client id.
+    per_client: HashMap<String, usize>,
     limits: Limits,
 }
 
@@ -123,7 +128,8 @@ impl Default for CursorStore {
                 map: HashMap::new(),
                 order: VecDeque::new(),
                 bytes: 0,
-                limits: Limits { ttl: TTL, max_count: MAX_CURSORS, max_bytes: MAX_BYTES },
+                per_client: HashMap::new(),
+                limits: Limits { ttl: TTL, max_count: MAX_CURSORS, max_bytes: MAX_BYTES, per_client: MAX_PER_CLIENT },
             }),
         }
     }
@@ -137,14 +143,31 @@ impl Inner {
     fn remove(&mut self, id: &str) {
         if let Some(e) = self.map.remove(id) {
             self.bytes -= e.bytes;
+            if let Some(n) = self.per_client.get_mut(&e.cursor.client_id) {
+                *n -= 1;
+                if *n == 0 {
+                    self.per_client.remove(&e.cursor.client_id);
+                }
+            }
         }
     }
 
-    fn evict(&mut self, now: Instant, incoming: usize) {
+    fn evict(&mut self, now: Instant, client_id: &str, incoming: usize) {
         self.order.retain(|id| self.map.get(id).is_some_and(|e| e.expires > now));
         let expired: Vec<String> = self.map.iter().filter(|(_, e)| e.expires <= now).map(|(k, _)| k.clone()).collect();
         for id in expired {
             self.remove(&id);
+        }
+        // A client at its share makes room among its own cursors first (oldest first).
+        while self.per_client.get(client_id).copied().unwrap_or(0) + 1 > self.limits.per_client {
+            let Some(pos) =
+                self.order.iter().position(|id| self.map.get(id).is_some_and(|e| e.cursor.client_id == client_id))
+            else {
+                break;
+            };
+            if let Some(old) = self.order.remove(pos) {
+                self.remove(&old);
+            }
         }
         while (self.map.len() + 1 > self.limits.max_count || self.bytes + incoming > self.limits.max_bytes)
             && let Some(old) = self.order.pop_front()
@@ -163,10 +186,11 @@ impl CursorStore {
             return Err(ToolError::new(ErrorCode::BudgetExceeded, "the result cursor is too large; narrow the query"));
         }
         let now = Instant::now();
-        g.evict(now, bytes);
+        g.evict(now, &cursor.client_id, bytes);
         let id = format!("c_{}", util::b64url(&util::random_bytes::<18>()));
         let expires = now + g.limits.ttl;
         g.bytes += bytes;
+        *g.per_client.entry(cursor.client_id.clone()).or_default() += 1;
         g.map.insert(id.clone(), Entry { cursor, bytes, expires });
         g.order.push_back(id.clone());
         Ok(id)
@@ -216,7 +240,12 @@ impl CursorStore {
 
     /// Overrides TTL and caps (tests exercise expiry and eviction without waiting 15 minutes).
     pub fn set_limits(&self, ttl: Duration, max_count: usize, max_bytes: usize) {
-        self.inner.lock().expect("lock").limits = Limits { ttl, max_count, max_bytes };
+        self.inner.lock().expect("lock").limits = Limits { ttl, max_count, max_bytes, per_client: MAX_PER_CLIENT };
+    }
+
+    /// Overrides the per-client share (tests).
+    pub fn set_per_client_limit(&self, n: usize) {
+        self.inner.lock().expect("lock").limits.per_client = n;
     }
 }
 
@@ -276,5 +305,32 @@ mod tests {
         s.set_limits(Duration::from_millis(0), 1000, MAX_BYTES);
         let id = s.insert(live("c1", "a", 1)).unwrap();
         assert_eq!(s.get(&id, "c1", 1).unwrap_err().code, ErrorCode::CursorInvalid);
+    }
+
+    #[test]
+    fn one_client_cannot_evict_another() {
+        let s = CursorStore::default();
+        // The victim's cursors are the oldest in the store.
+        let victim: Vec<String> = (0..3).map(|_| s.insert(live("victim", "a", 1)).unwrap()).collect();
+        let first_flood = s.insert(live("flood", "b", 1)).unwrap();
+        for _ in 0..(2 * MAX_PER_CLIENT) {
+            s.insert(live("flood", "b", 1)).unwrap();
+        }
+        for id in &victim {
+            assert!(s.get(id, "victim", 1).is_ok(), "another client's flood evicted a cursor");
+        }
+        assert_eq!(s.len(), 3 + MAX_PER_CLIENT);
+        // The flooding client lost its own oldest cursors first.
+        assert_eq!(s.get(&first_flood, "flood", 1).unwrap_err().code, ErrorCode::CursorInvalid);
+
+        // The global caps still hold and still evict globally oldest-first beyond the per-client share.
+        s.set_limits(TTL, 4, MAX_BYTES);
+        s.set_per_client_limit(3);
+        let c: Vec<String> = (0..3).map(|_| s.insert(live("c", "a", 1)).unwrap()).collect();
+        assert!(s.len() <= 4);
+        assert!(c.iter().all(|id| s.get(id, "c", 1).is_ok()));
+        s.insert(live("c", "a", 1)).unwrap();
+        assert_eq!(s.get(&c[0], "c", 1).unwrap_err().code, ErrorCode::CursorInvalid, "own oldest goes first");
+        assert!(s.get(&c[1], "c", 1).is_ok());
     }
 }
