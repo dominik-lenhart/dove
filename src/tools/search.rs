@@ -487,7 +487,20 @@ fn parse_live_req(cx: &ToolCx, args: &Value) -> Result<(LivePage, Vec<Value>), T
     }
     let select = query::parse_select(args.get("select"), LIVE_SELECT, query::DEFAULT_SELECT)?;
     let names = accounts_arg(args)?;
-    let (mbs, errors) = resolve_accounts(cx, names.as_deref())?;
+    let (mbs, mut errors) = resolve_accounts(cx, names.as_deref())?;
+    // The live source is Gmail's own search; IMAP mailboxes are searched through the index only.
+    let (mbs, imap): (Vec<Mailbox>, Vec<Mailbox>) =
+        mbs.into_iter().partition(|m| m.provider == crate::policy::Provider::Gmail);
+    if !imap.is_empty() {
+        if names.is_some() {
+            return Err(ToolError::invalid(
+                "source=gmail searches Gmail mailboxes only; search IMAP mailboxes with the index (the default source)",
+            ));
+        }
+        for m in imap {
+            errors.push(json!({ "account": m.alias, "code": ErrorCode::InvalidArgument.as_str() }));
+        }
+    }
     let page = LivePage {
         gmail_query: q.to_string(),
         select,

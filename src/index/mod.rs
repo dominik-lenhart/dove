@@ -14,6 +14,7 @@
 pub mod admin;
 pub mod cursor;
 pub mod db;
+pub mod imap_sync;
 pub mod ingest;
 pub mod query;
 pub mod schema;
@@ -311,6 +312,11 @@ pub(crate) fn drop_generation_step(tx: &Connection, gen_id: i64, rows: i64, bloc
         return Ok(false);
     }
     tx.execute_batch(&format!("DROP TABLE IF EXISTS {fts};"))?;
+    // IMAP folder checkpoints (one row per folder) belong to the generation.
+    tx.execute(
+        "DELETE FROM imap_checkpoints WHERE account_id = (SELECT account_id FROM generations WHERE id = ?1) AND gen = ?1",
+        [gen_id],
+    )?;
     tx.execute("DELETE FROM generations WHERE id = ?1", [gen_id])?;
     Ok(true)
 }

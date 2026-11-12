@@ -26,7 +26,7 @@ use crate::gmail::gateway::{GmailOp, Priority};
 use crate::util;
 
 /// Messages fetched per hydrate step.
-const BATCH: usize = 16;
+pub(super) const BATCH: usize = 16;
 /// Distinct changed messages one history replay may carry before it is treated as a gap (rebuild).
 const MAX_HISTORY_IDS: usize = 100_000;
 /// Base delay for retrying a message that failed transiently.
@@ -116,17 +116,17 @@ pub struct SyncReport {
     pub error: Option<String>,
 }
 
-enum Step {
+pub(super) enum Step {
     More,
     Idle,
 }
 
 /// Job identity: account plus the fence it started with.
 #[derive(Clone)]
-struct Job {
-    app: Arc<App>,
-    account_id: String,
-    fence: i64,
+pub(super) struct Job {
+    pub(super) app: Arc<App>,
+    pub(super) account_id: String,
+    pub(super) fence: i64,
 }
 
 impl Job {
@@ -154,7 +154,7 @@ impl Job {
     }
 
     /// Runs `f` in a write transaction that first re-checks the fence.
-    async fn tx<F, T>(&self, f: F) -> anyhow::Result<T>
+    pub(super) async fn tx<F, T>(&self, f: F) -> anyhow::Result<T>
     where
         F: FnOnce(&Connection) -> anyhow::Result<T> + Send + 'static,
         T: Send + 'static,
@@ -172,7 +172,7 @@ impl Job {
             .await
     }
 
-    async fn state(&self) -> anyhow::Result<SyncState> {
+    pub(super) async fn state(&self) -> anyhow::Result<SyncState> {
         let aid = self.account_id.clone();
         let fence = self.fence;
         self.app
@@ -185,16 +185,17 @@ impl Job {
     }
 }
 
-/// Is the account active and index-enabled in the durable state store?
-async fn account_ready(app: &App, account_id: &str) -> anyhow::Result<bool> {
+/// The account's provider if it is active and index-enabled in the durable state store.
+async fn account_ready(app: &App, account_id: &str) -> anyhow::Result<Option<String>> {
     let aid = account_id.to_string();
     app.store
         .call(move |c| {
-            Ok(c.query_row("SELECT status = 'active' AND index_enabled = 1 FROM accounts WHERE id = ?1", [&aid], |r| {
-                r.get::<_, bool>(0)
-            })
-            .optional()?
-            .unwrap_or(false))
+            Ok(c.query_row(
+                "SELECT provider FROM accounts WHERE id = ?1 AND status = 'active' AND index_enabled = 1",
+                [&aid],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?)
         })
         .await
 }
@@ -215,7 +216,7 @@ fn error_code(e: &anyhow::Error) -> String {
     "internal".into()
 }
 
-fn jitter_secs(base: u64) -> i64 {
+pub(super) fn jitter_secs(base: u64) -> i64 {
     let spread = (base / 10).max(1);
     let r = u64::from(u16::from_le_bytes(util::random_bytes::<2>()));
     (r % (spread + 1)) as i64
@@ -236,10 +237,12 @@ pub async fn sync_steps(app: &Arc<App>, account_id: &str, max_steps: usize) -> a
     let lock = app.index.lock_for(account_id);
     let _guard = lock.lock().await;
     let mut report = SyncReport::default();
-    if !account_ready(app, account_id).await? {
+    let Some(provider) = account_ready(app, account_id).await? else {
         report.skipped_inactive = true;
         return Ok(report);
-    }
+    };
+    // IMAP mailboxes run their own engine (`imap_sync`) under the same lock, fence, cancellation and error rules.
+    let mut imap = (provider == "imap").then(super::imap_sync::JobState::default);
     let aid = account_id.to_string();
     let Some(st) = app.index.write(move |c| load_state(c, &aid)).await? else {
         return Ok(report);
@@ -256,7 +259,12 @@ pub async fn sync_steps(app: &Arc<App>, account_id: &str, max_steps: usize) -> a
         }
         let step = tokio::select! {
             _ = cancel.cancelled() => { report.fenced = true; break; }
-            r = one_step(&job, &mut report) => r,
+            r = async {
+                match imap.as_mut() {
+                    Some(s) => super::imap_sync::one_step(&job, s, &mut report).await,
+                    None => one_step(&job, &mut report).await,
+                }
+            } => r,
         };
         report.steps += 1;
         match step {
@@ -381,7 +389,7 @@ async fn backfill_step(job: &Job, st: &SyncState, gen_id: i64, report: &mut Sync
         }
     };
     apply_changes(job, gen_id, changes, report).await?;
-    publish(job, st, gen_id, latest).await?;
+    publish(job, st, gen_id, Some(latest), util::now_unix()).await?;
     Ok(Step::More)
 }
 
@@ -459,7 +467,7 @@ async fn list_page(job: &Job, generation: &GenRow) -> anyhow::Result<()> {
     .await
 }
 
-enum Fetched {
+pub(super) enum Fetched {
     Doc(Box<Doc>),
     Labels(GmailMeta),
     Gone,
@@ -588,7 +596,7 @@ fn retry_delay(attempts: i64) -> i64 {
 }
 
 /// Applies fetched results to a generation in one fenced transaction. Failures become retry records.
-async fn commit_results(
+pub(super) async fn commit_results(
     job: &Job,
     gen_id: i64,
     results: Vec<(String, Fetched)>,
@@ -811,8 +819,15 @@ async fn apply_changes(
     Ok(())
 }
 
-/// Cutover: the building generation becomes active at history id `latest`; a previous one is retired and deleted.
-async fn publish(job: &Job, st: &SyncState, gen_id: i64, latest: String) -> anyhow::Result<()> {
+/// Cutover: the building generation becomes active at history id `latest` (IMAP: none, its checkpoints are per
+/// folder); a previous one is retired and deleted. `as_of` is when the data was last known complete.
+pub(super) async fn publish(
+    job: &Job,
+    st: &SyncState,
+    gen_id: i64,
+    latest: Option<String>,
+    as_of: i64,
+) -> anyhow::Result<()> {
     let aid = job.account_id.clone();
     let old = st.active_gen;
     let now = util::now_unix();
@@ -827,7 +842,7 @@ async fn publish(job: &Job, st: &SyncState, gen_id: i64, latest: String) -> anyh
             "UPDATE sync_state SET active_gen = ?1, building_gen = NULL, stage = 'ready', checkpoint = ?2, \
              last_success_at = ?3, last_error = NULL, backoff_secs = 0, next_run_at = ?4, data_seq = data_seq + 1 \
              WHERE account_id = ?5",
-            params![gen_id, latest, now, next, aid],
+            params![gen_id, latest, as_of, next, aid],
         )?;
         Ok(())
     })
@@ -938,9 +953,8 @@ async fn tick(
     let enabled: HashMap<String, bool> = app
         .store
         .call(|c| {
-            // Gmail sync only: IMAP accounts are synced by their own engine, never through the Gmail API.
-            let mut st =
-                c.prepare("SELECT id, status = 'active' FROM accounts WHERE index_enabled = 1 AND provider = 'gmail'")?;
+            // Both providers; `sync_account` dispatches IMAP mailboxes to their own engine.
+            let mut st = c.prepare("SELECT id, status = 'active' FROM accounts WHERE index_enabled = 1")?;
             Ok(st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?)
         })
         .await?;

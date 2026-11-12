@@ -115,10 +115,11 @@ async fn imap_get_message_shape() {
         let e = h.call(&token, "get_message", json!({ "account": "info", "message_id": bad })).await.1;
         assert_eq!(e, unknown, "{bad}");
     }
-    // Gmail-only paths stop at the provider instead of touching the vault or Google.
+    // Gmail-only paths stop at the provider instead of touching the vault or Google (Task 4: the live Gmail source
+    // refuses a named IMAP mailbox outright).
     let (_, v) =
         h.call(&token, "search_messages", json!({ "accounts": ["info"], "source": "gmail", "gmail_query": "x" })).await;
-    assert_eq!(v["account_errors"], json!([{ "account": "info", "code": "invalid_argument" }]), "{v}");
+    assert_eq!(v["error"]["code"], "invalid_argument", "{v}");
     h.imap.set_uidvalidity(&u.user, "INBOX", 77);
     let e = h.call(&token, "get_message", json!({ "account": "info", "message_id": id })).await.1;
     assert_eq!(e, unknown);

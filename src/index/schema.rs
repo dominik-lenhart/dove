@@ -15,7 +15,7 @@ pub enum Migration {
     Code(fn(&Transaction<'_>) -> anyhow::Result<()>),
 }
 
-pub const MIGRATIONS: &[Migration] = &[Migration::Sql(V1), Migration::Sql(V2), Migration::Code(v3)];
+pub const MIGRATIONS: &[Migration] = &[Migration::Sql(V1), Migration::Sql(V2), Migration::Code(v3), Migration::Sql(V4)];
 
 /// Name of a generation's FTS table. Derived only from the integer generation id, never from input.
 pub fn fts_table(gen_id: i64) -> String {
@@ -232,6 +232,25 @@ fn v3(tx: &Transaction<'_>) -> anyhow::Result<()> {
     tx.execute_batch("DROP TABLE fts;")?;
     Ok(())
 }
+
+/// Per-folder sync checkpoints of IMAP mailboxes (design "Search and index"), one row per folder and generation:
+/// UIDVALIDITY, UIDNEXT and HIGHESTMODSEQ (CONDSTORE) as of the last completed scan of that folder. `enumerated` is 0
+/// while a (re)started folder's UIDs are not all in `pending` yet; `flag_cursor` is where the bounded flag refresh
+/// of servers without CONDSTORE continues. Rows go with their generation.
+const V4: &str = r#"
+CREATE TABLE imap_checkpoints (
+    account_id    TEXT NOT NULL,
+    gen           INTEGER NOT NULL,
+    folder_id     INTEGER NOT NULL,
+    uidvalidity   INTEGER NOT NULL,
+    uidnext       INTEGER NOT NULL,
+    highestmodseq INTEGER,
+    enumerated    INTEGER NOT NULL DEFAULT 0,
+    flag_cursor   INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (account_id, gen, folder_id)
+) WITHOUT ROWID;
+INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES ('imap_checkpoints', 'imap_checkpoints', '500 50 25 1');
+"#;
 
 /// Applies pending index migrations in one transaction each.
 pub fn migrate(conn: &mut Connection) -> anyhow::Result<()> {

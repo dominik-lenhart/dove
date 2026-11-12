@@ -93,11 +93,7 @@ async fn fetch_imap(cx: &ToolCx, mb: &Mailbox, id: &str) -> Result<Fetched, Tool
     })?;
     let parsed =
         mime::parse(&raw, &mime::Limits::default()).map_err(|_| ToolError::upstream("message could not be parsed"))?;
-    let snippet = {
-        let text = read::body_text(&parsed);
-        let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
-        Some(content::truncate_chars(&flat, SNIPPET_CHARS).0)
-    };
+    let snippet = Some(imap_snippet(&parsed));
     let meta = MessageMeta {
         id: id.to_string(),
         thread_id: imap_thread_id(&parsed, id),
@@ -107,6 +103,13 @@ async fn fetch_imap(cx: &ToolCx, mb: &Mailbox, id: &str) -> Result<Fetched, Tool
         snippet,
     };
     Ok(Fetched { meta, raw, parsed })
+}
+
+/// Snippet of an IMAP message: the start of its body text with whitespace collapsed (Gmail computes its own).
+pub fn imap_snippet(parsed: &ParsedMessage) -> String {
+    let text = read::body_text(parsed);
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    content::truncate_chars(&flat, SNIPPET_CHARS).0
 }
 
 /// Labels of an IMAP message: its folder path, Gmail-style system labels from flags and the folder's special use,
@@ -151,6 +154,16 @@ pub fn imap_thread_id(parsed: &ParsedMessage, message_id: &str) -> String {
         .map(|s| s.trim().trim_start_matches('<').trim_end_matches('>').to_ascii_lowercase())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| format!("dove:{message_id}"));
+    thread_hash(&root)
+}
+
+/// Thread id of an IMAP message whose headers are unknown (indexed from metadata only): a thread of its own, the
+/// same id [`imap_thread_id`] gives a message without any Message-ID.
+pub fn imap_own_thread_id(message_id: &str) -> String {
+    thread_hash(&format!("dove:{message_id}"))
+}
+
+fn thread_hash(root: &str) -> String {
     let h = util::b64url(&Sha256::digest(root.as_bytes()));
     format!("t{}", &h[..22])
 }
