@@ -118,3 +118,7 @@ cargo fmt
   need a private target dir per worktree (the default `<worktree>/target` is private).
 - 2026-11-12: Client tests run the binary with `env_clear()`, a temp HOME and
   `DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent/...` so the real keychain and config are never touched.
+- 2026-11-12: There is no shared `fts` table any more (index V3): each generation has `fts_g<gen>`, created by
+  `index::new_generation` and dropped only through `index::drop_generation` (bounded steps). Tests that count
+  postings must iterate the `fts5` tables in `sqlite_schema`. Never build an FTS table name from anything but the
+  integer generation id.

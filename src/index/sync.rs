@@ -388,14 +388,13 @@ async fn backfill_step(job: &Job, st: &SyncState, gen_id: i64, report: &mut Sync
 async fn restart_generation(job: &Job, old_gen: i64) -> anyhow::Result<()> {
     let aid = job.account_id.clone();
     job.tx(move |tx| {
-        super::drop_generation(tx, old_gen)?;
         let g = new_generation(tx, &aid)?;
         tx.execute("UPDATE sync_state SET building_gen = ?1 WHERE account_id = ?2", params![g, aid])?;
         Ok(())
     })
     .await?;
     job.app.index.cursors.invalidate_account(&job.account_id);
-    Ok(())
+    super::drop_generation(&job.app.index, old_gen).await
 }
 
 fn history_id_of(v: &Value) -> Option<String> {
@@ -754,18 +753,7 @@ async fn publish(job: &Job, st: &SyncState, gen_id: i64, latest: String) -> anyh
     job.app.index.cursors.invalidate_account(&job.account_id);
     if let Some(o) = old {
         // Delete the retired generation in bounded chunks so the writer is never held for long.
-        loop {
-            let n = job.tx(move |tx| super::delete_gen_chunk(tx, o, 2000)).await?;
-            if n == 0 {
-                break;
-            }
-        }
-        job.tx(move |tx| {
-            tx.execute("DELETE FROM pending WHERE gen = ?1", [o])?;
-            tx.execute("DELETE FROM generations WHERE id = ?1", [o])?;
-            Ok(())
-        })
-        .await?;
+        super::drop_generation(&job.app.index, o).await?;
     }
     Ok(())
 }
@@ -837,9 +825,21 @@ async fn incremental(job: &Job, st: &SyncState, gen_id: i64, report: &mut SyncRe
 pub async fn scheduler(app: Arc<App>) {
     let sem = Arc::new(Semaphore::new(MAX_JOBS));
     let running: Arc<std::sync::Mutex<HashSet<String>>> = Default::default();
+    let collecting = Arc::new(std::sync::atomic::AtomicBool::new(false));
     loop {
         if let Err(e) = tick(&app, &sem, &running).await {
             tracing::warn!(error = %e, "index scheduler tick failed");
+        }
+        // Unreferenced generations (interrupted purge or drop, abandoned by the V3 migration) are collected in the
+        // background in bounded transactions; one collector at a time.
+        if !collecting.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            let (app, collecting) = (app.clone(), collecting.clone());
+            tokio::spawn(async move {
+                if let Err(e) = super::collect_garbage(&app.index, None).await {
+                    tracing::warn!(error = %e, "index garbage collection failed");
+                }
+                collecting.store(false, std::sync::atomic::Ordering::Release);
+            });
         }
         tokio::select! {
             _ = app.index.wake.notified() => {}

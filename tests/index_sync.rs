@@ -366,11 +366,24 @@ fn files_contain(dir: &std::path::Path, needle: &str) -> bool {
     })
 }
 
+/// Postings for `term` across every generation's FTS table.
 async fn fts_hits(h: &Harness, term: &str) -> i64 {
     let t = format!("\"{term}\"");
     h.app()
         .index
-        .write(move |c| Ok(c.query_row("SELECT count(*) FROM fts WHERE fts MATCH ?1", [t], |r| r.get(0))?))
+        .write(move |c| {
+            let tables: Vec<String> = {
+                let mut st = c.prepare("SELECT name FROM sqlite_schema WHERE sql LIKE 'CREATE VIRTUAL TABLE%fts5%'")?;
+                st.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?
+            };
+            let mut n = 0i64;
+            for tb in tables {
+                n += c.query_row(&format!("SELECT count(*) FROM {tb} WHERE {tb} MATCH ?1"), [&t], |r| {
+                    r.get::<_, i64>(0)
+                })?;
+            }
+            Ok(n)
+        })
         .await
         .unwrap()
 }

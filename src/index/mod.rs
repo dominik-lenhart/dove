@@ -242,33 +242,114 @@ pub(crate) fn check_fence(tx: &Connection, account_id: &str, fence: i64) -> anyh
     Ok(())
 }
 
-/// Creates a building generation for an account.
+/// Creates a building generation for an account, with its own FTS table. Ids come from `gen_seq` and are never
+/// reused, so a generation's table name can never point at another generation's postings.
 pub(crate) fn new_generation(tx: &Connection, account_id: &str) -> anyhow::Result<i64> {
+    tx.execute("UPDATE meta SET value = CAST(value AS INTEGER) + 1 WHERE key = 'gen_seq'", [])?;
+    let id: i64 = tx.query_row("SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'gen_seq'", [], |r| r.get(0))?;
     tx.execute(
-        "INSERT INTO generations(account_id, state, created_at) VALUES (?1, 'building', ?2)",
-        params![account_id, util::now_unix()],
+        "INSERT INTO generations(id, account_id, state, created_at) VALUES (?1, ?2, 'building', ?3)",
+        params![id, account_id, util::now_unix()],
     )?;
-    Ok(tx.last_insert_rowid())
+    schema::create_fts(tx, id)?;
+    Ok(id)
 }
 
-/// Deletes up to `limit` derived rows of a generation (FTS postings first). Returns rows deleted.
+/// Derived rows (and retry records) deleted per transaction when a generation is dropped.
+const DROP_ROWS: i64 = 2000;
+/// FTS segment blocks deleted per transaction when a generation's FTS table is dropped.
+const DROP_FTS_BLOCKS: i64 = 256;
+
+/// Deletes up to `limit` derived rows of a generation, without FTS (the generation's table is dropped with it).
+/// Returns rows deleted.
 pub(crate) fn delete_gen_chunk(tx: &Connection, gen_id: i64, limit: i64) -> anyhow::Result<usize> {
     let ids: Vec<i64> = {
         let mut st = tx.prepare_cached("SELECT id FROM messages WHERE gen = ?1 LIMIT ?2")?;
         st.query_map(params![gen_id, limit], |r| r.get(0))?.collect::<Result<_, _>>()?
     };
     for id in &ids {
-        ingest::delete_row(tx, *id)?;
+        ingest::delete_row_meta(tx, *id)?;
     }
     Ok(ids.len())
 }
 
-/// Removes a whole generation (rows, retry records, the generation itself).
-pub(crate) fn drop_generation(tx: &Connection, gen_id: i64) -> anyhow::Result<()> {
-    while delete_gen_chunk(tx, gen_id, 10_000)? > 0 {}
-    tx.execute("DELETE FROM pending WHERE gen = ?1", [gen_id])?;
+/// One bounded step of dropping a generation that no sync state references any more: derived rows, then retry
+/// records, then the FTS segment data in chunks, and finally the (now small) FTS table and the generation row.
+/// Returns true when nothing is left to do. Each step re-checks that the generation is unreferenced, so it is safe
+/// to run concurrently with sync jobs, purges and other collectors.
+pub(crate) fn drop_generation_step(tx: &Connection, gen_id: i64, rows: i64, blocks: i64) -> anyhow::Result<bool> {
+    let live: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM generations WHERE id = ?1) \
+         AND NOT EXISTS(SELECT 1 FROM sync_state WHERE active_gen = ?1 OR building_gen = ?1)",
+        [gen_id],
+        |r| r.get(0),
+    )?;
+    if !live {
+        return Ok(true);
+    }
+    if delete_gen_chunk(tx, gen_id, rows)? > 0 {
+        return Ok(false);
+    }
+    let n = tx.execute(
+        "DELETE FROM pending WHERE gen = ?1 AND gmail_id IN (SELECT gmail_id FROM pending WHERE gen = ?1 LIMIT ?2)",
+        params![gen_id, rows],
+    )?;
+    if n > 0 {
+        return Ok(false);
+    }
+    // The postings live in the FTS table's `_data` blocks. Deleting them in chunks keeps every transaction short;
+    // the generation is unreferenced, so no new read can reach the table, and older snapshots keep their view.
+    let fts = schema::fts_table(gen_id);
+    let data = format!("{fts}_data");
+    let has_data: bool =
+        tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)", [&data], |r| {
+            r.get(0)
+        })?;
+    if has_data
+        && tx.execute(&format!("DELETE FROM {data} WHERE id IN (SELECT id FROM {data} LIMIT ?1)"), [blocks])? > 0
+    {
+        return Ok(false);
+    }
+    tx.execute_batch(&format!("DROP TABLE IF EXISTS {fts};"))?;
     tx.execute("DELETE FROM generations WHERE id = ?1", [gen_id])?;
-    Ok(())
+    Ok(true)
+}
+
+/// Drops an unreferenced generation in bounded transactions, so the writer is never held for long (spec 7.9:
+/// retired generations are deleted after cutover; purges remove rows and postings).
+pub(crate) async fn drop_generation(index: &Index, gen_id: i64) -> anyhow::Result<()> {
+    loop {
+        let done = index
+            .write(move |c| {
+                let tx = c.transaction()?;
+                let done = drop_generation_step(&tx, gen_id, DROP_ROWS, DROP_FTS_BLOCKS)?;
+                tx.commit()?;
+                Ok(done)
+            })
+            .await?;
+        if done {
+            return Ok(());
+        }
+    }
+}
+
+/// Drops every generation that no sync state references: retired after cutover, replaced by a restart or rebuild,
+/// or left by an interrupted purge. `account_id` limits it to one account. Returns how many were dropped.
+pub(crate) async fn collect_garbage(index: &Index, account_id: Option<&str>) -> anyhow::Result<usize> {
+    let aid = account_id.map(str::to_string);
+    let gens: Vec<i64> = index
+        .write(move |c| {
+            let mut st = c.prepare(
+                "SELECT id FROM generations g WHERE (?1 IS NULL OR account_id = ?1) \
+                 AND NOT EXISTS (SELECT 1 FROM sync_state s WHERE s.active_gen = g.id OR s.building_gen = g.id)",
+            )?;
+            Ok(st.query_map([aid], |r| r.get(0))?.collect::<Result<_, _>>()?)
+        })
+        .await?;
+    for g in &gens {
+        drop_generation(index, *g).await?;
+    }
+    Ok(gens.len())
 }
 
 /// Creates the sync state of a newly enabled account (idempotent). Returns true if it was created.
@@ -290,22 +371,21 @@ pub async fn ensure_state(app: &App, account_id: &str) -> anyhow::Result<bool> {
         return Ok(false);
     }
     let aid = account_id.to_string();
+    let exists = app
+        .index
+        .write(move |c| {
+            Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM sync_state WHERE account_id = ?1)", [&aid], |r| r.get(0))?)
+        })
+        .await?;
+    if exists {
+        return Ok(false);
+    }
+    // Leftovers from an interrupted purge are removed before a new generation starts.
+    collect_garbage(&app.index, Some(account_id)).await?;
+    let aid = account_id.to_string();
     app.index
         .write(move |c| {
             let tx = c.transaction()?;
-            let exists: bool =
-                tx.query_row("SELECT EXISTS(SELECT 1 FROM sync_state WHERE account_id = ?1)", [&aid], |r| r.get(0))?;
-            if exists {
-                return Ok(false);
-            }
-            // Leftovers from an interrupted purge are removed before a new generation starts.
-            let old: Vec<i64> = {
-                let mut st = tx.prepare("SELECT id FROM generations WHERE account_id = ?1")?;
-                st.query_map([&aid], |r| r.get(0))?.collect::<Result<_, _>>()?
-            };
-            for g in old {
-                drop_generation(&tx, g)?;
-            }
             let fence = next_fence(&tx)?;
             let g = new_generation(&tx, &aid)?;
             tx.execute(
@@ -334,38 +414,18 @@ async fn try_purge(app: &App, account_id: &str) -> anyhow::Result<()> {
     let lock = app.index.lock_for(account_id);
     let _guard = lock.lock().await;
     let aid = account_id.to_string();
-    let removed = app
-        .index
+    // Deleting the sync state fences every job of this account and leaves all its generations unreferenced; they
+    // are then dropped in bounded transactions (searches never wait for them, other writers interleave). If this is
+    // interrupted, the scheduler's garbage collection finishes it.
+    app.index
         .write(move |c| {
-            let tx = c.transaction()?;
-            // Deleting the sync state first fences every job of this account.
-            tx.execute("DELETE FROM sync_state WHERE account_id = ?1", [&aid])?;
-            let gens: Vec<i64> = {
-                let mut st = tx.prepare("SELECT id FROM generations WHERE account_id = ?1")?;
-                st.query_map([&aid], |r| r.get(0))?.collect::<Result<_, _>>()?
-            };
-            let n: i64 = tx.query_row("SELECT count(*) FROM messages WHERE account_id = ?1", [&aid], |r| r.get(0))?;
-            for g in gens {
-                drop_generation(&tx, g)?;
-            }
-            // Rows whose generation row is already gone (interrupted earlier purge).
-            let stray: Vec<i64> = {
-                let mut st = tx.prepare("SELECT id FROM messages WHERE account_id = ?1")?;
-                st.query_map([&aid], |r| r.get(0))?.collect::<Result<_, _>>()?
-            };
-            for id in stray {
-                ingest::delete_row(&tx, id)?;
-            }
-            tx.commit()?;
-            if n > 0 {
-                // Merge away tombstoned postings so purged terms do not linger in FTS segments.
-                c.execute("INSERT INTO fts(fts) VALUES ('optimize')", [])?;
-            }
-            Ok(n)
+            c.execute("DELETE FROM sync_state WHERE account_id = ?1", [&aid])?;
+            Ok(())
         })
         .await?;
+    let dropped = collect_garbage(&app.index, Some(account_id)).await?;
     app.index.cursors.invalidate_account(account_id);
-    tracing::info!(rows = removed, "index purged for an account");
+    tracing::info!(generations = dropped, "index purged for an account");
     Ok(())
 }
 
@@ -384,6 +444,119 @@ pub fn start(app: Arc<App>) -> tokio::task::JoinHandle<()> {
 mod tests {
     use super::*;
     use crate::testing::TestEnv;
+
+    async fn indexed_account(env: &TestEnv, n: usize) -> (String, i64) {
+        let aid = env.add_account("info", "info@example.com", "rt");
+        let a = aid.clone();
+        env.app
+            .store
+            .call(move |c| Ok(c.execute("UPDATE accounts SET index_enabled = 1 WHERE id = ?1", [&a])?))
+            .await
+            .unwrap();
+        assert!(ensure_state(&env.app, &aid).await.unwrap());
+        let a = aid.clone();
+        let g = env
+            .app
+            .index
+            .write(move |c| {
+                let g: i64 =
+                    c.query_row("SELECT building_gen FROM sync_state WHERE account_id = ?1", [&a], |r| r.get(0))?;
+                let tx = c.transaction()?;
+                for i in 0..n {
+                    let meta = ingest::GmailMeta { id: format!("m{i}"), thread_id: "t".into(), ..Default::default() };
+                    let doc = ingest::Doc { meta, body: format!("zebracanary body {i}"), ..Default::default() };
+                    ingest::upsert(&tx, g, &a, &doc)?;
+                }
+                tx.commit()?;
+                Ok(g)
+            })
+            .await
+            .unwrap();
+        (aid, g)
+    }
+
+    async fn schema_names(env: &TestEnv, like: String) -> Vec<String> {
+        env.app
+            .index
+            .write(move |c| {
+                let mut st = c.prepare("SELECT name FROM sqlite_schema WHERE name LIKE ?1")?;
+                Ok(st.query_map([like], |r| r.get(0))?.collect::<Result<_, _>>()?)
+            })
+            .await
+            .unwrap()
+    }
+
+    /// Dropping a generation is a series of bounded transactions, each re-checking that nothing references the
+    /// generation; the last one removes its FTS table with every posting.
+    #[tokio::test]
+    async fn generations_are_dropped_in_bounded_steps() {
+        let env = TestEnv::new();
+        let (aid, g) = indexed_account(&env, 7).await;
+        let fts = schema::fts_table(g);
+        assert!(schema_names(&env, fts.clone()).await.contains(&fts));
+        let step = |rows: i64, blocks: i64| {
+            env.app.index.write(move |c| {
+                let tx = c.transaction()?;
+                let done = drop_generation_step(&tx, g, rows, blocks)?;
+                tx.commit()?;
+                Ok(done)
+            })
+        };
+        // Still referenced by the sync state: nothing happens.
+        assert!(step(3, 1).await.unwrap());
+        let rows_of = |g: i64| {
+            env.app.index.write(move |c| {
+                Ok(c.query_row("SELECT count(*) FROM messages WHERE gen = ?1", [g], |r| r.get::<_, i64>(0))?)
+            })
+        };
+        assert_eq!(rows_of(g).await.unwrap(), 7);
+
+        let a = aid.clone();
+        env.app
+            .index
+            .write(move |c| Ok(c.execute("DELETE FROM sync_state WHERE account_id = ?1", [a])?))
+            .await
+            .unwrap();
+        // One step deletes at most `rows` derived rows.
+        assert!(!step(3, 1).await.unwrap());
+        assert_eq!(rows_of(g).await.unwrap(), 4);
+        let mut steps = 1;
+        while !step(3, 1).await.unwrap() {
+            steps += 1;
+            assert!(steps < 100);
+        }
+        // Rows (3 steps) plus FTS blocks one at a time: postings are deleted in chunks too.
+        assert!(steps > 3, "{steps}");
+        assert_eq!(rows_of(g).await.unwrap(), 0);
+        assert!(schema_names(&env, format!("{fts}%")).await.is_empty(), "FTS table and shadow tables dropped");
+        let gens: i64 = env
+            .app
+            .index
+            .write(|c| Ok(c.query_row("SELECT count(*) FROM generations", [], |r| r.get(0))?))
+            .await
+            .unwrap();
+        assert_eq!(gens, 0);
+    }
+
+    /// Purge drops every generation of the account with its FTS table; other accounts keep theirs.
+    #[tokio::test]
+    async fn purge_drops_the_generation_tables() {
+        let env = TestEnv::new();
+        let (aid, g) = indexed_account(&env, 3).await;
+        let other = env.add_account("other", "other@example.com", "rt");
+        let o = other.clone();
+        env.app
+            .store
+            .call(move |c| Ok(c.execute("UPDATE accounts SET index_enabled = 1 WHERE id = ?1", [&o])?))
+            .await
+            .unwrap();
+        assert!(ensure_state(&env.app, &other).await.unwrap());
+        assert_eq!(schema_names(&env, "fts_g%_data".into()).await.len(), 2);
+        purge_account(&env.app, &aid).await;
+        let left = schema_names(&env, "fts_g%_data".into()).await;
+        assert_eq!(left.len(), 1);
+        assert_ne!(left[0], format!("{}_data", schema::fts_table(g)));
+    }
 
     /// A search never waits for the writer: while a long write transaction holds the writer connection, reads
     /// still complete well within their deadline (also on the very first use of the index).

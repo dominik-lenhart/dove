@@ -161,3 +161,14 @@ hosts or reference hardware.
   `budget_exceeded` with a smaller-request hint instead of a continuation token. The wire budget counts the
   structured result plus the text rendering. Legacy text-only clients get the structured result serialized as
   compact JSON (spec 5.3); mail content stays in its own JSON fields there instead of the text envelope.
+- A40. Full-text postings live in one contentless FTS5 table per generation (`fts_g<id>`, name derived only from
+  the integer id). A text predicate is a `UNION ALL` of MATCH over the eligible generations' tables only, so its
+  work never depends on other accounts' postings (spec 7.9). Generation ids come from `meta.gen_seq` and are never
+  reused. Index migration V3 cannot move the old shared table's postings (contentless), so it starts a rebuild for
+  every account: an active generation keeps serving metadata while the stage is `rebuilding` (coverage partial),
+  a half-built one is abandoned. Generations that no sync state references (retired, replaced, purged, abandoned)
+  are dropped in bounded transactions: derived rows and retry records in chunks of 2,000, then the FTS `_data`
+  blocks in chunks of 256, then the near-empty FTS table. Each step re-checks that the generation is unreferenced;
+  the scheduler collects leftovers of interrupted drops. Purge no longer runs FTS 'optimize': the postings go with
+  the dropped table (secure_delete zeroes the freed pages). Searches never take the writer lock (the schema is
+  migrated once on its own connection), so long writes delay other writers only.
