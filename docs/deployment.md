@@ -159,7 +159,9 @@ The file holds no secrets. Unknown keys are rejected. Settings and defaults (fro
 `upstream_request_timeout_secs` 10, `tool_call_timeout_secs` 30. `index` defaults: `poll_interval_secs` 60,
 `sql_heap_limit_mib` 96, `page_cache_kib` 8192, `reader_connections` 3, `body_jobs` 2, `max_message_bytes` 22 MiB (larger messages are indexed
 from metadata only),
-`max_body_chars` 200000, `imap_idle` true, `idle_renew_secs` 1500 (see [New IMAP mail](#new-imap-mail-idle-push)).
+`max_body_chars` 200000, `imap_idle` true, `idle_renew_secs` 1500 (see [New IMAP mail](#new-imap-mail-idle-push)),
+`imap_step_timeout_secs` 300 (wall-clock limit of one IMAP sync scan or fetch batch; IMAP sync also counts against
+the background share of `upstream_total_inflight`, like Gmail sync).
 
 The service refuses to start when: a secret file is readable by group or others, a secret file is missing (including
 the KEK), `public_url` is not an HTTPS origin, `listen` is not loopback, the data directory is not mode 0700, or the

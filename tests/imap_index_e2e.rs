@@ -296,6 +296,40 @@ async fn wide_vanished_ranges_remove_known_messages() {
     assert!(!cmds.iter().any(|c| c.contains("SEARCH ALL")), "{cmds:?}");
 }
 
+/// One sync step has a wall-clock limit (`index.imap_step_timeout_secs`): a server that answers each command just
+/// inside the command timeout cannot hold the session (and its upstream slots) for longer. The next poll recovers.
+#[tokio::test]
+async fn slow_scan_hits_the_step_deadline() {
+    let fx = setup_with(Opts::default(), |c| c.index.imap_step_timeout_secs = 1).await;
+    fx.add("INBOX", &simple("hello"), &[]);
+    fx.sync().await;
+    // Two folder selects of 600 ms each: every command is far inside the 3 s command timeout.
+    for _ in 0..2 {
+        fx.h.imap.fail_next("EXAMINE", Fault::Delay(std::time::Duration::from_millis(600)));
+    }
+    let t0 = std::time::Instant::now();
+    let r = sync_steps(fx.h.app(), &fx.u.account_id, usize::MAX).await.unwrap();
+    assert_eq!(r.error.as_deref(), Some("upstream_error"), "{r:?}");
+    assert!(t0.elapsed() < std::time::Duration::from_millis(1500), "{:?}", t0.elapsed());
+    fx.sync().await;
+}
+
+/// IMAP sync is background work: with every background slot of the shared upstream limit taken (by Gmail sync, say)
+/// it is not dispatched, while an agent's call on the same mailbox still gets through.
+#[tokio::test]
+async fn sync_needs_a_background_slot() {
+    let fx = setup(Opts::default()).await;
+    fx.add("INBOX", &simple("hello"), &[]);
+    fx.sync().await;
+    let bg = fx.h.app().google.gateway().background_limit();
+    let held = bg.clone().acquire_many_owned(bg.available_permits() as u32).await.unwrap();
+    let r = sync_steps(fx.h.app(), &fx.u.account_id, usize::MAX).await.unwrap();
+    assert_eq!(r.error.as_deref(), Some("upstream_error"), "{r:?}");
+    fx.h.ok(&fx.token, "list_labels", json!({"account": "info"})).await;
+    drop(held);
+    fx.sync().await;
+}
+
 /// Without CONDSTORE (Strato advertises none, checked 2026-11-12) a `\Seen` change made by another client shows in
 /// `is_unread` after the next poll, through the bounded flags-only refresh.
 #[tokio::test]
