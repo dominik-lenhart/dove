@@ -76,3 +76,14 @@ cargo fmt
   checks syntax; to test sandbox directives run the binary as `systemd-run --user` (the user manager cannot apply
   capability-dropping directives such as `PrivateDevices=`, so those stay untested there). `StateDirectoryMode=0700`
   is required, the service refuses any other data dir mode.
+- 2026-11-12: Caddyfile named matchers with several conditions need the block form (`@x { method POST; path /mcp }`
+  on separate lines). `@x method POST path /mcp` parses as extra method names and forwards every GET. Caddy `path`
+  is case-insensitive and nginx `map` keys are too unless prefixed with `~`; always test the allowlist with a real
+  proxy (docker `caddy:2`, `nginx:stable-alpine`), see docs/deployment.md.
+- 2026-11-12: Compose ignores `uid`/`gid`/`mode` of file secrets outside Swarm; the host file itself must be owned by
+  65532 with mode 0400, or Dove refuses to start. The distroless image has no shell: run admin commands with
+  `docker compose exec --user <operator_uid>:65532 dove /usr/local/bin/dove ...`. Dove listens on loopback only, so
+  Caddy joins its network namespace (`network_mode: service:dove`) and the ports are published on the dove service.
+- 2026-11-12: The docker host is shared with production. For container tests use unique names (`dove-t-*`), never
+  `docker system prune`, and remove only your own images and volumes.
+

@@ -1,0 +1,98 @@
+# Reverse proxy for Dove (spec 5.6, 6.6, 10). Caddy obtains and renews the TLS certificate automatically for the
+# hostname below (ports 80 and 443 must reach this host, and DNS must point here).
+#
+# Replace dove.example.com with the hostname from `public_url` in config.toml. It must be the same host: Dove
+# refuses requests whose Host header differs from it.
+#
+# This file is an ALLOWLIST. Only the routes below reach Dove; everything else gets 404 here and never touches the
+# service. There is deliberately no route for:
+#   /healthz  It reveals whether any mailbox needs re-authorization ("degraded"). Monitor it on the loopback
+#             address instead: curl -fsS http://127.0.0.1:8787/healthz
+#   admin     The admin interface is a Unix socket, not HTTP. Nothing here can reach it.
+#   GET/DELETE /mcp  The service answers 405 to them anyway; stateless Streamable HTTP needs only POST.
+
+{
+	# The admin API of Caddy itself stays off the network.
+	admin off
+}
+
+# One upstream: the loopback listener. Host is passed through unchanged. The client address is set (not
+# appended) as the only X-Forwarded-For entry, so a client cannot forge it. Dove takes the last entry when the
+# peer is loopback (src/http.rs).
+(upstream) {
+	reverse_proxy 127.0.0.1:8787 {
+		header_up X-Forwarded-For {remote_host}
+		header_up -X-Real-IP
+		header_up -Forwarded
+		transport http {
+			dial_timeout 3s
+			response_header_timeout 60s
+		}
+	}
+}
+
+dove.example.com {
+	tls {
+		protocols tls1.2 tls1.3
+	}
+
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
+	# Request size limit (spec 6.6). Dove enforces the same limit (limits.body_bytes, default 1 MiB).
+	request_body {
+		max_size 1MB
+	}
+
+	# --- Allowed routes -----------------------------------------------------------------------------------------
+	# A named matcher with two conditions needs the block form: both lines must match (AND). On one line, the second
+	# condition is silently read as more arguments of the first and the matcher stops being exact.
+	# Caddy's path matcher ignores case, so /MCP is forwarded too; Dove matches routes exactly and answers 404.
+	@mcp {
+		method POST
+		path /mcp
+	}
+	@google {
+		method GET
+		path /oauth/google/callback
+	}
+	@discovery {
+		method GET
+		path /.well-known/oauth-protected-resource /.well-known/oauth-protected-resource/mcp /.well-known/oauth-authorization-server
+	}
+	@approval_page {
+		method GET POST
+		path /oauth/dove/authorize
+	}
+	@oauth_post {
+		method POST
+		path /oauth/dove/token /oauth/dove/register /oauth/dove/revoke /connect/redeem
+	}
+
+	handle @mcp {
+		import upstream
+	}
+	handle @google {
+		import upstream
+	}
+	handle @discovery {
+		import upstream
+	}
+	handle @approval_page {
+		import upstream
+	}
+	handle @oauth_post {
+		import upstream
+	}
+
+	# Everything else: 404 at the proxy, with no body that hints at the backend.
+	handle {
+		respond 404
+	}
+}

@@ -42,7 +42,9 @@ hosts or reference hardware.
    - [ ] Restart/crash recovery tests, log canary test
    - [ ] Benchmarks (8.1) with synthetic 250k corpus, RSS measurement
    - [~] Deployment: systemd unit, container, Caddy allowlist, backup docs, SECURITY.md, README (done: systemd unit,
-     sysusers/tmpfiles; the unit is verified only as a transient user unit, see docs/deployment.md)
+     sysusers/tmpfiles, Containerfile, compose, Caddyfile, nginx snippet; the unit is verified only as a transient
+     user unit, the container only on a local Docker host, the proxy configs against stock images. None of it has run
+     on a production host with real TLS or Google)
 
 ## Assumptions and decisions
 
