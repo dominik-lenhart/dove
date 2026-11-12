@@ -18,7 +18,9 @@ use tokio::task::JoinSet;
 
 use super::remote::{self, MAX_RESPONSE_BYTES};
 
-pub const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
+/// Largest request line from the MCP host: a create_draft with the largest allowed inline attachments
+/// (`limits.draft_attachment_bytes` is at most 16 MiB, about 21.4 MiB as base64) plus the rest of the request.
+pub const MAX_LINE_BYTES: usize = 24 * 1024 * 1024;
 const MAX_IN_FLIGHT: usize = 8;
 const CONNECT_RETRIES: u32 = 3;
 
