@@ -22,6 +22,8 @@ pub enum ErrorCode {
     QueryTooBroad,
     IndexIncomplete,
     BudgetExceeded,
+    /// The requested object exceeds a size limit (for example `limits.attachment_bytes`).
+    TooLarge,
 }
 
 impl ErrorCode {
@@ -40,6 +42,7 @@ impl ErrorCode {
             ErrorCode::QueryTooBroad => "query_too_broad",
             ErrorCode::IndexIncomplete => "index_incomplete",
             ErrorCode::BudgetExceeded => "budget_exceeded",
+            ErrorCode::TooLarge => "too_large",
         }
     }
 }

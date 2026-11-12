@@ -241,6 +241,41 @@ pub fn parse(raw: &[u8], limits: &Limits) -> Result<ParsedMessage, MimeError> {
     Ok(out)
 }
 
+/// Decoded bytes of one attachment (`part-<n>` as listed by [`parse`]). `Ok(None)` when the message has no such
+/// attachment; [`MimeError::TooLarge`] when its decoded size exceeds `max_bytes` (checked before copying).
+pub fn attachment_bytes(
+    raw: &[u8],
+    part_id: &str,
+    max_bytes: usize,
+) -> Result<Option<(AttachmentMeta, Vec<u8>)>, MimeError> {
+    let limits = Limits::default();
+    if raw.len() > limits.max_raw_bytes {
+        return Err(MimeError::TooLarge);
+    }
+    let Some(n) = part_id.strip_prefix("part-").filter(|n| !n.starts_with('0') || *n == "0") else {
+        return Ok(None);
+    };
+    let Ok(n) = n.parse::<u32>() else { return Ok(None) };
+    let parser = MessageParser::new().max_parts(limits.max_parts).max_depth(limits.max_depth);
+    let msg = parser.parse(raw).ok_or(MimeError::Unparseable)?;
+    let Some(part) = msg.root().parts().find(|p| p.id() == n && !p.is_multipart()) else { return Ok(None) };
+    let filename = part.attachment_name().map(str::trim).filter(|n| !n.is_empty()).map(str::to_string);
+    if !is_attachment_part(&part, &filename) {
+        return Ok(None);
+    }
+    if part.decoded_len() > max_bytes {
+        return Err(MimeError::TooLarge);
+    }
+    let bytes = part.decoded().into_owned();
+    let meta = AttachmentMeta {
+        attachment_id: part_id.to_string(),
+        filename,
+        mime_type: mime_type_of(&part),
+        size_bytes: bytes.len() as u64,
+    };
+    Ok(Some((meta, bytes)))
+}
+
 /// Decoded values of one header (case-insensitive name), unfolded, RFC 2047 decoded.
 pub fn header_values(raw: &[u8], name: &str) -> Vec<String> {
     let Some(msg) = MessageParser::new().parse_headers(raw) else { return Vec::new() };
@@ -670,5 +705,23 @@ mod tests {
         }
         assert!(!text.replace("\r\n", "").contains('\r'));
         assert!(text.matches('\n').count() == text.matches("\r\n").count(), "bare LF in output");
+    }
+
+    #[test]
+    fn attachment_bytes_by_part_id() {
+        let raw = b"From: a@example.org\r\nSubject: x\r\nMIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"b\"\r\n\r\n--b\r\nContent-Type: text/plain\r\n\r\nbody\r\n\
+--b\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"x.bin\"\r\n\
+Content-Transfer-Encoding: base64\r\n\r\nAAECAwQFBgcICQ==\r\n--b--\r\n";
+        let p = parse(raw, &Limits::default()).unwrap();
+        let id = p.attachments[0].attachment_id.clone();
+        let (meta, bytes) = attachment_bytes(raw, &id, 10).unwrap().unwrap();
+        assert_eq!(bytes, (0u8..10).collect::<Vec<_>>());
+        assert_eq!((meta.filename.as_deref(), meta.size_bytes), (Some("x.bin"), 10));
+        // One byte over the limit is refused before copying; the text body and unknown parts are not attachments.
+        assert!(matches!(attachment_bytes(raw, &id, 9), Err(MimeError::TooLarge)));
+        assert!(attachment_bytes(raw, "part-1", 100).unwrap().is_none());
+        assert!(attachment_bytes(raw, "part-9", 100).unwrap().is_none());
+        assert!(attachment_bytes(raw, "part-02", 100).unwrap().is_none());
     }
 }

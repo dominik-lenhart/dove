@@ -36,13 +36,15 @@ pub struct GrantRow {
     pub status: String,
     pub generation: i64,
     pub alias: String,
+    pub provider: String,
     pub sealed: Option<SealedGrant>,
 }
 
 pub fn load_grant(conn: &rusqlite::Connection, account_id: &str) -> anyhow::Result<Option<GrantRow>> {
     Ok(conn
         .query_row(
-            "SELECT a.status, a.grant_generation, a.alias, g.dek_wrapped, g.kek_version, g.refresh_token_ciphertext, g.nonce \
+            "SELECT a.status, a.grant_generation, a.alias, g.dek_wrapped, g.kek_version, g.refresh_token_ciphertext, g.nonce, \
+             a.provider \
              FROM accounts a LEFT JOIN grants g ON g.account_id = a.id WHERE a.id = ?1",
             [account_id],
             |r| {
@@ -51,6 +53,7 @@ pub fn load_grant(conn: &rusqlite::Connection, account_id: &str) -> anyhow::Resu
                     status: r.get(0)?,
                     generation: r.get(1)?,
                     alias: r.get(2)?,
+                    provider: r.get(7)?,
                     sealed: match dek {
                         Some(dek_wrapped) => Some(SealedGrant {
                             dek_wrapped,
@@ -117,6 +120,11 @@ impl TokenManager {
         let Some(row) = row else { return Err(ToolError::not_found()) };
         if row.status != "active" {
             return Err(ToolError::unavailable());
+        }
+        // An IMAP mailbox holds a sealed password, not a refresh token: tools without an IMAP path stop here
+        // instead of failing on the vault kind.
+        if row.provider != "gmail" {
+            return Err(ToolError::invalid("this operation is not available for IMAP mailboxes yet"));
         }
         let sealed = row.sealed.as_ref().ok_or_else(ToolError::unavailable)?;
         let refresh = self.vault.open_grant(account_id, sealed).map_err(crate::error::internal_from)?;

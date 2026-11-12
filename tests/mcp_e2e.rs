@@ -101,6 +101,7 @@ async fn tools_are_listed_per_capability_and_enforced() {
     let reader = h.token("acme", "reader", vec![g("info", "read")]).await;
     let names = h.tool_names(&reader).await;
     assert!(names.contains(&"get_message".to_string()));
+    assert!(names.contains(&"get_attachment".to_string()));
     assert!(!names.contains(&"create_draft".to_string()));
     assert!(!names.contains(&"send_draft".to_string()));
     // AC2: calling a hidden tool directly is refused.
@@ -427,14 +428,30 @@ async fn every_tool_call_writes_one_audit_record_without_content() {
             subject: "CANARY-SUBJECT-123".into(),
             text: Some("CANARY-BODY-456".into()),
             internal_date_ms: 1,
+            attachments: vec![("CANARY-FILE-789.pdf".into(), "application/pdf".into(), b"%PDF-1.4 canary".to_vec())],
             ..Default::default()
         },
     );
+    let m = h.ok(&token, "get_message", json!({"account":"info","message_id":id})).await;
+    let part = m["message"]["attachments"][0]["attachment_id"].as_str().unwrap().to_string();
+    // Gmail get_attachment: the bytes come back as an embedded resource next to the text item.
+    let r = h
+        .rpc(
+            &token,
+            "tools/call",
+            json!({"name":"get_attachment","arguments":{"ref":m["message"]["ref"],"attachment_id":part}}),
+        )
+        .await;
+    let blob = r["result"]["content"][1]["resource"]["blob"].as_str().unwrap();
+    assert_eq!(dove::util::b64std(b"%PDF-1.4 canary"), blob);
+    assert_eq!(r["result"]["structuredContent"]["mime_type"], "application/pdf");
     let calls: Vec<(&str, Value)> = vec![
         ("list_accounts", json!({})),
         ("get_message", json!({"account":"info","message_id":id})),
         ("get_message", json!({"account":"secret","message_id":id})),
         ("list_labels", json!({"account":"billing"})),
+        ("get_attachment", json!({"account":"info","message_id":id,"attachment_id":part})),
+        ("get_attachment", json!({"account":"info","message_id":id,"attachment_id":"part-77"})),
         ("no_such_tool", json!({})),
     ];
     for (tool, args) in calls {
@@ -443,7 +460,7 @@ async fn every_tool_call_writes_one_audit_record_without_content() {
         assert_eq!(h.audit_count().await, before + 1, "{tool}");
     }
     let dump: String = h.app().store.call(|c| Ok(serde_json::to_string(&dove::audit::tail(c, 1000)?)?)).await.unwrap();
-    for canary in ["CANARY-SUBJECT-123", "CANARY-BODY-456", "canary-sender", &token[5..]] {
+    for canary in ["CANARY-SUBJECT-123", "CANARY-BODY-456", "canary-sender", "CANARY-FILE", &token[5..]] {
         assert!(!dump.contains(canary), "{canary} leaked into audit");
     }
     assert!(dove::audit::verify(&rusqlite::Connection::open(h.app().cfg.state_db_path()).unwrap()).unwrap().ok);

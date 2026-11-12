@@ -17,33 +17,8 @@ pub const ROLE_TO: i64 = 2;
 pub const ROLE_CC: i64 = 3;
 pub const ROLE_BCC: i64 = 4;
 
-/// Gmail message metadata that every format returns.
-#[derive(Debug, Clone, Default)]
-pub struct GmailMeta {
-    pub id: String,
-    pub thread_id: String,
-    pub labels: Vec<String>,
-    pub internal_date_ms: i64,
-    pub size_estimate: i64,
-    pub snippet: Option<String>,
-}
-
-impl GmailMeta {
-    pub fn from_json(v: &Value) -> Option<Self> {
-        let id = v["id"].as_str()?.to_string();
-        if !crate::gmail::gateway::valid_id(&id) {
-            return None;
-        }
-        Some(Self {
-            id,
-            thread_id: v["threadId"].as_str().unwrap_or_default().to_string(),
-            labels: labels_of(v),
-            internal_date_ms: v["internalDate"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0),
-            size_estimate: v["sizeEstimate"].as_i64().unwrap_or(0),
-            snippet: v["snippet"].as_str().map(|s| content::clean_text(s).trim().to_string()),
-        })
-    }
-}
+/// Gmail message metadata; the provider-neutral [`crate::mail::MessageMeta`] under its old name.
+pub type GmailMeta = crate::mail::MessageMeta;
 
 pub fn labels_of(v: &Value) -> Vec<String> {
     v["labelIds"]

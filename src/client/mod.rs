@@ -171,6 +171,27 @@ pub enum MessageCmd {
         #[arg(long)]
         headers: Option<String>,
     },
+    /// Attachments of a message.
+    #[command(subcommand)]
+    Attachment(AttachmentCmd),
+}
+
+#[derive(Subcommand)]
+pub enum AttachmentCmd {
+    /// Save one attachment as a file (mode 0600). Refuses to overwrite and never opens the file.
+    Save {
+        #[command(flatten)]
+        p: ProfileOpts,
+        /// Opaque message ref from search or get_message.
+        #[arg(long = "ref")]
+        reference: String,
+        /// Attachment id from get_message (e.g. part-2).
+        #[arg(long)]
+        attachment_id: String,
+        /// Target directory (default: the current directory).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -285,6 +306,9 @@ pub async fn run(cmd: RemoteCmd) -> anyhow::Result<()> {
         RemoteCmd::Logout { profile, revoke, keep_remote } => logout(profile.as_deref(), revoke, keep_remote).await,
         RemoteCmd::Status { p } => status(&p).await,
         RemoteCmd::Search(a) => search(a).await,
+        RemoteCmd::Message(MessageCmd::Attachment(AttachmentCmd::Save { p, reference, attachment_id, out })) => {
+            save_attachment(&p, &reference, &attachment_id, out).await
+        }
         RemoteCmd::Message(MessageCmd::Get { p, account, id, reference, max_body_chars, headers }) => {
             let mut args = json!({});
             match (reference, account, id) {
@@ -387,6 +411,51 @@ async fn tool(p: &ProfileOpts, name: &str, args: Value) -> anyhow::Result<()> {
     let (_, _, r) = remote_for(p.profile.as_deref())?;
     let res = r.call_tool(name, args).await?;
     print_tool(p.json, &res)
+}
+
+/// `dove message attachment save`: writes the bytes of one attachment to `<out>/<sanitised filename>`, mode 0600,
+/// failing if the file exists. The file is never opened or executed.
+async fn save_attachment(
+    p: &ProfileOpts,
+    reference: &str,
+    attachment_id: &str,
+    out: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let (_, _, r) = remote_for(p.profile.as_deref())?;
+    let res = r.call_tool("get_attachment", json!({ "ref": reference, "attachment_id": attachment_id })).await?;
+    if res.is_error {
+        return print_tool(p.json, &res);
+    }
+    let blob = res
+        .content
+        .iter()
+        .find_map(|c| (c["type"] == "resource").then(|| c["resource"]["blob"].as_str()).flatten())
+        .ok_or_else(|| anyhow!("the server returned no attachment bytes"))?;
+    let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, blob)
+        .context("the server returned undecodable attachment bytes")?;
+    if res.structured["size_bytes"].as_u64() != Some(bytes.len() as u64) {
+        bail!("the attachment size does not match what the server announced");
+    }
+    // The server sanitises the name already; do it again so a hostile name can never leave the target directory.
+    let name = crate::tools::attachments::sanitize_filename(res.structured["filename"].as_str());
+    let path = out.unwrap_or_else(|| PathBuf::from(".")).join(&name);
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .with_context(|| format!("cannot create {} (an existing file is never overwritten)", path.display()))?;
+    f.write_all(&bytes)?;
+    f.sync_all()?;
+    if p.json {
+        print_json(&json!({ "ok": true, "result": { "path": path, "size_bytes": bytes.len(),
+                                                     "mime_type": res.structured["mime_type"] } }));
+    } else {
+        println!("saved {} ({} bytes)", path.display(), bytes.len());
+    }
+    Ok(())
 }
 
 fn print_tool(json_out: bool, res: &remote::ToolResult) -> anyhow::Result<()> {

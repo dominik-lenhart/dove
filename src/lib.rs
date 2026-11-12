@@ -14,6 +14,7 @@ pub mod imap;
 pub mod index;
 pub mod invite;
 pub mod logging;
+pub mod mail;
 pub mod mcp;
 pub mod mime;
 pub mod notifier;

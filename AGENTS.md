@@ -153,3 +153,9 @@ cargo fmt
   `admin::Password` (redacted `Debug`). Tests connect IMAP mailboxes with `Harness::imap_mailbox` (real
   `AccountsConnectImap` against `h.imap`); assign `h.imap = FakeImap::start_with(..)` before connecting to change
   server options. Connect errors name the step and server address only, never server text.
+- 2026-11-12: Tools read messages through `mail::fetch_message` / `mail::list_labels`, which dispatch on
+  `Mailbox.provider`; `read::Fetched.meta` is a typed `mail::MessageMeta`. Gmail-only paths that reach
+  `TokenManager::access_token` with an IMAP account get `invalid_argument` (never the vault or Google). Extra MCP content
+  items (the `get_attachment` resource) go in `ToolOutput.extra`; `Remote::call_tool` keeps them in `ToolResult.content`.
+  IMAP `get_thread` takes `message_id` until the index can resolve derived thread ids. `tests/support/fake_imap.rs`
+  takes UTF-8 folder names while `imap_folders.name` stores the wire name (modified UTF-7).
