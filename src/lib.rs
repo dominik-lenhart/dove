@@ -9,6 +9,7 @@ pub mod error;
 pub mod gmail;
 pub mod index;
 pub mod logging;
+pub mod mime;
 pub mod notifier;
 pub mod policy;
 pub mod secrets;
