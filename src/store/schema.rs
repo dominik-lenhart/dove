@@ -1,6 +1,6 @@
 //! Versioned schema migrations for the durable state store. Never edit a released migration; append a new one.
 
-pub const MIGRATIONS: &[&str] = &[V1];
+pub const MIGRATIONS: &[&str] = &[V1, V2];
 
 const V1: &str = r#"
 CREATE TABLE accounts (
@@ -180,4 +180,10 @@ CREATE TABLE notifications (
     key          TEXT PRIMARY KEY,
     last_sent_at INTEGER NOT NULL
 );
+"#;
+
+/// V2: the source bucket of a dynamic registration (`oauth::ip_bucket`), for the per-source cap on unused
+/// registrations. NULL for rows registered before V2 and for pre-registered applications.
+const V2: &str = r#"
+ALTER TABLE oauth_apps ADD COLUMN registered_from TEXT;
 "#;

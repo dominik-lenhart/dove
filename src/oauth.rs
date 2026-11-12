@@ -44,6 +44,14 @@ const MAX_PENDING: usize = 10_000;
 const MAX_PENDING_PER_IP: usize = 20;
 const MAX_INVITATION_ATTEMPTS: u32 = 5;
 const DCR_STALE_SECS: i64 = 86_400;
+/// Unused dynamic registrations (no code ever issued) older than this may be evicted to make room for new ones.
+const DCR_EVICTABLE_SECS: i64 = 900;
+/// Unused dynamic registrations one source bucket may hold at a time.
+const MAX_UNUSED_DCR_PER_BUCKET: usize = 5;
+/// Dynamic registrations that have never led to an authorization code or token.
+const DCR_UNUSED: &str = "registered_via = 'dynamic' \
+     AND client_id NOT IN (SELECT app_client_id FROM oauth_codes) \
+     AND client_id NOT IN (SELECT app_client_id FROM oauth_tokens)";
 
 pub fn routes() -> Router<Arc<App>> {
     Router::new()
@@ -94,6 +102,12 @@ pub struct OAuthState {
 
 impl OAuthState {
     /// Loads pre-registered applications and their secret files (strict modes, spec 6.4).
+    /// Client ids with an open sign-in request; their registrations are never evicted.
+    fn in_flight_clients(&self) -> std::collections::HashSet<String> {
+        let map = self.pending.lock().expect("lock");
+        map.values().filter(|p| p.created.elapsed() < PENDING_TTL).map(|p| p.app.client_id.clone()).collect()
+    }
+
     pub fn load(cfg: &OAuthConfig) -> anyhow::Result<Self> {
         let mut preregistered = Vec::new();
         for c in &cfg.clients {
@@ -1203,38 +1217,77 @@ async fn register(State(app): State<Arc<App>>, req: Request) -> Response {
         .collect();
     let cap = app.cfg.oauth.max_dynamic_clients;
     let (uris_json, name2) = (serde_json::to_string(&redirect_uris).unwrap_or_default(), name.clone());
+    let bucket = ip_bucket(ip);
+    let in_flight = app.oauth.in_flight_clients();
     let r = app
         .store
         .call(move |c| {
             let tx = c.transaction()?;
             let now = util::now_unix();
-            // Prune stale registrations that never led to a connection, then enforce the bound.
+            // Prune stale registrations that never led to a connection, then enforce the bounds.
             tx.execute(
-                "DELETE FROM oauth_apps WHERE registered_via = 'dynamic' AND created_at < ?1 \
-                 AND client_id NOT IN (SELECT app_client_id FROM oauth_codes) \
-                 AND client_id NOT IN (SELECT app_client_id FROM oauth_tokens)",
+                &format!("DELETE FROM oauth_apps WHERE {DCR_UNUSED} AND created_at < ?1"),
                 [now - DCR_STALE_SECS],
             )?;
+            // Oldest unused registration (of one bucket, or of all) old enough to evict, skipping open sign-ins.
+            let evictable = |bucket: Option<&str>| -> anyhow::Result<Option<String>> {
+                let mut stmt = tx.prepare(&format!(
+                    "SELECT client_id FROM oauth_apps WHERE {DCR_UNUSED} AND created_at < ?1 \
+                     AND (?2 IS NULL OR registered_from = ?2) ORDER BY created_at, client_id"
+                ))?;
+                let ids = stmt.query_map(params![now - DCR_EVICTABLE_SECS, bucket], |r| r.get::<_, String>(0))?;
+                for id in ids {
+                    let id = id?;
+                    if !in_flight.contains(&id) {
+                        return Ok(Some(id));
+                    }
+                }
+                Ok(None)
+            };
+            let evict = |id: &str| -> anyhow::Result<()> {
+                tx.execute("DELETE FROM oauth_apps WHERE client_id = ?1", [id])?;
+                audit_auth(&tx, "oauth.register", "anonymous", None, vec![id.to_string()], "evicted", ip)
+            };
+            let unused_here: i64 = tx.query_row(
+                &format!("SELECT COUNT(*) FROM oauth_apps WHERE {DCR_UNUSED} AND registered_from = ?1"),
+                [&bucket],
+                |r| r.get(0),
+            )?;
+            if unused_here as usize >= MAX_UNUSED_DCR_PER_BUCKET {
+                match evictable(Some(&bucket))? {
+                    Some(id) => evict(&id)?,
+                    None => {
+                        drop(tx);
+                        audit_auth(c, "oauth.register", "anonymous", None, vec![], "bucket_limit_reached", ip)?;
+                        return Ok(Err(StatusCode::TOO_MANY_REQUESTS));
+                    }
+                }
+            }
             let count: i64 =
                 tx.query_row("SELECT COUNT(*) FROM oauth_apps WHERE registered_via = 'dynamic'", [], |r| r.get(0))?;
             if count as usize >= cap {
-                drop(tx);
-                audit_auth(c, "oauth.register", "anonymous", None, vec![], "limit_reached", ip)?;
-                return Ok(None);
+                match evictable(None)? {
+                    Some(id) => evict(&id)?,
+                    None => {
+                        drop(tx);
+                        audit_auth(c, "oauth.register", "anonymous", None, vec![], "limit_reached", ip)?;
+                        return Ok(Err(StatusCode::SERVICE_UNAVAILABLE));
+                    }
+                }
             }
             let client_id = format!("dcr-{}", util::new_id());
             tx.execute(
-                "INSERT INTO oauth_apps(client_id, client_name, redirect_uris, registered_via, created_at) \
-                 VALUES (?1, ?2, ?3, 'dynamic', ?4)",
-                params![client_id, name2, uris_json, now],
+                "INSERT INTO oauth_apps(client_id, client_name, redirect_uris, registered_via, created_at, \
+                 registered_from) VALUES (?1, ?2, ?3, 'dynamic', ?4, ?5)",
+                params![client_id, name2, uris_json, now, bucket],
             )?;
             audit_auth(&tx, "oauth.register", "anonymous", None, vec![client_id.clone()], "ok", ip)?;
             tx.commit()?;
-            Ok(Some((client_id, now)))
+            Ok(Ok((client_id, now)))
         })
         .await;
     match r {
-        Ok(Some((client_id, now))) => no_store(
+        Ok(Ok((client_id, now))) => no_store(
             (
                 StatusCode::CREATED,
                 axum::Json(json!({
@@ -1249,7 +1302,16 @@ async fn register(State(app): State<Arc<App>>, req: Request) -> Response {
             )
                 .into_response(),
         ),
-        Ok(None) => oauth_error(
+        Ok(Err(StatusCode::TOO_MANY_REQUESTS)) => {
+            let mut r = oauth_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+                "too many unused registrations from this address; finish a sign-in or try again later",
+            );
+            r.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from(DCR_EVICTABLE_SECS as u64));
+            r
+        }
+        Ok(Err(_)) => oauth_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "temporarily_unavailable",
             "registration limit reached; ask the operator",

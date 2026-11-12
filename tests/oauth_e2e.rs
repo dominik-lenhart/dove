@@ -557,6 +557,105 @@ async fn dynamic_registration_has_no_authority_and_is_bounded() {
     assert_eq!(r.status(), 429);
 }
 
+/// Registers from `ip` as the proxy would forward it. Returns (status, client_id when created).
+async fn register_from(o: &Oauth, ip: &str) -> (u16, Option<String>) {
+    let secret = o.h.app().proxy_secret.as_deref().unwrap().to_string();
+    let r = o
+        .web
+        .post(o.url("/oauth/dove/register"))
+        .header("host", HOST)
+        .header("x-forwarded-for", ip)
+        .header("x-dove-proxy-auth", secret)
+        .json(&json!({ "redirect_uris": [REDIRECT] }))
+        .send()
+        .await
+        .unwrap();
+    let status = r.status().as_u16();
+    let id = r.json::<Value>().await.unwrap()["client_id"].as_str().map(str::to_string);
+    (status, id)
+}
+
+/// Moves a registration `secs` seconds into the past.
+async fn age_registration(o: &Oauth, client_id: &str, secs: i64) {
+    let id = client_id.to_string();
+    o.h.app()
+        .store
+        .call(move |c| {
+            c.execute(
+                "UPDATE oauth_apps SET created_at = created_at - ?1 WHERE client_id = ?2",
+                rusqlite::params![secs, id],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+}
+
+async fn registered(o: &Oauth, client_id: &str) -> bool {
+    let id = client_id.to_string();
+    o.h.app()
+        .store
+        .call(move |c| {
+            Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM oauth_apps WHERE client_id = ?1)", [id], |r| r.get(0))?)
+        })
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn full_registration_table_evicts_old_unused_registrations() {
+    let o = Oauth::with(|c| {
+        c.oauth.max_dynamic_clients = 4;
+        c.oauth.registrations_per_hour = 100;
+    })
+    .await;
+    // One registration that led to a connection, then unused ones from three addresses.
+    let (used, _) = o.connected("used-host", "read", &["read.0"]).await;
+    let (_, a) = register_from(&o, "192.0.2.1").await;
+    let (_, b) = register_from(&o, "192.0.2.2").await;
+    let (_, c) = register_from(&o, "192.0.2.3").await;
+    let (a, b, c) = (a.unwrap(), b.unwrap(), c.unwrap());
+    // Full, and nothing is old enough to evict: refused.
+    assert_eq!(register_from(&o, "192.0.2.4").await.0, 503);
+    // Old enough: the oldest unused one goes. The used registration is older still and stays.
+    age_registration(&o, &used, 5000).await;
+    age_registration(&o, &a, 2000).await;
+    age_registration(&o, &b, 1000).await;
+    let (s, d) = register_from(&o, "192.0.2.4").await;
+    assert_eq!(s, 201);
+    assert!(!registered(&o, &a).await, "oldest unused registration evicted");
+    assert!(registered(&o, &used).await && registered(&o, &b).await && registered(&o, &c).await);
+    // A registration with an open sign-in request is not evicted, even when it is the oldest unused one.
+    let r = o.authorize_get(&Oauth::params(&b, &challenge(&verifier()))).await;
+    assert_eq!(r.status(), 200);
+    age_registration(&o, &c, 1000).await;
+    let (s, _) = register_from(&o, "192.0.2.5").await;
+    assert_eq!(s, 201);
+    assert!(registered(&o, &b).await, "in-flight registration kept");
+    assert!(!registered(&o, &c).await);
+    assert!(registered(&o, &d.unwrap()).await, "fresh registrations are never evicted");
+}
+
+#[tokio::test]
+async fn unused_registrations_are_capped_per_address() {
+    let o = Oauth::with(|c| c.oauth.registrations_per_hour = 100).await;
+    let mut ids = vec![];
+    for _ in 0..5 {
+        let (s, id) = register_from(&o, "2001:db8:1:2::1").await;
+        assert_eq!(s, 201);
+        ids.push(id.unwrap());
+    }
+    // A sixth from the same /64 is refused while the others are fresh; other addresses are not affected.
+    let (s, _) = register_from(&o, "2001:db8:1:2::99").await;
+    assert_eq!(s, 429);
+    assert_eq!(register_from(&o, "2001:db8:1:3::1").await.0, 201);
+    // Once its oldest unused registration is old enough, it makes room.
+    age_registration(&o, &ids[0], 1000).await;
+    assert_eq!(register_from(&o, "2001:db8:1:2::1").await.0, 201);
+    assert!(!registered(&o, &ids[0]).await);
+    assert!(registered(&o, &ids[1]).await);
+}
+
 #[tokio::test]
 async fn authorize_requests_are_bounded_per_ip() {
     let o = Oauth::with(|c| c.oauth.token_requests_per_minute = 1000).await;
