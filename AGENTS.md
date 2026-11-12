@@ -205,3 +205,9 @@ cargo fmt
   `google.requests()` and `imap.commands()` are empty right after the refused calls (clearing the log later hides a
   regression). `/mcp` authenticates before reading the body (`Limits::draft_body_bytes` for clients with draft).
   To scan audit rows as text, read cells as `rusqlite::types::Value` (`get_ref` Debug prints bytes).
+- 2026-11-12: Build speed, measured: a cold `cargo build` in a fresh target dir takes about 3 min at 3 jobs and is
+  dominated by the vendored OpenSSL/SQLCipher C build. sccache (enabled in `~/.cargo/config.toml`) caches the Rust
+  crates across target dirs but not that C build (paths differ per `OUT_DIR`), so it saved only ~3 %. The dev profile
+  uses `debug = "line-tables-only"` and no debug info for dependencies: a fresh target with all test binaries is
+  ~5 GB. Old target dirs grow past 30 GB; `cargo clean` them now and then. Copying a target dir to seed a worktree
+  is slower than building.

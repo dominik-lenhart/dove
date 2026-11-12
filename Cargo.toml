@@ -86,3 +86,11 @@ dove-mcp = { path = ".", features = ["testing"] }
 lto = "thin"
 codegen-units = 4
 strip = "symbols"
+
+# Faster dev and test builds on the shared host: line tables keep panics and backtraces readable, dependencies
+# carry no debug info (smaller objects, much less link time for the ~25 integration test binaries).
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
