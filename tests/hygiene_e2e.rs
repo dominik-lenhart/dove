@@ -111,6 +111,23 @@ async fn canaries_never_reach_logs_audit_or_plaintext_state() {
         .await
         .unwrap();
     assert_eq!(r.status(), 200);
+    // Index the mailbox and search it: canaries pass through ingest, FTS and the query compiler.
+    h.admin(AdminRequest::IndexEnable { alias: "info".into() }).await.unwrap();
+    let info_id: String = h
+        .app()
+        .store
+        .call(|c| Ok(c.query_row("SELECT id FROM accounts WHERE alias='info'", [], |r| r.get(0))?))
+        .await
+        .unwrap();
+    dove::index::sync::sync_account(h.app(), &info_id).await.unwrap();
+    let found = h
+        .ok(
+            &token,
+            "search_messages",
+            json!({"where":{"field":"text","op":"terms","value":"CANARY-BODY-91c2"},"select":["subject"]}),
+        )
+        .await;
+    assert!(found.to_string().contains(subject), "the indexed canary is searchable: {found}");
     // Invalid grant path (error logging and notification).
     h.google.invalidate_refresh_tokens("info@acme.test");
     let acct: String = h
@@ -161,4 +178,18 @@ async fn canaries_never_reach_logs_audit_or_plaintext_state() {
     for secret in [refresh.as_str(), token.as_str(), &token[5..], code, q["state"].as_str()] {
         assert!(!contains(&bytes, secret), "secret found in plaintext state files");
     }
+    // AC20: the index DB, its WAL and any other file in the data directory hold no plaintext content.
+    let data_dir = h.app().cfg.data_dir.clone();
+    let mut files = 0;
+    for e in std::fs::read_dir(&data_dir).unwrap() {
+        let p = e.unwrap().path();
+        if p.is_file() {
+            files += 1;
+            let b = file_bytes(&p);
+            for c in [subject, "CANARY-BODY-91c2", "canary-sender-55", "wire money"] {
+                assert!(!contains(&b, c), "content canary {c:?} in plaintext file {}", p.display());
+            }
+        }
+    }
+    assert!(files >= 3, "state and index files were checked");
 }

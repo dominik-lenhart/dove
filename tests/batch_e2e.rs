@@ -147,6 +147,38 @@ async fn search_rows_share_one_budget() {
 }
 
 #[tokio::test]
+async fn search_items_run_and_bad_cursors_or_fields_fail_per_item() {
+    let (h, token) = setup().await;
+    msg(&h, "info@acme.test", "indexed");
+    h.admin(dove::admin::AdminRequest::IndexEnable { alias: "info".into() }).await.unwrap();
+    let aid: String = h
+        .app()
+        .store
+        .call(|c| Ok(c.query_row("SELECT id FROM accounts WHERE alias='info'", [], |r| r.get(0))?))
+        .await
+        .unwrap();
+    dove::index::sync::sync_account(h.app(), &aid).await.unwrap();
+    let v = h
+        .ok(
+            &token,
+            "batch_read",
+            json!({"items": [
+                item("ok", "search_messages", json!({"accounts":["info"],"select":["subject"],"limit":5})),
+                item("cursor", "search_messages", json!({"cursor":"c_bogus"})),
+                item("field", "search_messages", json!({"where":{"field":"no_such_field","op":"eq","value":"x"}})),
+                item("hidden", "search_messages", json!({"accounts":["secret"]})),
+            ]}),
+        )
+        .await;
+    let items = v["items"].as_array().unwrap();
+    assert_eq!(items[0]["ok"], true, "{}", items[0]);
+    assert!(items[0]["result"].to_string().contains("Hello"));
+    assert_eq!(items[1]["error"]["code"], "cursor_invalid", "{}", items[1]);
+    assert_eq!(items[2]["error"]["code"], "invalid_argument", "{}", items[2]);
+    assert_eq!(items[3]["error"]["code"], "not_found", "{}", items[3]);
+}
+
+#[tokio::test]
 async fn denied_items_count_as_denials_and_audit_names_each_mailbox() {
     let (h, token) = setup().await;
     let a = msg(&h, "info@acme.test", "visible");
