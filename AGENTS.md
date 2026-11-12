@@ -187,3 +187,12 @@ cargo fmt
   draft's bytes (Bcc kept) in Sent with `\Seen` unless `save_sent_copy` is false, then deletes its draft; both are best
   effort and reported once. SMTP framing always ends DATA with CRLF, so compare submitted bytes with that in mind.
   Test SMTP-only auth failures with `smtp_fail_next("AUTH", SmtpFault::Reply(535))` (IMAP keeps working).
+- 2026-11-12: IMAP IDLE (`src/index/imap_idle.rs`): the supervisor and the scheduler are not started by the harness;
+  tests start them with `dove::index::imap_idle::start(app)` / `dove::index::start(app)` and abort the handles.
+  `app.index.idle.is_healthy(account_id)` tells whether a mailbox is idling. The fake server offers IDLE by default
+  (`Opts { idle: false, .. }` to test polling, `idle_timeout` for a server BYE, `kick_idle()` for a silent drop) and
+  counts `open_connections`, `max_open_connections` and `idling`. `ImapSession::idle_next` has no timeout and is
+  cancel-safe (state lives in the session), so it can sit in `select!`; every other command is refused while idling.
+- 2026-11-12: The harness's 3 s IMAP command timeout and 8 s tool deadline bound most stalls on their own; a test of a
+  smaller budget (search freshness, 2 s) must raise both or the budget mutation survives. Freshness tests age
+  `sync_state.last_success_at` instead of sleeping past the 5 s threshold.

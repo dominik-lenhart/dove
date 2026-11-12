@@ -34,7 +34,7 @@ The owner's typical requests, which define success:
 
 - OAuth/XOAUTH2 login for IMAP (Microsoft 365, Yahoo). Password and app-password login only.
 - POP3, Exchange/EWS, JMAP.
-- IMAP IDLE push. Polling is enough for now.
+- IMAP IDLE push. Polling is enough for now. (Reversed on owner request 2026-11-12, see the addendum at the end.)
 - Moving, deleting, flagging or marking messages read, folder management. Dove still never changes a human's mail.
 - Attachments in outgoing drafts.
 - Attachment text extraction for search (still spec phase 2).
@@ -235,3 +235,27 @@ test proves no other command can be produced.
 - Exact schema of the folder table and per-folder checkpoint.
 - Further presets, and the exact operator-facing error texts at connect.
 - Plan order, as long as connect + read + search ship before drafts and send, and attachments can land independently.
+
+## Addendum 2026-11-12: IDLE push and search freshness
+
+IDLE was a non-goal; reversed on owner request 2026-11-12 ("60 s poll is too slow"). New INBOX mail must be
+searchable within a few seconds.
+
+- **Push:** one dedicated, long-lived connection per active, index-enabled IMAP mailbox (`src/index/imap_idle.rs`),
+  outside the request pool and the global upstream semaphore, so a mailbox costs at most pool size + 1 connections.
+  It `EXAMINE`s INBOX and idles; `EXISTS`, `EXPUNGE`, `FETCH` and `VANISHED` wake the account's index sync through
+  the existing `index::wake` (debounced 300 ms, at most 1 s). `IDLE` and `DONE` are in the typed allowlist
+  (`src/imap/ops.rs`); `DONE` is the only untagged line Dove sends. IDLE is re-issued at least every 25 minutes
+  (`index.idle_renew_secs`). Network errors reconnect with exponential backoff and jitter; an authentication failure
+  uses the existing reauth marking once and stops until the credential generation changes. Servers without IDLE are
+  polled only. A supervisor reconciles the set of connections every second (enable, disable, remove, reauth, index
+  disable, reconnect).
+- **Freshness:** before an index search reads an IMAP mailbox without a healthy IDLE connection whose last full sync
+  is older than 5 s, one INBOX-only incremental pass (`imap_sync::quick_inbox`: new UIDs, CONDSTORE flags and
+  expunges of INBOX, then one fetch batch) runs within min(2 s, half the remaining call deadline), at most once per
+  5 s per mailbox, never on cursor pages. It holds the account lock and fence like a sync job, holds no transaction
+  across the network, and does not advance `last_success_at`, so `as_of` and coverage stay honest. On timeout the
+  search answers from the index.
+- **Unchanged:** `index.poll_interval_secs` stays 60; the poll covers the other folders, flags and IDLE-less servers.
+- **Known limit:** a connection that dies silently (no RST, no BYE) counts as healthy until the next renewal fails;
+  the poll still catches up within its interval.

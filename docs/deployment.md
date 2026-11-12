@@ -159,7 +159,7 @@ The file holds no secrets. Unknown keys are rejected. Settings and defaults (fro
 `upstream_request_timeout_secs` 10, `tool_call_timeout_secs` 30. `index` defaults: `poll_interval_secs` 60,
 `sql_heap_limit_mib` 96, `page_cache_kib` 8192, `reader_connections` 3, `body_jobs` 2, `max_message_bytes` 22 MiB (larger messages are indexed
 from metadata only),
-`max_body_chars` 200000.
+`max_body_chars` 200000, `imap_idle` true, `idle_renew_secs` 1500 (see [New IMAP mail](#new-imap-mail-idle-push)).
 
 The service refuses to start when: a secret file is readable by group or others, a secret file is missing (including
 the KEK), `public_url` is not an HTTPS origin, `listen` is not loopback, the data directory is not mode 0700, or the
@@ -272,6 +272,27 @@ Other commands: `accounts list`, `accounts check [alias]` (refreshes a token and
 <alias>`, `accounts remove <alias>` (revokes at Google, deletes the grant and key locally, keeps audit history).
 
 Aliases match `[a-z0-9-]{2,40}`.
+
+### New IMAP mail (IDLE push)
+
+For every active IMAP mailbox with indexing enabled, Dove keeps one extra, long-lived IMAP connection that watches
+INBOX with IDLE (RFC 2177). When the server reports new, removed or changed messages, Dove syncs the mailbox's index
+right away (after a 0.3 to 1 s debounce), so new INBOX mail is searchable within a few seconds. Plan for one
+connection per mailbox beyond the request pool (at most 2): some providers limit concurrent IMAP logins per account.
+
+- IDLE is re-issued every `index.idle_renew_secs` (default and maximum 1500 s, 25 minutes).
+- A lost connection is re-established with exponential backoff and jitter (about 1 s, doubling up to 5 minutes).
+- If the server rejects the password on a reconnect, the mailbox is marked `reauth_required` once and the owner is
+  notified, exactly as for any other login. IDLE then stays off until `dove accounts reconnect <alias>`.
+- Disabling or removing the mailbox, disabling its index, or reauth stops the connection within about a second.
+- Servers without IDLE are polled only. Logs say so once per start ("the mail server does not offer IDLE").
+- `index.imap_idle = false` turns push off for all mailboxes (polling and the search check below still work).
+
+`index.poll_interval_secs` (60) still applies: the poll covers the other folders, flag changes the server does not
+push, and mailboxes without IDLE. Searches add one more safeguard: when an IMAP mailbox has no working IDLE connection
+and its last full sync is older than 5 seconds, `search_messages` (also inside `batch_read`) first checks INBOX for new
+mail, within a 2 second budget (at most once every 5 seconds per mailbox). If the server is slow, the search answers
+from the index as before; `as_of` always reports the last full sync, never this INBOX-only check.
 
 ## Projects, clients and grants
 

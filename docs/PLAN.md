@@ -230,3 +230,8 @@ hosts or reference hardware.
 - A44. Secret files may be group-readable only when owned by root:root (group read, nothing else). systemd 259 copies
   `LoadCredential=` files as 0440 root:root into a 0550 root:root directory and grants the service user read through
   an ACL; the strict 0400/0600 rule made the documented unit fail to start (found on the first real install).
+- A45. IMAP IDLE push (owner request 2026-11-12, reversing the design's non-goal): one dedicated connection per
+  active, index-enabled IMAP mailbox wakes the index sync on INBOX changes; searches run a bounded INBOX check
+  (2 s, once per 5 s per mailbox) when IDLE is not healthy and the last full sync is older than 5 s. The check never
+  advances `last_success_at`, so `as_of` remains the last full sync. A scheduler wake that arrives while the account's
+  job runs is kept for the next tick instead of being dropped.
