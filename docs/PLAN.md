@@ -163,6 +163,10 @@ hosts or reference hardware.
   strips the header before any handler. The secret is optional for compatibility: unset means the old behaviour
   plus a startup warning and a failing `dove doctor` check. Caddy reads it with `{file.*}` (unverified with a real
   Caddy), nginx from a root-only included snippet (unverified with `nginx -t`).
+- A31. The in-memory rate limiter keeps at most 50 000 buckets before pruning. A prune drops only buckets that have
+  refilled to capacity (indistinguishable from a missing bucket), so exhausted callers keep their limit. The next
+  prune runs at twice the surviving size (at least 50 000), which keeps the cost amortized when most buckets are
+  active.
 - A7. Licence is a placeholder (Apache-2.0) until the owner decides (spec 13.7).
 - A16. batch_read: budgets are assigned in input order (deterministic). Items that do not fit return
   `budget_exceeded` with a smaller-request hint instead of a continuation token. The wire budget counts the
