@@ -103,14 +103,15 @@ pub fn defs() -> Vec<ToolDef> {
             input_schema: || {
                 let mut s = detail_schema();
                 s["properties"].as_object_mut().expect("object").remove("ref");
-                s["properties"].as_object_mut().expect("object").remove("message_id");
                 s["properties"]["thread_id"] = json!({ "type": "string" });
-                s["required"] = json!(["account", "thread_id"]);
+                s["properties"]["message_id"] =
+                    json!({ "type": "string", "description": "Instead of thread_id: the thread of this message." });
+                s["required"] = json!(["account"]);
                 s
             },
             output_schema: || {
                 object_schema(
-                    json!({ "messages": { "type": "array" }, "truncated": {"type":"boolean"}, "remaining_message_ids": {"type":"array"} }),
+                    json!({ "messages": { "type": "array" }, "truncated": {"type":"boolean"}, "remaining_message_ids": {"type":"array"}, "thread_incomplete": {"type":"boolean"} }),
                 )
             },
             handler: |cx, args| Box::pin(get_thread(cx, args)),
@@ -189,9 +190,9 @@ pub fn fmt_addrs(v: &[Addr]) -> Vec<String> {
     v.iter().map(fmt_addr).collect()
 }
 
-/// Gmail message resource (format=raw) plus its parsed MIME.
+/// One message: provider-neutral metadata, raw bytes and parsed MIME.
 pub struct Fetched {
-    pub meta: Value,
+    pub meta: crate::mail::MessageMeta,
     pub raw: Vec<u8>,
     pub parsed: ParsedMessage,
 }
@@ -201,17 +202,12 @@ pub fn decode_raw(meta: &Value) -> Result<Vec<u8>, ToolError> {
     util::b64url_decode(raw).ok_or_else(|| ToolError::upstream("undecodable message"))
 }
 
-pub async fn fetch_message(cx: &ToolCx, mb: &Mailbox, id: &str, prio: Priority) -> Result<Fetched, ToolError> {
-    let meta = cx
-        .app
-        .google
-        .call(&mb.account_id, || GmailOp::GetMessage(id), &[("format", "raw".into())], None, prio, cx.deadline)
-        .await?;
-    from_meta(meta)
-}
+pub use crate::mail::fetch_message;
 
-pub fn from_meta(meta: Value) -> Result<Fetched, ToolError> {
-    let raw = decode_raw(&meta)?;
+/// From a Gmail message resource (format=raw).
+pub fn from_meta(v: Value) -> Result<Fetched, ToolError> {
+    let raw = decode_raw(&v)?;
+    let meta = crate::mail::MessageMeta::from_json(&v).ok_or_else(|| ToolError::upstream("message without id"))?;
     let parsed =
         mime::parse(&raw, &mime::Limits::default()).map_err(|_| ToolError::upstream("message could not be parsed"))?;
     Ok(Fetched { meta, raw, parsed })
@@ -227,13 +223,6 @@ pub fn body_text(p: &ParsedMessage) -> String {
     }
 }
 
-fn labels_of(meta: &Value) -> Vec<String> {
-    meta["labelIds"]
-        .as_array()
-        .map(|a| a.iter().filter_map(|l| l.as_str().map(str::to_string)).collect())
-        .unwrap_or_default()
-}
-
 pub struct ShapeOpts {
     pub max_body_chars: usize,
     pub include_headers: Vec<String>,
@@ -242,8 +231,8 @@ pub struct ShapeOpts {
 
 /// Builds the detail object (spec 5.3 get_message output). Returns (object, body chars used).
 pub fn shape(mb: &Mailbox, f: &Fetched, opts: &ShapeOpts) -> (Value, usize) {
-    let id = f.meta["id"].as_str().unwrap_or_default();
-    let labels = labels_of(&f.meta);
+    let id = f.meta.id.as_str();
+    let labels = &f.meta.labels;
     let has = |l: &str| labels.iter().any(|x| x == l);
     let body = body_text(&f.parsed);
     let (body, truncated) = content::truncate_chars(&body, opts.max_body_chars);
@@ -255,18 +244,17 @@ pub fn shape(mb: &Mailbox, f: &Fetched, opts: &ShapeOpts) -> (Value, usize) {
     put("ref", json!(make_ref(&mb.account_id, id)));
     put("account", json!(mb.alias));
     put("message_id", json!(id));
-    put("thread_id", f.meta["threadId"].clone());
-    let internal: i64 = f.meta["internalDate"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
-    put("received_at", json!(util::rfc3339_ms(internal)));
+    put("thread_id", json!(f.meta.thread_id));
+    put("received_at", json!(util::rfc3339_ms(f.meta.internal_date_ms)));
     put("from", json!(f.parsed.from.first().map(fmt_addr)));
     put("to", json!(fmt_addrs(&f.parsed.to)));
     put("cc", json!(fmt_addrs(&f.parsed.cc)));
     put("bcc", json!(fmt_addrs(&f.parsed.bcc)));
     put("reply_to", json!(fmt_addrs(&f.parsed.reply_to)));
     put("subject", json!(f.parsed.subject.as_deref().map(|s| content::clean_text(s).trim().to_string())));
-    put("snippet", json!(f.meta["snippet"].as_str().map(content::clean_text)));
+    put("snippet", json!(f.meta.snippet));
     put("labels", json!(labels));
-    put("size_bytes", f.meta["sizeEstimate"].clone());
+    put("size_bytes", json!(f.meta.size_estimate));
     put("is_unread", json!(has("UNREAD")));
     put("is_starred", json!(has("STARRED")));
     put("is_draft", json!(has("DRAFT")));
@@ -389,6 +377,7 @@ async fn list_accounts(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError
         .join("\n");
     let n = accounts.len() as i64;
     Ok(ToolOutput {
+        extra: Vec::new(),
         structured: json!({ "accounts": accounts }),
         text,
         audit: AuditInfo { result_count: Some(n), ..Default::default() },
@@ -398,16 +387,7 @@ async fn list_accounts(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError
 async fn list_labels(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
     only_keys(&args, &["account"])?;
     let mb = account_arg(cx, &args, Capability::Read)?;
-    let v =
-        cx.app.google.call(&mb.account_id, || GmailOp::Labels, &[], None, Priority::Interactive, cx.deadline).await?;
-    let labels: Vec<Value> = v["labels"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .map(|l| json!({ "id": l["id"], "name": l["name"].as_str().map(content::clean_text), "type": l["type"] }))
-                .collect()
-        })
-        .unwrap_or_default();
+    let labels = crate::mail::list_labels(cx, mb).await?;
     let text = labels
         .iter()
         .map(|l| format!("{} {}", l["id"].as_str().unwrap_or(""), l["name"].as_str().unwrap_or("")))
@@ -415,6 +395,7 @@ async fn list_labels(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> 
         .join("\n");
     let n = labels.len() as i64;
     Ok(ToolOutput {
+        extra: Vec::new(),
         structured: json!({ "account": mb.alias, "labels": labels }),
         text,
         audit: AuditInfo { account: Some(mb.alias.clone()), result_count: Some(n), ..Default::default() },
@@ -422,7 +403,7 @@ async fn list_labels(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> 
 }
 
 /// Resolves `ref` or `account` + `message_id`.
-fn message_target<'a>(cx: &'a ToolCx, args: &Value) -> Result<(&'a Mailbox, String), ToolError> {
+pub(crate) fn message_target<'a>(cx: &'a ToolCx, args: &Value) -> Result<(&'a Mailbox, String), ToolError> {
     if let Some(r) = opt_str(args, "ref")? {
         if args.get("message_id").is_some() {
             return Err(ToolError::invalid("pass either ref or message_id, not both"));
@@ -447,6 +428,7 @@ async fn get_message(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> 
     let (msg, _) = shape(mb, &f, &opts);
     let text = render(&msg);
     Ok(ToolOutput {
+        extra: Vec::new(),
         structured: json!({ "message": msg }),
         text,
         audit: AuditInfo {
@@ -459,10 +441,42 @@ async fn get_message(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> 
 }
 
 async fn get_thread(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
-    only_keys(&args, &["account", "thread_id", "max_body_chars", "include_headers", "select"])?;
+    only_keys(&args, &["account", "thread_id", "message_id", "max_body_chars", "include_headers", "select"])?;
     let opts = shape_opts(&args)?;
     let mb = account_arg(cx, &args, Capability::Read)?;
-    let tid = gmail_id_arg(&args, "thread_id")?;
+    let present = |k: &str| !matches!(args.get(k), None | Some(Value::Null));
+    let (tid_arg, msg_arg) = match (present("thread_id"), present("message_id")) {
+        (true, false) => (Some(gmail_id_arg(&args, "thread_id")?), None),
+        (false, true) => (None, Some(gmail_id_arg(&args, "message_id")?)),
+        _ => return Err(ToolError::invalid("pass either thread_id or message_id")),
+    };
+    if mb.provider == crate::policy::Provider::Imap {
+        return imap_thread(cx, mb, tid_arg, msg_arg, &opts).await;
+    }
+    let tid_owned = match (tid_arg, msg_arg) {
+        (Some(t), _) => t.to_string(),
+        (None, Some(m)) => {
+            let v = cx
+                .app
+                .google
+                .call(
+                    &mb.account_id,
+                    || GmailOp::GetMessage(m),
+                    &[("format", "minimal".into())],
+                    None,
+                    Priority::Interactive,
+                    cx.deadline,
+                )
+                .await?;
+            v["threadId"]
+                .as_str()
+                .filter(|t| crate::gmail::gateway::valid_id(t))
+                .ok_or_else(|| ToolError::upstream("message without thread"))?
+                .to_string()
+        }
+        (None, None) => unreachable!("checked above"),
+    };
+    let tid = tid_owned.as_str();
     let t = cx
         .app
         .google
@@ -517,12 +531,50 @@ async fn get_thread(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
     }
     let n = messages.len() as i64;
     Ok(ToolOutput {
-        structured: json!({ "account": mb.alias, "thread_id": tid, "messages": messages, "truncated": truncated, "remaining_message_ids": remaining }),
+        extra: Vec::new(),
+        structured: json!({ "account": mb.alias, "thread_id": tid, "messages": messages, "truncated": truncated,
+                            "remaining_message_ids": remaining, "thread_incomplete": false }),
         text,
         audit: AuditInfo {
             account: Some(mb.alias.clone()),
             object_ids: vec![tid.to_string()],
             result_count: Some(n),
+            ..Default::default()
+        },
+    })
+}
+
+/// `get_thread` on an IMAP mailbox. Thread ids are derived (`mail::imap_thread_id`) and resolved through the
+/// index; without it the message given by `message_id` comes back alone, marked `thread_incomplete`.
+async fn imap_thread(
+    cx: &ToolCx,
+    mb: &Mailbox,
+    tid: Option<&str>,
+    message_id: Option<&str>,
+    opts: &ShapeOpts,
+) -> Result<ToolOutput, ToolError> {
+    let Some(id) = message_id else {
+        let _ = tid;
+        return Err(ToolError::invalid(
+            "threads of this mailbox are not indexed yet; pass message_id to read a message with its thread",
+        ));
+    };
+    let f = fetch_message(cx, mb, id, Priority::Interactive).await?;
+    let (msg, _) = shape(mb, &f, opts);
+    let text = format!(
+        "{}\n[thread incomplete: only this message is available because the mailbox has no thread index]\n",
+        render(&msg)
+    );
+    let tid = f.meta.thread_id.clone();
+    Ok(ToolOutput {
+        extra: Vec::new(),
+        structured: json!({ "account": mb.alias, "thread_id": tid, "messages": [msg], "truncated": false,
+                            "remaining_message_ids": [], "thread_incomplete": true }),
+        text,
+        audit: AuditInfo {
+            account: Some(mb.alias.clone()),
+            object_ids: vec![tid],
+            result_count: Some(1),
             ..Default::default()
         },
     })
@@ -594,13 +646,13 @@ async fn list_drafts(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> 
         let own = owned.iter().find(|(o, _, _)| o == d);
         Ok(json!({
             "draft_id": d,
-            "revision": f.meta["id"],
+            "revision": f.meta.id,
             "owned": own.is_some(),
-            "changed_outside_dove": own.is_some_and(|(_, m, _)| f.meta["id"].as_str() != Some(m.as_str())),
-            "thread_id": f.meta["threadId"],
+            "changed_outside_dove": own.is_some_and(|(_, m, _)| f.meta.id != *m),
+            "thread_id": f.meta.thread_id,
             "to": fmt_addrs(&f.parsed.to),
             "subject": f.parsed.subject.as_deref().map(content::clean_text),
-            "updated_at": util::rfc3339_ms(f.meta["internalDate"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0)),
+            "updated_at": util::rfc3339_ms(f.meta.internal_date_ms),
         }))
     }))
     .buffered(4)
@@ -633,6 +685,7 @@ async fn list_drafts(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> 
     let n = drafts.len() as i64;
     let next = if own_only { None } else { v["nextPageToken"].as_str().map(str::to_string) };
     Ok(ToolOutput {
+        extra: Vec::new(),
         structured: json!({ "account": mb.alias, "drafts": drafts, "next_page_token": next }),
         text,
         audit: AuditInfo { account: Some(mb.alias.clone()), result_count: Some(n), ..Default::default() },
@@ -665,7 +718,7 @@ async fn get_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
     let owned = owned_drafts(cx, &mb.account_id).await?;
     let own = owned.iter().find(|(d, _, _)| d == did);
     let (msg, _) = shape(mb, &f, &opts);
-    let revision = f.meta["id"].as_str().unwrap_or_default().to_string();
+    let revision = f.meta.id.clone();
     let changed = own.is_some_and(|(_, m, _)| *m != revision);
     let text = format!(
         "draft {did} revision {revision}{}\n{}",
@@ -674,6 +727,7 @@ async fn get_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
     );
     let _ = started;
     Ok(ToolOutput {
+        extra: Vec::new(),
         structured: json!({ "account": mb.alias, "draft_id": did, "revision": revision, "owned": own.is_some(),
                             "editable_by_dove": own.is_some() && !changed && f.parsed.is_simple_text, "message": msg }),
         text,

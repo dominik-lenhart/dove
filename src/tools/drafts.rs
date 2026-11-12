@@ -284,6 +284,7 @@ async fn create_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError>
         OpState::Done(v) => {
             let ids = vec![v["draft_id"].as_str().unwrap_or_default().to_string()];
             return Ok(ToolOutput {
+                extra: Vec::new(),
                 text: format!(
                     "draft {} already created for this request_key (revision {})",
                     v["draft_id"].as_str().unwrap_or(""),
@@ -342,6 +343,7 @@ async fn create_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError>
             }
             crate::index::wake(&cx.app, &mb.account_id);
             Ok(ToolOutput {
+                extra: Vec::new(),
                 text: format!(
                     "Created draft {draft_id} in {} (revision {message_id}). Review it in the mailbox's Drafts.",
                     mb.alias
@@ -426,10 +428,10 @@ async fn dispatch_create(
                 } else {
                     format!("Re: {}", orig_subject.trim())
                 };
-                thread_id = orig.meta["threadId"].as_str().map(str::to_string);
+                thread_id = Some(orig.meta.thread_id.clone()).filter(|t| !t.is_empty());
             }
             Some(s) if normalize_subject(s) == normalize_subject(&orig_subject) => {
-                thread_id = orig.meta["threadId"].as_str().map(str::to_string);
+                thread_id = Some(orig.meta.thread_id.clone()).filter(|t| !t.is_empty());
             }
             // A different subject starts a new conversation; threadId cannot force grouping (spec 5.3).
             Some(_) => {}
@@ -513,7 +515,7 @@ async fn fresh_checked(
         )
         .await?;
     let f = from_meta(v["message"].clone())?;
-    let current = f.meta["id"].as_str().unwrap_or_default();
+    let current = f.meta.id.as_str();
     if current != own.message_id {
         return Err(conflict(&f, "the draft was changed outside Dove; it is now human-owned"));
     }
@@ -524,7 +526,7 @@ async fn fresh_checked(
 }
 
 fn conflict(f: &super::read::Fetched, why: &str) -> ToolError {
-    ToolError::new(ErrorCode::DraftConflict, why).with_details(json!({ "current_revision": f.meta["id"] }))
+    ToolError::new(ErrorCode::DraftConflict, why).with_details(json!({ "current_revision": f.meta.id }))
 }
 
 // ------------------------------------------------------------------ update
@@ -586,8 +588,8 @@ async fn update_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError>
     fields.date = util::now_unix();
     let raw = mime::build_draft(&fields).map_err(mime_err)?;
     let mut message = json!({ "raw": util::b64url(&raw) });
-    if let Some(t) = f.meta["threadId"].as_str() {
-        message["threadId"] = json!(t);
+    if !f.meta.thread_id.is_empty() {
+        message["threadId"] = json!(f.meta.thread_id);
     }
     let body = json!({ "id": draft_id, "message": message });
     let did = draft_id.clone();
@@ -620,6 +622,7 @@ async fn update_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError>
             }
             crate::index::wake(&cx.app, &mb.account_id);
             Ok(ToolOutput {
+                extra: Vec::new(),
                 text: format!("Updated draft {draft_id} (revision {new_rev})."),
                 structured: json!({ "account": mb.alias, "draft_id": draft_id, "revision": new_rev, "message_id": new_rev, "thread_id": v["message"]["threadId"] }),
                 audit: AuditInfo {
@@ -734,6 +737,7 @@ async fn send_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
                 .await;
             crate::index::wake(&cx.app, &mb.account_id);
             Ok(ToolOutput {
+                extra: Vec::new(),
                 text: format!("Sent draft {draft_id} as message {sent_id}."),
                 structured: json!({ "account": mb.alias, "draft_id": draft_id, "sent_message_id": sent_id, "thread_id": v["threadId"] }),
                 audit: AuditInfo {

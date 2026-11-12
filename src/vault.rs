@@ -1,4 +1,4 @@
-//! Envelope encryption for Google grants (spec 6.4).
+//! Envelope encryption for Google grants and IMAP passwords (spec 6.4, IMAP design).
 //!
 //! Each account has a random DEK. The DEK is wrapped by the KEK (versioned) and the refresh token is encrypted with
 //! the DEK. Both use XChaCha20-Poly1305 with a fresh random 192-bit nonce. Associated data binds every ciphertext to
@@ -15,6 +15,8 @@ use crate::secrets::KeyRing;
 use crate::util;
 
 const NONCE_LEN: usize = 24;
+const KIND_REFRESH: &str = "refresh_token";
+const KIND_PASSWORD: &str = "imap_password";
 
 /// Stored form of one grant secret.
 #[derive(Debug, Clone)]
@@ -69,13 +71,7 @@ impl Vault {
 
     /// Encrypts a refresh token for `account_id` under a fresh DEK.
     pub fn seal_grant(&self, account_id: &str, refresh_token: &str) -> anyhow::Result<SealedGrant> {
-        let (kek_version, kek) = self.kek.current();
-        let dek = Zeroizing::new(util::random_bytes::<32>());
-        let (dek_nonce, dek_ct) = seal(kek, &aad("dek", account_id, kek_version), &dek[..])?;
-        let mut dek_wrapped = dek_nonce;
-        dek_wrapped.extend_from_slice(&dek_ct);
-        let (nonce, ciphertext) = seal(&dek, &aad("refresh_token", account_id, kek_version), refresh_token.as_bytes())?;
-        Ok(SealedGrant { dek_wrapped, kek_version, ciphertext, nonce })
+        self.seal_kind(account_id, KIND_REFRESH, refresh_token)
     }
 
     fn unwrap_dek(&self, account_id: &str, sealed: &SealedGrant) -> anyhow::Result<Zeroizing<[u8; 32]>> {
@@ -96,9 +92,39 @@ impl Vault {
 
     /// Decrypts the refresh token. Fails if the row was moved to another account or tampered with.
     pub fn open_grant(&self, account_id: &str, sealed: &SealedGrant) -> anyhow::Result<Zeroizing<String>> {
+        self.open_kind(account_id, KIND_REFRESH, sealed)
+    }
+
+    /// Encrypts an IMAP/SMTP password for `account_id` under a fresh DEK. The AAD kind `imap_password` differs from
+    /// `refresh_token`, so neither secret can be opened as the other.
+    pub fn seal_password(&self, account_id: &str, password: &str) -> anyhow::Result<SealedGrant> {
+        self.seal_kind(account_id, KIND_PASSWORD, password)
+    }
+
+    pub fn open_password(&self, account_id: &str, sealed: &SealedGrant) -> anyhow::Result<Zeroizing<String>> {
+        self.open_kind(account_id, KIND_PASSWORD, sealed)
+    }
+
+    /// Re-wraps an IMAP password under the current KEK version.
+    pub fn rewrap_password(&self, account_id: &str, sealed: &SealedGrant) -> anyhow::Result<SealedGrant> {
+        let pw = self.open_password(account_id, sealed)?;
+        self.seal_password(account_id, &pw)
+    }
+
+    fn seal_kind(&self, account_id: &str, kind: &str, secret: &str) -> anyhow::Result<SealedGrant> {
+        let (kek_version, kek) = self.kek.current();
+        let dek = Zeroizing::new(util::random_bytes::<32>());
+        let (dek_nonce, dek_ct) = seal(kek, &aad("dek", account_id, kek_version), &dek[..])?;
+        let mut dek_wrapped = dek_nonce;
+        dek_wrapped.extend_from_slice(&dek_ct);
+        let (nonce, ciphertext) = seal(&dek, &aad(kind, account_id, kek_version), secret.as_bytes())?;
+        Ok(SealedGrant { dek_wrapped, kek_version, ciphertext, nonce })
+    }
+
+    fn open_kind(&self, account_id: &str, kind: &str, sealed: &SealedGrant) -> anyhow::Result<Zeroizing<String>> {
         let dek = self.unwrap_dek(account_id, sealed)?;
-        let pt = open(&dek, &aad("refresh_token", account_id, sealed.kek_version), &sealed.nonce, &sealed.ciphertext)?;
-        let s = String::from_utf8(pt.to_vec()).map_err(|_| anyhow!("grant is not UTF-8"))?;
+        let pt = open(&dek, &aad(kind, account_id, sealed.kek_version), &sealed.nonce, &sealed.ciphertext)?;
+        let s = String::from_utf8(pt.to_vec()).map_err(|_| anyhow!("sealed secret is not UTF-8"))?;
         Ok(Zeroizing::new(s))
     }
 
@@ -174,6 +200,25 @@ mod tests {
         assert_eq!(&**both.open_grant("a", &rewrapped).unwrap(), "tok");
         // The old-only vault cannot open the new version.
         assert!(old.open_grant("a", &rewrapped).is_err());
+    }
+
+    #[test]
+    fn vault_kinds_do_not_cross() {
+        let v = vault();
+        let pw = v.seal_password("acct", "p\"a\\\u{df} w").unwrap();
+        assert_eq!(&**v.open_password("acct", &pw).unwrap(), "p\"a\\\u{df} w");
+        // A sealed password is not a refresh token and a refresh token is not a password.
+        assert!(v.open_grant("acct", &pw).is_err());
+        let rt = v.seal_grant("acct", "1//refresh").unwrap();
+        assert!(v.open_password("acct", &rt).is_err());
+        // Bound to the account like grants are.
+        assert!(v.open_password("other", &pw).is_err());
+        let needle = b"\"a\\";
+        assert!(!pw.ciphertext.windows(needle.len()).any(|w| w == needle));
+        // Rotation keeps the kind.
+        let re = v.rewrap_password("acct", &pw).unwrap();
+        assert_eq!(&**v.open_password("acct", &re).unwrap(), "p\"a\\\u{df} w");
+        assert!(v.rewrap("acct", &pw).is_err());
     }
 
     #[test]

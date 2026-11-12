@@ -234,6 +234,7 @@ async fn batch_read(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
         _ => Some(accounts.into_iter().collect::<Vec<_>>().join(",")),
     };
     Ok(ToolOutput {
+        extra: Vec::new(),
         structured: json!({ "items": out_items, "ok_count": ok, "error_count": failed }),
         text: format!("batch_read: {ok} ok, {failed} failed\n{text}"),
         audit,

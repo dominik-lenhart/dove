@@ -32,6 +32,7 @@ cargo fmt
 - `src/admin/`: Unix socket admin protocol (server + CLI client)
 - `src/policy.rs`: the single authorization decision point
 - `src/gmail/`: outbound gateway (allowlist), token manager, typed Gmail operations, MIME/HTML handling
+- `src/imap/`: IMAP/SMTP provider; `ops.rs` is the command allowlist and the only place that builds command strings
 - `src/mcp/`: JSON-RPC / Streamable HTTP protocol layer; `src/tools/`: tool handlers
 - `src/index/`: SQLCipher FTS5 index, sync engine, query compiler
 - `src/client/`: remote client commands (login, search, mcp install, stdio bridge)
@@ -140,3 +141,21 @@ cargo fmt
   service user, so a strict "no group bits" secret check rejects them; `secrets::secret_mode_ok` allows that one case
   (A44). Test unit directives with `sudo systemd-run --wait --pipe -p User=dove -p LoadCredential=...` before
   documenting them. Globs over root-only directories in docs must run inside `sudo sh -c '...'`.
+- 2026-11-12: The IMAP/SMTP client is hand-written (`src/imap/`), not `async-imap`: it is small, uses the rustls,
+  aws-lc-rs provider and platform verifier already in the tree through reqwest (no new crates), and lets outcome
+  classification follow exactly where a write stopped (`ExecError::sent_all`, SMTP `data_terminator_sent`).
+  Plaintext exists only as `ImapConnector::plaintext_for_tests()` (cfg `test`/`testing`). Tests use
+  `tests/support/fake_imap.rs`: non-PEEK fetches set `\Seen` there, `fail_next_containing` targets one command
+  (for example the body fetch), and `assert_only_allowlisted()` checks the command log.
+- 2026-11-12: IMAP accounts (`accounts.provider = 'imap'`) keep their sealed password in `grants` (vault AAD kind
+  `imap_password`, so `open_grant` fails on it): code that walks `grants` (remove, keys rotate) must branch on
+  `provider`. `zeroize::Zeroizing`'s `Debug` prints the secret, so admin requests carry passwords as
+  `admin::Password` (redacted `Debug`). Tests connect IMAP mailboxes with `Harness::imap_mailbox` (real
+  `AccountsConnectImap` against `h.imap`); assign `h.imap = FakeImap::start_with(..)` before connecting to change
+  server options. Connect errors name the step and server address only, never server text.
+- 2026-11-12: Tools read messages through `mail::fetch_message` / `mail::list_labels`, which dispatch on
+  `Mailbox.provider`; `read::Fetched.meta` is a typed `mail::MessageMeta`. Gmail-only paths that reach
+  `TokenManager::access_token` with an IMAP account get `invalid_argument` (never the vault or Google). Extra MCP content
+  items (the `get_attachment` resource) go in `ToolOutput.extra`; `Remote::call_tool` keeps them in `ToolResult.content`.
+  IMAP `get_thread` takes `message_id` until the index can resolve derived thread ids. `tests/support/fake_imap.rs`
+  takes UTF-8 folder names while `imap_folders.name` stores the wire name (modified UTF-7).

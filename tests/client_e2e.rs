@@ -516,3 +516,60 @@ async fn remote_commands_have_no_path_to_the_admin_socket() {
     assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1, "control: admin commands use the socket");
     server.abort();
 }
+
+#[tokio::test]
+async fn cli_attachment_save_refuses_overwrite() {
+    let h = setup().await;
+    let c = Client::new(&h);
+    let data: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+    let id = h.google.add_message(
+        "info@acme.test",
+        MessageSpec {
+            from: "Ann <ann@example.test>".into(),
+            to: vec!["info@acme.test".into()],
+            subject: "Scan".into(),
+            text: Some("See attached.".into()),
+            attachments: vec![("../scan.pdf".into(), "application/pdf".into(), data.clone())],
+            internal_date_ms: 1_700_000_000_000,
+            ..Default::default()
+        },
+    );
+    c.login("ro", &invite(&h, "reader", &["info"], "read").await).await;
+    let o = c.ok(&["message", "get", "--profile", "ro", "--account", "info", "--id", &id, "--json"], "").await;
+    let v: Value = serde_json::from_str(&o.stdout).unwrap();
+    let r = v["result"]["message"]["ref"].as_str().unwrap().to_string();
+    let part = v["result"]["message"]["attachments"][0]["attachment_id"].as_str().unwrap().to_string();
+    let dir = c.path("downloads");
+    std::fs::create_dir_all(&dir).unwrap();
+    let args = [
+        "message",
+        "attachment",
+        "save",
+        "--profile",
+        "ro",
+        "--ref",
+        &r,
+        "--attachment-id",
+        &part,
+        "--out",
+        dir.to_str().unwrap(),
+    ];
+    let o = c.ok(&args, "").await;
+    // The name loses its path part; the file holds exactly the bytes and only the owner can read it.
+    let file = dir.join("scan.pdf");
+    assert!(o.stdout.contains("scan.pdf"), "{}", o.stdout);
+    assert_eq!(std::fs::read(&file).unwrap(), data);
+    assert_eq!(mode(&file), 0o600);
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+    // A second save never overwrites, even a file that changed in between.
+    std::fs::write(&file, b"mine").unwrap();
+    let o = c.run(&args, "").await;
+    assert_ne!(o.code, 0);
+    assert!(o.stderr.contains("never overwritten"), "{}", o.stderr);
+    assert_eq!(std::fs::read(&file).unwrap(), b"mine");
+    // Errors from the server come back as a non-zero exit with the stable code.
+    let args = ["message", "attachment", "save", "--profile", "ro", "--ref", &r, "--attachment-id", "part-99"];
+    let o = c.run(&args, "").await;
+    assert_ne!(o.code, 0);
+    assert!(o.stderr.contains("not_found"), "{}", o.stderr);
+}

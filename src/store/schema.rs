@@ -1,6 +1,6 @@
 //! Versioned schema migrations for the durable state store. Never edit a released migration; append a new one.
 
-pub const MIGRATIONS: &[&str] = &[V1, V2];
+pub const MIGRATIONS: &[&str] = &[V1, V2, V3];
 
 const V1: &str = r#"
 CREATE TABLE accounts (
@@ -186,4 +186,24 @@ CREATE TABLE notifications (
 /// registrations. NULL for rows registered before V2 and for pre-registered applications.
 const V2: &str = r#"
 ALTER TABLE oauth_apps ADD COLUMN registered_from TEXT;
+"#;
+
+/// V3: IMAP/SMTP accounts (design 2026-11-12). `imap_settings` holds the server endpoints and options as JSON (no
+/// secrets); the password is sealed in `grants` with its own AAD kind. `imap_folders` maps small per-account folder
+/// ids (part of agent-visible message ids) to the server's wire name (modified UTF-7). `own_drafts.content_hash` is
+/// the SHA-256 of the server's bytes of an IMAP draft.
+const V3: &str = r#"
+ALTER TABLE accounts ADD COLUMN provider TEXT NOT NULL DEFAULT 'gmail' CHECK (provider IN ('gmail', 'imap'));
+ALTER TABLE accounts ADD COLUMN imap_settings TEXT;
+
+CREATE TABLE imap_folders (
+    account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    folder_id  INTEGER NOT NULL,
+    name       TEXT NOT NULL,
+    special    TEXT CHECK (special IN ('drafts', 'sent', 'junk', 'trash')),
+    PRIMARY KEY (account_id, folder_id),
+    UNIQUE (account_id, name)
+);
+
+ALTER TABLE own_drafts ADD COLUMN content_hash BLOB;
 "#;

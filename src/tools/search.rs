@@ -457,6 +457,7 @@ async fn index_search(
     }
     let text = render_text(&out);
     Ok(ToolOutput {
+        extra: Vec::new(),
         structured: out,
         text,
         audit: AuditInfo {
@@ -717,6 +718,7 @@ async fn live_search(
     let count = out["rows"].as_array().map_or(0, |r| r.len()) as i64;
     let text = render_text(&out);
     Ok(ToolOutput {
+        extra: Vec::new(),
         structured: out,
         text,
         audit: AuditInfo {

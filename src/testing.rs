@@ -68,13 +68,14 @@ impl TestEnv {
         let uid = nix::unistd::getuid().as_raw();
         let mut cfg = test_config(dir.path(), uid);
         customize(&mut cfg);
-        let app = App::from_config_with(cfg, upstream).unwrap();
+        let app = App::from_config_with(cfg, upstream, crate::imap::ImapConnector::plaintext_for_tests()).unwrap();
         Self { dir, app }
     }
 
     /// Reopens the same data directory as a fresh process would (restart tests).
     pub fn restart(&self, upstream: crate::gmail::gateway::Upstream) -> Arc<App> {
-        App::from_config_with(self.app.cfg.clone(), upstream).unwrap()
+        App::from_config_with(self.app.cfg.clone(), upstream, crate::imap::ImapConnector::plaintext_for_tests())
+            .unwrap()
     }
 
     /// Inserts an active account with a sealed fake refresh token, as a completed connect would.

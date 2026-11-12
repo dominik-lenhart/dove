@@ -25,6 +25,10 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
 tower = { version = "0.5", features = ["limit", "timeout", "util"] }
 tower-http = { version = "0.7", features = ["limit"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "form", "query", "http2"] }
+# IMAP/SMTP TLS: the same rustls stack, crypto provider and platform verifier reqwest uses (no second TLS path).
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs", "tls12"] }
+rustls-platform-verifier = "0.7"
 
 # Storage. bundled-sqlcipher-vendored-openssl: SQLCipher + FTS5 built in, no system library needed.
 rusqlite = { version = "0.42", features = ["bundled-sqlcipher-vendored-openssl"] }

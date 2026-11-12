@@ -7,11 +7,35 @@ pub mod client;
 pub mod ops;
 pub mod server;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
+use zeroize::Zeroizing;
 
 use crate::audit::SearchFilter;
+use crate::imap::ServerEndpoint;
 use ops::GrantSpec;
+
+/// A mailbox password inside an admin request: zeroized on drop, never printed by `Debug`.
+#[derive(Clone, Default)]
+pub struct Password(pub Zeroizing<String>);
+
+impl std::fmt::Debug for Password {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[redacted]")
+    }
+}
+
+impl Serialize for Password {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for Password {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(Self(Zeroizing::new(String::deserialize(d)?)))
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "verb", rename_all = "snake_case", deny_unknown_fields)]
@@ -39,6 +63,23 @@ pub enum AdminRequest {
     },
     AccountsReconnect {
         alias: String,
+    },
+    /// Connects an IMAP/SMTP mailbox after verifying both logins (design "Account model and connect").
+    AccountsConnectImap {
+        alias: String,
+        email: String,
+        username: Option<String>,
+        smtp_username: Option<String>,
+        password: Password,
+        imap: Option<ServerEndpoint>,
+        smtp: Option<ServerEndpoint>,
+        drafts_folder: Option<String>,
+        preset: Option<String>,
+    },
+    /// Replaces an IMAP mailbox's password after verifying it.
+    AccountsReconnectImap {
+        alias: String,
+        password: Password,
     },
     AccountsRemove {
         alias: String,
@@ -137,6 +178,8 @@ impl AdminRequest {
             AccountsList => ("accounts.list", None, None, vec![]),
             AccountsConnect { alias, .. } => ("accounts.connect", None, Some(alias.clone()), vec![]),
             AccountsReconnect { alias } => ("accounts.reconnect", None, Some(alias.clone()), vec![]),
+            AccountsConnectImap { alias, .. } => ("accounts.connect_imap", None, Some(alias.clone()), vec![]),
+            AccountsReconnectImap { alias, .. } => ("accounts.reconnect_imap", None, Some(alias.clone()), vec![]),
             AccountsRemove { alias } => ("accounts.remove", None, Some(alias.clone()), vec![]),
             AccountsDisable { alias } => ("accounts.disable", None, Some(alias.clone()), vec![]),
             AccountsEnable { alias } => ("accounts.enable", None, Some(alias.clone()), vec![]),

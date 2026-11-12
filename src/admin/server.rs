@@ -57,7 +57,8 @@ async fn handle_conn(app: Arc<App>, stream: UnixStream) -> anyhow::Result<()> {
     let uid = cred.uid();
     let (rd, mut wr) = stream.into_split();
     let mut reader = BufReader::new(rd).take(MAX_REQUEST_BYTES as u64 + 1);
-    let mut line = String::new();
+    // The line may carry a mailbox password (connect-imap): wipe it when the call is done.
+    let mut line = zeroize::Zeroizing::new(String::new());
     reader.read_line(&mut line).await?;
     let request_id = util::new_id();
     let actor = Actor { name: format!("uid:{uid}"), request_id: request_id.clone() };
@@ -73,7 +74,13 @@ async fn handle_conn(app: Arc<App>, stream: UnixStream) -> anyhow::Result<()> {
             Ok(req) => dispatch(&app, &actor, req).await,
             Err(e) => {
                 write_audit(&app, &actor, ("admin.invalid", None, None, vec![]), "invalid_argument").await;
-                AdminResponse::err(format!("invalid request: {e}"))
+                // serde can quote input values ("invalid type: string ..."); a password must not come back in an
+                // error, so requests that carry one get only the error category and position.
+                if line.contains("\"password\"") {
+                    AdminResponse::err(format!("invalid request at line {} column {}", e.line(), e.column()))
+                } else {
+                    AdminResponse::err(format!("invalid request: {e}"))
+                }
             }
         }
     };
@@ -267,6 +274,21 @@ async fn execute(call: &mut AdminCall<'_>, req: AdminRequest) -> anyhow::Result<
             let url = crate::gmail::connect::start(&app, &alias, None, true).await?;
             Ok(json!({ "open_this_link": url, "expires_in_minutes": 10 }))
         }
+        AccountsConnectImap { alias, email, username, smtp_username, password, imap, smtp, drafts_folder, preset } => {
+            let req = crate::imap::connect::ConnectImap {
+                alias,
+                email,
+                username,
+                smtp_username,
+                password: password.0,
+                imap,
+                smtp,
+                drafts_folder,
+                preset,
+            };
+            crate::imap::connect::connect(call, req).await
+        }
+        AccountsReconnectImap { alias, password } => crate::imap::connect::reconnect(call, &alias, password.0).await,
         AccountsRemove { alias } => accounts_remove(call, &alias).await,
         AccountsCheck { alias } => accounts_check(&app, alias).await,
         KeysRotate => keys_rotate(call).await,
@@ -282,17 +304,20 @@ async fn execute(call: &mut AdminCall<'_>, req: AdminRequest) -> anyhow::Result<
 async fn accounts_remove(call: &mut AdminCall<'_>, alias: &str) -> anyhow::Result<Value> {
     let app = call.app.clone();
     let a = alias.to_string();
-    let (account_id, row) = app
+    let (account_id, provider, row) = app
         .store
         .call(move |c| {
             let id = ops::account_id(c, &a)?;
+            let provider: String = c.query_row("SELECT provider FROM accounts WHERE id = ?1", [&id], |r| r.get(0))?;
             let row = crate::gmail::tokens::load_grant(c, &id)?;
-            Ok((id, row))
+            Ok((id, provider, row))
         })
         .await?;
-    // Revoke at Google first (best effort); local deletion happens regardless (spec 7.9 step 3, FR-A4).
-    let mut revoked = "no_grant";
-    if let Some(sealed) = row.and_then(|r| r.sealed) {
+    // Revoke at Google first (best effort); local deletion happens regardless (spec 7.9 step 3, FR-A4). An IMAP
+    // password cannot be revoked remotely: deleting the sealed copy is all Dove can do.
+    let mut revoked = if provider == "imap" { "not_applicable" } else { "no_grant" };
+    app.imap.evict(&account_id);
+    if let Some(sealed) = row.and_then(|r| r.sealed).filter(|_| provider != "imap") {
         revoked = match app.vault.open_grant(&account_id, &sealed) {
             Ok(rt) => match app.google.gateway().revoke(&rt).await {
                 Ok(()) => "revoked",
@@ -323,19 +348,24 @@ async fn accounts_remove(call: &mut AdminCall<'_>, alias: &str) -> anyhow::Resul
 }
 
 async fn accounts_check(app: &Arc<App>, alias: Option<String>) -> anyhow::Result<Value> {
-    let accounts: Vec<(String, String, String)> = app
+    let accounts: Vec<(String, String, String, String)> = app
         .store
         .call(move |c| {
-            let mut stmt =
-                c.prepare("SELECT id, alias, status FROM accounts WHERE (?1 IS NULL OR alias = ?1) ORDER BY alias")?;
-            let rows = stmt.query_map([&alias], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            let mut stmt = c.prepare(
+                "SELECT id, alias, status, provider FROM accounts WHERE (?1 IS NULL OR alias = ?1) ORDER BY alias",
+            )?;
+            let rows = stmt.query_map([&alias], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
             Ok(rows.collect::<Result<_, _>>()?)
         })
         .await?;
     let mut out = Vec::new();
-    for (id, alias, status) in accounts {
+    for (id, alias, status, provider) in accounts {
         if status != "active" {
             out.push(json!({ "account": alias, "status": status }));
+            continue;
+        }
+        if provider == "imap" {
+            out.push(crate::imap::connect::check(app, &id, &alias).await);
             continue;
         }
         app.google.tokens().evict(&id);
@@ -371,20 +401,22 @@ async fn keys_rotate(call: &mut AdminCall<'_>) -> anyhow::Result<Value> {
     let (rewrapped, remaining) = call
         .tx(move |tx| {
             #[allow(clippy::type_complexity)] // one row of the grants table
-            let rows: Vec<(String, Vec<u8>, u32, Vec<u8>, Vec<u8>)> = {
+            let rows: Vec<(String, Vec<u8>, u32, Vec<u8>, Vec<u8>, String)> = {
                 let mut stmt = tx.prepare(
-                    "SELECT account_id, dek_wrapped, kek_version, refresh_token_ciphertext, nonce FROM grants",
+                    "SELECT g.account_id, g.dek_wrapped, g.kek_version, g.refresh_token_ciphertext, g.nonce, a.provider \
+                     FROM grants g JOIN accounts a ON a.id = g.account_id",
                 )?;
-                stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
+                stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?
                     .collect::<Result<_, _>>()?
             };
             let mut n = 0;
-            for (id, dek_wrapped, kek_version, ciphertext, nonce) in rows {
+            for (id, dek_wrapped, kek_version, ciphertext, nonce, provider) in rows {
                 if kek_version == current {
                     continue;
                 }
                 let sealed = crate::vault::SealedGrant { dek_wrapped, kek_version, ciphertext, nonce };
-                let new = vault.rewrap(&id, &sealed)?;
+                let new =
+                    if provider == "imap" { vault.rewrap_password(&id, &sealed)? } else { vault.rewrap(&id, &sealed)? };
                 tx.execute(
                     "UPDATE grants SET dek_wrapped = ?1, kek_version = ?2, refresh_token_ciphertext = ?3, nonce = ?4, \
                      rotated_at = ?5 WHERE account_id = ?6",
@@ -435,8 +467,12 @@ async fn doctor(app: &Arc<App>) -> Value {
             "secrets.proxy_secret_file is not set; local processes can forge X-Forwarded-For".into()
         },
     );
-    let google = app.google.jwks(true).await;
-    add("google_reachable", google.is_ok(), google.err().map(|e| e.to_string()).unwrap_or_default());
+    if app.cfg.google.is_some() {
+        let google = app.google.jwks(true).await;
+        add("google_reachable", google.is_ok(), google.err().map(|e| e.to_string()).unwrap_or_default());
+    } else {
+        add("google_reachable", true, "no [google] section: Gmail mailboxes cannot be connected".into());
+    }
     let (_, key) = app.index_key.current();
     let idx = crate::index::db::open(&app.cfg.index_db_path(), key, &app.cfg.index);
     add("index_encryption", idx.is_ok(), idx.err().map(|e| e.to_string()).unwrap_or_default());

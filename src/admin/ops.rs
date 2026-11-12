@@ -149,7 +149,7 @@ pub fn project_show(conn: &Connection, name: &str) -> anyhow::Result<Value> {
 pub fn account_list(conn: &Connection) -> anyhow::Result<Value> {
     let mut stmt = conn.prepare(
         "SELECT alias, email, display_name, status, granted_scopes, connected_at, last_used_at, last_error_code, \
-         index_enabled FROM accounts ORDER BY alias",
+         index_enabled, provider FROM accounts ORDER BY alias",
     )?;
     let rows = stmt.query_map([], |r| {
         Ok(json!({
@@ -160,6 +160,7 @@ pub fn account_list(conn: &Connection) -> anyhow::Result<Value> {
             "last_used_at": r.get::<_, Option<i64>>(6)?.map(util::rfc3339),
             "last_error": r.get::<_, Option<String>>(7)?,
             "index_enabled": r.get::<_, i64>(8)? != 0,
+            "provider": r.get::<_, String>(9)?,
         }))
     })?;
     Ok(Value::Array(rows.collect::<Result<_, _>>()?))

@@ -35,7 +35,7 @@ pub enum Command {
     },
     /// Print an example configuration.
     ConfigExample,
-    /// Manage connected Google mailboxes (admin).
+    /// Manage connected mailboxes: Gmail and IMAP/SMTP (admin).
     #[command(subcommand)]
     Accounts(AccountsCmd),
     /// Manage projects (admin).
@@ -89,12 +89,19 @@ pub enum AccountsCmd {
         #[command(flatten)]
         admin: AdminOpts,
     },
+    /// Connect an IMAP/SMTP mailbox (Strato, iCloud, any provider with app passwords). Both logins are verified
+    /// before anything is stored. The password is read from the terminal without echo, or from stdin.
+    ConnectImap(Box<ConnectImapArgs>),
+    /// Gmail: print a new authorization link. IMAP: ask for the new (app) password and verify it.
     Reconnect {
         alias: String,
+        /// IMAP only: read the new password from stdin instead of the terminal.
+        #[arg(long)]
+        password_stdin: bool,
         #[command(flatten)]
         admin: AdminOpts,
     },
-    /// Revoke the grant at Google and delete it locally.
+    /// Gmail: revoke the grant at Google. Deletes the stored credentials and index data locally.
     Remove {
         alias: String,
         #[command(flatten)]
@@ -115,6 +122,107 @@ pub enum AccountsCmd {
         #[command(flatten)]
         admin: AdminOpts,
     },
+}
+
+#[derive(Args)]
+pub struct ConnectImapArgs {
+    alias: String,
+    #[arg(long)]
+    email: String,
+    /// IMAP login name (default: the email address).
+    #[arg(long)]
+    username: Option<String>,
+    /// SMTP login name, if it differs from the IMAP one.
+    #[arg(long)]
+    smtp_username: Option<String>,
+    #[arg(long)]
+    imap_host: Option<String>,
+    /// Default 993 (implicit TLS) or 143 (STARTTLS).
+    #[arg(long)]
+    imap_port: Option<u16>,
+    /// implicit or starttls (default implicit).
+    #[arg(long)]
+    imap_tls: Option<String>,
+    #[arg(long)]
+    smtp_host: Option<String>,
+    /// Default 465 (implicit TLS) or 587 (STARTTLS).
+    #[arg(long)]
+    smtp_port: Option<u16>,
+    /// implicit or starttls (default implicit).
+    #[arg(long)]
+    smtp_tls: Option<String>,
+    /// Drafts folder name, when the server marks none and none is called Drafts/Entwürfe/Draft.
+    #[arg(long)]
+    drafts_folder: Option<String>,
+    /// Known provider settings: strato or icloud (chosen from the address when possible).
+    #[arg(long)]
+    preset: Option<String>,
+    /// Read the password from stdin (one line) instead of prompting.
+    #[arg(long)]
+    password_stdin: bool,
+    #[command(flatten)]
+    admin: AdminOpts,
+}
+
+/// Builds an endpoint from `--<which>-host/-port/-tls`; `None` when no host is given (preset or error later).
+fn endpoint(
+    which: &str,
+    host: Option<String>,
+    port: Option<u16>,
+    tls: Option<String>,
+    ports: (u16, u16),
+) -> anyhow::Result<Option<crate::imap::ServerEndpoint>> {
+    use crate::imap::{ServerEndpoint, TlsMode};
+    let Some(host) = host else {
+        if port.is_some() || tls.is_some() {
+            anyhow::bail!("--{which}-port and --{which}-tls need --{which}-host");
+        }
+        return Ok(None);
+    };
+    let tls = match tls.as_deref() {
+        Some(t) => TlsMode::parse(t).ok_or_else(|| anyhow::anyhow!("--{which}-tls must be implicit or starttls"))?,
+        None => TlsMode::Implicit,
+    };
+    let port = port.unwrap_or(if tls == TlsMode::Implicit { ports.0 } else { ports.1 });
+    Ok(Some(ServerEndpoint { host: host.trim().to_string(), port, tls }))
+}
+
+/// Reads a mailbox password: from the terminal without echo, or one line from stdin. Only the line ending is
+/// removed (passwords may start or end with spaces).
+fn read_password(prompt: &str, from_stdin: bool) -> anyhow::Result<crate::admin::Password> {
+    use std::io::{BufRead, IsTerminal};
+    let pw = if from_stdin || !std::io::stdin().is_terminal() {
+        let mut line = zeroize::Zeroizing::new(String::new());
+        std::io::stdin().lock().read_line(&mut line)?;
+        let end = line.trim_end_matches(['\r', '\n']).len();
+        zeroize::Zeroizing::new(line[..end].to_string())
+    } else {
+        zeroize::Zeroizing::new(
+            rpassword::prompt_password(prompt).map_err(|e| anyhow::anyhow!("cannot read from the terminal: {e}"))?,
+        )
+    };
+    if pw.is_empty() {
+        anyhow::bail!("no password given");
+    }
+    Ok(crate::admin::Password(pw))
+}
+
+/// `accounts reconnect`: Gmail accounts get a new authorization link; IMAP accounts are asked for the password.
+async fn reconnect(alias: String, password_stdin: bool, admin: &AdminOpts) -> anyhow::Result<Value> {
+    let list = admin_client::send(&admin.socket, &AdminRequest::AccountsList).await?;
+    let provider = list
+        .as_array()
+        .and_then(|a| a.iter().find(|r| r["alias"] == alias.as_str()))
+        .and_then(|r| r["provider"].as_str())
+        .unwrap_or("gmail")
+        .to_string();
+    let req = if provider == "imap" {
+        let password = read_password(&format!("New password for '{alias}': "), password_stdin)?;
+        AdminRequest::AccountsReconnectImap { alias, password }
+    } else {
+        AdminRequest::AccountsReconnect { alias }
+    };
+    admin_client::send(&admin.socket, &req).await
 }
 
 #[derive(Subcommand)]
@@ -310,7 +418,27 @@ fn admin_request(cmd: Command) -> anyhow::Result<(AdminOpts, AdminRequest)> {
         Command::Accounts(c) => match c {
             AccountsCmd::List { admin } => (admin, R::AccountsList),
             AccountsCmd::Connect { alias, email, admin } => (admin, R::AccountsConnect { alias, email }),
-            AccountsCmd::Reconnect { alias, admin } => (admin, R::AccountsReconnect { alias }),
+            AccountsCmd::ConnectImap(a) => {
+                let a = *a;
+                let imap = endpoint("imap", a.imap_host, a.imap_port, a.imap_tls, (993, 143))?;
+                let smtp = endpoint("smtp", a.smtp_host, a.smtp_port, a.smtp_tls, (465, 587))?;
+                let password = read_password(&format!("Password for {}: ", a.email), a.password_stdin)?;
+                (
+                    a.admin,
+                    R::AccountsConnectImap {
+                        alias: a.alias,
+                        email: a.email,
+                        username: a.username,
+                        smtp_username: a.smtp_username,
+                        password,
+                        imap,
+                        smtp,
+                        drafts_folder: a.drafts_folder,
+                        preset: a.preset,
+                    },
+                )
+            }
+            AccountsCmd::Reconnect { .. } => unreachable!("handled in run"),
             AccountsCmd::Remove { alias, admin } => (admin, R::AccountsRemove { alias }),
             AccountsCmd::Disable { alias, admin } => (admin, R::AccountsDisable { alias }),
             AccountsCmd::Enable { alias, admin } => (admin, R::AccountsEnable { alias }),
@@ -445,6 +573,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         // Remote commands never reach the admin socket (spec 5.6).
         Command::Remote(cmd) => crate::client::run(*cmd).await,
         Command::Doctor { profile: Some(p), admin } => crate::client::doctor(Some(&p), admin.json).await,
+        Command::Accounts(AccountsCmd::Reconnect { alias, password_stdin, admin }) => {
+            let v = reconnect(alias, password_stdin, &admin).await?;
+            print(&v, admin.json);
+            Ok(())
+        }
         other => {
             let (opts, req) = admin_request(other)?;
             let v = admin_client::send(&opts.socket, &req).await?;

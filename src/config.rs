@@ -25,7 +25,9 @@ pub struct Config {
     #[serde(default)]
     pub allow_send: bool,
     pub admin: AdminConfig,
-    pub google: GoogleConfig,
+    /// Google OAuth client for Gmail mailboxes. Optional: an instance with only IMAP mailboxes needs none.
+    #[serde(default)]
+    pub google: Option<GoogleConfig>,
     pub secrets: SecretPaths,
     #[serde(default)]
     pub limits: Limits,
@@ -126,6 +128,8 @@ pub struct Limits {
     pub upstream_search_mailboxes: usize,
     pub upstream_request_timeout_secs: u64,
     pub tool_call_timeout_secs: u64,
+    /// Largest attachment `get_attachment` returns (decoded bytes).
+    pub attachment_bytes: usize,
 }
 
 impl Default for Limits {
@@ -140,6 +144,7 @@ impl Default for Limits {
             upstream_search_mailboxes: 8,
             upstream_request_timeout_secs: 10,
             tool_call_timeout_secs: 30,
+            attachment_bytes: 10 * 1024 * 1024,
         }
     }
 }
@@ -234,16 +239,14 @@ impl Config {
         {
             bail!("notifier.webhook_url must use https");
         }
-        if self.google.client_id.trim().is_empty() {
-            bail!("google.client_id is empty");
+        if let Some(g) = &self.google {
+            if g.client_id.trim().is_empty() {
+                bail!("google.client_id is empty");
+            }
+            secrets::check_secret_file_mode(&g.client_secret_file)?;
         }
         self.validate_oauth()?;
-        for p in [
-            &self.secrets.kek_file,
-            &self.secrets.pepper_file,
-            &self.secrets.index_key_file,
-            &self.google.client_secret_file,
-        ] {
+        for p in [&self.secrets.kek_file, &self.secrets.pepper_file, &self.secrets.index_key_file] {
             secrets::check_secret_file_mode(p)?;
         }
         if let Some(p) = &self.secrets.proxy_secret_file {
@@ -291,6 +294,17 @@ impl Config {
             }
         }
         Ok(())
+    }
+
+    /// The Google OAuth client id, or an error naming the missing `[google]` section (Gmail connect, doctor).
+    pub fn google_client_id(&self) -> anyhow::Result<&str> {
+        match &self.google {
+            Some(g) => Ok(&g.client_id),
+            None => bail!(
+                "Gmail is not configured: add a [google] section with client_id and client_secret_file to the \
+                 config file (IMAP mailboxes do not need it)"
+            ),
+        }
     }
 
     pub fn public_base(&self) -> String {
@@ -408,5 +422,19 @@ mod tests {
         let mut cfg = config(dir4.path(), "https://dove.example.com", 0o400);
         cfg.listen = "0.0.0.0:8787".parse().unwrap();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn google_section_is_optional() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = config(dir.path(), "https://dove.example.com", 0o400);
+        let text = EXAMPLE.split("[google]").next().unwrap().to_string()
+            + "[secrets]"
+            + EXAMPLE.split("[secrets]").nth(1).unwrap();
+        let parsed: Config = toml::from_str(&text).unwrap();
+        assert!(parsed.google.is_none());
+        cfg.google = None;
+        cfg.validate().unwrap();
+        assert!(cfg.google_client_id().unwrap_err().to_string().contains("[google]"));
     }
 }

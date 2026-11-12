@@ -341,7 +341,9 @@ pub async fn call_tool(app: &Arc<App>, ctx: &ClientCtx, version: &str, name: &st
             rec.query_len = out.audit.query.as_ref().map(|q| q.len() as i64);
             rec.query_hash = out.audit.query.as_ref().map(|q| app.pepper.fingerprint(q));
             let text = if structured { out.text } else { serde_json::to_string(&out.structured).unwrap_or_default() };
-            let mut r = json!({ "content": [{ "type": "text", "text": text }], "isError": false });
+            let mut content = vec![json!({ "type": "text", "text": text })];
+            content.extend(out.extra);
+            let mut r = json!({ "content": content, "isError": false });
             if structured {
                 r["structuredContent"] = out.structured;
             }

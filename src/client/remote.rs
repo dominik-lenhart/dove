@@ -44,6 +44,8 @@ pub struct ToolResult {
     pub is_error: bool,
     pub structured: Value,
     pub text: String,
+    /// All MCP content items (text and embedded resources).
+    pub content: Vec<Value>,
 }
 
 impl Remote {
@@ -97,7 +99,8 @@ impl Remote {
             .get("structuredContent")
             .cloned()
             .unwrap_or_else(|| serde_json::from_str(&text).unwrap_or(Value::String(text.clone())));
-        Ok(ToolResult { is_error: r["isError"].as_bool().unwrap_or(false), structured, text })
+        let content = r["content"].as_array().cloned().unwrap_or_default();
+        Ok(ToolResult { is_error: r["isError"].as_bool().unwrap_or(false), structured, text, content })
     }
 
     pub async fn tool_names(&self) -> anyhow::Result<Vec<String>> {

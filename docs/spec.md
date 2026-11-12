@@ -200,7 +200,7 @@ The default source is `index`. A search returns messages at the authorized index
 Tool failures return an MCP tool result with `isError: true` and structured content with a stable `code`, a short
 human message and, where useful, `retry_after_seconds`. Codes: `not_found`, `forbidden` (capability missing),
 `invalid_argument`, `account_unavailable` (disabled or `reauth_required`), `rate_limited`, `upstream_error`,
-`internal`, `draft_conflict`, `outcome_unknown`, `cursor_invalid`, `query_too_broad`, `index_incomplete`, `budget_exceeded`. Errors disclose no tokens, mail content, stack traces or unauthorized account data.
+`internal`, `draft_conflict`, `outcome_unknown`, `cursor_invalid`, `query_too_broad`, `index_incomplete`, `budget_exceeded`, `too_large` (an attachment above `limits.attachment_bytes`, with its size). Errors disclose no tokens, mail content, stack traces or unauthorized account data.
 
 ### 5.5 Administration CLI
 
