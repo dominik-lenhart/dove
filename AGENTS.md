@@ -86,4 +86,9 @@ cargo fmt
   Caddy joins its network namespace (`network_mode: service:dove`) and the ports are published on the dove service.
 - 2026-11-12: The docker host is shared with production. For container tests use unique names (`dove-t-*`), never
   `docker system prune`, and remove only your own images and volumes.
+- 2026-11-12: `cargo deny check` (deny.toml) passes only with two documented advisory ignores: RUSTSEC-2023-0071 (rsa)
+  and RUSTSEC-2026-0387 (crypto-bigint), both pulled in by jsonwebtoken's `rust_crypto` backend. Dove only verifies
+  RS256 signatures, so they do not apply; drop the ignores once jsonwebtoken updates. MPL-2.0 (the scraper/cssparser
+  stack) and sqlcipher-src (WTFPL, blessing) are allowed explicitly. CI scans secrets with the gitleaks container
+  image (no licence key needed), pinned by digest; locally: `docker run --rm -v $PWD:/repo ghcr.io/gitleaks/gitleaks:v8.30.1 dir /repo`.
 

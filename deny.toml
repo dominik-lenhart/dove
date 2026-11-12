@@ -1,0 +1,55 @@
+# cargo-deny configuration (spec 6.2 "Supply chain": few dependencies, lockfile, audit in CI).
+# Run locally with: cargo deny check
+
+[graph]
+all-features = true
+
+[advisories]
+# RustSec advisory database. Vulnerabilities and unsound crates fail the check. Unmaintained crates are reported
+# for direct dependencies only; review them instead of silencing them.
+yanked = "deny"
+unmaintained = "workspace"
+# Both advisories reach us through jsonwebtoken's `rust_crypto` backend (rsa, ecdsa, p256, crypto-bigint). Dove only
+# VERIFIES Google ID-token signatures with public keys; it never signs, decrypts or holds an RSA/EC private key, which is
+# the scenario both advisories describe. Revisit when jsonwebtoken moves to rsa >= 0.10 / crypto-bigint >= 0.7.6.
+ignore = [
+    { id = "RUSTSEC-2023-0071", reason = "rsa Marvin attack: private-key operations only; Dove verifies public-key signatures" },
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint timing: reached via ecdsa/p256 in jsonwebtoken; no private-key operations in Dove" },
+]
+
+[licenses]
+# Licences accepted for dependencies. Dove itself is Apache-2.0 (placeholder until the owner decides, see
+# docs/PLAN.md A7). Add a licence here only after reading it.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    # File-level copyleft, used unmodified by the HTML parser stack (scraper, selectors, cssparser). Fine for a
+    # binary that links them as dependencies; modifying those files would need the source to be published.
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+# SQLCipher bundles SQLite (public domain "blessing"), libtomcrypt (WTFPL / public domain) and its own BSD licence.
+[[licenses.exceptions]]
+name = "sqlcipher-src"
+allow = ["WTFPL", "blessing"]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# OpenSSL is vendored for SQLCipher only (docs/PLAN.md A3); nothing else should link a system TLS stack.
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
