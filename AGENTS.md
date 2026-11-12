@@ -59,3 +59,12 @@ cargo fmt
 - 2026-11-12: Rust toolchain lives in `~/.cargo/bin` (rustup, no system Rust). Crate versions are newer than
   older model knowledge (reqwest 0.13, rand 0.10, hmac 0.13/sha2 0.11 on digest 0.11, chacha20poly1305 0.11,
   rusqlite 0.42). Check APIs in `~/.cargo/registry/src/*/<crate>-<ver>/` instead of guessing.
+- 2026-11-12: axum 0.8 rejects `Option<ConnectInfo<_>>` as an extractor; take the full `Request` and read
+  `ConnectInfo` from its extensions. Streams with `buffered(n)` over closures that borrow locals need
+  `let x = &x;` rebinding before the `move` closure, or rustc reports "FnOnce is not general enough".
+- 2026-11-12: reqwest `.header()` appends; a test helper that sets defaults must build a `HeaderMap` with
+  `insert` or overrides silently become duplicate headers (the server sees the first value).
+- 2026-11-12: Mutation checks catch weak tests: a guard that is shadowed by a second check (e.g. stale revision vs
+  human-owned draft, single-use state vs alias-exists) needs a test where only that guard can fire.
+- 2026-11-12: `pkill -f <pattern>` inside a Bash tool call matches the tool's own shell; use `pgrep -af` and kill
+  by PID.

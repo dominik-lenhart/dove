@@ -37,8 +37,32 @@ pub async fn run(config_path: &Path) -> anyhow::Result<()> {
 }
 
 async fn run_until_shutdown(app: Arc<App>) -> anyhow::Result<()> {
-    let _ = app;
-    tokio::signal::ctrl_c().await?;
-    tracing::info!("shutting down");
+    let recovered = app.store.call(|c| crate::tools::drafts::recover_after_restart(c)).await?;
+    if recovered > 0 {
+        tracing::warn!(count = recovered, "sends interrupted by a restart are marked outcome-unknown");
+    }
+    let listener = tokio::net::TcpListener::bind(app.cfg.listen).await.context("cannot bind listen address")?;
+    let shutdown = async {
+        let mut term =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("signal handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = term.recv() => {},
+        }
+        tracing::info!("shutting down, finishing in-flight requests");
+    };
+    // Graceful shutdown finishes in-flight requests for up to 10 seconds (spec 8.2).
+    let server = crate::http::serve(app.clone(), listener, shutdown);
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let handle = tokio::spawn(async move {
+        let r = server.await;
+        let _ = tx.send(());
+        r
+    });
+    let _ = rx.await;
+    match tokio::time::timeout(std::time::Duration::from_secs(10), handle).await {
+        Ok(r) => r??,
+        Err(_) => tracing::warn!("shutdown timed out"),
+    }
     Ok(())
 }

@@ -17,13 +17,15 @@ hosts or reference hardware.
    - [x] Admin socket with peer-credential check; projects/clients/grants CLI (FR-C1, FR-P*, AC19)
    - [x] Client tokens: `dove_` + 32 bytes, HMAC-SHA-256 pepper lookup, rotate/revoke/expiry/IP (6.4, AC11)
 2. Google + MCP core
-   - [ ] Outbound gateway with exact method/path allowlist and fixed origins (7.5)
-   - [ ] Connect/reconnect flow: pending state, PKCE, ID-token validation, scope + identity checks (7.3, AC7)
-   - [ ] Token manager: single-flight refresh, `invalid_grant` -> `reauth_required` + one notification (AC10)
-   - [ ] MCP Streamable HTTP (stateless), Host/Origin checks, bearer auth before MCP (7.1, AC13)
-   - [ ] Tools: list_accounts, list_labels, get_message, get_thread, list_drafts, get_draft
-   - [ ] Untrusted content envelope, HTML-to-text, invisible Unicode removal (6.5, AC12)
-   - [ ] create_draft (idempotent request_key), update_draft (revision check, per-draft lock) (5.3, AC4, AC6, AC18)
+   - [x] Outbound gateway with exact method/path allowlist and fixed origins (7.5)
+   - [x] Connect/reconnect flow: pending state, PKCE, ID-token validation, scope + identity checks (7.3, AC7)
+   - [x] Token manager: single-flight refresh, `invalid_grant` -> `reauth_required` + one notification (AC10)
+   - [x] MCP Streamable HTTP (stateless), Host/Origin checks, bearer auth before MCP (7.1, AC13)
+   - [x] Tools: list_accounts, list_labels, get_message, get_thread, list_drafts, get_draft
+   - [x] Untrusted content envelope, HTML-to-text, invisible Unicode removal (6.5, AC12)
+   - [x] create_draft (idempotent request_key), update_draft (revision check, per-draft lock) (5.3, AC4, AC6, AC18)
+   - Unverified: real Google consent screen, real Gmail draft round-trips, Apple Mail editing a Dove draft. All
+     step-2 evidence is against the fake Google server in `tests/support/fake_google.rs`.
 3. Index + sync
    - [ ] Encrypted index DB, generations, backfill with durable progress, history polling, expiry rebuild (7.9)
    - [ ] `dove index enable|disable|status|rebuild`, purge + cursor invalidation
@@ -35,7 +37,8 @@ hosts or reference hardware.
    - [ ] Client onboarding: invitations, `dove login`, remote CLI commands, `mcp install`, `mcp stdio` (5.6, AC22)
    - [ ] Downstream OAuth AS for ChatGPT/Claude (5.6, AC23)
 5. Hardening
-   - [ ] Fake Google server integration suite covering AC1-AC21
+   - [~] Fake Google server integration suite covering AC1-AC21 (done: AC1, AC2, AC4, AC6, AC7, AC10, AC12, AC13,
+     AC16, AC18 in `tests/mcp_e2e.rs`, `tests/connect_e2e.rs`)
    - [ ] Restart/crash recovery tests, log canary test
    - [ ] Benchmarks (8.1) with synthetic 250k corpus, RSS measurement
    - [ ] Deployment: systemd unit, container, Caddy allowlist, backup docs, SECURITY.md, README
