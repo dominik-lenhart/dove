@@ -224,6 +224,11 @@ impl Gateway {
         }
     }
 
+    /// The global in-flight limit, shared with the IMAP pool (one budget for all upstream work).
+    pub fn global_limit(&self) -> Arc<Semaphore> {
+        self.global.clone()
+    }
+
     fn mailbox_sem(&self, account_id: &str) -> Arc<Semaphore> {
         let mut map = self.per_mailbox.lock().expect("lock");
         map.entry(account_id.to_string()).or_insert_with(|| Arc::new(Semaphore::new(self.per_mailbox_limit))).clone()

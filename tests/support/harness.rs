@@ -11,6 +11,7 @@ use dove::testing::TestEnv;
 use serde_json::{Value, json};
 
 use super::fake_google::FakeGoogle;
+use super::fake_imap::FakeImap;
 
 pub const CLIENT_ID: &str = "000000000000-example.apps.googleusercontent.com";
 pub const CLIENT_SECRET: &str = "test-client-secret";
@@ -19,6 +20,8 @@ pub const HOST: &str = "dove.example.com";
 pub struct Harness {
     pub env: TestEnv,
     pub google: FakeGoogle,
+    /// Fake IMAP/SMTP server (plaintext, loopback); IMAP mailboxes connect to it.
+    pub imap: FakeImap,
     pub base: String,
     pub http: reqwest::Client,
     server: tokio::task::JoinHandle<()>,
@@ -29,6 +32,20 @@ impl Drop for Harness {
         self.server.abort();
     }
 }
+
+/// An IMAP mailbox connected through the real `AccountsConnectImap` path.
+#[allow(dead_code)]
+pub struct FakeImapUser {
+    pub alias: String,
+    pub email: String,
+    /// IMAP/SMTP login on the fake server (the email address).
+    pub user: String,
+    pub password: String,
+    pub account_id: String,
+}
+
+/// A password with characters that need an IMAP literal or quoting (space, quote, backslash, braces, umlaut).
+pub const IMAP_PASSWORD: &str = "p\"a ss\\w{0}rd-ä";
 
 pub fn g(account: &str, actions: &str) -> GrantSpec {
     GrantSpec { account: account.into(), actions: actions.into() }
@@ -49,7 +66,8 @@ impl Harness {
             customize(c)
         });
         let (base, server) = serve(env.app.clone()).await;
-        Self { env, google, base, http: reqwest::Client::new(), server }
+        let imap = FakeImap::start().await;
+        Self { env, google, imap, base, http: reqwest::Client::new(), server }
     }
 
     /// Like [`Harness::start_with`], but the public URL is `https://127.0.0.1:<port>` of the listener itself, so a
@@ -71,7 +89,8 @@ impl Harness {
         let server = tokio::spawn(async move {
             let _ = dove::http::serve(app, listener, std::future::pending()).await;
         });
-        Self { env, google, base: format!("http://{addr}"), http: reqwest::Client::new(), server }
+        let imap = FakeImap::start().await;
+        Self { env, google, imap, base: format!("http://{addr}"), http: reqwest::Client::new(), server }
     }
 
     pub fn app(&self) -> &Arc<App> {
@@ -89,7 +108,12 @@ impl Harness {
         self.server.abort();
         let mut cfg = self.env.app.cfg.clone();
         customize(&mut cfg);
-        let app = dove::app::App::from_config_with(cfg, Upstream::single_origin(&self.google.base_url)).unwrap();
+        let app = dove::app::App::from_config_with(
+            cfg,
+            Upstream::single_origin(&self.google.base_url),
+            dove::imap::ImapConnector::plaintext_for_tests(),
+        )
+        .unwrap();
         app.store.call(|c| dove::tools::drafts::recover_after_restart(c).map(|_| ())).await.unwrap();
         self.env.app = app;
         let (base, server) = serve(self.env.app.clone()).await;
@@ -102,6 +126,60 @@ impl Harness {
         self.google.add_mailbox(email, &format!("sub-{alias}"));
         let rt = self.google.issue_refresh_token(email);
         self.env.add_account(alias, email, &rt)
+    }
+
+    /// Endpoints of the fake IMAP and SMTP servers.
+    #[allow(dead_code)]
+    pub fn imap_endpoints(&self) -> (dove::imap::ServerEndpoint, dove::imap::ServerEndpoint) {
+        use dove::imap::{ServerEndpoint, TlsMode};
+        let ep = |a: std::net::SocketAddr| ServerEndpoint {
+            host: a.ip().to_string(),
+            port: a.port(),
+            tls: TlsMode::Implicit,
+        };
+        (ep(self.imap.imap_addr), ep(self.imap.smtp_addr))
+    }
+
+    /// The `AccountsConnectImap` request for a user of the fake server.
+    #[allow(dead_code)]
+    pub fn connect_imap_request(&self, alias: &str, email: &str, password: &str) -> AdminRequest {
+        let (imap, smtp) = self.imap_endpoints();
+        AdminRequest::AccountsConnectImap {
+            alias: alias.into(),
+            email: email.into(),
+            username: None,
+            smtp_username: None,
+            password: dove::admin::Password(zeroize::Zeroizing::new(password.into())),
+            imap: Some(imap),
+            smtp: Some(smtp),
+            drafts_folder: None,
+            preset: None,
+        }
+    }
+
+    /// Creates a user with INBOX, Drafts, Sent, Junk and Trash (special-use flags) on the fake server and connects
+    /// it as an IMAP mailbox through the real admin verb.
+    #[allow(dead_code)]
+    pub async fn imap_mailbox(&self, alias: &str, email: &str) -> FakeImapUser {
+        self.imap.add_user(email, IMAP_PASSWORD);
+        for (name, special) in [("Drafts", "\\Drafts"), ("Sent", "\\Sent"), ("Junk", "\\Junk"), ("Trash", "\\Trash")] {
+            self.imap.add_folder(email, name, Some(special));
+        }
+        self.admin(self.connect_imap_request(alias, email, IMAP_PASSWORD)).await.expect("connect-imap");
+        let a = alias.to_string();
+        let account_id = self
+            .app()
+            .store
+            .call(move |c| Ok(c.query_row("SELECT id FROM accounts WHERE alias = ?1", [a], |r| r.get(0))?))
+            .await
+            .unwrap();
+        FakeImapUser {
+            alias: alias.into(),
+            email: email.into(),
+            user: email.into(),
+            password: IMAP_PASSWORD.into(),
+            account_id,
+        }
     }
 
     pub async fn admin(&self, req: AdminRequest) -> Result<Value, String> {

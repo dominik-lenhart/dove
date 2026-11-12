@@ -78,6 +78,27 @@ impl std::fmt::Display for Actions {
     }
 }
 
+/// Which upstream a mailbox lives on. Tools dispatch on it; authorization does not depend on it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Provider {
+    #[default]
+    Gmail,
+    Imap,
+}
+
+impl Provider {
+    pub fn parse(s: &str) -> Self {
+        if s == "imap" { Provider::Imap } else { Provider::Gmail }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Provider::Gmail => "gmail",
+            Provider::Imap => "imap",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Mailbox {
     pub account_id: String,
@@ -86,6 +107,7 @@ pub struct Mailbox {
     pub status: String,
     pub actions: Actions,
     pub index_enabled: bool,
+    pub provider: Provider,
 }
 
 /// The authenticated caller, loaded fresh for each request.
@@ -159,7 +181,7 @@ impl ClientCtx {
 /// Loads effective mailboxes for a client: grants intersected with current project membership.
 pub fn load_mailboxes(conn: &Connection, client_id: &str) -> anyhow::Result<Vec<Mailbox>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT a.id, a.alias, a.email, a.status, cm.actions, a.index_enabled \
+        "SELECT a.id, a.alias, a.email, a.status, cm.actions, a.index_enabled, a.provider \
          FROM client_mailboxes cm \
          JOIN clients c ON c.id = cm.client_id \
          JOIN accounts a ON a.id = cm.account_id \
@@ -175,6 +197,7 @@ pub fn load_mailboxes(conn: &Connection, client_id: &str) -> anyhow::Result<Vec<
             status: r.get(3)?,
             actions: Actions::parse(&actions).unwrap_or_default(),
             index_enabled: r.get::<_, i64>(5)? != 0,
+            provider: Provider::parse(&r.get::<_, String>(6)?),
         })
     })?;
     Ok(rows.collect::<Result<_, _>>()?)
@@ -323,6 +346,7 @@ mod tests {
             status: status.into(),
             actions: Actions::parse(a).unwrap(),
             index_enabled: false,
+            provider: Provider::Gmail,
         };
         ClientCtx {
             client_id: "c".into(),

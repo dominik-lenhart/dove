@@ -17,9 +17,11 @@ pub async fn send(socket: &Path, req: &AdminRequest) -> anyhow::Result<Value> {
         )
     })?;
     let (rd, mut wr) = stream.into_split();
-    let mut line = serde_json::to_vec(req)?;
-    line.push(b'\n');
+    // The request may carry a mailbox password: wipe the serialized copy after sending.
+    // No push onto the buffer: a reallocation would leave an unwiped copy behind.
+    let line = zeroize::Zeroizing::new(serde_json::to_vec(req)?);
     wr.write_all(&line).await?;
+    wr.write_all(b"\n").await?;
     wr.shutdown().await.ok();
     let mut reader = BufReader::new(rd);
     let mut resp = String::new();

@@ -147,3 +147,9 @@ cargo fmt
   Plaintext exists only as `ImapConnector::plaintext_for_tests()` (cfg `test`/`testing`). Tests use
   `tests/support/fake_imap.rs`: non-PEEK fetches set `\Seen` there, `fail_next_containing` targets one command
   (for example the body fetch), and `assert_only_allowlisted()` checks the command log.
+- 2026-11-12: IMAP accounts (`accounts.provider = 'imap'`) keep their sealed password in `grants` (vault AAD kind
+  `imap_password`, so `open_grant` fails on it): code that walks `grants` (remove, keys rotate) must branch on
+  `provider`. `zeroize::Zeroizing`'s `Debug` prints the secret, so admin requests carry passwords as
+  `admin::Password` (redacted `Debug`). Tests connect IMAP mailboxes with `Harness::imap_mailbox` (real
+  `AccountsConnectImap` against `h.imap`); assign `h.imap = FakeImap::start_with(..)` before connecting to change
+  server options. Connect errors name the step and server address only, never server text.

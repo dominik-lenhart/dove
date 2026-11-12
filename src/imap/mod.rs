@@ -5,9 +5,12 @@
 //! sessions per account, [`smtp`] submits mail. Plaintext exists only through
 //! [`ImapConnector::plaintext_for_tests`], which is compiled only with the `testing` feature.
 
+pub mod account;
+pub mod connect;
 pub mod ids;
 pub(crate) mod ops;
 pub mod pool;
+pub mod presets;
 pub mod session;
 pub mod smtp;
 pub mod utf7;

@@ -938,7 +938,9 @@ async fn tick(
     let enabled: HashMap<String, bool> = app
         .store
         .call(|c| {
-            let mut st = c.prepare("SELECT id, status = 'active' FROM accounts WHERE index_enabled = 1")?;
+            // Gmail sync only: IMAP accounts are synced by their own engine, never through the Gmail API.
+            let mut st =
+                c.prepare("SELECT id, status = 'active' FROM accounts WHERE index_enabled = 1 AND provider = 'gmail'")?;
             Ok(st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?)
         })
         .await?;

@@ -32,6 +32,7 @@ pub fn redirect_uri(app: &App) -> String {
 
 /// Creates a pending connect and returns the authorization URL (spec 7.3 steps 2-3).
 pub async fn start(app: &App, alias: &str, email: Option<&str>, reconnect: bool) -> anyhow::Result<String> {
+    let client_id = app.cfg.google_client_id()?.to_string();
     if !valid_alias(alias) {
         bail!("alias must match [a-z0-9-]{{2,40}}");
     }
@@ -44,9 +45,15 @@ pub async fn start(app: &App, alias: &str, email: Option<&str>, reconnect: bool)
     let expected_email = app
         .store
         .call(move |c| {
-            let existing: Option<(String, String)> = c
-                .query_row("SELECT id, email FROM accounts WHERE alias = ?1", [&alias_s], |r| Ok((r.get(0)?, r.get(1)?)))
+            let existing: Option<(String, String, String)> = c
+                .query_row("SELECT id, email, provider FROM accounts WHERE alias = ?1", [&alias_s], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })
                 .optional()?;
+            if existing.as_ref().is_some_and(|e| e.2 != "gmail") {
+                bail!("'{alias_s}' is an IMAP mailbox; reconnect it with its password");
+            }
+            let existing = existing.map(|(id, email, _)| (id, email));
             let (mode, account_id, expected) = match (reconnect, existing) {
                 (false, Some(_)) => bail!("account alias '{alias_s}' already exists; use reconnect"),
                 (false, None) => {
@@ -81,7 +88,7 @@ pub async fn start(app: &App, alias: &str, email: Option<&str>, reconnect: bool)
     let mut url = url::Url::parse(&app.google.upstream().auth_url)?;
     url.query_pairs_mut()
         .append_pair("response_type", "code")
-        .append_pair("client_id", &app.cfg.google.client_id)
+        .append_pair("client_id", &client_id)
         .append_pair("redirect_uri", &redirect_uri(app))
         .append_pair("scope", &REQUIRED_SCOPES.join(" "))
         .append_pair("access_type", "offline")
@@ -231,13 +238,16 @@ async fn complete(app: &App, p: &Pending, code: Option<String>, error: Option<St
     let verifier = std::str::from_utf8(&p.verifier).map_err(|_| reject(alias, "internal error", "internal"))?;
     let redirect = redirect_uri(app);
     let gw = app.google.gateway();
+    let (Ok(client_id), Some(client_secret)) = (app.cfg.google_client_id(), app.google_client_secret.as_ref()) else {
+        return Err(reject(alias, "Gmail is not configured on this server. Nothing was stored.", "internal"));
+    };
     let tok = gw
         .token_request(&[
             ("grant_type", "authorization_code"),
             ("code", &code),
             ("code_verifier", verifier),
-            ("client_id", &app.cfg.google.client_id),
-            ("client_secret", &app.google_client_secret),
+            ("client_id", client_id),
+            ("client_secret", client_secret),
             ("redirect_uri", &redirect),
         ])
         .await
@@ -377,7 +387,7 @@ async fn verify_id_token(app: &App, token: &str) -> anyhow::Result<IdClaims> {
     };
     let mut v = Validation::new(Algorithm::RS256);
     v.set_issuer(&["https://accounts.google.com", "accounts.google.com"]);
-    v.set_audience(&[&app.cfg.google.client_id]);
+    v.set_audience(&[app.cfg.google_client_id()?]);
     v.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
     Ok(jsonwebtoken::decode::<IdClaims>(token, &key, &v)?.claims)
 }
