@@ -37,15 +37,8 @@ fn aad(kind: &str, scope: &str, version: u32) -> Vec<u8> {
 fn seal(key: &[u8; 32], aad: &[u8], plaintext: &[u8]) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
     let cipher = XChaCha20Poly1305::new(key.into());
     let nonce = util::random_bytes::<NONCE_LEN>();
-    let ct = cipher
-        .encrypt(
-            (&nonce).into(),
-            Payload {
-                msg: plaintext,
-                aad,
-            },
-        )
-        .map_err(|_| anyhow!("encryption failed"))?;
+    let ct =
+        cipher.encrypt((&nonce).into(), Payload { msg: plaintext, aad }).map_err(|_| anyhow!("encryption failed"))?;
     Ok((nonce.to_vec(), ct))
 }
 
@@ -81,28 +74,13 @@ impl Vault {
         let (dek_nonce, dek_ct) = seal(kek, &aad("dek", account_id, kek_version), &dek[..])?;
         let mut dek_wrapped = dek_nonce;
         dek_wrapped.extend_from_slice(&dek_ct);
-        let (nonce, ciphertext) = seal(
-            &dek,
-            &aad("refresh_token", account_id, kek_version),
-            refresh_token.as_bytes(),
-        )?;
-        Ok(SealedGrant {
-            dek_wrapped,
-            kek_version,
-            ciphertext,
-            nonce,
-        })
+        let (nonce, ciphertext) = seal(&dek, &aad("refresh_token", account_id, kek_version), refresh_token.as_bytes())?;
+        Ok(SealedGrant { dek_wrapped, kek_version, ciphertext, nonce })
     }
 
-    fn unwrap_dek(
-        &self,
-        account_id: &str,
-        sealed: &SealedGrant,
-    ) -> anyhow::Result<Zeroizing<[u8; 32]>> {
-        let kek = self
-            .kek
-            .get(sealed.kek_version)
-            .ok_or_else(|| anyhow!("KEK version {} not loaded", sealed.kek_version))?;
+    fn unwrap_dek(&self, account_id: &str, sealed: &SealedGrant) -> anyhow::Result<Zeroizing<[u8; 32]>> {
+        let kek =
+            self.kek.get(sealed.kek_version).ok_or_else(|| anyhow!("KEK version {} not loaded", sealed.kek_version))?;
         if sealed.dek_wrapped.len() <= NONCE_LEN {
             bail!("wrapped DEK too short");
         }
@@ -117,18 +95,9 @@ impl Vault {
     }
 
     /// Decrypts the refresh token. Fails if the row was moved to another account or tampered with.
-    pub fn open_grant(
-        &self,
-        account_id: &str,
-        sealed: &SealedGrant,
-    ) -> anyhow::Result<Zeroizing<String>> {
+    pub fn open_grant(&self, account_id: &str, sealed: &SealedGrant) -> anyhow::Result<Zeroizing<String>> {
         let dek = self.unwrap_dek(account_id, sealed)?;
-        let pt = open(
-            &dek,
-            &aad("refresh_token", account_id, sealed.kek_version),
-            &sealed.nonce,
-            &sealed.ciphertext,
-        )?;
+        let pt = open(&dek, &aad("refresh_token", account_id, sealed.kek_version), &sealed.nonce, &sealed.ciphertext)?;
         let s = String::from_utf8(pt.to_vec()).map_err(|_| anyhow!("grant is not UTF-8"))?;
         Ok(Zeroizing::new(s))
     }
@@ -150,26 +119,13 @@ impl Vault {
         Ok(out)
     }
 
-    pub fn open_aux(
-        &self,
-        kind: &str,
-        scope: &str,
-        blob: &[u8],
-    ) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+    pub fn open_aux(&self, kind: &str, scope: &str, blob: &[u8]) -> anyhow::Result<Zeroizing<Vec<u8>>> {
         if blob.len() < 4 + NONCE_LEN {
             bail!("sealed blob too short");
         }
         let v = u32::from_be_bytes(blob[..4].try_into().expect("4 bytes"));
-        let kek = self
-            .kek
-            .get(v)
-            .ok_or_else(|| anyhow!("KEK version {v} not loaded"))?;
-        open(
-            kek,
-            &aad(kind, scope, v),
-            &blob[4..4 + NONCE_LEN],
-            &blob[4 + NONCE_LEN..],
-        )
+        let kek = self.kek.get(v).ok_or_else(|| anyhow!("KEK version {v} not loaded"))?;
+        open(kek, &aad(kind, scope, v), &blob[4..4 + NONCE_LEN], &blob[4 + NONCE_LEN..])
     }
 }
 
@@ -185,10 +141,7 @@ mod tests {
     fn roundtrip_and_binding() {
         let v = vault();
         let sealed = v.seal_grant("acct-a", "1//refresh-secret").unwrap();
-        assert_eq!(
-            &**v.open_grant("acct-a", &sealed).unwrap(),
-            "1//refresh-secret"
-        );
+        assert_eq!(&**v.open_grant("acct-a", &sealed).unwrap(), "1//refresh-secret");
         // A grant row copied to another account must not decrypt (AC8).
         assert!(v.open_grant("acct-b", &sealed).is_err());
         // The plaintext never appears in the stored bytes.
@@ -214,11 +167,7 @@ mod tests {
         let k1 = util::random_bytes::<32>();
         let old = Vault::new(KeyRing::single(1, k1));
         let sealed = old.seal_grant("a", "tok").unwrap();
-        let text = format!(
-            "1 {}\n2 {}",
-            util::b64url(&k1),
-            util::b64url(&util::random_bytes::<32>())
-        );
+        let text = format!("1 {}\n2 {}", util::b64url(&k1), util::b64url(&util::random_bytes::<32>()));
         let both = Vault::new(KeyRing::parse(&text).unwrap());
         let rewrapped = both.rewrap("a", &sealed).unwrap();
         assert_eq!(rewrapped.kek_version, 2);
@@ -231,10 +180,7 @@ mod tests {
     fn aux_binding() {
         let v = vault();
         let blob = v.seal_aux("pkce", "state1", b"verifier").unwrap();
-        assert_eq!(
-            &v.open_aux("pkce", "state1", &blob).unwrap()[..],
-            b"verifier"
-        );
+        assert_eq!(&v.open_aux("pkce", "state1", &blob).unwrap()[..], b"verifier");
         assert!(v.open_aux("pkce", "state2", &blob).is_err());
     }
 }

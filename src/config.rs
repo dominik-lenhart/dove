@@ -100,9 +100,7 @@ pub struct AuditConfig {
 
 impl Default for AuditConfig {
     fn default() -> Self {
-        Self {
-            retention_days: 180,
-        }
+        Self { retention_days: 180 }
     }
 }
 
@@ -151,8 +149,7 @@ pub const DEFAULT_ADMIN_SOCKET: &str = "/run/dove/admin.sock";
 
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("cannot read config {}", path.display()))?;
+        let text = std::fs::read_to_string(path).with_context(|| format!("cannot read config {}", path.display()))?;
         let cfg: Config = toml::from_str(&text).context("invalid config file")?;
         Ok(cfg)
     }
@@ -170,8 +167,7 @@ impl Config {
             bail!("listen must be a loopback address; put a TLS reverse proxy in front (spec 6.6)");
         }
         for o in &self.allowed_origins {
-            let u =
-                url::Url::parse(o).with_context(|| format!("allowed origin {o} is not a URL"))?;
+            let u = url::Url::parse(o).with_context(|| format!("allowed origin {o} is not a URL"))?;
             if u.origin().ascii_serialization() != *o {
                 bail!("allowed origin {o} must be a bare origin");
             }
@@ -261,19 +257,14 @@ mod tests {
         let line = secrets::generate_key_line(1);
         let text = EXAMPLE
             .replace("https://dove.example.com", public_url)
-            .replace(
-                "/run/credentials/dove.service/kek",
-                write_secret(dir, "kek", &line, kek_mode).to_str().unwrap(),
-            )
+            .replace("/run/credentials/dove.service/kek", write_secret(dir, "kek", &line, kek_mode).to_str().unwrap())
             .replace(
                 "/run/credentials/dove.service/pepper",
                 write_secret(dir, "pepper", &line, 0o400).to_str().unwrap(),
             )
             .replace(
                 "/run/credentials/dove.service/index_key",
-                write_secret(dir, "index_key", &line, 0o400)
-                    .to_str()
-                    .unwrap(),
+                write_secret(dir, "index_key", &line, 0o400).to_str().unwrap(),
             )
             .replace(
                 "/run/credentials/dove.service/google_client_secret",
@@ -285,27 +276,17 @@ mod tests {
     #[test]
     fn example_config_validates_with_strict_secrets() {
         let dir = tempfile::tempdir().unwrap();
-        config(dir.path(), "https://dove.example.com", 0o400)
-            .validate()
-            .unwrap();
+        config(dir.path(), "https://dove.example.com", 0o400).validate().unwrap();
     }
 
     #[test]
     fn startup_refusals() {
         let dir = tempfile::tempdir().unwrap();
         // AC15: HTTP public URL.
-        assert!(
-            config(dir.path(), "http://dove.example.com", 0o400)
-                .validate()
-                .is_err()
-        );
+        assert!(config(dir.path(), "http://dove.example.com", 0o400).validate().is_err());
         // AC15: world-readable secret file.
         let dir2 = tempfile::tempdir().unwrap();
-        assert!(
-            config(dir2.path(), "https://dove.example.com", 0o644)
-                .validate()
-                .is_err()
-        );
+        assert!(config(dir2.path(), "https://dove.example.com", 0o644).validate().is_err());
         // AC15: missing KEK.
         let dir3 = tempfile::tempdir().unwrap();
         let cfg = config(dir3.path(), "https://dove.example.com", 0o400);

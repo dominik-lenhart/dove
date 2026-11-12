@@ -50,20 +50,14 @@ pub fn now_unix_ms() -> i64 {
 pub fn rfc3339(ts: i64) -> String {
     time::OffsetDateTime::from_unix_timestamp(ts)
         .ok()
-        .and_then(|t| {
-            t.format(&time::format_description::well_known::Rfc3339)
-                .ok()
-        })
+        .and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok())
         .unwrap_or_default()
 }
 
 pub fn rfc3339_ms(ts_ms: i64) -> String {
     time::OffsetDateTime::from_unix_timestamp_nanos(ts_ms as i128 * 1_000_000)
         .ok()
-        .and_then(|t| {
-            t.format(&time::format_description::well_known::Rfc3339)
-                .ok()
-        })
+        .and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok())
         .unwrap_or_default()
 }
 

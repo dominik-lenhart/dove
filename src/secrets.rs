@@ -17,8 +17,7 @@ pub type Key32 = Zeroizing<[u8; 32]>;
 
 /// Fails unless `path` is a regular file with no group/other permission bits.
 pub fn check_secret_file_mode(path: &Path) -> anyhow::Result<()> {
-    let meta = std::fs::metadata(path)
-        .with_context(|| format!("secret file {} is missing", path.display()))?;
+    let meta = std::fs::metadata(path).with_context(|| format!("secret file {} is missing", path.display()))?;
     if !meta.is_file() {
         bail!("secret file {} is not a regular file", path.display());
     }
@@ -36,18 +35,14 @@ pub fn check_secret_file_mode(path: &Path) -> anyhow::Result<()> {
 /// Reads a secret file after checking its mode.
 pub fn read_secret_file(path: &Path) -> anyhow::Result<Zeroizing<Vec<u8>>> {
     check_secret_file_mode(path)?;
-    let data = std::fs::read(path)
-        .with_context(|| format!("cannot read secret file {}", path.display()))?;
+    let data = std::fs::read(path).with_context(|| format!("cannot read secret file {}", path.display()))?;
     Ok(Zeroizing::new(data))
 }
 
 /// Reads a secret string (for example the Google client secret), trimming surrounding whitespace.
 pub fn read_secret_string(path: &Path) -> anyhow::Result<Zeroizing<String>> {
     let raw = read_secret_file(path)?;
-    let s = std::str::from_utf8(&raw)
-        .context("secret file is not UTF-8")?
-        .trim()
-        .to_string();
+    let s = std::str::from_utf8(&raw).context("secret file is not UTF-8")?.trim().to_string();
     if s.is_empty() {
         bail!("secret file {} is empty", path.display());
     }
@@ -68,20 +63,10 @@ impl KeyRing {
 
     pub fn parse(text: &str) -> anyhow::Result<Self> {
         let mut keys = BTreeMap::new();
-        let lines: Vec<&str> = text
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty() && !l.starts_with('#'))
-            .collect();
+        let lines: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).collect();
         for line in &lines {
             let (version, b64) = match line.split_once(char::is_whitespace) {
-                Some((v, k)) => (
-                    v.trim()
-                        .trim_start_matches('v')
-                        .parse::<u32>()
-                        .context("bad key version")?,
-                    k.trim(),
-                ),
+                Some((v, k)) => (v.trim().trim_start_matches('v').parse::<u32>().context("bad key version")?, k.trim()),
                 None if lines.len() == 1 => (1, *line),
                 None => bail!("key line without version"),
             };
@@ -127,10 +112,7 @@ impl KeyRing {
 /// Generates a new key line for a key file (used by `dove keys generate`).
 pub fn generate_key_line(version: u32) -> String {
     let key = Zeroizing::new(util::random_bytes::<32>());
-    format!(
-        "{version} {}",
-        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &*key)
-    )
+    format!("{version} {}", base64::Engine::encode(&base64::engine::general_purpose::STANDARD, *key))
 }
 
 #[cfg(test)]
@@ -153,18 +135,11 @@ mod tests {
 
     #[test]
     fn parses_versions_and_picks_newest() {
-        let text = format!(
-            "# comment\n{}\n{}\n",
-            generate_key_line(1),
-            generate_key_line(3)
-        );
+        let text = format!("# comment\n{}\n{}\n", generate_key_line(1), generate_key_line(3));
         let ring = KeyRing::parse(&text).unwrap();
         assert_eq!(ring.current().0, 3);
         assert_eq!(ring.versions(), vec![1, 3]);
-        assert!(
-            KeyRing::parse("1 AAAA").is_err(),
-            "short key must be rejected"
-        );
+        assert!(KeyRing::parse("1 AAAA").is_err(), "short key must be rejected");
         assert!(KeyRing::parse("").is_err());
     }
 }

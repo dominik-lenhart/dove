@@ -61,13 +61,8 @@ fn record_hash(prev: &[u8], seq: i64, ts: i64, r: &AuditRecord) -> Vec<u8> {
 }
 
 fn last_hash(conn: &Connection) -> anyhow::Result<Vec<u8>> {
-    let last: Option<Vec<u8>> = conn
-        .query_row(
-            "SELECT hash FROM audit ORDER BY seq DESC LIMIT 1",
-            [],
-            |r| r.get(0),
-        )
-        .ok();
+    let last: Option<Vec<u8>> =
+        conn.query_row("SELECT hash FROM audit ORDER BY seq DESC LIMIT 1", [], |r| r.get(0)).ok();
     match last {
         Some(h) => Ok(h),
         None => Ok(boundary(conn)?.1),
@@ -76,12 +71,8 @@ fn last_hash(conn: &Connection) -> anyhow::Result<Vec<u8>> {
 
 /// (first retained seq - 1, hash of the record before it). Zero hash before any pruning.
 fn boundary(conn: &Connection) -> anyhow::Result<(i64, Vec<u8>)> {
-    let seq = get_meta(conn, "audit_boundary_seq")?
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let hash = get_meta(conn, "audit_boundary_hash")?
-        .and_then(|h| util::b64url_decode(&h))
-        .unwrap_or(vec![0; 32]);
+    let seq = get_meta(conn, "audit_boundary_seq")?.and_then(|s| s.parse().ok()).unwrap_or(0);
+    let hash = get_meta(conn, "audit_boundary_hash")?.and_then(|h| util::b64url_decode(&h)).unwrap_or(vec![0; 32]);
     Ok((seq, hash))
 }
 
@@ -92,9 +83,7 @@ pub fn append(conn: &Connection, r: &AuditRecord) -> anyhow::Result<i64> {
 
 fn append_at(conn: &Connection, r: &AuditRecord, ts: i64) -> anyhow::Result<i64> {
     let prev = last_hash(conn)?;
-    let max_seq: i64 = conn.query_row("SELECT COALESCE(MAX(seq), 0) FROM audit", [], |row| {
-        row.get(0)
-    })?;
+    let max_seq: i64 = conn.query_row("SELECT COALESCE(MAX(seq), 0) FROM audit", [], |row| row.get(0))?;
     let seq = max_seq.max(boundary(conn)?.0) + 1;
     let hash = record_hash(&prev, seq, ts, r);
     conn.execute(
@@ -182,24 +171,18 @@ pub fn verify(conn: &Connection) -> anyhow::Result<VerifyReport> {
         prev = hash;
         expected_seq += 1;
     }
-    Ok(VerifyReport {
-        ok: true,
-        records: n,
-        first_bad_seq: None,
-        retained_from_seq: bseq + 1,
-    })
+    Ok(VerifyReport { ok: true, records: n, first_bad_seq: None, retained_from_seq: bseq + 1 })
 }
 
 pub fn tail(conn: &Connection, limit: i64) -> anyhow::Result<Vec<StoredRecord>> {
     let mut stmt = conn.prepare(&format!("{SELECT} ORDER BY seq DESC LIMIT ?1"))?;
-    let mut out: Vec<StoredRecord> = stmt
-        .query_map([limit], |r| row_to_record(r).map(|x| x.0))?
-        .collect::<Result<_, _>>()?;
+    let mut out: Vec<StoredRecord> =
+        stmt.query_map([limit], |r| row_to_record(r).map(|x| x.0))?.collect::<Result<_, _>>()?;
     out.reverse();
     Ok(out)
 }
 
-#[derive(Debug, Default, Clone, serde::Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, serde::Deserialize)]
 pub struct SearchFilter {
     pub actor: Option<String>,
     pub tool: Option<String>,
@@ -216,14 +199,7 @@ pub fn search(conn: &Connection, f: &SearchFilter) -> anyhow::Result<Vec<StoredR
          ORDER BY seq DESC LIMIT ?6"
     ))?;
     let rows = stmt.query_map(
-        params![
-            f.actor,
-            f.tool,
-            f.account,
-            f.result_code,
-            f.since,
-            f.limit.unwrap_or(100).clamp(1, 10_000)
-        ],
+        params![f.actor, f.tool, f.account, f.result_code, f.since, f.limit.unwrap_or(100).clamp(1, 10_000)],
         |r| row_to_record(r).map(|x| x.0),
     )?;
     Ok(rows.collect::<Result<_, _>>()?)
@@ -234,11 +210,9 @@ pub fn prune(conn: &mut Connection, retention_days: u32, request_id: &str) -> an
     let cutoff = util::now_unix() - i64::from(retention_days) * 86_400;
     let tx = conn.transaction()?;
     let last: Option<(i64, Vec<u8>)> = tx
-        .query_row(
-            "SELECT seq, hash FROM audit WHERE ts < ?1 ORDER BY seq DESC LIMIT 1",
-            [cutoff],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
+        .query_row("SELECT seq, hash FROM audit WHERE ts < ?1 ORDER BY seq DESC LIMIT 1", [cutoff], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
         .ok();
     let mut deleted = 0;
     if let Some((seq, hash)) = last {
@@ -285,10 +259,7 @@ mod tests {
             }
             assert!(verify(c)?.ok);
             // AC16: an edited record is detected.
-            c.execute(
-                "UPDATE audit SET result_code = 'forbidden' WHERE seq = 3",
-                [],
-            )?;
+            c.execute("UPDATE audit SET result_code = 'forbidden' WHERE seq = 3", [])?;
             let r = verify(c)?;
             assert!(!r.ok);
             assert_eq!(r.first_bad_seq, Some(3));

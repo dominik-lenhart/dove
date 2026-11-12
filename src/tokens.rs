@@ -24,9 +24,7 @@ pub struct Pepper {
 
 impl Pepper {
     pub fn new(ring: KeyRing) -> Self {
-        Self {
-            ring: Arc::new(ring),
-        }
+        Self { ring: Arc::new(ring) }
     }
 
     pub fn version(&self) -> u32 {
@@ -57,10 +55,7 @@ pub fn generate(prefix: &str) -> String {
 /// Syntactic check before hashing, so obviously malformed input is rejected cheaply.
 pub fn looks_valid(prefix: &str, token: &str) -> bool {
     token.strip_prefix(prefix).is_some_and(|rest| {
-        rest.len() == 43
-            && rest
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        rest.len() == 43 && rest.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
     })
 }
 
@@ -77,15 +72,7 @@ mod tests {
         let p = Pepper::new(KeyRing::single(1, [7; 32]));
         let other = Pepper::new(KeyRing::single(1, [8; 32]));
         assert_eq!(p.hash("client", &t), p.hash("client", &t));
-        assert_ne!(
-            p.hash("client", &t),
-            p.hash("invite", &t),
-            "purpose separates hashes"
-        );
-        assert_ne!(
-            p.hash("client", &t),
-            other.hash("client", &t),
-            "pepper is part of the hash"
-        );
+        assert_ne!(p.hash("client", &t), p.hash("invite", &t), "purpose separates hashes");
+        assert_ne!(p.hash("client", &t), other.hash("client", &t), "pepper is part of the hash");
     }
 }

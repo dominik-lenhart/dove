@@ -1,0 +1,443 @@
+//! Command-line interface. Admin subcommands talk to the local admin socket; `serve` runs the service.
+
+use std::path::PathBuf;
+
+use clap::{Args, Parser, Subcommand};
+use serde_json::Value;
+
+use crate::admin::{AdminRequest, client as admin_client, ops::parse_grant_args};
+use crate::audit::SearchFilter;
+use crate::config::{self, DEFAULT_ADMIN_SOCKET};
+
+#[derive(Parser)]
+#[command(name = "dove", version, about = "Dove: a self-hosted mail MCP server for AI agents")]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+#[derive(Args, Clone)]
+pub struct AdminOpts {
+    /// Admin socket of the local service. Access is decided by the service from your OS user id.
+    #[arg(long, global = true, env = "DOVE_ADMIN_SOCKET", default_value = DEFAULT_ADMIN_SOCKET)]
+    pub socket: PathBuf,
+    /// Print raw JSON.
+    #[arg(long, global = true)]
+    pub json: bool,
+}
+
+#[derive(Subcommand)]
+pub enum Command {
+    /// Run the service.
+    Serve {
+        #[arg(long, default_value = "/etc/dove/config.toml")]
+        config: PathBuf,
+    },
+    /// Print an example configuration.
+    ConfigExample,
+    /// Manage connected Google mailboxes (admin).
+    #[command(subcommand)]
+    Accounts(AccountsCmd),
+    /// Manage projects (admin).
+    #[command(subcommand)]
+    Projects(ProjectsCmd),
+    /// Manage client connections and their grants (admin).
+    #[command(subcommand)]
+    Clients(ClientsCmd),
+    /// Inspect and verify the audit log (admin).
+    #[command(subcommand)]
+    Audit(AuditCmd),
+    /// Key management.
+    #[command(subcommand)]
+    Keys(KeysCmd),
+    /// Manage the per-mailbox search index (admin).
+    #[command(subcommand)]
+    Index(IndexCmd),
+    /// Unknown-outcome draft operations (admin).
+    #[command(subcommand)]
+    Operations(OperationsCmd),
+    /// Check configuration, permissions and reachability (admin).
+    Doctor {
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+    /// Export projects, clients and accounts without secrets (admin).
+    Export {
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum AccountsCmd {
+    List {
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+    /// Start the Google authorization for a new mailbox and print the link to open.
+    Connect {
+        #[arg(long)]
+        alias: String,
+        #[arg(long)]
+        email: String,
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+    Reconnect {
+        alias: String,
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+    /// Revoke the grant at Google and delete it locally.
+    Remove {
+        alias: String,
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+    Disable {
+        alias: String,
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+    Enable {
+        alias: String,
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+    Check {
+        alias: Option<String>,
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ProjectsCmd {
+    Create {
+        name: String,
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+    AddAccount {
+        project: String,
+        alias: String,
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+    RemoveAccount {
+        project: String,
+        alias: String,
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+    List {
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+    Show {
+        name: String,
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ClientsCmd {
+    /// Create a client token. Prints the token once.
+    Create {
+        name: String,
+        #[arg(long)]
+        project: String,
+        /// alias=read[,draft[,send]], repeatable.
+        #[arg(long = "grant", required = true)]
+        grants: Vec<String>,
+        #[arg(long)]
+        expires: Option<String>,
+        #[arg(long = "allow-ip")]
+        allow_ip: Vec<String>,
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+    /// Atomically replace the whole grant set.
+    SetGrants {
+        name: String,
+        #[arg(long = "grant", required = true)]
+        grants: Vec<String>,
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+    Rotate {
+        name: String,
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+    Revoke {
+        name: String,
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+    Show {
+        name: String,
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+    List {
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+    /// Create a one-time invitation for `dove login` or the OAuth approval page.
+    Invite {
+        name: String,
+        #[arg(long)]
+        project: String,
+        /// `all` (expanded once, now) or a comma-separated alias list.
+        #[arg(long, default_value = "all")]
+        accounts: String,
+        #[arg(long, default_value = "read")]
+        capabilities: String,
+        #[arg(long)]
+        expires: Option<String>,
+        #[arg(long = "allow-ip")]
+        allow_ip: Vec<String>,
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum AuditCmd {
+    Tail {
+        #[arg(long, default_value_t = 50)]
+        limit: i64,
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+    Search {
+        #[arg(long)]
+        actor: Option<String>,
+        #[arg(long)]
+        tool: Option<String>,
+        #[arg(long)]
+        account: Option<String>,
+        #[arg(long)]
+        result: Option<String>,
+        #[arg(long)]
+        limit: Option<i64>,
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+    Verify {
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+    Prune {
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum KeysCmd {
+    /// Print a new key line for a key file (KEK, pepper or index key). Local only, talks to nothing.
+    Generate {
+        #[arg(long, default_value_t = 1)]
+        version: u32,
+    },
+    /// Re-wrap all grants under the newest KEK version in the KEK file (admin).
+    Rotate {
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum IndexCmd {
+    Enable {
+        alias: String,
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+    Disable {
+        alias: String,
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+    Status {
+        alias: Option<String>,
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+    Rebuild {
+        alias: String,
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum OperationsCmd {
+    List {
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+    /// Remove a create-operation record after verifying the mailbox by hand.
+    Remove {
+        #[arg(long)]
+        client: String,
+        #[arg(long)]
+        account: String,
+        #[arg(long)]
+        request_key: String,
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+}
+
+fn split_list(s: &str) -> Vec<String> {
+    s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()
+}
+
+/// Maps an admin subcommand to its socket request.
+fn admin_request(cmd: Command) -> anyhow::Result<(AdminOpts, AdminRequest)> {
+    use AdminRequest as R;
+    Ok(match cmd {
+        Command::Accounts(c) => match c {
+            AccountsCmd::List { admin } => (admin, R::AccountsList),
+            AccountsCmd::Connect { alias, email, admin } => (admin, R::AccountsConnect { alias, email }),
+            AccountsCmd::Reconnect { alias, admin } => (admin, R::AccountsReconnect { alias }),
+            AccountsCmd::Remove { alias, admin } => (admin, R::AccountsRemove { alias }),
+            AccountsCmd::Disable { alias, admin } => (admin, R::AccountsDisable { alias }),
+            AccountsCmd::Enable { alias, admin } => (admin, R::AccountsEnable { alias }),
+            AccountsCmd::Check { alias, admin } => (admin, R::AccountsCheck { alias }),
+        },
+        Command::Projects(c) => match c {
+            ProjectsCmd::Create { name, admin } => (admin, R::ProjectsCreate { name }),
+            ProjectsCmd::AddAccount { project, alias, admin } => {
+                (admin, R::ProjectsAddAccount { project, account: alias })
+            }
+            ProjectsCmd::RemoveAccount { project, alias, admin } => {
+                (admin, R::ProjectsRemoveAccount { project, account: alias })
+            }
+            ProjectsCmd::List { admin } => (admin, R::ProjectsList),
+            ProjectsCmd::Show { name, admin } => (admin, R::ProjectsShow { name }),
+        },
+        Command::Clients(c) => match c {
+            ClientsCmd::Create { name, project, grants, expires, allow_ip, admin } => {
+                (admin, R::ClientsCreate { name, project, grants: parse_grant_args(&grants)?, expires, allow_ip })
+            }
+            ClientsCmd::SetGrants { name, grants, admin } => {
+                (admin, R::ClientsSetGrants { name, grants: parse_grant_args(&grants)? })
+            }
+            ClientsCmd::Rotate { name, admin } => (admin, R::ClientsRotate { name }),
+            ClientsCmd::Revoke { name, admin } => (admin, R::ClientsRevoke { name }),
+            ClientsCmd::Show { name, admin } => (admin, R::ClientsShow { name }),
+            ClientsCmd::List { admin } => (admin, R::ClientsList),
+            ClientsCmd::Invite { name, project, accounts, capabilities, expires, allow_ip, admin } => (
+                admin,
+                R::ClientsInvite { name, project, accounts: split_list(&accounts), capabilities, expires, allow_ip },
+            ),
+        },
+        Command::Audit(c) => match c {
+            AuditCmd::Tail { limit, admin } => (admin, R::AuditTail { limit: Some(limit) }),
+            AuditCmd::Search { actor, tool, account, result, limit, admin } => (
+                admin,
+                R::AuditSearch {
+                    filter: SearchFilter { actor, tool, account, result_code: result, since: None, limit },
+                },
+            ),
+            AuditCmd::Verify { admin } => (admin, R::AuditVerify),
+            AuditCmd::Prune { admin } => (admin, R::AuditPrune),
+        },
+        Command::Keys(KeysCmd::Rotate { admin }) => (admin, R::KeysRotate),
+        Command::Index(c) => match c {
+            IndexCmd::Enable { alias, admin } => (admin, R::IndexEnable { alias }),
+            IndexCmd::Disable { alias, admin } => (admin, R::IndexDisable { alias }),
+            IndexCmd::Status { alias, admin } => (admin, R::IndexStatus { alias }),
+            IndexCmd::Rebuild { alias, admin } => (admin, R::IndexRebuild { alias }),
+        },
+        Command::Operations(c) => match c {
+            OperationsCmd::List { admin } => (admin, R::OperationsList),
+            OperationsCmd::Remove { client, account, request_key, admin } => {
+                (admin, R::OperationsRemove { client, account, request_key })
+            }
+        },
+        Command::Doctor { admin } => (admin, R::Doctor),
+        Command::Export { admin } => (admin, R::Export),
+        Command::Serve { .. } | Command::ConfigExample | Command::Keys(KeysCmd::Generate { .. }) => {
+            unreachable!("not an admin command")
+        }
+    })
+}
+
+fn print(value: &Value, json: bool) {
+    if json {
+        println!("{}", serde_json::to_string_pretty(value).unwrap_or_default());
+        return;
+    }
+    // Human output: YAML-like rendering of the JSON value, keeping secrets shown once where returned.
+    fn render(v: &Value, indent: usize, out: &mut String) {
+        let pad = " ".repeat(indent);
+        match v {
+            Value::Object(map) => {
+                for (k, val) in map {
+                    match val {
+                        Value::Object(_) | Value::Array(_) if !is_empty(val) => {
+                            out.push_str(&format!("{pad}{k}:\n"));
+                            render(val, indent + 2, out);
+                        }
+                        _ => out.push_str(&format!("{pad}{k}: {}\n", scalar(val))),
+                    }
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    match item {
+                        Value::Object(_) => {
+                            let mut inner = String::new();
+                            render(item, indent + 2, &mut inner);
+                            let trimmed = inner.trim_start();
+                            out.push_str(&format!("{pad}- {trimmed}"));
+                        }
+                        _ => out.push_str(&format!("{pad}- {}\n", scalar(item))),
+                    }
+                }
+            }
+            _ => out.push_str(&format!("{pad}{}\n", scalar(v))),
+        }
+    }
+    fn is_empty(v: &Value) -> bool {
+        matches!(v, Value::Array(a) if a.is_empty()) || matches!(v, Value::Object(o) if o.is_empty())
+    }
+    fn scalar(v: &Value) -> String {
+        match v {
+            Value::String(s) => s.clone(),
+            Value::Null => "-".into(),
+            Value::Array(_) => "[]".into(),
+            Value::Object(_) => "{}".into(),
+            other => other.to_string(),
+        }
+    }
+    let mut out = String::new();
+    render(value, 0, &mut out);
+    print!("{out}");
+}
+
+pub async fn run(cli: Cli) -> anyhow::Result<()> {
+    match cli.command {
+        Command::Serve { config } => crate::serve::run(&config).await,
+        Command::ConfigExample => {
+            print!("{}", config::EXAMPLE);
+            Ok(())
+        }
+        Command::Keys(KeysCmd::Generate { version }) => {
+            println!("{}", crate::secrets::generate_key_line(version));
+            Ok(())
+        }
+        other => {
+            let (opts, req) = admin_request(other)?;
+            let v = admin_client::send(&opts.socket, &req).await?;
+            print(&v, opts.json);
+            Ok(())
+        }
+    }
+}

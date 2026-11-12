@@ -16,17 +16,13 @@ pub fn redact(input: &str) -> String {
     let mut i = 0;
     'outer: while i < bytes.len() {
         // Dove secrets: dove_, dovei_, doveat_, dovert_, dovec_ followed by base64url.
-        for prefix in [
-            "dove_", "dovei_", "doveat_", "dovert_", "dovec_", "ya29.", "1//",
-        ] {
+        for prefix in ["dove_", "dovei_", "doveat_", "dovert_", "dovec_", "ya29.", "1//"] {
             if input[i..].starts_with(prefix) {
                 let start = i + prefix.len();
                 let end = start
                     + input[start..]
                         .bytes()
-                        .take_while(|b| {
-                            b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')
-                        })
+                        .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
                         .count();
                 if end - start >= 16 {
                     out.push_str(prefix);
@@ -36,23 +32,12 @@ pub fn redact(input: &str) -> String {
                 }
             }
         }
-        for key in [
-            "Bearer ",
-            "bearer ",
-            "code=",
-            "state=",
-            "refresh_token=",
-            "access_token=",
-            "code_verifier=",
-        ] {
+        for key in ["Bearer ", "bearer ", "code=", "state=", "refresh_token=", "access_token=", "code_verifier="] {
             if input[i..].starts_with(key) {
                 out.push_str(key);
                 out.push_str("[REDACTED]");
                 i += key.len();
-                i += input[i..]
-                    .bytes()
-                    .take_while(|b| !matches!(b, b' ' | b'&' | b'"' | b'\'' | b','))
-                    .count();
+                i += input[i..].bytes().take_while(|b| !matches!(b, b' ' | b'&' | b'"' | b'\'' | b',')).count();
                 continue 'outer;
             }
         }
@@ -71,9 +56,7 @@ pub struct RedactingWriter<W: Write + Send + 'static> {
 
 impl<W: Write + Send + 'static> RedactingWriter<W> {
     pub fn new(inner: W) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(inner)),
-        }
+        Self { inner: Arc::new(Mutex::new(inner)) }
     }
 }
 
@@ -106,10 +89,7 @@ impl<W: Write + Send + 'static> Drop for RedactingGuard<W> {
 impl<'a, W: Write + Send + 'static> MakeWriter<'a> for RedactingWriter<W> {
     type Writer = RedactingGuard<W>;
     fn make_writer(&'a self) -> Self::Writer {
-        RedactingGuard {
-            inner: self.inner.clone(),
-            buf: Vec::with_capacity(256),
-        }
+        RedactingGuard { inner: self.inner.clone(), buf: Vec::with_capacity(256) }
     }
 }
 

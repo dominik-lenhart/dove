@@ -24,8 +24,7 @@ impl Store {
         if let Some(dir) = path.parent() {
             ensure_private_dir(dir)?;
         }
-        let conn = Connection::open(path)
-            .with_context(|| format!("cannot open state store {}", path.display()))?;
+        let conn = Connection::open(path).with_context(|| format!("cannot open state store {}", path.display()))?;
         for suffix in ["", "-wal", "-shm"] {
             let p = PathBuf::from(format!("{}{suffix}", path.display()));
             if p.exists() {
@@ -45,10 +44,7 @@ impl Store {
              PRAGMA busy_timeout=5000; PRAGMA secure_delete=ON; PRAGMA temp_store=MEMORY;",
         )?;
         migrate(&mut conn)?;
-        Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
-            path,
-        })
+        Ok(Self { conn: Arc::new(Mutex::new(conn)), path })
     }
 
     pub fn path(&self) -> Option<&Path> {
@@ -63,9 +59,7 @@ impl Store {
     {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
-            let mut guard = conn
-                .lock()
-                .map_err(|_| anyhow::anyhow!("state store lock poisoned"))?;
+            let mut guard = conn.lock().map_err(|_| anyhow::anyhow!("state store lock poisoned"))?;
             f(&mut guard)
         })
         .await
@@ -77,10 +71,7 @@ impl Store {
     where
         F: FnOnce(&mut Connection) -> anyhow::Result<T>,
     {
-        let mut guard = self
-            .conn
-            .lock()
-            .map_err(|_| anyhow::anyhow!("state store lock poisoned"))?;
+        let mut guard = self.conn.lock().map_err(|_| anyhow::anyhow!("state store lock poisoned"))?;
         f(&mut guard)
     }
 }
@@ -93,26 +84,16 @@ pub fn ensure_private_dir(dir: &Path) -> anyhow::Result<()> {
     }
     let mode = std::fs::metadata(dir)?.permissions().mode() & 0o777;
     if mode & 0o077 != 0 {
-        bail!(
-            "data directory {} has mode {:o}; it must be 0700",
-            dir.display(),
-            mode
-        );
+        bail!("data directory {} has mode {:o}; it must be 0700", dir.display(), mode);
     }
     Ok(())
 }
 
 /// Applies migrations in order, each inside its own transaction. A failure rolls back and stops startup (spec 10).
 fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
-    )?;
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")?;
     let current: i64 = conn
-        .query_row(
-            "SELECT value FROM meta WHERE key = 'schema_version'",
-            [],
-            |r| r.get::<_, String>(0),
-        )
+        .query_row("SELECT value FROM meta WHERE key = 'schema_version'", [], |r| r.get::<_, String>(0))
         .optional()?
         .map(|v| v.parse().unwrap_or(-1))
         .unwrap_or(0);
@@ -122,8 +103,7 @@ fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
     for (i, sql) in schema::MIGRATIONS.iter().enumerate().skip(current as usize) {
         let version = i + 1;
         let tx = conn.transaction()?;
-        tx.execute_batch(sql)
-            .with_context(|| format!("migration {version} failed"))?;
+        tx.execute_batch(sql).with_context(|| format!("migration {version} failed"))?;
         tx.execute(
             "INSERT INTO meta(key, value) VALUES('schema_version', ?1) \
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -135,9 +115,7 @@ fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
 }
 
 pub fn get_meta(conn: &Connection, key: &str) -> anyhow::Result<Option<String>> {
-    Ok(conn
-        .query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
-        .optional()?)
+    Ok(conn.query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0)).optional()?)
 }
 
 pub fn set_meta(conn: &Connection, key: &str, value: &str) -> anyhow::Result<()> {
@@ -158,17 +136,10 @@ mod tests {
         let path = dir.path().join("data/state.db");
         let s = Store::open(&path).unwrap();
         let v = s.call_blocking(|c| get_meta(c, "schema_version")).unwrap();
-        assert_eq!(
-            v.as_deref(),
-            Some(schema::MIGRATIONS.len().to_string().as_str())
-        );
+        assert_eq!(v.as_deref(), Some(schema::MIGRATIONS.len().to_string().as_str()));
         drop(s);
         Store::open(&path).unwrap();
-        let mode = std::fs::metadata(dir.path().join("data"))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
+        let mode = std::fs::metadata(dir.path().join("data")).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
     }
 
@@ -178,8 +149,7 @@ mod tests {
         let path = dir.path().join("state.db");
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let s = Store::open(&path).unwrap();
-        s.call_blocking(|c| set_meta(c, "schema_version", "999"))
-            .unwrap();
+        s.call_blocking(|c| set_meta(c, "schema_version", "999")).unwrap();
         drop(s);
         assert!(Store::open(&path).is_err());
     }

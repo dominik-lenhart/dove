@@ -57,12 +57,7 @@ pub struct ToolError {
 
 impl ToolError {
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
-        Self {
-            code,
-            message: message.into(),
-            retry_after_seconds: None,
-            details: None,
-        }
+        Self { code, message: message.into(), retry_after_seconds: None, details: None }
     }
     /// The single not-found shape used for unknown and out-of-scope objects alike (FR-P5).
     pub fn not_found() -> Self {
@@ -84,10 +79,7 @@ impl ToolError {
         Self::new(ErrorCode::UpstreamError, message)
     }
     pub fn rate_limited(retry_after: Option<u64>) -> Self {
-        Self {
-            retry_after_seconds: retry_after,
-            ..Self::new(ErrorCode::RateLimited, "rate limited")
-        }
+        Self { retry_after_seconds: retry_after, ..Self::new(ErrorCode::RateLimited, "rate limited") }
     }
     pub fn with_details(mut self, details: Value) -> Self {
         self.details = Some(details);
