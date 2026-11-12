@@ -82,7 +82,13 @@ pub struct Opts {
     pub idle: bool,
     /// End IDLE with `* BYE` and close the connection after this long.
     pub idle_timeout: Option<Duration>,
+    /// Report `VANISHED (EARLIER)` as wide ranges: every UID from 1 to `UIDNEXT + WIDE_VANISHED` that is not in
+    /// the folder (RFC 7162 lets a server include UIDs that never existed).
+    pub wide_vanished: bool,
 }
+
+/// How far past `UIDNEXT` the ranges of [`Opts::wide_vanished`] reach.
+pub const WIDE_VANISHED: u32 = 2_000_000;
 
 impl Default for Opts {
     fn default() -> Self {
@@ -95,6 +101,7 @@ impl Default for Opts {
             smtp_auth: "PLAIN LOGIN",
             idle: true,
             idle_timeout: None,
+            wide_vanished: false,
         }
     }
 }
@@ -1078,6 +1085,7 @@ fn handle(
             };
             let uidplus = s.opts.uidplus;
             let qresync = conn.qresync;
+            let wide_vanished = s.opts.wide_vanished;
             let user = s.users.get_mut(authed.as_ref().unwrap()).unwrap();
             let Some(f) = user.folders.iter_mut().find(|f| f.raw_name == sel) else {
                 out.line(format!("{tag} NO mailbox gone"));
@@ -1120,12 +1128,25 @@ fn handle(
                     if let (Some(cs), true, true) = (changedsince, want_vanished, qresync) {
                         // `*` in a UID range covers expunged UIDs above the current highest one.
                         let vset = parse_set(&args.first().map(Tok::s).unwrap_or_default(), u32::MAX);
-                        let v: Vec<String> = f
+                        let mut v: Vec<String> = f
                             .vanished
                             .iter()
                             .filter(|(u, ms)| *ms > cs && in_set(&vset, *u))
                             .map(|(u, _)| u.to_string())
                             .collect();
+                        if wide_vanished && !v.is_empty() {
+                            // The complement of the folder's UIDs up to far past UIDNEXT, as ranges.
+                            let mut present: Vec<u32> = f.msgs.iter().map(|m| m.uid).collect();
+                            present.sort_unstable();
+                            let (mut lo, end) = (1u32, f.uidnext + WIDE_VANISHED);
+                            v.clear();
+                            for p in present.into_iter().chain([end + 1]) {
+                                if p > lo {
+                                    v.push(if p - 1 == lo { lo.to_string() } else { format!("{lo}:{}", p - 1) });
+                                }
+                                lo = p + 1;
+                            }
+                        }
                         if !v.is_empty() {
                             out.line(format!("* VANISHED (EARLIER) {}", v.join(",")));
                         }

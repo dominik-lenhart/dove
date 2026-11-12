@@ -239,6 +239,6 @@ async fn changed_since_reports_flags_and_vanished() {
     assert_eq!(ch.changed.len(), 1);
     assert_eq!(ch.changed[0].uid, a);
     assert!(ch.changed[0].flags.contains(&"\\Seen".to_string()));
-    assert_eq!(ch.vanished, Some(vec![b]));
+    assert_eq!(ch.vanished.unwrap().ranges(), &[(b, b)]);
     assert_eq!(s.uid_search_since_uid(b + 10).await.unwrap(), Vec::<u32>::new());
 }

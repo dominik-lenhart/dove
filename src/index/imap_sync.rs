@@ -456,8 +456,14 @@ impl Scanner {
         // 1. Flag changes and (QRESYNC) expunges since the checkpoint.
         if condstore && st.highestmodseq > cp.highestmodseq {
             let ch = s.changed_since(cp.highestmodseq.unwrap_or(0)).await?;
-            if let Some(v) = &ch.vanished {
-                self.remove_uids(f.folder_id, uv, v).await?;
+            // VANISHED stays a set of ranges (it may cover UIDs that never existed); only the UIDs Dove knows are
+            // looked up in it. An incomplete set (`None`) is left to the count check below.
+            if let Some(v) = ch.vanished.as_ref().filter(|v| !v.is_empty()) {
+                let (indexed, pending) = self.known(f.folder_id, uv).await?;
+                let mut gone: Vec<u32> = indexed.into_iter().chain(pending).filter(|u| v.contains(*u)).collect();
+                gone.sort_unstable();
+                gone.dedup();
+                self.remove_uids(f.folder_id, uv, &gone).await?;
             }
             self.apply_flags(f, uv, ch.changed).await?;
         }

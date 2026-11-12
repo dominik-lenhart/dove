@@ -275,6 +275,27 @@ async fn deletion_via_qresync_and_via_diff_fallback() {
     }
 }
 
+/// A server may report `VANISHED` as ranges that cover UIDs which never existed (RFC 7162). A range wider than a
+/// million UIDs still removes the known messages inside it, without falling back to `UID SEARCH ALL`.
+#[tokio::test]
+async fn wide_vanished_ranges_remove_known_messages() {
+    let fx = setup(Opts { wide_vanished: true, ..Default::default() }).await;
+    let uids: Vec<u32> = (0..4).map(|i| fx.add("INBOX", &simple(&format!("keep {i}")), &[])).collect();
+    fx.sync().await;
+    let gone = [fx.id("INBOX", uids[1]).await, fx.id("INBOX", uids[3]).await];
+    fx.h.imap.expunge_external(&fx.u.user, "INBOX", uids[1]);
+    fx.h.imap.expunge_external(&fx.u.user, "INBOX", uids[3]);
+    let mark = fx.h.imap.commands().len();
+    let r = fx.sync().await;
+    assert_eq!(r.removed, 2, "{r:?}");
+    let left = fx.indexed().await;
+    assert_eq!(left.len(), 2, "{left:?}");
+    assert!(gone.iter().all(|g| !left.contains(g)), "{left:?}");
+    let cmds = fx.commands_since(mark);
+    assert!(cmds.iter().any(|c| c.contains("VANISHED")), "{cmds:?}");
+    assert!(!cmds.iter().any(|c| c.contains("SEARCH ALL")), "{cmds:?}");
+}
+
 /// Without CONDSTORE (Strato advertises none, checked 2026-11-12) a `\Seen` change made by another client shows in
 /// `is_unread` after the next poll, through the bounded flags-only refresh.
 #[tokio::test]

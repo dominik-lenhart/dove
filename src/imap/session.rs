@@ -23,6 +23,9 @@ const MAX_UNTAGGED: usize = 200_000;
 const COMMAND_OVERHEAD: usize = 16 * 1024 * 1024;
 /// Nesting depth of parenthesized lists in one response.
 const MAX_DEPTH: usize = 32;
+/// Most UID ranges kept from the `VANISHED` responses of one command. Ranges stay `(lo, hi)` pairs and are never
+/// expanded; beyond this many the set is reported incomplete and the caller falls back to the UID diff.
+pub const MAX_VANISHED_RANGES: usize = 50_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -92,8 +95,44 @@ pub struct FetchedMeta {
 pub struct Changes {
     /// Messages whose flags (or existence) changed since the given mod-sequence.
     pub changed: Vec<FetchedMeta>,
-    /// UIDs expunged since then; `None` when QRESYNC is not enabled (the caller diffs `UID SEARCH ALL` instead).
-    pub vanished: Option<Vec<u32>>,
+    /// UIDs expunged since then, as ranges (a server may include UIDs that never existed, RFC 7162 3.2.10). `None`
+    /// when QRESYNC is not enabled or the server sent more than [`MAX_VANISHED_RANGES`] ranges: the caller then
+    /// diffs `UID SEARCH ALL` instead.
+    pub vanished: Option<UidRanges>,
+}
+
+/// A set of UIDs as sorted, disjoint, inclusive ranges. Memory is proportional to the number of ranges, never to
+/// their width; callers intersect it with the UIDs they know instead of listing it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UidRanges(Vec<(u32, u32)>);
+
+impl UidRanges {
+    /// Sorts and merges overlapping or adjacent ranges.
+    pub fn from_ranges(mut v: Vec<(u32, u32)>) -> Self {
+        v.sort_unstable();
+        let mut out: Vec<(u32, u32)> = Vec::with_capacity(v.len());
+        for (lo, hi) in v {
+            match out.last_mut() {
+                Some(last) if lo <= last.1.saturating_add(1) => last.1 = last.1.max(hi),
+                _ => out.push((lo, hi)),
+            }
+        }
+        out.shrink_to_fit();
+        Self(out)
+    }
+
+    pub fn contains(&self, uid: u32) -> bool {
+        let i = self.0.partition_point(|(_, hi)| *hi < uid);
+        self.0.get(i).is_some_and(|(lo, _)| *lo <= uid)
+    }
+
+    pub fn ranges(&self) -> &[(u32, u32)] {
+        &self.0
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -340,27 +379,26 @@ pub(crate) fn parse_internal_date(s: &str) -> Option<i64> {
     Some(dt.assume_utc().unix_timestamp() - sign * (zh * 3600 + zm * 60))
 }
 
-fn parse_uid_set(s: &str) -> Vec<u32> {
-    let mut out = Vec::new();
+/// Parses a UID set (`1:3,7,9:8`) into `out` as `(lo, hi)` pairs without expanding ranges. Returns false (and stops)
+/// once `out` holds `max` ranges. Malformed parts are skipped.
+fn parse_uid_ranges(s: &str, out: &mut Vec<(u32, u32)>, max: usize) -> bool {
     for part in s.split(',') {
-        match part.split_once(':') {
-            Some((a, b)) => {
-                if let (Ok(a), Ok(b)) = (a.parse::<u32>(), b.parse::<u32>()) {
-                    let (lo, hi) = (a.min(b), a.max(b));
-                    // Bounded: a hostile server cannot make us allocate billions of entries.
-                    if hi - lo <= 1_000_000 {
-                        out.extend(lo..=hi);
-                    }
-                }
-            }
-            None => {
-                if let Ok(u) = part.parse() {
-                    out.push(u);
-                }
-            }
+        let range = match part.split_once(':') {
+            Some((a, b)) => match (a.parse::<u32>(), b.parse::<u32>()) {
+                (Ok(a), Ok(b)) => (a.min(b), a.max(b)),
+                _ => continue,
+            },
+            None => match part.parse::<u32>() {
+                Ok(u) => (u, u),
+                Err(_) => continue,
+            },
+        };
+        if out.len() >= max {
+            return false;
         }
+        out.push(range);
     }
-    out
+    true
 }
 
 // ------------------------------------------------------------------ session
@@ -1029,20 +1067,22 @@ impl ImapSession {
         }
         let vanished = self.qresync;
         let d = self.simple(ImapOp::UidFetchChangedSince { modseq, vanished }, SMALL_LITERAL).await?;
-        let mut changes = Changes { vanished: vanished.then(Vec::new), ..Default::default() };
+        let mut changes = Changes::default();
         for (uid, kv) in Self::fetches(&d) {
             changes.changed.push(Self::meta_of(uid, &kv));
         }
-        if let Some(v) = changes.vanished.as_mut() {
+        if vanished {
+            let mut ranges = Vec::new();
+            let mut complete = true;
             for Untagged(t) in &d.untagged {
-                if t.first().and_then(Tok::atom).is_some_and(|a| a.eq_ignore_ascii_case("VANISHED"))
+                if complete
+                    && t.first().and_then(Tok::atom).is_some_and(|a| a.eq_ignore_ascii_case("VANISHED"))
                     && let Some(set) = t.iter().skip(1).rev().find_map(Tok::atom)
                 {
-                    v.extend(parse_uid_set(set));
+                    complete = parse_uid_ranges(set, &mut ranges, MAX_VANISHED_RANGES);
                 }
             }
-            v.sort_unstable();
-            v.dedup();
+            changes.vanished = complete.then(|| UidRanges::from_ranges(ranges));
         }
         Ok(changes)
     }
@@ -1356,13 +1396,71 @@ mod tests {
         assert!(!s.is_idling());
     }
 
+    /// VANISHED sets stay ranges: a range wider than any mailbox costs one pair (and is not dropped), and the number
+    /// of pairs kept per command is capped.
+    #[test]
+    fn uid_ranges_are_never_expanded() {
+        let mut v = Vec::new();
+        assert!(parse_uid_ranges("4294967295:1", &mut v, 1));
+        let r = UidRanges::from_ranges(v);
+        assert_eq!(r.ranges(), &[(1, u32::MAX)]);
+        assert!(r.contains(3_000_000) && r.contains(u32::MAX) && !r.contains(0));
+        let r = UidRanges::from_ranges(vec![(5, 9), (1, 3), (4, 4), (20, 30), (25, 26), (1, 2)]);
+        assert_eq!(r.ranges(), &[(1, 9), (20, 30)]);
+        assert!(r.contains(1) && r.contains(9) && !r.contains(10) && r.contains(20) && !r.contains(31));
+        let hostile = ["1:1000000"; 10].join(",");
+        let mut v = Vec::new();
+        assert!(!parse_uid_ranges(&hostile, &mut v, 4));
+        assert_eq!(v.len(), 4);
+    }
+
+    fn condstore_session(io: tokio::io::DuplexStream) -> ImapSession {
+        let mut s = over_stream(io);
+        s.caps = vec!["IMAP4REV1".into(), "CONDSTORE".into(), "QRESYNC".into()];
+        s.qresync = true;
+        s.selected = Some(("INBOX".into(), true, FolderStatus { uidvalidity: 1, ..Default::default() }));
+        s
+    }
+
+    /// A `VANISHED (EARLIER)` range wider than a million UIDs still names the UIDs inside it; more ranges than
+    /// [`MAX_VANISHED_RANGES`] make the set incomplete (`None`) instead of growing without bound.
+    #[tokio::test]
+    async fn vanished_ranges_are_kept_and_bounded() {
+        let (client, server) = tokio::io::duplex(1 << 20);
+        let mut s = condstore_session(client);
+        let (_sr, mut sw) = tokio::io::split(server);
+        sw.write_all(
+            b"* VANISHED (EARLIER) 7,1:3000000\r\n* 1 FETCH (UID 3000001 FLAGS () MODSEQ (9))\r\nd1 OK done\r\n",
+        )
+        .await
+        .unwrap();
+        let ch = s.changed_since(1).await.unwrap();
+        let v = ch.vanished.unwrap();
+        assert_eq!(v.ranges(), &[(1, 3_000_000)]);
+        assert!(v.contains(2_500_000) && !v.contains(3_000_001));
+        assert_eq!(ch.changed.len(), 1);
+
+        let many: Vec<String> = (0..=MAX_VANISHED_RANGES as u32).map(|i| (2 * i + 1).to_string()).collect();
+        let feed = tokio::spawn(async move {
+            sw.write_all(format!("* VANISHED (EARLIER) {}\r\nd2 OK done\r\n", many.join(",")).as_bytes())
+                .await
+                .unwrap();
+            sw
+        });
+        let ch = s.changed_since(1).await.unwrap();
+        assert_eq!(ch.vanished, None, "over the cap: incomplete, the caller diffs instead");
+        feed.await.unwrap();
+    }
+
     #[test]
     fn internal_dates_and_sets() {
         assert_eq!(parse_internal_date("17-Jul-1996 02:44:25 -0700"), Some(837596665));
         assert_eq!(parse_internal_date(" 1-Jan-2026 00:00:00 +0000"), Some(1767225600));
         assert_eq!(parse_internal_date("garbage"), None);
         assert_eq!(parse_internal_date("17-Jul-1996 02:44:25 -\u{e9}00"), None);
-        assert_eq!(parse_uid_set("1:3,7,9:8"), vec![1, 2, 3, 7, 8, 9]);
+        let mut v = Vec::new();
+        assert!(parse_uid_ranges("1:3,7,9:8,x,5:y", &mut v, 10));
+        assert_eq!(v, vec![(1, 3), (7, 7), (8, 9)]);
         assert_eq!(literal_len(b"* 1 FETCH (BODY[] {123}"), Some(123));
         assert_eq!(literal_len(b"* OK {weird}"), None);
     }
