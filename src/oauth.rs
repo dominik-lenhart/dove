@@ -81,7 +81,7 @@ struct Pending {
     invitation_id: Option<String>,
     attempts: u32,
     created: Instant,
-    ip: Option<IpAddr>,
+    ip_bucket: String,
 }
 
 pub struct OAuthState {
@@ -203,8 +203,22 @@ fn rate_limited(wait: u64) -> Response {
     r
 }
 
+/// Rate-limit bucket of a source address: IPv4 as is, IPv6 by its /64, since one host usually controls a whole
+/// /64 and could otherwise rotate addresses to get fresh limits.
+pub fn ip_bucket(ip: Option<IpAddr>) -> String {
+    match ip {
+        Some(IpAddr::V6(v6)) if v6.to_ipv4_mapped().is_none() => {
+            let s = v6.segments();
+            format!("{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3])
+        }
+        Some(IpAddr::V6(v6)) => v6.to_ipv4_mapped().map(|v4| v4.to_string()).unwrap_or_default(),
+        Some(IpAddr::V4(v4)) => v4.to_string(),
+        None => String::new(),
+    }
+}
+
 fn ip_key(prefix: &str, ip: Option<IpAddr>) -> String {
-    format!("{prefix}:{}", ip.map(|i| i.to_string()).unwrap_or_default())
+    format!("{prefix}:{}", ip_bucket(ip))
 }
 
 fn issuer(app: &App) -> String {
@@ -461,13 +475,14 @@ async fn authorize_get(State(app): State<Arc<App>>, req: Request) -> Response {
         invitation_id: None,
         attempts: 0,
         created: Instant::now(),
-        ip,
+        ip_bucket: ip_bucket(ip),
     };
     let mut resp = invitation_page(&pending, &rid, None);
     {
         let mut map = app.oauth.pending.lock().expect("lock");
         map.retain(|_, p| p.created.elapsed() < PENDING_TTL);
-        if map.values().filter(|p| p.ip == ip).count() >= MAX_PENDING_PER_IP {
+        let bucket = ip_bucket(ip);
+        if map.values().filter(|p| p.ip_bucket == bucket).count() >= MAX_PENDING_PER_IP {
             return error_page(StatusCode::TOO_MANY_REQUESTS, "Too many open sign-in requests. Try again later.");
         }
         if map.len() >= MAX_PENDING {
@@ -1211,6 +1226,17 @@ mod tests {
         assert!(validate_redirect_uri("https://user:pw@a.example/cb").is_err());
         assert!(validate_redirect_uri("myapp://cb").is_err());
         assert!(validate_redirect_uri("javascript:alert(1)").is_err());
+    }
+
+    #[test]
+    fn ipv6_limits_use_the_64() {
+        let a = Some("2001:db8:1:2:aaaa::1".parse().unwrap());
+        let b = Some("2001:db8:1:2:bbbb::9".parse().unwrap());
+        let c = Some("2001:db8:1:3::1".parse().unwrap());
+        assert_eq!(ip_bucket(a), ip_bucket(b));
+        assert_ne!(ip_bucket(a), ip_bucket(c));
+        assert_eq!(ip_bucket(Some("::ffff:10.0.0.1".parse().unwrap())), "10.0.0.1");
+        assert_eq!(ip_bucket(Some("10.0.0.1".parse().unwrap())), "10.0.0.1");
     }
 
     #[test]

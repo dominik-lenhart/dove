@@ -306,7 +306,7 @@ pub async fn redeem(State(app): State<Arc<App>>, req: Request) -> Response {
     let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0);
     let ip = crate::http::client_ip(req.headers(), peer);
     let limit = app.cfg.oauth.redeem_per_minute;
-    let key = format!("redeem:{}", ip.map(|i| i.to_string()).unwrap_or_default());
+    let key = format!("redeem:{}", crate::oauth::ip_bucket(ip));
     if let Some(wait) = app.rate_limiter.check(&key, limit, limit) {
         let mut r = json_no_store(StatusCode::TOO_MANY_REQUESTS, json!({ "error": "rate_limited" }));
         r.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from(wait));
