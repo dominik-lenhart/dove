@@ -48,9 +48,11 @@ pub fn defs() -> Vec<ToolDef> {
 pub fn sanitize_filename(name: Option<&str>) -> String {
     let cleaned = content::clean_text(name.unwrap_or_default());
     let s: String = cleaned.chars().filter(|c| !c.is_control() && !matches!(c, '/' | '\\')).collect();
-    let s = s.trim().trim_start_matches('.').trim();
+    // Leading dots and spaces in any order (".. .x"), so a sanitized name sanitizes to itself.
+    let s = s.trim_start_matches(|c: char| c == '.' || c.is_whitespace()).trim_end();
     let (s, _) = content::truncate_chars(s, 200);
-    if s.is_empty() { "attachment".into() } else { s }
+    let s = s.trim_end();
+    if s.is_empty() { "attachment".into() } else { s.to_string() }
 }
 
 /// Audit size class (never the filename).
@@ -133,6 +135,11 @@ mod tests {
         assert_eq!(sanitize_filename(Some("  ")), "attachment");
         assert_eq!(sanitize_filename(None), "attachment");
         assert_eq!(sanitize_filename(Some("Rechnung März.pdf")), "Rechnung März.pdf");
+        assert_eq!(sanitize_filename(Some(". .x")), "x");
+        for n in [". .x", " . a ", "../.. /b", &"é".repeat(300), &format!("{} x", "a".repeat(199))] {
+            let once = sanitize_filename(Some(n));
+            assert_eq!(sanitize_filename(Some(&once)), once, "{n:?}");
+        }
         assert_eq!(size_class(10), "<1MiB");
         assert_eq!(size_class(MIB), "<10MiB");
         assert!(valid_part_id("part-3") && !valid_part_id("part-") && !valid_part_id("part-1/2"));

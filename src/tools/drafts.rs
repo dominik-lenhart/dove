@@ -12,8 +12,8 @@ use serde_json::{Value, json};
 
 use super::read::{fmt_addrs, from_meta};
 use super::{
-    AuditInfo, ToolCx, ToolDef, ToolOutput, account_arg, account_schema, arg_str, gmail_id_arg, object_schema,
-    only_keys, opt_str,
+    AuditInfo, ToolCx, ToolDef, ToolOutput, account_arg, account_schema, arg_str, compose, gmail_id_arg, object_schema,
+    only_keys, opt_bool, opt_str,
 };
 use crate::error::{ErrorCode, ToolError};
 use crate::gmail::WriteError;
@@ -39,17 +39,30 @@ impl DraftLocks {
     }
 }
 
+fn attachments_schema() -> Value {
+    json!({ "type": "array", "maxItems": mime::MAX_DRAFT_ATTACHMENTS, "description": concat!(
+        "Files to attach. Either a reference {ref | account + message_id, attachment_id} to an attachment of a message ",
+        "you can read, or inline {filename, mime_type, content_base64}."
+    ), "items": { "type": "object", "properties": {
+        "ref": { "type": "string" }, "account": { "type": "string" }, "message_id": { "type": "string" },
+        "attachment_id": { "type": "string", "description": "From get_message attachments[].attachment_id." },
+        "filename": { "type": "string" }, "mime_type": { "type": "string", "description": "type/subtype, e.g. application/pdf" },
+        "content_base64": { "type": "string" }
+    }, "additionalProperties": false } })
+}
+
 pub fn defs() -> Vec<ToolDef> {
-    let recipients = json!({ "type": "array", "items": { "type": "string" }, "maxItems": 50 });
-    let _ = recipients;
     vec![
         ToolDef {
             name: "create_draft",
             title: "Create draft",
             description: concat!(
-                "Create a new draft or a threaded reply (reply_to_message_id) in a mailbox's server Drafts. Recipients ",
-                "are never inferred. Generate a fresh UUID request_key per intent and reuse it only to retry the same ",
-                "request. The owner reviews and sends it in Apple Mail unless send rights exist."
+                "Create a new draft, a threaded reply (reply_to_message_id, quotes the original by default) or a ",
+                "forward (forward_message_id or forward_ref, includes the original's attachments by default) in a ",
+                "mailbox's server Drafts. Attach files by reference to a message you can read (bytes stay on the ",
+                "server) or inline as base64: at most 10 per draft, 10 MiB in total by default. Recipients are never ",
+                "inferred. Generate a fresh UUID request_key per intent and reuse it only to retry the same request. ",
+                "The owner reviews and sends it in Apple Mail unless send rights exist."
             ),
             capability: Capability::Draft,
             read_only: false,
@@ -63,6 +76,11 @@ pub fn defs() -> Vec<ToolDef> {
                     "subject": { "type": "string" },
                     "body_text": { "type": "string" },
                     "reply_to_message_id": { "type": "string" },
+                    "quote_original": { "type": "boolean", "description": "Replies: quote the original's text below body_text (default true when you have read on this mailbox)." },
+                    "forward_message_id": { "type": "string", "description": "Forward this message of `account` (needs read)." },
+                    "forward_ref": { "type": "string", "description": "Forward the message of this ref from search_messages (any mailbox you can read)." },
+                    "include_attachments": { "type": "boolean", "description": "Forwards: attach the original's attachments (default true)." },
+                    "attachments": attachments_schema(),
                     "from_address": { "type": "string", "description": "One of the mailbox's send-as addresses." }
                 }, "required": ["account", "request_key", "body_text"], "additionalProperties": false })
             },
@@ -77,7 +95,8 @@ pub fn defs() -> Vec<ToolDef> {
             name: "update_draft",
             title: "Revise draft",
             description: concat!(
-                "Patch a draft this project created, conditional on expected_revision. Omitted fields are kept. ",
+                "Patch a draft this project created, conditional on expected_revision. Omitted fields are kept, ",
+                "including attachments; changes.attachments replaces the whole list ([] removes all). ",
                 "Fails with draft_conflict if the draft changed elsewhere (for example saved in Apple Mail)."
             ),
             capability: Capability::Draft,
@@ -90,7 +109,8 @@ pub fn defs() -> Vec<ToolDef> {
                     "draft_id": { "type": "string" },
                     "expected_revision": { "type": "string" },
                     "changes": { "type": "object", "properties": {
-                        "to": r, "cc": r, "bcc": r, "subject": { "type": "string" }, "body_text": { "type": "string" }
+                        "to": r, "cc": r, "bcc": r, "subject": { "type": "string" }, "body_text": { "type": "string" },
+                        "attachments": attachments_schema()
                     }, "additionalProperties": false }
                 }, "required": ["account", "draft_id", "expected_revision", "changes"], "additionalProperties": false })
             },
@@ -162,7 +182,7 @@ pub fn normalize_subject(s: &str) -> String {
 fn mime_err(e: mime::MimeError) -> ToolError {
     match e {
         mime::MimeError::Invalid(m) => ToolError::invalid(m),
-        mime::MimeError::TooLarge => ToolError::invalid("draft exceeds size limits"),
+        mime::MimeError::TooLarge => ToolError::new(ErrorCode::TooLarge, "the draft exceeds the message size limit"),
         mime::MimeError::Unparseable => ToolError::invalid("draft could not be built"),
     }
 }
@@ -205,7 +225,22 @@ enum OpState {
 async fn create_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
     only_keys(
         &args,
-        &["account", "request_key", "to", "cc", "bcc", "subject", "body_text", "reply_to_message_id", "from_address"],
+        &[
+            "account",
+            "request_key",
+            "to",
+            "cc",
+            "bcc",
+            "subject",
+            "body_text",
+            "reply_to_message_id",
+            "quote_original",
+            "forward_message_id",
+            "forward_ref",
+            "include_attachments",
+            "attachments",
+            "from_address",
+        ],
     )?;
     let mb = account_arg(cx, &args, Capability::Draft)?.clone();
     let request_key = arg_str(&args, "request_key")?;
@@ -235,11 +270,45 @@ async fn create_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError>
         Some(f) => Some(mime::parse_address(f).map_err(|_| ToolError::invalid("invalid from_address"))?),
         None => None,
     };
+    // Every referenced message is authorized here, before any upstream call (identical not_found without read).
+    let limit = cx.app.cfg.limits.draft_attachment_bytes;
+    let attachments = compose::parse_attachments(cx, args.get("attachments"), limit)?.unwrap_or_default();
+    let forward = match (opt_str(&args, "forward_message_id")?, opt_str(&args, "forward_ref")?) {
+        (Some(_), Some(_)) => return Err(ToolError::invalid("pass either forward_message_id or forward_ref")),
+        (Some(id), None) => Some(compose::readable_message(cx, None, Some(arg_str(&args, "account")?), Some(id))?),
+        (None, Some(r)) => Some(compose::readable_message(cx, Some(r), None, None)?),
+        (None, None) => None,
+    }
+    .map(|(m, id)| (m.account_id.clone(), id));
+    if forward.is_some() && reply_to.is_some() {
+        return Err(ToolError::invalid("a draft is either a reply or a forward, not both"));
+    }
+    let include_attachments = match args.get("include_attachments") {
+        Some(v) if forward.is_none() && !v.is_null() => {
+            return Err(ToolError::invalid("include_attachments applies to forwards only"));
+        }
+        _ => opt_bool(&args, "include_attachments", true)?,
+    };
+    // Quoting copies the original's text into the draft: only for callers who may read this mailbox.
+    let quote = match (reply_to.is_some(), args.get("quote_original").filter(|v| !v.is_null())) {
+        (false, Some(_)) => return Err(ToolError::invalid("quote_original applies to replies only")),
+        (false, None) => false,
+        (true, None) => cx.client.authorize_id(Capability::Read, &mb.account_id).is_ok(),
+        (true, Some(_)) => {
+            let q = opt_bool(&args, "quote_original", true)?;
+            if q {
+                cx.client.authorize_id(Capability::Read, &mb.account_id)?;
+            }
+            q
+        }
+    };
 
     // Idempotency record (spec 5.3 create_draft): keyed by (client, account, request_key), no content.
     let canonical = json!({
         "to": fmt_addrs(&to), "cc": fmt_addrs(&cc), "bcc": fmt_addrs(&bcc), "subject": subject_arg,
         "body": body, "reply": reply_to, "from": from_arg.as_ref().map(|a| a.email.clone()),
+        "attachments": attachments.iter().map(compose::AttachSpec::canonical).collect::<Vec<_>>(),
+        "forward": forward, "include_attachments": include_attachments, "quote": quote,
     });
     let input_hash = cx.app.pepper.hash("create-op", &canonical.to_string());
     let (cid, aid, key) = (cx.client.client_id.clone(), mb.account_id.clone(), request_key.to_string());
@@ -312,10 +381,24 @@ async fn create_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError>
         OpState::New => {}
     }
 
-    let result = dispatch_create(cx, &mb, to, cc, bcc, subject_arg, body, reply_to, from_arg).await;
+    let source_ids: Vec<String> = forward.iter().map(|(_, m)| m.clone()).collect();
+    let input = CreateInput {
+        to,
+        cc,
+        bcc,
+        subject_arg,
+        body,
+        reply_to,
+        quote,
+        forward,
+        include_attachments,
+        attachments,
+        from_arg,
+    };
+    let result = dispatch_create(cx, &mb, input).await;
     let (cid, aid, key) = (cx.client.client_id.clone(), mb.account_id.clone(), request_key.to_string());
     match result {
-        Ok(Created { draft_id, message_id, thread_id, content_hash }) => {
+        Ok((Created { draft_id, message_id, thread_id, content_hash }, stats)) => {
             let out = json!({ "account": mb.alias, "draft_id": draft_id, "message_id": message_id, "thread_id": thread_id, "revision": message_id });
             let (o2, pid, client_id) = (out.clone(), cx.client.project_id.clone(), cx.client.client_id.clone());
             let (d2, m2, t2) = (draft_id.clone(), message_id.clone(), thread_id.clone());
@@ -351,7 +434,7 @@ async fn create_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError>
                     mb.alias
                 ),
                 structured: out,
-                audit: audit(vec![draft_id]),
+                audit: audit([vec![draft_id], source_ids, stats.audit_ids()].concat()),
             })
         }
         Err((err, dispatched)) => {
@@ -391,20 +474,63 @@ pub(super) struct Created {
     pub content_hash: Option<Vec<u8>>,
 }
 
-/// Builds and posts the draft. The bool in the error says whether the create request may have reached the provider.
-#[allow(clippy::too_many_arguments)]
-async fn dispatch_create(
-    cx: &ToolCx,
-    mb: &Mailbox,
+/// Validated create_draft inputs (sources already authorized).
+struct CreateInput {
     to: Vec<Addr>,
     cc: Vec<Addr>,
     bcc: Vec<Addr>,
     subject_arg: Option<String>,
     body: String,
     reply_to: Option<String>,
+    quote: bool,
+    /// (account id, message id) of the message to forward.
+    forward: Option<(String, String)>,
+    include_attachments: bool,
+    attachments: Vec<compose::AttachSpec>,
     from_arg: Option<Addr>,
-) -> Result<Created, (ToolError, bool)> {
+}
+
+/// Count and total size of a new draft's attachments, for the audit record (never names).
+#[derive(Default)]
+struct AttachStats {
+    count: usize,
+    bytes: u64,
+}
+
+impl AttachStats {
+    fn of(list: &[mime::DraftAttachment]) -> Self {
+        Self { count: list.len(), bytes: list.iter().map(|a| a.bytes.len() as u64).sum() }
+    }
+
+    fn audit_ids(&self) -> Vec<String> {
+        if self.count == 0 {
+            return vec![];
+        }
+        vec![format!("attachments:{}", self.count), compose::size_class(self.bytes).to_string()]
+    }
+}
+
+/// Builds and posts the draft. The bool in the error says whether the create request may have reached the provider.
+async fn dispatch_create(
+    cx: &ToolCx,
+    mb: &Mailbox,
+    input: CreateInput,
+) -> Result<(Created, AttachStats), (ToolError, bool)> {
+    let CreateInput {
+        to,
+        cc,
+        bcc,
+        subject_arg,
+        mut body,
+        reply_to,
+        quote,
+        forward,
+        include_attachments,
+        attachments,
+        from_arg,
+    } = input;
     let pre = |e: ToolError| (e, false);
+    let limit = cx.app.cfg.limits.draft_attachment_bytes;
     let send_as = match mb.provider {
         Provider::Gmail => send_as_addresses(cx, mb).await.map_err(pre)?,
         // No send-as aliases on IMAP: the mailbox address is the only sender (design "Send").
@@ -426,6 +552,7 @@ async fn dispatch_create(
     let mut in_reply_to = None;
     let mut references = Vec::new();
     let mut thread_id = None;
+    let mut files = Vec::new();
     if let Some(orig_id) = &reply_to {
         let orig = super::read::fetch_message(cx, mb, orig_id, Priority::Interactive).await.map_err(pre)?;
         let orig_subject = orig.parsed.subject.clone().unwrap_or_default();
@@ -435,12 +562,12 @@ async fn dispatch_create(
             references.push(mid.clone());
         }
         match &subject_arg {
-            // Default keeps the threading subject.
+            // Default keeps the threading subject (as one clean line: it comes from untrusted mail).
             None => {
                 subject = if normalize_subject(&orig_subject) != orig_subject.trim().to_lowercase() {
-                    orig_subject.trim().to_string()
+                    compose::one_line(&orig_subject)
                 } else {
-                    format!("Re: {}", orig_subject.trim())
+                    format!("Re: {}", compose::one_line(&orig_subject))
                 };
                 thread_id = Some(orig.meta.thread_id.clone()).filter(|t| !t.is_empty());
             }
@@ -450,7 +577,24 @@ async fn dispatch_create(
             // A different subject starts a new conversation; threadId cannot force grouping (spec 5.3).
             Some(_) => {}
         }
+        if quote {
+            body = compose::with_quote(&body, &orig);
+        }
     }
+    if let Some((aid, mid)) = &forward {
+        let src = cx.client.resolve_id(aid).map_err(pre)?.clone();
+        let orig = crate::mail::fetch_message(cx, &src, mid, Priority::Interactive).await.map_err(pre)?;
+        if subject_arg.is_none() {
+            subject = compose::forward_subject(orig.parsed.subject.as_deref());
+        }
+        body = compose::with_forward(&body, &orig);
+        if include_attachments {
+            files = compose::forward_attachments(&orig, limit).map_err(pre)?;
+        }
+    }
+    let used = (files.len(), files.iter().map(|a| a.bytes.len()).sum());
+    files.extend(compose::resolve(cx, attachments, limit, used).await.map_err(pre)?);
+    let stats = AttachStats::of(&files);
     let fields = DraftFields {
         message_id: new_message_id(&from),
         from,
@@ -462,10 +606,12 @@ async fn dispatch_create(
         in_reply_to,
         references,
         date: util::now_unix(),
+        attachments: files,
     };
     let raw = mime::build_draft(&fields).map_err(|e| pre(mime_err(e)))?;
+    drop(fields);
     if mb.provider == Provider::Imap {
-        return super::drafts_imap::append_new(cx, mb, raw).await;
+        return super::drafts_imap::append_new(cx, mb, raw).await.map(|c| (c, stats));
     }
     let mut message = json!({ "raw": util::b64url(&raw) });
     if let Some(t) = &thread_id {
@@ -483,12 +629,13 @@ async fn dispatch_create(
         .ok_or_else(|| (ToolError::new(ErrorCode::OutcomeUnknown, "unexpected Gmail response"), true))?;
     let message_id = v["message"]["id"].as_str().unwrap_or_default();
     let thread = v["message"]["threadId"].as_str().unwrap_or_default();
-    Ok(Created {
+    let created = Created {
         draft_id: draft_id.to_string(),
         message_id: message_id.to_string(),
         thread_id: thread.to_string(),
         content_hash: None,
-    })
+    };
+    Ok((created, stats))
 }
 
 // ------------------------------------------------------------------ update / send common
@@ -564,7 +711,7 @@ async fn update_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError>
         .get("changes")
         .filter(|c| c.is_object())
         .ok_or_else(|| ToolError::invalid("'changes' must be an object"))?;
-    only_keys(changes, &["to", "cc", "bcc", "subject", "body_text"])?;
+    only_keys(changes, &["to", "cc", "bcc", "subject", "body_text", "attachments"])?;
     let to = changes.get("to").map(|_| addr_list(changes, "to")).transpose()?;
     let cc = changes.get("cc").map(|_| addr_list(changes, "cc")).transpose()?;
     let bcc = changes.get("bcc").map(|_| addr_list(changes, "bcc")).transpose()?;
@@ -573,6 +720,12 @@ async fn update_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError>
         header_text(s, "subject")?;
     }
     let body = opt_str(changes, "body_text")?.map(str::to_string);
+    if body.as_ref().is_some_and(|b| b.len() > mime::MAX_BODY_BYTES) {
+        return Err(ToolError::invalid("body_text exceeds 500 KB"));
+    }
+    // Sources are authorized before any upstream call; absent means keep the draft's attachments.
+    let limit = cx.app.cfg.limits.draft_attachment_bytes;
+    let new_files = compose::parse_attachments(cx, changes.get("attachments"), limit)?;
 
     let own = own_row(cx, &mb, &draft_id).await?;
     if own.state != "active" {
@@ -581,6 +734,11 @@ async fn update_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError>
             "an earlier operation on this draft has an unknown outcome; read it with get_draft",
         ));
     }
+    // Referenced attachments are fetched before the per-draft lock and the fresh check, keeping that window short.
+    let new_files = match new_files {
+        Some(specs) => Some(compose::resolve(cx, specs, limit, (0, 0)).await?),
+        None => None,
+    };
     let lock = cx.app.draft_locks.get(&mb.account_id, &draft_id);
     let _guard = lock.lock().await;
     // Re-read ownership under the lock: a concurrent Dove edit may have moved the revision.
@@ -592,11 +750,22 @@ async fn update_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError>
             (c.fetched, Some(c.id))
         }
     };
-    if !f.parsed.is_simple_text {
-        return Err(conflict(&f, "the draft has parts Dove cannot preserve (HTML or attachments)"));
+    if !f.parsed.is_draft_shape {
+        return Err(conflict(&f, "the draft has parts Dove cannot preserve (HTML or inline parts)"));
     }
     let mut fields =
         mime::read_draft_fields(&f.raw).map_err(|_| conflict(&f, "the draft has a structure Dove cannot preserve"))?;
+    match new_files {
+        Some(files) => fields.attachments = files,
+        // Kept attachments are rebuilt from the stored bytes, names and types re-checked like new ones.
+        None => {
+            for a in &mut fields.attachments {
+                a.filename = super::attachments::sanitize_filename(Some(&a.filename));
+                a.mime_type =
+                    mime::normalize_mime_type(&a.mime_type).unwrap_or_else(|| "application/octet-stream".into());
+            }
+        }
+    }
     if let Some(v) = to {
         fields.to = v;
     }

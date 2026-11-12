@@ -130,6 +130,21 @@ pub struct Limits {
     pub tool_call_timeout_secs: u64,
     /// Largest attachment `get_attachment` returns (decoded bytes).
     pub attachment_bytes: usize,
+    /// Largest total of attachments in one draft (decoded bytes, at most 16 MiB). Authenticated callers with `draft`
+    /// get a request body limit large enough for this much inline base64 ([`Limits::draft_body_bytes`]).
+    pub draft_attachment_bytes: usize,
+}
+
+/// Upper bound for `limits.draft_attachment_bytes`: a draft must stay below the 25 MiB MIME parse limit once
+/// base64 encoded.
+pub const MAX_DRAFT_ATTACHMENT_BYTES: usize = 16 * 1024 * 1024;
+
+impl Limits {
+    /// Request body limit for authenticated callers with `draft` on some mailbox: room for
+    /// `draft_attachment_bytes` as base64 plus 2 MiB for the body text and JSON. Everyone else gets `body_bytes`.
+    pub fn draft_body_bytes(&self) -> usize {
+        self.body_bytes.max(self.draft_attachment_bytes.div_ceil(3) * 4 + 2 * 1024 * 1024)
+    }
 }
 
 impl Default for Limits {
@@ -145,6 +160,7 @@ impl Default for Limits {
             upstream_request_timeout_secs: 10,
             tool_call_timeout_secs: 30,
             attachment_bytes: 10 * 1024 * 1024,
+            draft_attachment_bytes: 10 * 1024 * 1024,
         }
     }
 }
@@ -246,6 +262,9 @@ impl Config {
             secrets::check_secret_file_mode(&g.client_secret_file)?;
         }
         self.validate_oauth()?;
+        if self.limits.draft_attachment_bytes > MAX_DRAFT_ATTACHMENT_BYTES {
+            bail!("limits.draft_attachment_bytes must be at most {MAX_DRAFT_ATTACHMENT_BYTES}");
+        }
         for p in [&self.secrets.kek_file, &self.secrets.pepper_file, &self.secrets.index_key_file] {
             secrets::check_secret_file_mode(p)?;
         }

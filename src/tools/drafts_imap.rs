@@ -538,7 +538,7 @@ pub(super) async fn get_draft(cx: &ToolCx, mb: &Mailbox, args: &Value) -> Result
     Ok(ToolOutput {
         extra: Vec::new(),
         structured: json!({ "account": mb.alias, "draft_id": draft_id, "revision": message_id, "owned": own.is_some(),
-                            "editable_by_dove": own.is_some() && !changed && f.parsed.is_simple_text, "message": msg }),
+                            "editable_by_dove": own.is_some() && !changed && f.parsed.is_draft_shape, "message": msg }),
         text,
         audit: AuditInfo {
             account: Some(mb.alias.clone()),
