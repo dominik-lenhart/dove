@@ -242,3 +242,9 @@ hosts or reference hardware.
   both root and subject can still join (the root Message-ID is no secret, so stronger binding would need sender
   checks, out of scope). Index migration V5 rebuilds every IMAP mailbox with indexed data into a fresh generation so
   old and new ids never mix; thread ids handed out before become `not_found`.
+- A47. Password copies: the admin server reads a request into one buffer allocated at `MAX_REQUEST_BYTES + 1` and
+  wiped on drop (no `BufReader`, no reallocation), and the vault turns a decrypted secret into its string in place.
+  Copies inside serde_json are out of scope: the internally tagged `AdminRequest` buffers the request as serde
+  `Content` (owned strings, not wiped) before `Password` takes its own `Zeroizing` copy, and serde's scratch buffer
+  for escaped strings is not wiped either. Avoiding them would need a hand-written request parser; the process is
+  the service itself, so this only matters for memory disclosure after the fact (core dumps are disabled by the unit).
