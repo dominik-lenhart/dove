@@ -18,7 +18,11 @@ const BIG_LINE: usize = 32 * 1024 * 1024;
 /// Literal cap for responses that carry no message content (LIST names, flags).
 const SMALL_LITERAL: usize = 64 * 1024;
 /// Upper bound for the number of untagged responses collected for one command.
-const MAX_UNTAGGED: usize = 1_000_000;
+const MAX_UNTAGGED: usize = 200_000;
+/// Bytes read for one command beyond its largest literal (all lines and small literals together).
+const COMMAND_OVERHEAD: usize = 16 * 1024 * 1024;
+/// Nesting depth of parenthesized lists in one response.
+const MAX_DEPTH: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -157,12 +161,14 @@ enum Seg {
 }
 
 /// Tokenizes one response (text segments and literals). Lenient: unbalanced input ends the current list.
-fn tokenize(segs: Vec<Seg>) -> Vec<Tok> {
+/// `None` when lists nest deeper than [`MAX_DEPTH`] (a hostile server must not exhaust the stack).
+fn tokenize(segs: Vec<Seg>) -> Option<Vec<Tok>> {
     struct Cur {
         segs: std::vec::IntoIter<Seg>,
         text: Vec<u8>,
         pos: usize,
         pending_lit: Option<Vec<u8>>,
+        too_deep: bool,
     }
     impl Cur {
         fn peek(&mut self) -> Option<u8> {
@@ -183,8 +189,12 @@ fn tokenize(segs: Vec<Seg>) -> Vec<Tok> {
             }
         }
     }
-    fn list(c: &mut Cur, close: u8) -> Vec<Tok> {
+    fn list(c: &mut Cur, close: u8, depth: usize) -> Vec<Tok> {
         let mut out = Vec::new();
+        if depth > MAX_DEPTH {
+            c.too_deep = true;
+            return out;
+        }
         while let Some(b) = c.peek() {
             if let Some(l) = c.pending_lit.take() {
                 out.push(Tok::Str(l));
@@ -194,11 +204,11 @@ fn tokenize(segs: Vec<Seg>) -> Vec<Tok> {
                 b' ' => c.pos += 1,
                 b'(' => {
                     c.pos += 1;
-                    out.push(Tok::List(list(c, b')')));
+                    out.push(Tok::List(list(c, b')', depth + 1)));
                 }
                 b'[' => {
                     c.pos += 1;
-                    out.push(Tok::Code(list(c, b']')));
+                    out.push(Tok::Code(list(c, b']', depth + 1)));
                 }
                 b')' | b']' => {
                     c.pos += 1;
@@ -245,8 +255,9 @@ fn tokenize(segs: Vec<Seg>) -> Vec<Tok> {
         }
         out
     }
-    let mut c = Cur { segs: segs.into_iter(), text: Vec::new(), pos: 0, pending_lit: None };
-    list(&mut c, 0)
+    let mut c = Cur { segs: segs.into_iter(), text: Vec::new(), pos: 0, pending_lit: None, too_deep: false };
+    let toks = list(&mut c, 0, 0);
+    (!c.too_deep).then_some(toks)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -312,7 +323,7 @@ pub(crate) fn parse_internal_date(s: &str) -> Option<i64> {
     let mut t = time.split(':');
     let (h, m, sec): (u8, u8, u8) = (t.next()?.parse().ok()?, t.next()?.parse().ok()?, t.next()?.parse().ok()?);
     let z = zone.trim();
-    if z.len() != 5 {
+    if z.len() != 5 || !z.is_ascii() {
         return None;
     }
     let sign = match &z[..1] {
@@ -580,21 +591,28 @@ impl ImapSession {
         }
     }
 
-    /// Reads one response with its literals (each at most `max_literal` bytes).
-    async fn read_response(&mut self, max_literal: usize, max_line: usize) -> Result<Vec<Seg>, ImapError> {
+    /// Reads one response with its literals (each at most `max_literal` bytes), charging every byte to `budget`.
+    async fn read_response(
+        &mut self,
+        max_literal: usize,
+        max_line: usize,
+        budget: &mut usize,
+    ) -> Result<Vec<Seg>, ImapError> {
         let mut segs = Vec::new();
         let mut total = 0usize;
         loop {
             let line = read_raw_line(&mut self.io, self.timeout, max_line).await?;
             total += line.len();
+            *budget = budget.checked_sub(line.len()).ok_or(ImapError::Protocol("response over the size limit"))?;
             if total > max_line * 4 {
                 return Err(ImapError::Protocol("response too long"));
             }
             match literal_len(&line) {
                 Some(n) => {
-                    if n > max_literal {
+                    if n > max_literal || n > *budget {
                         return Err(ImapError::Protocol("response literal over the size limit"));
                     }
+                    *budget -= n;
                     let open = line.iter().rposition(|b| *b == b'{').expect("checked");
                     segs.push(Seg::Text(line[..open].to_vec()));
                     let mut buf = vec![0u8; n];
@@ -625,6 +643,7 @@ impl ImapSession {
             return Err(fail(ImapError::Protocol("command not allowlisted")));
         }
         let mut untagged = Vec::new();
+        let mut budget = max_literal.saturating_add(max_line).saturating_add(COMMAND_OVERHEAD);
         let mut buf: Zeroizing<Vec<u8>> = Zeroizing::new(format!("{tag} ").into_bytes());
         let mut sasl = None;
         for part in cmd.parts {
@@ -634,7 +653,7 @@ impl ImapSession {
                     buf.extend_from_slice(format!("{{{}}}\r\n", bytes.len()).as_bytes());
                     self.write(&buf).await.map_err(fail)?;
                     buf.clear();
-                    if let Some(d) = self.await_continuation(&tag, &mut untagged).await.map_err(fail)? {
+                    if let Some(d) = self.await_continuation(&tag, &mut untagged, &mut budget).await.map_err(fail)? {
                         return Ok(d);
                     }
                     self.write(&bytes).await.map_err(fail)?;
@@ -645,7 +664,7 @@ impl ImapSession {
         buf.extend_from_slice(b"\r\n");
         self.write(&buf).await.map_err(fail)?;
         if let Some(line) = sasl {
-            if let Some(d) = self.await_continuation(&tag, &mut untagged).await.map_err(fail)? {
+            if let Some(d) = self.await_continuation(&tag, &mut untagged, &mut budget).await.map_err(fail)? {
                 return Ok(d);
             }
             let mut l = Zeroizing::new(line.as_bytes().to_vec());
@@ -654,7 +673,7 @@ impl ImapSession {
         }
         let sent = |err| ExecError { err, sent_all: true };
         loop {
-            let segs = self.read_response(max_literal, max_line).await.map_err(sent)?;
+            let segs = self.read_response(max_literal, max_line, &mut budget).await.map_err(sent)?;
             match self.classify(&tag, segs).map_err(sent)? {
                 Resp::Untagged(u) => {
                     if untagged.len() >= MAX_UNTAGGED {
@@ -669,11 +688,19 @@ impl ImapSession {
     }
 
     /// Waits for `+`. Returns `Some(done)` if the server answered the command (NO/BAD) instead.
-    async fn await_continuation(&mut self, tag: &str, untagged: &mut Vec<Untagged>) -> Result<Option<Done>, ImapError> {
+    async fn await_continuation(
+        &mut self,
+        tag: &str,
+        untagged: &mut Vec<Untagged>,
+        budget: &mut usize,
+    ) -> Result<Option<Done>, ImapError> {
         loop {
-            let segs = self.read_response(SMALL_LITERAL, MAX_LINE).await?;
+            let segs = self.read_response(SMALL_LITERAL, MAX_LINE, budget).await?;
             match self.classify(tag, segs)? {
                 Resp::Continuation => return Ok(None),
+                Resp::Untagged(_) if untagged.len() >= MAX_UNTAGGED => {
+                    return Err(ImapError::Protocol("too many responses"));
+                }
                 Resp::Untagged(u) => untagged.push(u),
                 Resp::Tagged(status, code) => {
                     return Ok(Some(Done { status, code, untagged: std::mem::take(untagged) }));
@@ -690,7 +717,7 @@ impl ImapSession {
         if first.starts_with(b"+") {
             return Ok(Resp::Continuation);
         }
-        let toks = tokenize(segs);
+        let toks = tokenize(segs).ok_or(ImapError::Protocol("response nested too deeply"))?;
         let head = toks.first().and_then(Tok::atom).unwrap_or_default().to_string();
         if head == "*" {
             if toks.get(1).and_then(Tok::atom).is_some_and(|a| a.eq_ignore_ascii_case("BYE")) {
@@ -1034,7 +1061,7 @@ mod tests {
     use super::*;
 
     fn toks(s: &str) -> Vec<Tok> {
-        tokenize(vec![Seg::Text(s.as_bytes().to_vec())])
+        tokenize(vec![Seg::Text(s.as_bytes().to_vec())]).unwrap()
     }
 
     #[test]
@@ -1052,7 +1079,11 @@ mod tests {
             Seg::Text(b"* 1 FETCH (UID 5 BODY[] ".to_vec()),
             Seg::Lit(b"a)b\"c".to_vec()),
             Seg::Text(b")".to_vec()),
-        ]);
+        ])
+        .unwrap();
+        // Deep nesting from a hostile server is refused instead of recursing without bound.
+        assert!(tokenize(vec![Seg::Text(format!("* {}", "(".repeat(100_000)).into_bytes())]).is_none());
+        assert!(tokenize(vec![Seg::Text(format!("* {}", "[".repeat(100_000)).into_bytes())]).is_none());
         assert_eq!(
             t[3],
             Tok::List(vec![
@@ -1067,11 +1098,47 @@ mod tests {
         assert_eq!(t[4], Tok::Str(b"a\"b".to_vec()));
     }
 
+    fn over_stream(io: tokio::io::DuplexStream) -> ImapSession {
+        ImapSession {
+            io: BufReader::new(Box::new(io)),
+            tag: 0,
+            caps: Vec::new(),
+            timeout: Duration::from_secs(5),
+            drafts: None,
+            sent: None,
+            selected: None,
+            qresync: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_are_bounded_per_command() {
+        // Each literal is under the per-literal cap, but together they exceed the per-command budget.
+        let (client, mut server) = tokio::io::duplex(1 << 16);
+        let mut s = over_stream(client);
+        let feeder = tokio::spawn(async move {
+            let mut cmd = vec![0u8; 64];
+            let _ = server.read(&mut cmd).await;
+            let lit = vec![b'x'; 60 * 1024];
+            for _ in 0..400 {
+                let head = format!("* OK {{{}}}\r\n", lit.len());
+                if server.write_all(head.as_bytes()).await.is_err() || server.write_all(&lit).await.is_err() {
+                    return;
+                }
+                let _ = server.write_all(b"\r\n").await;
+            }
+            let _ = server.write_all(b"d1 OK done\r\n").await;
+        });
+        assert_eq!(s.noop().await.unwrap_err(), ImapError::Protocol("response literal over the size limit"));
+        feeder.abort();
+    }
+
     #[test]
     fn internal_dates_and_sets() {
         assert_eq!(parse_internal_date("17-Jul-1996 02:44:25 -0700"), Some(837596665));
         assert_eq!(parse_internal_date(" 1-Jan-2026 00:00:00 +0000"), Some(1767225600));
         assert_eq!(parse_internal_date("garbage"), None);
+        assert_eq!(parse_internal_date("17-Jul-1996 02:44:25 -\u{e9}00"), None);
         assert_eq!(parse_uid_set("1:3,7,9:8"), vec![1, 2, 3, 7, 8, 9]);
         assert_eq!(literal_len(b"* 1 FETCH (BODY[] {123}"), Some(123));
         assert_eq!(literal_len(b"* OK {weird}"), None);

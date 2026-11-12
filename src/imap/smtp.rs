@@ -226,21 +226,26 @@ pub async fn verify_login(
     }
 }
 
-/// Dot-stuffs and CRLF-normalizes the message and appends the terminator.
+/// CRLF-normalizes (bare CR and bare LF both become CRLF, so no line ending can be smuggled past the server's
+/// parser), dot-stuffs every line and ends with CRLF.
 fn data_payload(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len() + bytes.len() / 50 + 8);
     let mut at_line_start = true;
-    let mut prev = 0u8;
-    for &b in bytes {
-        if b == b'\n' && prev != b'\r' {
-            out.push(b'\r');
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\r' || b == b'\n' {
+            out.extend_from_slice(b"\r\n");
+            i += if b == b'\r' && bytes.get(i + 1) == Some(&b'\n') { 2 } else { 1 };
+            at_line_start = true;
+            continue;
         }
         if at_line_start && b == b'.' {
             out.push(b'.');
         }
         out.push(b);
-        at_line_start = b == b'\n';
-        prev = b;
+        at_line_start = false;
+        i += 1;
     }
     if !out.ends_with(b"\r\n") {
         out.extend_from_slice(b"\r\n");
@@ -320,6 +325,9 @@ mod tests {
     fn dot_stuffing_and_line_endings() {
         assert_eq!(data_payload(b"a\n.b\r\n..c"), b"a\r\n..b\r\n...c\r\n");
         assert_eq!(data_payload(b".\r\n"), b"..\r\n");
+        // Bare CR is a line ending too: "\r.\r" cannot smuggle an end-of-data marker.
+        assert_eq!(data_payload(b"a\r.\rMAIL FROM:<x@y.z>\r\n"), b"a\r\n..\r\nMAIL FROM:<x@y.z>\r\n");
+        assert_eq!(data_payload(b"a\n\n.\n"), b"a\r\n\r\n..\r\n");
         let ehlo = vec!["LOCALHOST".to_string(), "AUTH=LOGIN PLAIN".into(), "STARTTLS".into()];
         assert_eq!(auth_mechs(&ehlo), vec!["LOGIN", "PLAIN"]);
         assert!(has_ext(&ehlo, "STARTTLS"));
