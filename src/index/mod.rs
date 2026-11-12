@@ -21,6 +21,7 @@ pub mod sync;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -40,6 +41,10 @@ pub struct Index {
     key: Arc<KeyRing>,
     pub cfg: IndexConfig,
     writer: Arc<Mutex<Option<Connection>>>,
+    /// Set once the schema is migrated. Readers check it without touching the writer lock, so a long write never
+    /// delays a search (WAL readers do not wait for the writer).
+    migrated: Arc<AtomicBool>,
+    migrate_lock: Arc<Mutex<()>>,
     readers: Arc<Mutex<Vec<Connection>>>,
     reader_sem: Arc<Semaphore>,
     /// Admission for body fetch/parse jobs across all mailboxes (spec 8.1a: 2 by default).
@@ -68,6 +73,8 @@ impl Index {
             key,
             cfg,
             writer: Arc::new(Mutex::new(None)),
+            migrated: Arc::new(AtomicBool::new(false)),
+            migrate_lock: Arc::new(Mutex::new(())),
             readers: Arc::new(Mutex::new(Vec::new())),
             reader_sem: Arc::new(Semaphore::new(readers)),
             body_jobs: Arc::new(Semaphore::new(jobs)),
@@ -79,7 +86,7 @@ impl Index {
         }
     }
 
-    /// Runs `f` on the single writer connection on a blocking thread. Opens and migrates the index on first use.
+    /// Runs `f` on the single writer connection on a blocking thread. Migrates the index on first use.
     pub async fn write<F, T>(&self, f: F) -> anyhow::Result<T>
     where
         F: FnOnce(&mut Connection) -> anyhow::Result<T> + Send + 'static,
@@ -87,17 +94,34 @@ impl Index {
     {
         let writer = self.writer.clone();
         let opener = self.opener();
+        let migrate = self.migrator();
         tokio::task::spawn_blocking(move || {
+            migrate()?;
             let mut guard = writer.lock().map_err(|_| anyhow::anyhow!("index writer poisoned"))?;
             if guard.is_none() {
-                let mut c = opener()?;
-                schema::migrate(&mut c)?;
-                *guard = Some(c);
+                *guard = Some(opener()?);
             }
             f(guard.as_mut().expect("opened"))
         })
         .await
         .context("index writer task failed")?
+    }
+
+    /// Migrates the schema once, on its own connection and outside the writer lock.
+    fn migrator(&self) -> impl Fn() -> anyhow::Result<()> + Send + 'static {
+        let (done, lock, opener) = (self.migrated.clone(), self.migrate_lock.clone(), self.opener());
+        move || {
+            if done.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            let _g = lock.lock().map_err(|_| anyhow::anyhow!("index migration lock poisoned"))?;
+            if !done.load(Ordering::Acquire) {
+                let mut c = opener()?;
+                schema::migrate(&mut c)?;
+                done.store(true, Ordering::Release);
+            }
+            Ok(())
+        }
     }
 
     fn opener(&self) -> impl Fn() -> anyhow::Result<Connection> + Send + 'static {
@@ -110,9 +134,12 @@ impl Index {
         }
     }
 
-    /// Ensures the schema exists (readers never migrate).
+    /// Ensures the schema exists. Never takes the writer lock.
     pub async fn ensure_open(&self) -> anyhow::Result<()> {
-        self.write(|_| Ok(())).await
+        if self.migrated.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        tokio::task::spawn_blocking(self.migrator()).await.context("index migration task failed")?
     }
 
     /// Runs `f` on a pooled reader connection. The statement is interrupted at `deadline`; SQLite interrupts map to
@@ -357,6 +384,39 @@ pub fn start(app: Arc<App>) -> tokio::task::JoinHandle<()> {
 mod tests {
     use super::*;
     use crate::testing::TestEnv;
+
+    /// A search never waits for the writer: while a long write transaction holds the writer connection, reads
+    /// still complete well within their deadline (also on the very first use of the index).
+    #[tokio::test]
+    async fn reads_do_not_wait_for_a_long_write() {
+        let env = TestEnv::new();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let index = env.app.clone();
+        let long = tokio::spawn(async move {
+            index
+                .index
+                .write(move |c| {
+                    let t = c.transaction()?;
+                    t.execute("UPDATE meta SET value = value WHERE key = 'fence_seq'", [])?;
+                    let _ = started_tx.send(());
+                    let _ = rx.recv_timeout(std::time::Duration::from_secs(30));
+                    t.commit()?;
+                    Ok(())
+                })
+                .await
+        });
+        started_rx.await.unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        let read = env
+            .app
+            .index
+            .read(deadline, |c| Ok(c.query_row("SELECT count(*) FROM messages", [], |r| r.get::<_, i64>(0))?));
+        let n = tokio::time::timeout(std::time::Duration::from_secs(3), read).await;
+        tx.send(()).unwrap();
+        long.await.unwrap().unwrap();
+        assert_eq!(n.expect("the read waited for the writer").unwrap(), 0);
+    }
 
     #[tokio::test]
     async fn deadline_interrupts_query_as_too_broad() {
