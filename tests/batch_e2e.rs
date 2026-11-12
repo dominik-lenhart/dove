@@ -147,6 +147,39 @@ async fn search_rows_share_one_budget() {
 }
 
 #[tokio::test]
+async fn resumed_cursors_are_budgeted_at_their_stored_limit() {
+    let (h, token) = setup().await;
+    for i in 0..61 {
+        msg(&h, "info@acme.test", &format!("m{i}"));
+    }
+    h.admin(dove::admin::AdminRequest::IndexEnable { alias: "info".into() }).await.unwrap();
+    let aid: String = h
+        .app()
+        .store
+        .call(|c| Ok(c.query_row("SELECT id FROM accounts WHERE alias='info'", [], |r| r.get(0))?))
+        .await
+        .unwrap();
+    dove::index::sync::sync_account(h.app(), &aid).await.unwrap();
+    let first = h.ok(&token, "search_messages", json!({"accounts":["info"],"select":["message_id"],"limit":60})).await;
+    let cursor = first["next_cursor"].as_str().expect("a second page").to_string();
+    let v = h
+        .ok(
+            &token,
+            "batch_read",
+            json!({"items": [
+                item("resume", "search_messages", json!({"cursor": cursor})),
+                item("more", "search_messages", json!({"accounts":["info"],"limit":60})),
+            ]}),
+        )
+        .await;
+    let items = v["items"].as_array().unwrap();
+    assert_eq!(items[0]["ok"], true, "{}", items[0]);
+    // The cursor holds a 60-row page, so only 40 of the 100 shared rows remain for the next item.
+    assert_eq!(items[1]["error"]["code"], "budget_exceeded", "{}", items[1]);
+    assert!(items[1]["error"]["message"].as_str().unwrap().contains("40 remain"), "{}", items[1]);
+}
+
+#[tokio::test]
 async fn search_items_run_and_bad_cursors_or_fields_fail_per_item() {
     let (h, token) = setup().await;
     msg(&h, "info@acme.test", "indexed");

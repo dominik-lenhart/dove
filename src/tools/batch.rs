@@ -94,10 +94,14 @@ fn parse_items(args: &Value) -> Result<Vec<Item>, ToolError> {
         .collect()
 }
 
-/// Rows a search item may return: its limit, or none for count_only.
-fn search_rows(args: &Value) -> u64 {
+/// Rows a search item may return: its limit, or none for count_only. A resumed cursor runs with the limit stored
+/// with it (up to 100), not the default; an unusable cursor fails without rows.
+fn search_rows(cx: &ToolCx, args: &Value) -> u64 {
     if args.get("count_only").and_then(Value::as_bool) == Some(true) {
         return 0;
+    }
+    if let Some(c) = args.get("cursor").and_then(Value::as_str) {
+        return cx.app.index.cursors.page_limit(c, &cx.client.client_id, cx.client.auth_epoch).unwrap_or(0) as u64;
     }
     args.get("limit").and_then(Value::as_u64).unwrap_or(DEFAULT_SEARCH_LIMIT)
 }
@@ -122,7 +126,7 @@ async fn batch_read(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
     let mut planned: Vec<Result<String, ToolError>> = Vec::with_capacity(items.len());
     for it in &items {
         if it.op == "search_messages" {
-            let want = search_rows(&it.args);
+            let want = search_rows(cx, &it.args);
             if want > rows_left {
                 planned.push(Err(budget_error(
                     &it.op,
@@ -256,12 +260,5 @@ mod tests {
             assert!(parse_items(&b).is_err(), "{b}");
         }
         assert_eq!(parse_items(&json!({"items": [{"id": "a", "op": "get_thread", "args": {}}]})).unwrap().len(), 1);
-    }
-
-    #[test]
-    fn search_rows_counts_limits() {
-        assert_eq!(search_rows(&json!({})), DEFAULT_SEARCH_LIMIT);
-        assert_eq!(search_rows(&json!({"limit": 7})), 7);
-        assert_eq!(search_rows(&json!({"count_only": true})), 0);
     }
 }

@@ -213,6 +213,20 @@ impl CursorStore {
         Ok(e.cursor.clone())
     }
 
+    /// Rows a resumed page may return: the limit stored with the cursor, or None if the cursor is not usable by this
+    /// client (resuming it then fails with `cursor_invalid` and returns no rows). Does not refresh or consume it.
+    pub fn page_limit(&self, id: &str, client_id: &str, auth_epoch: i64) -> Option<usize> {
+        let g = self.inner.lock().expect("lock");
+        let e = g.map.get(id)?;
+        if e.expires <= Instant::now() || e.cursor.client_id != client_id || e.cursor.auth_epoch != auth_epoch {
+            return None;
+        }
+        Some(match &e.cursor.payload {
+            Payload::Index(p) => p.req.limit,
+            Payload::Live(p) => p.limit,
+        })
+    }
+
     pub fn invalidate_account(&self, account_id: &str) {
         let mut g = self.inner.lock().expect("lock");
         let ids: Vec<String> = g
