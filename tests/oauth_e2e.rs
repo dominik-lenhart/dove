@@ -42,6 +42,13 @@ fn field(html: &str, name: &str) -> String {
     html[start..].split('"').next().unwrap().to_string()
 }
 
+/// The full name of the first form field starting with `prefix` (checkbox names carry account ids).
+fn field_name(html: &str, prefix: &str) -> String {
+    let pat = format!("name=\"{prefix}");
+    let start = html.find(&pat).unwrap_or_else(|| panic!("no field {prefix} in {html}")) + 6;
+    html[start..].split('"').next().unwrap().to_string()
+}
+
 fn query_of(location: &str) -> HashMap<String, String> {
     url::Url::parse(location).unwrap().query_pairs().into_owned().collect()
 }
@@ -634,6 +641,32 @@ async fn full_registration_table_evicts_old_unused_registrations() {
     assert!(registered(&o, &b).await, "in-flight registration kept");
     assert!(!registered(&o, &c).await);
     assert!(registered(&o, &d.unwrap()).await, "fresh registrations are never evicted");
+}
+
+#[tokio::test]
+async fn approval_for_an_evicted_registration_keeps_the_invitation() {
+    let o = Oauth::new().await;
+    let inv = o.invite("evicted-host", &["info"], "read").await;
+    let client_id = o.register(REDIRECT).await;
+    let (cookie, rid, csrf, html) = o.enter_invitation(&client_id, &challenge(&verifier()), &inv).await;
+    assert!(html.contains("Approve"));
+    // The registration disappears between the two steps (eviction or the 24 h prune).
+    let id = client_id.clone();
+    o.h.app().store.call(move |c| Ok(c.execute("DELETE FROM oauth_apps WHERE client_id = ?1", [id])?)).await.unwrap();
+    let read = field_name(&html, "read.");
+    let r = o
+        .post_form(
+            &cookie,
+            &[("rid", &rid), ("csrf", &csrf), ("step", "approve"), ("action", "approve"), (&read, "on")],
+        )
+        .await;
+    assert_eq!(r.status(), 400);
+    assert!(r.text().await.unwrap().contains("registration has expired"));
+    // Nothing was consumed: the invitation still works for a fresh registration.
+    let client_id = o.register(REDIRECT).await;
+    let v = verifier();
+    let code = o.approve(&client_id, &challenge(&v), &inv, &["read.0"]).await;
+    assert_eq!(o.exchange(&client_id, &code, &v).await.0, 200);
 }
 
 #[tokio::test]

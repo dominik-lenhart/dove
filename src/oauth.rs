@@ -644,6 +644,7 @@ async fn authorize_post(State(app): State<Arc<App>>, req: Request) -> Response {
 enum Approval {
     Done { code: String },
     InvitationGone,
+    AppGone,
     NothingSelected(invite::Invitation),
 }
 
@@ -658,6 +659,7 @@ async fn approve(
     let pepper = app.pepper.clone();
     let (app_client_id, redirect_uri, challenge, resource) =
         (p.app.client_id.clone(), p.redirect_uri.clone(), p.code_challenge.clone(), p.resource.clone());
+    let dynamic = p.app.dynamic;
     let code_ttl = app.cfg.oauth.code_ttl_secs;
     let form = form.clone();
     let result = app
@@ -665,6 +667,17 @@ async fn approve(
         .call(move |c| {
             let checked = |k: String| form.get(&k).is_some_and(|v| v == "on");
             let tx = c.transaction()?;
+            // A dynamic registration may have been evicted while this request was being processed (it is out of the
+            // pending map then). Checked in the same transaction that consumes the invitation.
+            let app_exists: bool = !dynamic
+                || tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM oauth_apps WHERE client_id = ?1 AND registered_via = 'dynamic')",
+                    [&app_client_id],
+                    |r| r.get(0),
+                )?;
+            if !app_exists {
+                return Ok(Approval::AppGone);
+            }
             let Some(inv) = invite::load(&tx, &inv_id)? else {
                 return Ok(Approval::InvitationGone);
             };
@@ -726,6 +739,11 @@ async fn approve(
             app.oauth.pending.lock().expect("lock").insert(rid, p);
             r
         }
+        Ok(Approval::AppGone) => error_page(
+            StatusCode::BAD_REQUEST,
+            "This application's registration has expired. Start again from the application; your invitation is \
+             still valid.",
+        ),
         Ok(Approval::InvitationGone) => error_page(
             StatusCode::BAD_REQUEST,
             "The invitation is no longer valid (expired or already used). Ask the operator for a new one.",
