@@ -50,7 +50,8 @@ cargo fmt
 ## Conventions
 
 - Errors to agents use the stable codes in `src/error.rs` (spec 5.4).
-- Time is stored as unix seconds (i64, UTC). Wire format is RFC 3339.
+- Time is stored as unix seconds (i64, UTC). Wire format is RFC 3339. Exception: the index stores Gmail
+  `internalDate` in milliseconds (PLAN A12) for exact ordering and ties.
 - Tests: write the test, break the code on purpose to see it fail, then fix. No trivial tests.
 - Commit after each verified change; only your own files. Message style: imperative, scoped (`vault: ...`).
 
