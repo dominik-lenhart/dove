@@ -71,3 +71,8 @@ cargo fmt
 - 2026-11-12: Gmail writes go through `Google::write`, which classifies failures once: not dispatched or 4xx is
   definitive (safe to retry), 5xx / lost response / unreadable body is `outcome_unknown`. Never classify by
   matching error message text.
+- 2026-11-12: Do not set `PrivateUsers=` in the systemd unit: inside a user namespace `SO_PEERCRED` reports the
+  operator uid as unmapped, and the admin socket's peer check rejects the operator. `systemd-analyze verify` only
+  checks syntax; to test sandbox directives run the binary as `systemd-run --user` (the user manager cannot apply
+  capability-dropping directives such as `PrivateDevices=`, so those stay untested there). `StateDirectoryMode=0700`
+  is required, the service refuses any other data dir mode.

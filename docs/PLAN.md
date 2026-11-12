@@ -41,7 +41,8 @@ hosts or reference hardware.
      AC16, AC18 in `tests/mcp_e2e.rs`, `tests/connect_e2e.rs`)
    - [ ] Restart/crash recovery tests, log canary test
    - [ ] Benchmarks (8.1) with synthetic 250k corpus, RSS measurement
-   - [ ] Deployment: systemd unit, container, Caddy allowlist, backup docs, SECURITY.md, README
+   - [~] Deployment: systemd unit, container, Caddy allowlist, backup docs, SECURITY.md, README (done: systemd unit,
+     sysusers/tmpfiles; the unit is verified only as a transient user unit, see docs/deployment.md)
 
 ## Assumptions and decisions
 
