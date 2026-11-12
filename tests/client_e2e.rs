@@ -573,3 +573,91 @@ async fn cli_attachment_save_refuses_overwrite() {
     assert_ne!(o.code, 0);
     assert!(o.stderr.contains("not_found"), "{}", o.stderr);
 }
+
+#[tokio::test]
+async fn cli_draft_attach_and_forward() {
+    let h = setup().await;
+    let c = Client::new(&h);
+    let scan: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+    let id = h.google.add_message(
+        "info@acme.test",
+        MessageSpec {
+            from: "ann@example.test".into(),
+            to: vec!["info@acme.test".into()],
+            subject: "Scan".into(),
+            text: Some("See attached.".into()),
+            attachments: vec![("scan.pdf".into(), "application/pdf".into(), scan.clone())],
+            internal_date_ms: 1_700_000_000_000,
+            ..Default::default()
+        },
+    );
+    c.login("rw", &invite(&h, "writer", &["info"], "read,draft").await).await;
+    let pdf: Vec<u8> = (0..=255u8).cycle().take(40_000).collect();
+    std::fs::write(c.path("project/Angebot 2026.PDF"), &pdf).unwrap();
+    std::fs::write(c.path("project/notes"), b"a\nb\n").unwrap();
+    let o = c.ok(&["message", "get", "--profile", "rw", "--account", "info", "--id", &id, "--json"], "").await;
+    let r = serde_json::from_str::<Value>(&o.stdout).unwrap()["result"]["message"]["ref"].as_str().unwrap().to_string();
+    let o = c
+        .ok(
+            &[
+                "draft",
+                "create",
+                "--profile",
+                "rw",
+                "--account",
+                "info",
+                "--to",
+                "bob@example.test",
+                "--forward",
+                &r,
+                "--attach",
+                "Angebot 2026.PDF",
+                "--attach",
+                "notes",
+                "--json",
+            ],
+            "",
+        )
+        .await;
+    let created: Value = serde_json::from_str(&o.stdout).unwrap();
+    let raw = h.google.draft_raw("info@acme.test", created["result"]["draft_id"].as_str().unwrap()).unwrap();
+    let f = dove::mime::read_draft_fields(&raw).unwrap();
+    assert_eq!(f.subject, "Fwd: Scan");
+    assert!(f.body_text.starts_with("---------- Forwarded message ---------\n"), "{}", f.body_text);
+    let got: Vec<(&str, &str, &[u8])> =
+        f.attachments.iter().map(|a| (a.filename.as_str(), a.mime_type.as_str(), a.bytes.as_slice())).collect();
+    assert_eq!(
+        got,
+        [
+            ("scan.pdf", "application/pdf", scan.as_slice()),
+            ("Angebot 2026.PDF", "application/pdf", pdf.as_slice()),
+            ("notes", "application/octet-stream", &b"a\nb\n"[..]),
+        ]
+    );
+    // --no-forward-attachments leaves the original's files out; a missing file fails before anything is sent.
+    let o = c
+        .ok(
+            &[
+                "draft",
+                "create",
+                "--profile",
+                "rw",
+                "--account",
+                "info",
+                "--forward",
+                &r,
+                "--no-forward-attachments",
+                "--json",
+            ],
+            "",
+        )
+        .await;
+    let created: Value = serde_json::from_str(&o.stdout).unwrap();
+    let raw = h.google.draft_raw("info@acme.test", created["result"]["draft_id"].as_str().unwrap()).unwrap();
+    assert!(dove::mime::read_draft_fields(&raw).unwrap().attachments.is_empty());
+    let before = h.google.drafts("info@acme.test").len();
+    let o = c.run(&["draft", "create", "--profile", "rw", "--account", "info", "--attach", "missing.pdf"], "").await;
+    assert_ne!(o.code, 0);
+    assert!(o.stderr.contains("missing.pdf"), "{}", o.stderr);
+    assert_eq!(h.google.drafts("info@acme.test").len(), before);
+}

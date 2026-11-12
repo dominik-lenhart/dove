@@ -832,7 +832,7 @@ async fn get_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
     Ok(ToolOutput {
         extra: Vec::new(),
         structured: json!({ "account": mb.alias, "draft_id": did, "revision": revision, "owned": own.is_some(),
-                            "editable_by_dove": own.is_some() && !changed && f.parsed.is_simple_text, "message": msg }),
+                            "editable_by_dove": own.is_some() && !changed && f.parsed.is_draft_shape, "message": msg }),
         text,
         audit: AuditInfo {
             account: Some(mb.alias.clone()),

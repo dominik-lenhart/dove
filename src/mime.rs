@@ -8,12 +8,19 @@ use std::str::FromStr;
 use email_address::EmailAddress;
 use mail_builder::MessageBuilder;
 use mail_builder::headers::address::Address as BAddress;
+use mail_builder::headers::content_type::ContentType as BContentType;
 use mail_builder::headers::message_id::MessageId as BMessageId;
+use mail_builder::mime::{BodyPart, MimePart};
 use mail_parser::{HeaderForm, MessageParser, MessagePart, PartFlags, PartKind};
 
 const MAX_RECIPIENTS: usize = 50;
 const MAX_SUBJECT_ENCODED: usize = 998;
-const MAX_BODY_BYTES: usize = 500 * 1024;
+/// Largest draft body text (spec 7.6).
+pub const MAX_BODY_BYTES: usize = 500 * 1024;
+/// Most attachments in one draft (spec 7.6).
+pub const MAX_DRAFT_ATTACHMENTS: usize = 10;
+/// Longest attachment filename Dove writes, in characters.
+const MAX_FILENAME_CHARS: usize = 200;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Addr {
@@ -69,8 +76,12 @@ pub struct ParsedMessage {
     pub attachments: Vec<AttachmentMeta>,
     pub has_attachment: bool,
     pub part_count: usize,
-    /// Exactly one leaf part, text/plain, no attachments: what Dove can safely rewrite.
+    /// Exactly one leaf part, text/plain, no attachments.
     pub is_simple_text: bool,
+    /// What Dove builds and can rebuild without loss: a simple text/plain message, or `multipart/mixed` whose first
+    /// part is the text/plain body and every other part is a leaf with `Content-Disposition: attachment` (no nested
+    /// multiparts, no HTML, no inline parts).
+    pub is_draft_shape: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -194,20 +205,30 @@ pub fn parse(raw: &[u8], limits: &Limits) -> Result<ParsedMessage, MimeError> {
     let mut leaves = 0usize;
     let mut simple_leaf_is_plain = false;
     let mut part_count = 0usize;
+    let mut multiparts = 0usize;
+    // Every leaf after the first is an explicit attachment (draft shape).
+    let mut rest_are_attachments = true;
     for part in root.parts() {
         part_count += 1;
         if part.flags().contains(PartFlags::LIMIT_REACHED) {
             out.body_complete = false;
         }
         if part.is_multipart() {
+            multiparts += 1;
             continue;
         }
         leaves += 1;
         let mime = mime_type_of(&part);
-        if leaves == 1 {
-            simple_leaf_is_plain = mime == "text/plain" && matches!(part.kind(), PartKind::Text);
-        }
         let filename = part.attachment_name().map(str::trim).filter(|n| !n.is_empty()).map(str::to_string);
+        if leaves == 1 {
+            simple_leaf_is_plain = mime == "text/plain"
+                && matches!(part.kind(), PartKind::Text)
+                && !part.content_disposition().is_some_and(|d| d.is_attachment());
+        } else if !(part.content_disposition().is_some_and(|d| d.is_attachment())
+            && matches!(part.kind(), PartKind::Binary | PartKind::InlineBinary | PartKind::Text))
+        {
+            rest_are_attachments = false;
+        }
         if is_attachment_part(&part, &filename) {
             out.attachments.push(AttachmentMeta {
                 attachment_id: format!("part-{}", part.id()),
@@ -220,6 +241,16 @@ pub fn parse(raw: &[u8], limits: &Limits) -> Result<ParsedMessage, MimeError> {
     out.part_count = part_count;
     out.has_attachment = !out.attachments.is_empty();
     out.is_simple_text = leaves == 1 && simple_leaf_is_plain && out.attachments.is_empty();
+    let root_part = root.root_part();
+    let mixed_root = root_part.is_multipart() && mime_type_of(&root_part) == "multipart/mixed";
+    out.is_draft_shape = out.is_simple_text
+        || (mixed_root
+            && multiparts == 1
+            && simple_leaf_is_plain
+            && rest_are_attachments
+            && leaves >= 2
+            && out.body_complete
+            && out.attachments.len() == leaves - 1);
 
     let is_att = |p: &MessagePart<'_>| {
         let f = p.attachment_name().map(str::trim).filter(|n| !n.is_empty()).map(str::to_string);
@@ -388,6 +419,71 @@ pub struct DraftFields {
     pub references: Vec<String>,
     /// Unix seconds.
     pub date: i64,
+    /// Files attached after the text body (at most [`MAX_DRAFT_ATTACHMENTS`]). Empty: a plain text/plain message.
+    pub attachments: Vec<DraftAttachment>,
+}
+
+/// One attachment of a Dove-built draft: decoded bytes plus the filename and MIME type Dove writes for it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct DraftAttachment {
+    pub filename: String,
+    pub mime_type: String,
+    pub bytes: Vec<u8>,
+}
+
+impl std::fmt::Debug for DraftAttachment {
+    // Never print a filename or content (logs, panics).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DraftAttachment").field("mime_type", &self.mime_type).field("len", &self.bytes.len()).finish()
+    }
+}
+
+/// A MIME type Dove writes into a header: `type/subtype`, lowercase, RFC 6838 restricted-name characters only, no
+/// parameters. `multipart/*` and `message/*` are refused: as attachments they would change the message structure.
+pub fn normalize_mime_type(s: &str) -> Option<String> {
+    if s.chars().any(char::is_control) {
+        return None;
+    }
+    let s = s.trim().to_ascii_lowercase();
+    let (t, sub) = s.split_once('/')?;
+    let name_ok = |n: &str| {
+        (1..=127).contains(&n.len())
+            && n.as_bytes()[0].is_ascii_alphanumeric()
+            && n.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$&-^_.+".contains(&b))
+    };
+    if !name_ok(t) || !name_ok(sub) || matches!(t, "multipart" | "message") {
+        return None;
+    }
+    Some(s)
+}
+
+/// An attachment filename Dove may write: non-empty, at most 200 characters, no control characters or path
+/// separators. Header encoding (RFC 2231) is the builder's job; this only keeps the name meaningful and safe.
+fn check_filename(name: &str) -> Result<(), MimeError> {
+    let n = name.chars().count();
+    if n == 0
+        || n > MAX_FILENAME_CHARS
+        || name.trim() != name
+        || name.starts_with('.')
+        || name.chars().any(|c| c.is_control() || matches!(c, '/' | '\\'))
+    {
+        return Err(invalid("invalid attachment filename"));
+    }
+    Ok(())
+}
+
+/// Standard base64 in 76-character lines (RFC 2045), CRLF separated.
+fn base64_lines(bytes: &[u8]) -> Vec<u8> {
+    use base64::Engine;
+    let enc = base64::engine::general_purpose::STANDARD.encode(bytes);
+    let mut out = Vec::with_capacity(enc.len() + enc.len() / 76 * 2 + 2);
+    for (i, chunk) in enc.as_bytes().chunks(76).enumerate() {
+        if i > 0 {
+            out.extend_from_slice(b"\r\n");
+        }
+        out.extend_from_slice(chunk);
+    }
+    out
 }
 
 fn check_addr(a: &Addr) -> Result<(), MimeError> {
@@ -436,6 +532,16 @@ pub fn build_draft(f: &DraftFields) -> Result<Vec<u8>, MimeError> {
     let message_id = check_msg_id(&f.message_id)?;
     let in_reply_to = f.in_reply_to.as_deref().map(check_msg_id).transpose()?;
     let refs = f.references.iter().map(|r| check_msg_id(r)).collect::<Result<Vec<_>, _>>()?;
+    if f.attachments.len() > MAX_DRAFT_ATTACHMENTS {
+        return Err(invalid("too many attachments"));
+    }
+    for a in &f.attachments {
+        check_filename(&a.filename)?;
+        // The type is written verbatim into Content-Type: only the normalized form passes.
+        if normalize_mime_type(&a.mime_type).as_deref() != Some(a.mime_type.as_str()) {
+            return Err(invalid("invalid attachment MIME type"));
+        }
+    }
 
     let mut b = MessageBuilder::new()
         .from(BAddress::new_address(f.from.name.clone(), f.from.email.clone()))
@@ -459,8 +565,25 @@ pub fn build_draft(f: &DraftFields) -> Result<Vec<u8>, MimeError> {
     }
     // Normalize to LF first so the builder's CRLF conversion cannot produce CR CR LF.
     let body = f.body_text.replace("\r\n", "\n").replace('\r', "\n");
-    b = b.text_body(body);
+    if f.attachments.is_empty() {
+        b = b.text_body(body);
+    } else {
+        // multipart/mixed: the text body, then each attachment base64 encoded (also text/*, so the decoded bytes are
+        // exactly the input: no line-ending or charset conversion).
+        let mut parts = vec![MimePart::new("text/plain", BodyPart::Text(body.into()))];
+        for a in &f.attachments {
+            parts.push(
+                MimePart::new(BContentType::new(a.mime_type.clone()), BodyPart::Binary(base64_lines(&a.bytes).into()))
+                    .attachment(a.filename.clone())
+                    .transfer_encoding("base64"),
+            );
+        }
+        b = b.body(MimePart::new("multipart/mixed", parts));
+    }
     let out = b.write_to_vec().map_err(|_| invalid("failed to build message"))?;
+    if out.len() > Limits::default().max_raw_bytes {
+        return Err(MimeError::TooLarge);
+    }
 
     // Subject length after encoding (unfolded).
     if let Some(msg) = MessageParser::new().parse_headers(&out)
@@ -474,11 +597,29 @@ pub fn build_draft(f: &DraftFields) -> Result<Vec<u8>, MimeError> {
     Ok(out)
 }
 
-/// Reads back the fields of a Dove-built (simple text/plain) draft. Body line endings are normalized to LF.
+/// Reads back the fields of a Dove-built draft (text/plain, optionally with attachments: see
+/// [`ParsedMessage::is_draft_shape`]). Body line endings are normalized to LF. Attachment filenames and types are
+/// returned as found; callers sanitize them before rebuilding.
 pub fn read_draft_fields(raw: &[u8]) -> Result<DraftFields, MimeError> {
     let p = parse(raw, &Limits::default())?;
-    if !p.is_simple_text {
+    if !p.is_draft_shape {
         return Err(invalid("unsupported structure"));
+    }
+    let mut attachments = Vec::new();
+    if !p.is_simple_text {
+        let limits = Limits::default();
+        let msg = MessageParser::new()
+            .max_parts(limits.max_parts)
+            .max_depth(limits.max_depth)
+            .parse(raw)
+            .ok_or(MimeError::Unparseable)?;
+        for part in msg.root().parts().filter(|p| !p.is_multipart()).skip(1) {
+            attachments.push(DraftAttachment {
+                filename: part.attachment_name().map(str::to_string).unwrap_or_default(),
+                mime_type: mime_type_of(&part),
+                bytes: part.decoded().into_owned(),
+            });
+        }
     }
     Ok(DraftFields {
         from: p.from.into_iter().next().ok_or_else(|| invalid("draft has no From"))?,
@@ -491,6 +632,7 @@ pub fn read_draft_fields(raw: &[u8]) -> Result<DraftFields, MimeError> {
         in_reply_to: p.in_reply_to.into_iter().next(),
         references: p.references,
         date: p.date.ok_or_else(|| invalid("draft has no Date"))?,
+        attachments,
     })
 }
 
@@ -514,6 +656,7 @@ mod tests {
             in_reply_to: Some("<orig@example.org>".into()),
             references: vec!["<root@example.org>".into(), "<orig@example.org>".into()],
             date: 1_700_000_000,
+            attachments: vec![],
         }
     }
 
@@ -765,5 +908,129 @@ Content-Transfer-Encoding: base64\r\n\r\nAAECAwQFBgcICQ==\r\n--b--\r\n";
         assert!(attachment_bytes(raw, "part-1", 100).unwrap().is_none());
         assert!(attachment_bytes(raw, "part-9", 100).unwrap().is_none());
         assert!(attachment_bytes(raw, "part-02", 100).unwrap().is_none());
+    }
+
+    fn att(name: &str, mime: &str, bytes: &[u8]) -> DraftAttachment {
+        DraftAttachment { filename: name.into(), mime_type: mime.into(), bytes: bytes.to_vec() }
+    }
+
+    #[test]
+    fn draft_with_attachments_roundtrips_exact_bytes() {
+        let mut f = fields();
+        let binary: Vec<u8> = (0..=255u8).cycle().take(5000).collect();
+        // Text attachments keep bare LF, lone CR and a trailing space: no canonicalisation of attachment bytes.
+        let text = b"line1\nline2\r\nline3\rend \n".to_vec();
+        f.attachments = vec![
+            att("Rechnung \"März\" 2026.pdf", "application/pdf", &binary),
+            att("notes.txt", "text/plain", &text),
+            att("empty.bin", "application/octet-stream", b""),
+            // Plain ASCII with bare LF: a text encoder would send this as 7bit and turn LF into CRLF.
+            att("plain.txt", "text/plain", b"hello\nworld\n"),
+        ];
+        let raw = build_draft(&f).unwrap();
+        let p = parse(&raw, &Limits::default()).unwrap();
+        assert!(p.is_draft_shape && !p.is_simple_text, "{}", String::from_utf8_lossy(&raw));
+        assert_eq!(p.text_plain.as_deref().map(|t| t.replace("\r\n", "\n")), Some(f.body_text.clone()));
+        let names: Vec<_> = p.attachments.iter().map(|a| a.filename.clone().unwrap_or_default()).collect();
+        assert_eq!(names, ["Rechnung \"März\" 2026.pdf", "notes.txt", "empty.bin", "plain.txt"]);
+        let g = read_draft_fields(&raw).unwrap();
+        assert_eq!(g.attachments, f.attachments);
+        assert_eq!((g.subject.as_str(), g.body_text.as_str()), (f.subject.as_str(), f.body_text.as_str()));
+        assert_eq!((g.to, g.bcc, g.in_reply_to), (f.to.clone(), f.bcc.clone(), f.in_reply_to.clone()));
+        // get_attachment's extractor sees the same bytes under the listed ids.
+        let (_, bytes) = attachment_bytes(&raw, &p.attachments[1].attachment_id, 1 << 20).unwrap().unwrap();
+        assert_eq!(bytes, text);
+        // A rebuild from the read-back fields is again the draft shape with the same attachments.
+        let again = read_draft_fields(&build_draft(&read_draft_fields(&raw).unwrap()).unwrap()).unwrap();
+        assert_eq!(again.attachments, f.attachments);
+        // Only the allowlisted top-level headers; every attachment is base64.
+        let text = String::from_utf8(raw).unwrap();
+        assert_eq!(text.matches("Content-Disposition: attachment").count(), 4, "{text}");
+        for part in text.split("Content-Disposition: attachment").skip(1) {
+            let head = part.split("\r\n\r\n").next().unwrap();
+            assert!(head.contains("Content-Transfer-Encoding: base64"), "{head}");
+        }
+        assert!(text.matches('\n').count() == text.matches("\r\n").count(), "bare LF in output");
+    }
+
+    #[test]
+    fn draft_shape_rejects_other_structures() {
+        let shape = |raw: &[u8]| parse(raw, &Limits::default()).unwrap().is_draft_shape;
+        let mixed = |inner: &str| {
+            format!(
+                "From: a@x.org\r\nMessage-ID: <m@x>\r\nDate: Tue, 14 Nov 2023 22:13:20 +0000\r\n\
+                 Content-Type: multipart/mixed; boundary=M\r\n\r\n--M\r\nContent-Type: text/plain\r\n\r\nhi\r\n{inner}--M--\r\n"
+            )
+        };
+        let ok =
+            mixed("--M\r\nContent-Type: image/png\r\nContent-Disposition: attachment; filename=a.png\r\n\r\nx\r\n");
+        assert!(shape(ok.as_bytes()));
+        assert_eq!(read_draft_fields(ok.as_bytes()).unwrap().attachments.len(), 1);
+        for bad in [
+            // Inline image, an extra text part without disposition, a nested message, nested multipart.
+            mixed("--M\r\nContent-Type: image/png\r\nContent-Disposition: inline; filename=a.png\r\n\r\nx\r\n"),
+            mixed("--M\r\nContent-Type: text/plain\r\n\r\nsecond\r\n"),
+            mixed(
+                "--M\r\nContent-Type: message/rfc822\r\nContent-Disposition: attachment\r\n\r\nSubject: x\r\n\r\ny\r\n",
+            ),
+            mixed(
+                "--M\r\nContent-Type: multipart/alternative; boundary=A\r\n\r\n--A\r\nContent-Type: text/plain\r\n\r\np\r\n\
+                 --A\r\nContent-Type: text/html\r\n\r\n<p>h</p>\r\n--A--\r\n",
+            ),
+        ] {
+            assert!(!shape(bad.as_bytes()), "{bad}");
+            assert!(read_draft_fields(bad.as_bytes()).is_err());
+        }
+        // An HTML body with an attachment is not a Dove draft either.
+        let html = "From: a@x.org\r\nContent-Type: multipart/mixed; boundary=M\r\n\r\n--M\r\nContent-Type: text/html\r\n\r\n<b>x</b>\r\n\
+                    --M\r\nContent-Type: image/png\r\nContent-Disposition: attachment; filename=a.png\r\n\r\nx\r\n--M--\r\n";
+        assert!(!shape(html.as_bytes()));
+    }
+
+    #[test]
+    fn attachment_header_injection_impossible() {
+        for name in [
+            "a\r\nBcc: evil@x.org",
+            "a\nb",
+            "a\u{0}b",
+            "../etc/passwd",
+            "a\\b",
+            ".hidden",
+            " pad",
+            "",
+            &"x".repeat(201),
+        ] {
+            let mut f = fields();
+            f.attachments = vec![att(name, "application/pdf", b"x")];
+            assert!(build_draft(&f).is_err(), "{name:?}");
+        }
+        for t in [
+            "application/pdf\r\nBcc: evil@x.org",
+            "application/pdf; name=x",
+            "text/plain;charset=utf-8",
+            "multipart/mixed",
+            "message/rfc822",
+            "Application/PDF",
+            "pdf",
+            "/pdf",
+            "a/b/c",
+            "application/\"x\"",
+        ] {
+            let mut f = fields();
+            f.attachments = vec![att("a.pdf", t, b"x")];
+            assert!(build_draft(&f).is_err(), "{t:?}");
+        }
+        assert_eq!(normalize_mime_type(" Application/PDF ").as_deref(), Some("application/pdf"));
+        assert_eq!(normalize_mime_type("application/vnd.ms-excel").as_deref(), Some("application/vnd.ms-excel"));
+        assert_eq!(normalize_mime_type("image/svg+xml").as_deref(), Some("image/svg+xml"));
+        for t in ["multipart/mixed", "message/rfc822", "text/plain; charset=x", "a b/c", "x/", "text/plain\r\n"] {
+            assert_eq!(normalize_mime_type(t), None, "{t:?}");
+        }
+        let mut f = fields();
+        f.attachments = (0..11).map(|i| att(&format!("{i}.txt"), "text/plain", b"x")).collect();
+        assert!(build_draft(&f).is_err());
+        f.attachments.truncate(10);
+        let raw = build_draft(&f).unwrap();
+        assert_eq!(parse(&raw, &Limits::default()).unwrap().attachments.len(), 10);
     }
 }

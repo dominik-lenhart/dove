@@ -36,7 +36,7 @@ The owner's typical requests, which define success:
 - POP3, Exchange/EWS, JMAP.
 - IMAP IDLE push. Polling is enough for now. (Reversed on owner request 2026-11-12, see the addendum at the end.)
 - Moving, deleting, flagging or marking messages read, folder management. Dove still never changes a human's mail.
-- Attachments in outgoing drafts.
+- Attachments in outgoing drafts. (Reversed on owner request 2026-11-12, see the addendum at the end.)
 - Attachment text extraction for search (still spec phase 2).
 - Autodiscovery over the network (DNS SRV, Mozilla ISPDB lookups). Presets are compiled in.
 
@@ -259,3 +259,31 @@ searchable within a few seconds.
 - **Unchanged:** `index.poll_interval_secs` stays 60; the poll covers the other folders, flags and IDLE-less servers.
 - **Known limit:** a connection that dies silently (no RST, no BYE) counts as healthy until the next renewal fails;
   the poll still catches up within its interval.
+## Addendum 2026-11-12: attachments, forwards and quoting in drafts
+
+Attachments in outgoing drafts were a non-goal; reversed on owner request 2026-11-12, for Gmail and IMAP alike,
+through the existing `create_draft` / `update_draft` tools and the remote CLI (`dove draft create --attach FILE`,
+`--forward REF`).
+
+- **Sources.** By reference to an attachment of a message the caller may read (`{ref | account + message_id,
+  attachment_id}`), fetched server-side so the bytes never pass through the agent; or inline from the agent
+  (`{filename, mime_type, content_base64}`). A reference to a mailbox without a `read` grant is the identical
+  `not_found`, decided before any upstream call. Grants already enforce `draft` ⇒ `read`.
+- **Forward.** `forward_message_id` (in `account`) or `forward_ref` (any readable mailbox): subject `Fwd: ...`, a
+  standard forwarded-message block (From, Date, Subject, To, Cc) and the original plain text below the agent's text,
+  the original's attachments by default (`include_attachments`). Over a limit is an error that names
+  `include_attachments: false`, never a silent drop.
+- **Reply quoting.** `reply_to_message_id` quotes the original below the body (`On <date>, <sender> wrote:` and `> `
+  lines), `quote_original` default true, at most 100 KiB of original text and never beyond the 500 KB body limit.
+- **Limits.** At most 10 attachments and `limits.draft_attachment_bytes` (default 10 MiB, at most 16 MiB) decoded
+  bytes per draft. `/mcp` reads the request body only after authentication; a client with `draft` on some mailbox gets
+  room for that much base64 (`× 4/3 + 2 MiB`), everyone else keeps `limits.body_bytes`.
+- **Shape.** Drafts stay a text/plain body; with attachments the message is `multipart/mixed` with the body first and
+  one base64 leaf per attachment (`Content-Disposition: attachment`, RFC 2231 filename). Filenames are sanitized like
+  `get_attachment`'s; MIME types must be a plain `type/subtype` (no parameters, no `multipart/*` or `message/*`; a
+  referenced attachment with such a type is attached as `application/octet-stream`). Dove rebuilds only this shape;
+  anything else (HTML, inline parts, nested messages) is `draft_conflict` on update, as before.
+- **Unchanged.** Own-draft revision and content-hash checks, the send state machine and the exact submission of the
+  stored bytes; one audit record per call, which gets the forwarded message id, `attachments:<n>` and a size class but
+  never filenames or content. Quote and forward text are untrusted content in the body; only the original subject
+  reaches a header, reduced to one clean line.

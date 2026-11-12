@@ -24,8 +24,10 @@ notification webhook if you configure one. It does not check for updates or phon
   intersection of its explicit per-mailbox grants (`read`, `draft`, `send`) and the project's current mailboxes.
   Unknown and out-of-scope mailboxes and ids return the identical `not_found`.
 - **Tools** (implemented): `list_accounts`, `list_labels`, `get_message`, `get_thread`, `list_drafts`, `get_draft`,
-  `create_draft` (idempotent by `request_key`), `update_draft` (revision-checked), `batch_read`, and `send_draft`
-  when enabled. Not implemented yet: `search_messages` and the encrypted search index.
+  `create_draft` (idempotent by `request_key`; replies quote the original, forwards carry its attachments, files
+  attach by reference to a readable message or inline, at most 10 and 10 MiB per draft), `update_draft`
+  (revision-checked, keeps attachments unless replaced), `get_attachment`, `batch_read`, and `send_draft` when
+  enabled. Not implemented yet: `search_messages` and the encrypted search index.
 - **Untrusted content handling.** Mail text reaches the model inside a clearly delimited envelope; HTML is reduced to
   text without hidden content, invisible Unicode is stripped, and Dove never follows links or fetches remote images.
 - **Audit.** One hash-chained audit record per tool call and per admin action, without mail content.
@@ -147,6 +149,7 @@ server in `tests/support/`, not against real services.
 | Google connect flow, token manager, outbound allowlist gateway | done (fake Google) |
 | MCP transport and read tools, untrusted-content envelope | done (fake Google) |
 | `create_draft`, `update_draft`, `send_draft` behind both gates, `batch_read` | done (fake Google) |
+| Draft attachments (by reference and inline), forwards, reply quoting, `dove draft create --attach/--forward` | done (fake Google, fake IMAP) |
 | Encrypted search index, sync engine, typed `search_messages` | done (fake Google) |
 | Client onboarding (`dove login`, `mcp install`, `mcp stdio`) and downstream OAuth for ChatGPT and Claude | done (fake Google, no real MCP host tried) |
 | Restart and crash recovery tests, log canary test | done |

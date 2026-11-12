@@ -235,3 +235,11 @@ hosts or reference hardware.
   (2 s, once per 5 s per mailbox) when IDLE is not healthy and the last full sync is older than 5 s. The check never
   advances `last_success_at`, so `as_of` remains the last full sync. A scheduler wake that arrives while the account's
   job runs is kept for the next tick instead of being dropped.
+- A46. Draft attachments, forwards and reply quoting (owner request 2026-11-12, design addendum): a source message
+  needs `read`; since grants enforce `draft` ⇒ `read`, quoting is on by default for every reply. A referenced
+  attachment whose type Dove may not write (`multipart/*`, `message/*`, parameters, bad syntax) is attached as
+  `application/octet-stream`; an inline one with such a type is `invalid_argument`. Forwarded attachments come first,
+  then `attachments` in request order. `/mcp` now authenticates before reading the body, so an unauthenticated
+  request is refused with 401 without its body being read. Not verified: the Gmail API's limit for `raw` inside a
+  JSON `drafts.create`/`drafts.update` body (a 10 MiB attachment makes about 18 MiB of JSON; the upload endpoint
+  is not in the gateway allowlist).

@@ -234,9 +234,21 @@ pub enum DraftCmd {
         account: String,
         #[command(flatten)]
         content: DraftContent,
-        /// Message id to reply to (threads the draft).
+        /// Message id to reply to (threads the draft and quotes the original below the body).
         #[arg(long)]
         reply_to: Option<String>,
+        /// With --reply-to: do not quote the original.
+        #[arg(long, requires = "reply_to")]
+        no_quote: bool,
+        /// Forward the message with this ref (from `dove search` or `dove message get`), its attachments included.
+        #[arg(long, value_name = "REF", conflicts_with = "reply_to")]
+        forward: Option<String>,
+        /// With --forward: leave out the original's attachments.
+        #[arg(long, requires = "forward")]
+        no_forward_attachments: bool,
+        /// Attach a local file (repeatable). Uploaded inline; the server allows 10 files and 10 MiB in total by default.
+        #[arg(long = "attach", value_name = "FILE")]
+        attach: Vec<PathBuf>,
         /// Send-as address of the mailbox.
         #[arg(long)]
         from: Option<String>,
@@ -606,15 +618,94 @@ fn draft_changes(c: &DraftContent) -> anyhow::Result<Value> {
     Ok(v)
 }
 
+/// Largest local file `--attach` reads (the server's own limit applies on top).
+const ATTACH_FILE_MAX: u64 = 16 * 1024 * 1024;
+
+/// An inline attachment for create_draft from a local file: its base name, a MIME type from the extension, base64.
+fn attachment_arg(path: &std::path::Path) -> anyhow::Result<Value> {
+    let meta = std::fs::metadata(path).with_context(|| format!("cannot read {}", path.display()))?;
+    if !meta.is_file() {
+        bail!("{} is not a regular file", path.display());
+    }
+    if meta.len() > ATTACH_FILE_MAX {
+        bail!("{} is larger than {} MiB", path.display(), ATTACH_FILE_MAX >> 20);
+    }
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| anyhow!("{} has no usable file name", path.display()))?;
+    let bytes = std::fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
+    Ok(json!({ "filename": name, "mime_type": mime_for(name), "content_base64": crate::util::b64std(&bytes) }))
+}
+
+/// MIME type by file extension; unknown types are `application/octet-stream`.
+fn mime_for(name: &str) -> &'static str {
+    let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+    match ext.as_str() {
+        "pdf" => "application/pdf",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "heic" => "image/heic",
+        "svg" => "image/svg+xml",
+        "txt" | "log" => "text/plain",
+        "csv" => "text/csv",
+        "md" => "text/markdown",
+        "html" | "htm" => "text/html",
+        "ics" => "text/calendar",
+        "vcf" => "text/vcard",
+        "json" => "application/json",
+        "xml" => "application/xml",
+        "zip" => "application/zip",
+        "gz" => "application/gzip",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xls" => "application/vnd.ms-excel",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "ppt" => "application/vnd.ms-powerpoint",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "odt" => "application/vnd.oasis.opendocument.text",
+        "ods" => "application/vnd.oasis.opendocument.spreadsheet",
+        _ => "application/octet-stream",
+    }
+}
+
 async fn draft(d: DraftCmd) -> anyhow::Result<()> {
     match d {
-        DraftCmd::Create { p, account, content, reply_to, from, request_key } => {
+        DraftCmd::Create {
+            p,
+            account,
+            content,
+            reply_to,
+            no_quote,
+            forward,
+            no_forward_attachments,
+            attach,
+            from,
+            request_key,
+        } => {
             let key = request_key.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
             let mut args = draft_changes(&content)?;
             args["account"] = json!(account);
             args["request_key"] = json!(key);
+            if args.get("body_text").is_none() && (forward.is_some() || !attach.is_empty()) {
+                args["body_text"] = json!("");
+            }
             if let Some(r) = reply_to {
                 args["reply_to_message_id"] = json!(r);
+                if no_quote {
+                    args["quote_original"] = json!(false);
+                }
+            }
+            if let Some(r) = forward {
+                args["forward_ref"] = json!(r);
+                if no_forward_attachments {
+                    args["include_attachments"] = json!(false);
+                }
+            }
+            if !attach.is_empty() {
+                args["attachments"] = Value::Array(attach.iter().map(|f| attachment_arg(f)).collect::<Result<_, _>>()?);
             }
             if let Some(f) = from {
                 args["from_address"] = json!(f);

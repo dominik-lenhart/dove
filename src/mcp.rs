@@ -162,10 +162,7 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
     let ip = crate::http::request_ip(&req);
     let (parts, body) = req.into_parts();
     let headers: HeaderMap = parts.headers;
-    let body: Bytes = match axum::body::to_bytes(body, app.cfg.limits.body_bytes).await {
-        Ok(b) => b,
-        Err(_) => return (StatusCode::PAYLOAD_TOO_LARGE, "request too large").into_response(),
-    };
+    // The body is read only after authentication: unauthenticated requests never get past `limits.body_bytes`.
     let bearer = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -189,6 +186,17 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
         }
     };
     let ctx = authed.ctx;
+    // Draft creation may carry inline attachments (`limits.draft_attachment_bytes` as base64); only an authenticated
+    // caller with `draft` on some mailbox gets the larger body limit.
+    let body_limit = if ctx.has_any(policy::Capability::Draft) {
+        app.cfg.limits.draft_body_bytes()
+    } else {
+        app.cfg.limits.body_bytes
+    };
+    let body: Bytes = match axum::body::to_bytes(body, body_limit).await {
+        Ok(b) => b,
+        Err(_) => return (StatusCode::PAYLOAD_TOO_LARGE, "request too large").into_response(),
+    };
     if authed.new_ip {
         let app2 = app.clone();
         let (name, ipstr) = (ctx.client_name.clone(), ip.map(|i| i.to_string()).unwrap_or_default());
