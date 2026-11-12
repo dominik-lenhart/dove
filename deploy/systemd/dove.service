@@ -65,7 +65,6 @@ LimitCORE=0
 NoNewPrivileges=yes
 CapabilityBoundingSet=
 AmbientCapabilities=
-SecureBits=noroot-locked
 
 # File system. The root is read-only; only the data directory and the admin socket directory are writable.
 # PrivateTmp gives the service its own /tmp. The index keeps SQL temporaries in memory, so nothing needs a shared tmp.

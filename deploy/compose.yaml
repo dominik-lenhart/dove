@@ -5,7 +5,7 @@
 #   (put the Google OAuth client secret into secrets/google_client_secret)
 #   sudo chown 65532:65532 secrets/* && sudo chmod 0400 secrets/*
 #   cp config.container.toml config.toml   # edit public_url, google.client_id, admin.operator_uid
-#   cp Caddyfile Caddyfile.local           # edit the hostname; mount it below instead of ./Caddyfile
+#   $EDITOR Caddyfile                      # replace dove.example.com with your hostname
 #   docker compose up -d
 #
 # Why the secret files must be owned by 65532 with mode 0400: Compose bind-mounts file secrets as they are on the
