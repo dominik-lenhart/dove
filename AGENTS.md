@@ -126,3 +126,5 @@ cargo fmt
   `check_name` in `tests/oauth_e2e.rs`. The bundled SQLCipher has JSON1 (`json_each`, `json_extract`).
 - 2026-11-12: When mutation-checking with `sed`, confirm the mutation applied (`grep -c`) before trusting a passing
   test; quoting `$` or `'` in patterns silently matches nothing.
+- 2026-11-12: Canary checks must compare whole secrets (minus known `dove*_` prefixes). Cutting at the first `_`
+  made random base64url secrets degenerate to 1-3 characters and caused a flaky "secret found in logs".

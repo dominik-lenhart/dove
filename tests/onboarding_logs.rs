@@ -224,7 +224,10 @@ async fn no_onboarding_secret_reaches_logs_audit_or_store() {
         bytes.extend(w);
     }
     for s in &secrets {
-        let body = &s[s.find('_').map(|i| i + 1).unwrap_or(0)..];
+        // Strip only Dove's known prefixes; unprefixed secrets (codes, PKCE verifier, CSRF) contain '_' at random.
+        let body =
+            ["dovei_", "doveat_", "dovert_", "dovec_", "dove_"].iter().find_map(|p| s.strip_prefix(p)).unwrap_or(s);
+        assert!(body.len() >= 20, "canary too short to be meaningful");
         assert!(!logs.contains(body), "secret found in logs: {}...", &s[..8.min(s.len())]);
         assert!(!audit.contains(body), "secret found in audit");
         assert!(!bytes.windows(body.len()).any(|w| w == body.as_bytes()), "secret stored in plaintext: {}...", &s[..8]);
