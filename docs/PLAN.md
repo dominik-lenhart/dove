@@ -58,13 +58,19 @@ hosts or reference hardware.
      pre-registered clients in config (`tests/oauth_e2e.rs`). Unverified: real ChatGPT and Claude hosts (AC23);
      host versions/settings are not recorded because no real host was available.
 5. Hardening
-   - [~] Fake Google server integration suite covering AC1-AC21 (done: AC1, AC2, AC4, AC6, AC7, AC10, AC12, AC13,
-     AC16, AC18 in `tests/mcp_e2e.rs`, `tests/connect_e2e.rs`; AC14, AC17 and AC20 except the log canary in
-     `tests/search_contract.rs`, `tests/index_sync.rs`; AC3 `send_e2e`, AC8/AC9 `hygiene_e2e`, AC19 `agent_shell`,
-     AC21 `batch_e2e`)
-   - [~] Restart/crash recovery tests, log canary test (AC8, AC9 in `tests/hygiene_e2e.rs`; restart cases in
+   - [x] Fake Google server integration suite covering the automatable parts of AC1-AC21 (AC1, AC2, AC4, AC6, AC7,
+     AC10, AC12, AC13, AC16, AC18 in `tests/mcp_e2e.rs`, `tests/connect_e2e.rs`; AC14, AC17, AC20 in
+     `tests/search_contract.rs`, `tests/index_sync.rs`, content canaries in `hygiene_e2e`; AC3 `send_e2e`, AC8/AC9
+     `hygiene_e2e`, `onboarding_logs`; AC11 `admin`, `oauth_e2e`, `proxy_e2e`; AC15 config unit tests; AC19
+     `agent_shell` (ignored by default, needs `sudo -n -u nobody`); AC21 `batch_e2e`). Manual by definition and not
+     done: AC5 (Apple Mail), AC22 on clean machines with real hosts, AC23 (real ChatGPT/Claude), spec 9.8 (real
+     Google account obtains a long-lived refresh token for an unverified production app).
+   - [x] Restart/crash recovery tests, log canary test (AC8, AC9 in `tests/hygiene_e2e.rs`; restart cases in
      `send_e2e`, `connect_e2e`, `mcp_e2e`, `index_sync`, graceful shutdown in `shutdown_e2e`)
-   - [ ] Benchmarks (8.1) with synthetic 250k corpus, RSS measurement
+   - [ ] Benchmarks (8.1) with synthetic 250k corpus, RSS measurement. Only measured so far: peak heap of the
+     parse path per message (`cargo test --release --test ingest_memory -- --ignored --nocapture`, counting
+     allocator, dev host, 2026-11-12): 22.6 MB raw -> 29.3 MiB peak, under the 32 MiB per-job budget (8.1a). This is
+     not RSS and not a service benchmark; all 8.1 latency/RSS targets remain unverified.
    - [~] Deployment: systemd unit, container, Caddy allowlist, backup docs, SECURITY.md, README (files written:
      `deploy/` (systemd, Containerfile, compose, Caddyfile, nginx), `docs/deployment.md`, `README.md`, `SECURITY.md`,
      CI workflow with `deny.toml` and secret scan. Verified: syntax and sandbox start of the unit as a user unit,
