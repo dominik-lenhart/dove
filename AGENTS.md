@@ -75,3 +75,7 @@ cargo fmt
   shifts later pages and makes enumeration skip messages (real Gmail tokens do not); avoid that in sync tests.
 - 2026-11-12: Index jobs, purge, rebuild and sync-state creation serialize on a per-account lock; every write also
   re-checks the job's fence. Tests: `dove::index::sync::{sync_account, sync_steps}` run passes deterministically.
+- 2026-11-12: Without ANALYZE data SQLite planned `m.id IN (SELECT msg FROM addrs ...)` as a scan of the whole
+  mailbox partition; the fixed `sqlite_stat1` rows in index migration V2 fix that. If you add an index, add a stat row
+  and extend the EXPLAIN QUERY PLAN assertions in `tests/search_contract.rs`.
+- 2026-11-12: Timestamp ties are ordered by random fake message ids; tests must not assume which tied row comes first.

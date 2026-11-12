@@ -768,9 +768,15 @@ fn sort_terms(order: &[(OrderField, Dir)]) -> Vec<(&'static str, Dir)> {
     v
 }
 
-fn where_clause(req: &SearchReq, scope: &Scope<'_>) -> Result<Sql, ToolError> {
+fn where_clause(req: &SearchReq, scope: &Scope<'_>, page: bool) -> Result<Sql, ToolError> {
     let mut q = Sql { text: String::new(), params: vec![] };
-    q.s("m.gen IN ").list(gens(scope.targets));
+    // Newest-first pages over several mailboxes walk `messages_recent` in order and stop after limit + 1 rows; the
+    // unary `+` keeps the planner from sorting every row of every mailbox via the gen-prefixed indexes instead.
+    let ordered_walk = page
+        && scope.targets.len() > 1
+        && !req.include_spam_trash
+        && req.order.first().is_some_and(|(f, _)| *f == OrderField::ReceivedAt);
+    q.s(if ordered_walk { "+m.gen IN " } else { "m.gen IN " }).list(gens(scope.targets));
     // SPAM/TRASH are excluded unless requested; the IN form keeps the (gen, spam_trash, ...) indexes usable.
     if req.include_spam_trash {
         q.s(" AND m.spam_trash IN (0, 1)");
@@ -790,7 +796,7 @@ const ROW_COLS: &str = "m.account_id, m.gmail_id, m.received_at, m.size_bytes, m
 
 /// The page query: filters, keyset seek after `after`, order and `limit + 1` rows.
 pub fn page_sql(req: &SearchReq, scope: &Scope<'_>, after: &[KeyValue]) -> Result<(String, Vec<SqlValue>), ToolError> {
-    let w = where_clause(req, scope)?;
+    let w = where_clause(req, scope, true)?;
     let terms = sort_terms(&req.order);
     let mut q = Sql { text: format!("SELECT {ROW_COLS} FROM messages m WHERE "), params: vec![] };
     q.s(&w.text);
@@ -826,7 +832,7 @@ pub fn page_sql(req: &SearchReq, scope: &Scope<'_>, after: &[KeyValue]) -> Resul
 }
 
 pub fn count_sql(req: &SearchReq, scope: &Scope<'_>) -> Result<(String, Vec<SqlValue>), ToolError> {
-    let w = where_clause(req, scope)?;
+    let w = where_clause(req, scope, false)?;
     Ok((format!("SELECT count(*) FROM messages m WHERE {}", w.text), w.params))
 }
 

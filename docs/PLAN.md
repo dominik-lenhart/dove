@@ -31,16 +31,21 @@ hosts or reference hardware.
      (`src/index/`, `tests/index_sync.rs`: arrival/label/deletion during backfill, history expiry, interrupted pass
      before checkpoint, retry records, rate-limit backoff, disk full)
    - [x] `dove index enable|disable|status|rebuild`, purge + cursor invalidation, fenced jobs
-   - [~] Typed query compiler -> parameterized SQL, coverage reporting (5.3, AC17, AC20)
+   - [x] Typed query compiler -> parameterized SQL, coverage reporting (5.3, AC17, AC20) (`src/index/query.rs`,
+     `tests/search_contract.rs`; hot paths checked with EXPLAIN QUERY PLAN)
+   - Unverified: index build time, query latency and RSS (8.1, 8.1a) are not measured; the planner statistics
+     describe an assumed 250k-message / 10-mailbox index, not a measured one. Real Gmail history/paging behaviour.
 4. Contracts
-   - [ ] Projections, keyset cursors (15 min TTL, bounded), count_only, live Gmail route
+   - [x] Projections, keyset cursors (15 min TTL, bounded), count_only, live Gmail route (search_messages only;
+     batch_read is separate)
    - [ ] batch_read with budgets (AC21)
    - [ ] send_draft behind instance gate + send grant + ownership, at-most-once (6.3, AC3)
    - [ ] Client onboarding: invitations, `dove login`, remote CLI commands, `mcp install`, `mcp stdio` (5.6, AC22)
    - [ ] Downstream OAuth AS for ChatGPT/Claude (5.6, AC23)
 5. Hardening
    - [~] Fake Google server integration suite covering AC1-AC21 (done: AC1, AC2, AC4, AC6, AC7, AC10, AC12, AC13,
-     AC16, AC18 in `tests/mcp_e2e.rs`, `tests/connect_e2e.rs`)
+     AC16, AC18 in `tests/mcp_e2e.rs`, `tests/connect_e2e.rs`; AC14, AC17 and AC20 except the log canary in
+     `tests/search_contract.rs`, `tests/index_sync.rs`)
    - [ ] Restart/crash recovery tests, log canary test
    - [ ] Benchmarks (8.1) with synthetic 250k corpus, RSS measurement
    - [ ] Deployment: systemd unit, container, Caddy allowlist, backup docs, SECURITY.md, README
@@ -75,4 +80,15 @@ hosts or reference hardware.
   lookup. `received_at` is stored as Gmail internalDate in milliseconds (wire format keeps ms precision).
 - A13. Unparseable or oversized MIME is indexed from Gmail metadata only (labels, dates, size, snippet) with
   `meta_complete = 0`; queries that filter/project/order on MIME-derived fields then report partial coverage.
+- A14. The index ships fixed `sqlite_stat1` rows (index migration V2) for an assumed large index, and Dove never
+  runs ANALYZE, so plans do not flip with index size. Multi-mailbox newest-first pages walk `messages_recent` in
+  order (gen index disabled with unary `+`); single-mailbox and count queries use the gen-prefixed indexes. Both are
+  tunables to revisit with the 8.1 benchmark.
+- A15. `search_messages` details: `alias:ID` qualifies label/thread_id/message_id values to one mailbox (unknown or
+  out-of-scope alias = `not_found`); text predicates are re-tokenized like unicode61 and emitted as quoted FTS
+  literals; `prefix` needs at least 2 characters (`query_too_broad` otherwise); `gmail_query` is limited to 1024
+  characters without control characters; the text rendering is the compact JSON result inside the untrusted-content
+  envelope. Coverage `exceptions` list per mailbox `stage` (`not_indexed`, `pending`, `backfill`, `rebuilding`,
+  `stale`, `ready`) with a reason; `account_errors` list unavailable mailboxes. Cursors are not single use: a page
+  can be fetched again until the cursor expires or is evicted.
 - A7. Licence is a placeholder (Apache-2.0) until the owner decides (spec 13.7).

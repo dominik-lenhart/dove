@@ -8,7 +8,7 @@
 use anyhow::bail;
 use rusqlite::Connection;
 
-pub const MIGRATIONS: &[&str] = &[V1];
+pub const MIGRATIONS: &[&str] = &[V1, V2];
 
 const V1: &str = r#"
 CREATE TABLE meta (
@@ -93,7 +93,8 @@ CREATE TABLE messages (
     meta_complete    INTEGER NOT NULL,
     UNIQUE (gen, gmail_id)
 );
-CREATE INDEX messages_date ON messages(gen, spam_trash, received_at, account_id, gmail_id);
+-- Tiebreaker columns DESC: a backwards walk yields received_at DESC, (account_id, gmail_id) ASC, the default order.
+CREATE INDEX messages_date ON messages(gen, spam_trash, received_at, account_id DESC, gmail_id DESC);
 CREATE INDEX messages_size ON messages(gen, spam_trash, size_bytes);
 CREATE INDEX messages_subject ON messages(gen, spam_trash, subject_missing, subject_key);
 CREATE INDEX messages_thread ON messages(thread_id, gen);
@@ -139,6 +140,37 @@ CREATE INDEX atts_msg ON atts(msg);
 CREATE VIRTUAL TABLE fts USING fts5(subject, body, content='', contentless_delete=1, tokenize='unicode61');
 "#;
 
+/// Query planner support. Newest-first top-N across several mailboxes walks `messages_recent` in order and stops
+/// after `limit + 1` eligible rows instead of sorting every row of every mailbox.
+///
+/// Fixed `sqlite_stat1` rows describe a representative large index (250k messages over 10 mailboxes) so plans do not
+/// depend on how full the index happens to be: selective lookups (addresses, attachment names, ids) drive the join,
+/// mailbox-wide predicates do not. Dove never runs ANALYZE afterwards, so these numbers stay authoritative.
+const V2: &str = r#"
+CREATE INDEX messages_recent ON messages(spam_trash, received_at, account_id DESC, gmail_id DESC);
+ANALYZE meta;
+DELETE FROM sqlite_stat1;
+INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+    ('messages', 'messages_date', '250000 25000 12500 2 1 1'),
+    ('messages', 'messages_recent', '250000 125000 2 1 1'),
+    ('messages', 'messages_size', '250000 25000 12500 3'),
+    ('messages', 'messages_subject', '250000 25000 12500 12500 4'),
+    ('messages', 'messages_thread', '250000 3 3'),
+    ('messages', 'messages_gmail_id', '250000 1 1'),
+    ('messages', 'messages_body_incomplete', '2500 250'),
+    ('messages', 'messages_meta_incomplete', '250 25'),
+    ('messages', 'sqlite_autoindex_messages_1', '250000 25000 1'),
+    ('addrs', 'addrs_addr', '1000000 40 30 20 1'),
+    ('addrs', 'addrs_domain', '1000000 400 300 200 1'),
+    ('addrs', 'addrs_msg', '1000000 4'),
+    ('labels', 'sqlite_autoindex_labels_1', '750000 25000 2500 1'),
+    ('labels', 'labels_msg', '750000 3'),
+    ('atts', 'atts_name', '100000 2 2 1'),
+    ('atts', 'atts_name_rev', '100000 2 2 1'),
+    ('atts', 'atts_mime', '100000 5000 500 1'),
+    ('atts', 'atts_msg', '100000 2');
+"#;
+
 /// Applies pending index migrations in one transaction each.
 pub fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -152,5 +184,7 @@ pub fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
         tx.execute_batch(&format!("PRAGMA user_version = {}", i + 1))?;
         tx.commit()?;
     }
+    // Load the planner statistics into this connection (later connections read them at open).
+    conn.execute_batch("ANALYZE sqlite_schema;")?;
     Ok(())
 }
