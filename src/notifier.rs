@@ -60,7 +60,7 @@ impl Notifier {
         if let Some(url) = &self.webhook {
             let body = json!({ "title": "Dove", "message": message });
             if let Err(e) = self.http.post(url).json(&body).send().await {
-                tracing::error!(error = %crate::logging::redact(&e.to_string()), "notification webhook failed");
+                tracing::error!(error = %crate::logging::redact(&e.without_url().to_string()), "notification webhook failed");
             }
         }
     }
