@@ -8,14 +8,14 @@ hosts or reference hardware.
 ## Steps
 
 1. Foundation
-   - [ ] Cargo package `dove-mcp`, binary `dove`, module layout (spec 7.8)
-   - [ ] Config file + startup checks: secret file modes, HTTPS public URL, KEK present (8.4, AC15)
-   - [ ] Vault: per-account DEK, KEK wrap, XChaCha20-Poly1305 with AAD (6.4, AC8)
-   - [ ] State store: SQLite WAL, versioned migrations in one transaction (7.2, 10)
-   - [ ] SQLCipher/FTS5/temp-store startup self-check for the index (7.9)
-   - [ ] Audit log with hash chain, `audit verify|tail|search`, retention pruning (6.7, AC16)
-   - [ ] Admin socket with peer-credential check; projects/clients/grants CLI (FR-C1, FR-P*, AC19)
-   - [ ] Client tokens: `dove_` + 32 bytes, HMAC-SHA-256 pepper lookup, rotate/revoke/expiry/IP (6.4, AC11)
+   - [x] Cargo package `dove-mcp`, binary `dove`, module layout (spec 7.8)
+   - [x] Config file + startup checks: secret file modes, HTTPS public URL, KEK present (8.4, AC15)
+   - [x] Vault: per-account DEK, KEK wrap, XChaCha20-Poly1305 with AAD (6.4, AC8)
+   - [x] State store: SQLite WAL, versioned migrations in one transaction (7.2, 10)
+   - [x] SQLCipher/FTS5/temp-store startup self-check for the index (7.9)
+   - [x] Audit log with hash chain, `audit verify|tail|search`, retention pruning (6.7, AC16)
+   - [x] Admin socket with peer-credential check; projects/clients/grants CLI (FR-C1, FR-P*, AC19)
+   - [x] Client tokens: `dove_` + 32 bytes, HMAC-SHA-256 pepper lookup, rotate/revoke/expiry/IP (6.4, AC11)
 2. Google + MCP core
    - [ ] Outbound gateway with exact method/path allowlist and fixed origins (7.5)
    - [ ] Connect/reconnect flow: pending state, PKCE, ID-token validation, scope + identity checks (7.3, AC7)
@@ -54,4 +54,9 @@ hosts or reference hardware.
 - A5. Admin protocol is newline-delimited JSON over a Unix socket (`0660`, group = operator group). The server
   verifies `SO_PEERCRED` uid against `admin.operator_uid` (or root). The CLI binary carries no authority.
 - A6. The service process is the only writer to the state store; admin commands mutate state through the socket.
+- A8. KEK rotation: the KEK file is read-only to the service (systemd credential). The operator appends a new
+  `<version> <key>` line (`dove keys generate --version N`), restarts, runs `dove keys rotate` to re-wrap every grant
+  under the newest version, then deletes the old line. `keys rotate` reports which versions are still referenced.
+- A9. Admin actions are audited in the same transaction as their state change; failed actions get a separate
+  `error` record, so every admin request yields exactly one record.
 - A7. Licence is a placeholder (Apache-2.0) until the owner decides (spec 13.7).

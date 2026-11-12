@@ -7,6 +7,7 @@ pub mod cli;
 pub mod config;
 pub mod error;
 pub mod gmail;
+pub mod index;
 pub mod logging;
 pub mod notifier;
 pub mod policy;
