@@ -275,6 +275,61 @@ async fn deletion_via_qresync_and_via_diff_fallback() {
     }
 }
 
+/// A server may report `VANISHED` as ranges that cover UIDs which never existed (RFC 7162). A range wider than a
+/// million UIDs still removes the known messages inside it, without falling back to `UID SEARCH ALL`.
+#[tokio::test]
+async fn wide_vanished_ranges_remove_known_messages() {
+    let fx = setup(Opts { wide_vanished: true, ..Default::default() }).await;
+    let uids: Vec<u32> = (0..4).map(|i| fx.add("INBOX", &simple(&format!("keep {i}")), &[])).collect();
+    fx.sync().await;
+    let gone = [fx.id("INBOX", uids[1]).await, fx.id("INBOX", uids[3]).await];
+    fx.h.imap.expunge_external(&fx.u.user, "INBOX", uids[1]);
+    fx.h.imap.expunge_external(&fx.u.user, "INBOX", uids[3]);
+    let mark = fx.h.imap.commands().len();
+    let r = fx.sync().await;
+    assert_eq!(r.removed, 2, "{r:?}");
+    let left = fx.indexed().await;
+    assert_eq!(left.len(), 2, "{left:?}");
+    assert!(gone.iter().all(|g| !left.contains(g)), "{left:?}");
+    let cmds = fx.commands_since(mark);
+    assert!(cmds.iter().any(|c| c.contains("VANISHED")), "{cmds:?}");
+    assert!(!cmds.iter().any(|c| c.contains("SEARCH ALL")), "{cmds:?}");
+}
+
+/// One sync step has a wall-clock limit (`index.imap_step_timeout_secs`): a server that answers each command just
+/// inside the command timeout cannot hold the session (and its upstream slots) for longer. The next poll recovers.
+#[tokio::test]
+async fn slow_scan_hits_the_step_deadline() {
+    let fx = setup_with(Opts::default(), |c| c.index.imap_step_timeout_secs = 1).await;
+    fx.add("INBOX", &simple("hello"), &[]);
+    fx.sync().await;
+    // Two folder selects of 600 ms each: every command is far inside the 3 s command timeout.
+    for _ in 0..2 {
+        fx.h.imap.fail_next("EXAMINE", Fault::Delay(std::time::Duration::from_millis(600)));
+    }
+    let t0 = std::time::Instant::now();
+    let r = sync_steps(fx.h.app(), &fx.u.account_id, usize::MAX).await.unwrap();
+    assert_eq!(r.error.as_deref(), Some("upstream_error"), "{r:?}");
+    assert!(t0.elapsed() < std::time::Duration::from_millis(1500), "{:?}", t0.elapsed());
+    fx.sync().await;
+}
+
+/// IMAP sync is background work: with every background slot of the shared upstream limit taken (by Gmail sync, say)
+/// it is not dispatched, while an agent's call on the same mailbox still gets through.
+#[tokio::test]
+async fn sync_needs_a_background_slot() {
+    let fx = setup(Opts::default()).await;
+    fx.add("INBOX", &simple("hello"), &[]);
+    fx.sync().await;
+    let bg = fx.h.app().google.gateway().background_limit();
+    let held = bg.clone().acquire_many_owned(bg.available_permits() as u32).await.unwrap();
+    let r = sync_steps(fx.h.app(), &fx.u.account_id, usize::MAX).await.unwrap();
+    assert_eq!(r.error.as_deref(), Some("upstream_error"), "{r:?}");
+    fx.h.ok(&fx.token, "list_labels", json!({"account": "info"})).await;
+    drop(held);
+    fx.sync().await;
+}
+
 /// Without CONDSTORE (Strato advertises none, checked 2026-11-12) a `\Seen` change made by another client shows in
 /// `is_unread` after the next poll, through the bounded flags-only refresh.
 #[tokio::test]
@@ -417,6 +472,14 @@ async fn get_thread_groups_by_references() {
         DAY0 + 120,
     );
     fx.h.imap.add_message_at(u, "INBOX", &simple("unrelated"), &[], DAY0 + 30);
+    // A stranger who knows the root Message-ID but not the subject cannot join the thread.
+    fx.h.imap.add_message_at(
+        u,
+        "INBOX",
+        &mail("Eve <eve@evil.example>", "Urgent: new bank details", "f@evil", "References: <root@x>\r\n", "forged"),
+        &[],
+        DAY0 + 90,
+    );
     fx.sync().await;
     let by_msg =
         fx.h.ok(&fx.token, "get_thread", json!({"account": "info", "message_id": fx.id("INBOX", last).await})).await;

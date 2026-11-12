@@ -23,7 +23,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -31,6 +31,7 @@ use super::ingest::{self, Doc};
 use super::sync::{self, BATCH, Fetched, Job, Step, SyncReport, commit_results, load_state};
 use crate::app::App;
 use crate::error::ToolError;
+use crate::gmail::gateway::Priority;
 use crate::imap::account::{self, Folder};
 use crate::imap::{FetchedMeta, FolderStatus, ImapError, ImapMsgId, ImapSession};
 use crate::mail::{self, MessageMeta};
@@ -48,6 +49,17 @@ const ENUM_CHUNK: usize = 5000;
 const DROP_ROWS: i64 = 2000;
 /// Most thread members `get_thread` resolves from the index.
 pub const MAX_THREAD: i64 = 500;
+
+/// Wall-clock bound of one scan or one fetch batch (`index.imap_step_timeout_secs`). Every read already has the
+/// command timeout, but a slow or hostile server answering just inside it could otherwise hold a session and its
+/// upstream slots for as long as it likes.
+fn step_deadline(app: &App) -> Duration {
+    Duration::from_secs(app.cfg.index.imap_step_timeout_secs.max(1))
+}
+
+fn step_timed_out() -> ToolError {
+    ToolError::upstream("the mail server is too slow: the sync step ran out of time")
+}
 
 /// Entry point with the same contract as [`sync::sync_steps`] (which dispatches IMAP accounts here).
 pub async fn sync_steps(app: &Arc<App>, account_id: &str, max_steps: usize) -> anyhow::Result<SyncReport> {
@@ -238,7 +250,7 @@ struct Scanner {
 async fn scan(job: &Job, gen_id: i64, report: &mut SyncReport) -> anyhow::Result<()> {
     let sc = Scanner { job: job.clone(), gen_id, stats: Arc::default() };
     let stats = sc.stats.clone();
-    let r = account::with_session(&job.app, &job.account_id, move |s| {
+    let session = account::with_session_prio(&job.app, &job.account_id, Priority::Background, move |s| {
         Box::pin(async move {
             match sc.run(s).await {
                 Ok(()) => Ok(Ok(())),
@@ -246,8 +258,9 @@ async fn scan(job: &Job, gen_id: i64, report: &mut SyncReport) -> anyhow::Result
                 Err(ScanErr::Db(e)) => Ok(Err(e)),
             }
         })
-    })
-    .await;
+    });
+    // Folders finished before the deadline keep their checkpoints; the next scan continues cheaply.
+    let r = tokio::time::timeout(step_deadline(&job.app), session).await.unwrap_or_else(|_| Err(step_timed_out()));
     {
         let st = stats.lock().expect("lock");
         report.indexed += st.updated;
@@ -456,8 +469,14 @@ impl Scanner {
         // 1. Flag changes and (QRESYNC) expunges since the checkpoint.
         if condstore && st.highestmodseq > cp.highestmodseq {
             let ch = s.changed_since(cp.highestmodseq.unwrap_or(0)).await?;
-            if let Some(v) = &ch.vanished {
-                self.remove_uids(f.folder_id, uv, v).await?;
+            // VANISHED stays a set of ranges (it may cover UIDs that never existed); only the UIDs Dove knows are
+            // looked up in it. An incomplete set (`None`) is left to the count check below.
+            if let Some(v) = ch.vanished.as_ref().filter(|v| !v.is_empty()) {
+                let (indexed, pending) = self.known(f.folder_id, uv).await?;
+                let mut gone: Vec<u32> = indexed.into_iter().chain(pending).filter(|u| v.contains(*u)).collect();
+                gone.sort_unstable();
+                gone.dedup();
+                self.remove_uids(f.folder_id, uv, &gone).await?;
             }
             self.apply_flags(f, uv, ch.changed).await?;
         }
@@ -699,7 +718,11 @@ async fn hydrate(job: &Job, gen_id: i64, report: &mut SyncReport) -> anyhow::Res
         Ok(())
     } else {
         let (sh, app) = (shared.clone(), job.app.clone());
-        account::with_session(&job.app, &job.account_id, move |s| Box::pin(fetch_groups(s, app, groups, sh))).await
+        let session = account::with_session_prio(&job.app, &job.account_id, Priority::Background, move |s| {
+            Box::pin(fetch_groups(s, app, groups, sh))
+        });
+        // Messages fetched before the deadline are still committed below.
+        tokio::time::timeout(step_deadline(&job.app), session).await.unwrap_or_else(|_| Err(step_timed_out()))
     };
     let mut fetch = std::mem::take(&mut *shared.lock().expect("lock"));
     done.append(&mut fetch.results);

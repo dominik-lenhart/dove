@@ -15,7 +15,8 @@ pub enum Migration {
     Code(fn(&Transaction<'_>) -> anyhow::Result<()>),
 }
 
-pub const MIGRATIONS: &[Migration] = &[Migration::Sql(V1), Migration::Sql(V2), Migration::Code(v3), Migration::Sql(V4)];
+pub const MIGRATIONS: &[Migration] =
+    &[Migration::Sql(V1), Migration::Sql(V2), Migration::Code(v3), Migration::Sql(V4), Migration::Code(v5)];
 
 /// Name of a generation's FTS table. Derived only from the integer generation id, never from input.
 pub fn fts_table(gen_id: i64) -> String {
@@ -252,6 +253,31 @@ CREATE TABLE imap_checkpoints (
 INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES ('imap_checkpoints', 'imap_checkpoints', '500 50 25 1');
 "#;
 
+/// IMAP thread ids include the normalised subject from V5 on (`mail::imap_thread_id`). Stored rows cannot be
+/// re-keyed in place (the index keeps the subject but not the `References` root), so every IMAP mailbox with indexed
+/// data rebuilds into a fresh generation, exactly like `dove index rebuild`: an active generation keeps serving
+/// meanwhile, a half-built one is left unreferenced for garbage collection. Gmail mailboxes keep their index (their
+/// thread ids come from Gmail). IMAP mailboxes are the accounts with folder checkpoints (V4).
+fn v5(tx: &Transaction<'_>) -> anyhow::Result<()> {
+    let accounts: Vec<String> = {
+        let mut st = tx.prepare(
+            "SELECT account_id FROM sync_state WHERE account_id IN (SELECT DISTINCT account_id FROM imap_checkpoints)",
+        )?;
+        st.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?
+    };
+    for aid in accounts {
+        let fence = super::next_fence(tx)?;
+        let g = super::new_generation(tx, &aid)?;
+        tx.execute(
+            "UPDATE sync_state SET fence = ?1, building_gen = ?2, \
+             stage = CASE WHEN active_gen IS NULL THEN 'backfill' ELSE 'rebuilding' END, \
+             next_run_at = 0, data_seq = data_seq + 1 WHERE account_id = ?3",
+            rusqlite::params![fence, g, aid],
+        )?;
+    }
+    Ok(())
+}
+
 /// Applies pending index migrations in one transaction each.
 pub fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -332,5 +358,54 @@ mod tests {
         let tx = c.transaction().unwrap();
         let next = crate::index::new_generation(&tx, "a").unwrap();
         assert!(next > building.max(building_b));
+    }
+
+    /// V5 rebuilds IMAP mailboxes (new thread ids) into fresh generations and leaves Gmail mailboxes alone.
+    #[test]
+    fn v5_rebuilds_imap_mailboxes_only() {
+        let mut c = Connection::open_in_memory().unwrap();
+        let tx = c.transaction().unwrap();
+        for (i, m) in MIGRATIONS[..4].iter().enumerate() {
+            match m {
+                Migration::Sql(sql) => tx.execute_batch(sql).unwrap(),
+                Migration::Code(f) => f(&tx).unwrap(),
+            }
+            tx.execute_batch(&format!("PRAGMA user_version = {}", i + 1)).unwrap();
+        }
+        tx.commit().unwrap();
+        c.execute_batch(
+            "INSERT INTO generations(id, account_id, state, created_at) VALUES (5, 'imap', 'active', 0), \
+                (6, 'gmail', 'active', 0), (7, 'imap2', 'building', 0);
+             UPDATE meta SET value = '7' WHERE key = 'gen_seq';
+             UPDATE meta SET value = '3' WHERE key = 'fence_seq';
+             INSERT INTO sync_state(account_id, fence, stage, active_gen, building_gen, enabled_at) VALUES \
+                ('imap', 1, 'ready', 5, NULL, 0), ('gmail', 2, 'ready', 6, NULL, 0), ('imap2', 3, 'backfill', NULL, 7, 0);
+             INSERT INTO imap_checkpoints(account_id, gen, folder_id, uidvalidity, uidnext) VALUES \
+                ('imap', 5, 1, 1, 10), ('imap2', 7, 1, 1, 10);",
+        )
+        .unwrap();
+        migrate(&mut c).unwrap();
+        let st = |a: &str| {
+            c.query_row(
+                "SELECT stage, active_gen, building_gen, fence FROM sync_state WHERE account_id = ?1",
+                [a],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<i64>>(1)?,
+                        r.get::<_, Option<i64>>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .unwrap()
+        };
+        let (stage, active, building, fence) = st("imap");
+        assert_eq!((stage.as_str(), active), ("rebuilding", Some(5)));
+        assert!(building.unwrap() > 7 && fence > 3, "{building:?} {fence}");
+        let (stage, active, building2, _) = st("imap2");
+        assert_eq!((stage.as_str(), active), ("backfill", None));
+        assert!(building2.unwrap() > 7 && building2 != building);
+        assert_eq!(st("gmail"), ("ready".to_string(), Some(6), None, 2), "Gmail keeps its index");
     }
 }

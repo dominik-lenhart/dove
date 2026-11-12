@@ -8,8 +8,9 @@ use std::sync::Arc;
 use anyhow::{Context, anyhow, bail};
 use rusqlite::Transaction;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
+use zeroize::Zeroizing;
 
 use super::ops::{self, Actor};
 use super::{AdminRequest, AdminResponse, MAX_REQUEST_BYTES};
@@ -47,6 +48,29 @@ pub async fn serve(app: Arc<App>, listener: UnixListener) {
     }
 }
 
+/// Reads one request line (without the newline; bytes after it are ignored) into a buffer allocated once at its
+/// maximum size and wiped on drop. Growing a buffer while reading would leave unwiped copies of a password in freed
+/// memory, and a `BufReader` would keep one in its own buffer. A result longer than [`MAX_REQUEST_BYTES`] means
+/// the request was too large.
+async fn read_request<R: AsyncRead + Unpin>(rd: &mut R) -> std::io::Result<Zeroizing<Vec<u8>>> {
+    let mut buf = Zeroizing::new(vec![0u8; MAX_REQUEST_BYTES + 1]);
+    let mut len = 0;
+    while len < buf.len() {
+        let n = rd.read(&mut buf[len..]).await?;
+        if n == 0 {
+            break;
+        }
+        if let Some(i) = buf[len..len + n].iter().position(|b| *b == b'\n') {
+            len += i;
+            break;
+        }
+        len += n;
+    }
+    // Shrinking the length keeps the allocation (and wipes the whole capacity on drop).
+    buf.truncate(len);
+    Ok(buf)
+}
+
 /// Returns true when `uid` may administer this instance.
 pub fn uid_allowed(app: &App, uid: u32) -> bool {
     uid == 0 || uid == app.cfg.admin.operator_uid
@@ -55,11 +79,9 @@ pub fn uid_allowed(app: &App, uid: u32) -> bool {
 async fn handle_conn(app: Arc<App>, stream: UnixStream) -> anyhow::Result<()> {
     let cred = stream.peer_cred().context("cannot read peer credentials")?;
     let uid = cred.uid();
-    let (rd, mut wr) = stream.into_split();
-    let mut reader = BufReader::new(rd).take(MAX_REQUEST_BYTES as u64 + 1);
-    // The line may carry a mailbox password (connect-imap): wipe it when the call is done.
-    let mut line = zeroize::Zeroizing::new(String::new());
-    reader.read_line(&mut line).await?;
+    let (mut rd, mut wr) = stream.into_split();
+    // The line may carry a mailbox password (connect-imap): wiped when the call is done, never copied on the way.
+    let line = read_request(&mut rd).await?;
     let request_id = util::new_id();
     let actor = Actor { name: format!("uid:{uid}"), request_id: request_id.clone() };
 
@@ -70,13 +92,13 @@ async fn handle_conn(app: Arc<App>, stream: UnixStream) -> anyhow::Result<()> {
     } else if line.len() > MAX_REQUEST_BYTES {
         AdminResponse::err("request too large")
     } else {
-        match serde_json::from_str::<AdminRequest>(&line) {
+        match serde_json::from_slice::<AdminRequest>(&line) {
             Ok(req) => dispatch(&app, &actor, req).await,
             Err(e) => {
                 write_audit(&app, &actor, ("admin.invalid", None, None, vec![]), "invalid_argument").await;
                 // serde can quote input values ("invalid type: string ..."); a password must not come back in an
                 // error, so requests that carry one get only the error category and position.
-                if line.contains("\"password\"") {
+                if line.windows(10).any(|w| w == b"\"password\"") {
                     AdminResponse::err(format!("invalid request at line {} column {}", e.line(), e.column()))
                 } else {
                     AdminResponse::err(format!("invalid request: {e}"))
@@ -492,4 +514,37 @@ async fn doctor(app: &Arc<App>) -> Value {
     };
     add("public_url_tls", tls_ok, health);
     json!(checks)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A request arriving in small pieces is read into the one buffer allocated up front (no reallocation copies), up
+    /// to its newline; an over-long one is reported as longer than the limit.
+    #[tokio::test]
+    async fn request_is_read_into_one_buffer() {
+        let (mut a, mut b) = tokio::io::duplex(64);
+        let req = format!("{{\"password\":\"{}\"}}\nignored", "x".repeat(40_000));
+        let w = tokio::spawn(async move {
+            for c in req.as_bytes().chunks(100) {
+                a.write_all(c).await.unwrap();
+            }
+        });
+        let line = read_request(&mut b).await.unwrap();
+        w.await.unwrap();
+        assert_eq!(line.capacity(), MAX_REQUEST_BYTES + 1);
+        assert_eq!(line.len(), 40_000 + 15);
+        assert!(line.starts_with(b"{\"password\":\"xx") && line.ends_with(b"x\"}"));
+
+        let (mut a, mut b) = tokio::io::duplex(64);
+        let w = tokio::spawn(async move {
+            let _ = a.write_all(&vec![b'y'; MAX_REQUEST_BYTES + 10]).await;
+        });
+        let line = read_request(&mut b).await.unwrap();
+        assert!(line.len() > MAX_REQUEST_BYTES);
+        assert_eq!(line.capacity(), MAX_REQUEST_BYTES + 1);
+        drop(b);
+        w.await.unwrap();
+    }
 }

@@ -1,4 +1,6 @@
 //! A few logged-in IMAP sessions per account (default 2, idle timeout 60 s), inside the global upstream limit.
+//! Background work (index sync) also takes a slot of the background sub-limit the Gmail gateway uses, so it can never
+//! hold every global slot and starve interactive calls (spec 7.7).
 //!
 //! A session goes back to the pool only after a call succeeded. Any error drops it, so a half-read stream (lost
 //! connection mid-FETCH, timeout mid-literal) is never reused.
@@ -14,6 +16,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::session::ImapSession;
 use super::{Credentials, ImapConnector, ImapError, ServerEndpoint};
+use crate::gmail::gateway::Priority;
 
 pub const DEFAULT_PER_ACCOUNT: usize = 2;
 pub const DEFAULT_IDLE: Duration = Duration::from_secs(60);
@@ -37,6 +40,7 @@ pub struct ImapPool {
     per_account: usize,
     idle_timeout: Duration,
     global: Option<Arc<Semaphore>>,
+    background: Option<Arc<Semaphore>>,
     sems: Mutex<HashMap<String, Arc<Semaphore>>>,
     slots: Mutex<HashMap<String, Slot>>,
     /// New connections opened (tests check that broken sessions are replaced).
@@ -51,15 +55,17 @@ impl ImapPool {
             per_account: DEFAULT_PER_ACCOUNT,
             idle_timeout: DEFAULT_IDLE,
             global: None,
+            background: None,
             sems: Mutex::default(),
             slots: Mutex::default(),
             connects: AtomicU64::new(0),
         }
     }
 
-    /// Shares the global upstream in-flight limit with the Gmail gateway.
-    pub fn with_global_limit(mut self, global: Arc<Semaphore>) -> Self {
+    /// Shares the global upstream in-flight limit and its background sub-limit with the Gmail gateway.
+    pub fn with_global_limit(mut self, global: Arc<Semaphore>, background: Arc<Semaphore>) -> Self {
         self.global = Some(global);
+        self.background = Some(background);
         self
     }
 
@@ -86,10 +92,7 @@ impl ImapPool {
         format!("{}:{}:{:?}:{}", ep.host, ep.port, ep.tls, creds.username)
     }
 
-    async fn permits(
-        &self,
-        account_id: &str,
-    ) -> Result<(OwnedSemaphorePermit, Option<OwnedSemaphorePermit>), ImapError> {
+    async fn permits(&self, account_id: &str, prio: Priority) -> Result<Vec<OwnedSemaphorePermit>, ImapError> {
         let sem = self
             .sems
             .lock()
@@ -97,13 +100,17 @@ impl ImapPool {
             .entry(account_id.to_string())
             .or_insert_with(|| Arc::new(Semaphore::new(self.per_account)))
             .clone();
+        // Same order as the gateway: background sub-limit, then the mailbox, then the global limit.
         let wait = async {
-            let mine = sem.acquire_owned().await.ok()?;
-            let global = match &self.global {
-                Some(g) => Some(g.clone().acquire_owned().await.ok()?),
-                None => None,
-            };
-            Some((mine, global))
+            let mut held = Vec::with_capacity(3);
+            if let (Priority::Background, Some(b)) = (prio, &self.background) {
+                held.push(b.clone().acquire_owned().await.ok()?);
+            }
+            held.push(sem.acquire_owned().await.ok()?);
+            if let Some(g) = &self.global {
+                held.push(g.clone().acquire_owned().await.ok()?);
+            }
+            Some(held)
         };
         match tokio::time::timeout(self.cmd_timeout, wait).await {
             Ok(Some(p)) => Ok(p),
@@ -122,7 +129,22 @@ impl ImapPool {
     where
         F: for<'s> FnOnce(&'s mut ImapSession) -> SessionFuture<'s, T>,
     {
-        let _permits = self.permits(account_id).await?;
+        self.with_session_prio(account_id, endpoint, creds, Priority::Interactive, f).await
+    }
+
+    /// [`Self::with_session`] at a given priority: background work also holds a background slot.
+    pub async fn with_session_prio<T, F>(
+        &self,
+        account_id: &str,
+        endpoint: &ServerEndpoint,
+        creds: &Credentials,
+        prio: Priority,
+        f: F,
+    ) -> Result<T, ImapError>
+    where
+        F: for<'s> FnOnce(&'s mut ImapSession) -> SessionFuture<'s, T>,
+    {
+        let _permits = self.permits(account_id, prio).await?;
         let key = Self::key(endpoint, creds);
         let reused = {
             let mut slots = self.slots.lock().expect("lock");

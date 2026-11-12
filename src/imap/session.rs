@@ -1,7 +1,9 @@
 //! One logged-in IMAP connection with typed calls. Commands come only from [`super::ops`].
 //!
 //! Any error leaves the stream in an unknown state; the owner must drop the session (the pool does). Responses are
-//! bounded: lines at [`MAX_LINE`], literals at the per-call cap.
+//! bounded: lines at [`MAX_LINE`] (only `SEARCH`/`VANISHED` number lists, parsed from bytes, up to [`BIG_LINE`]),
+//! literals at the per-call cap, bytes per command at the literal cap plus [`COMMAND_OVERHEAD`], and what a command
+//! keeps (tokens, FETCH metadata, UIDs) at the literal cap plus [`RETAINED`].
 
 use std::borrow::Cow;
 use std::time::Duration;
@@ -13,8 +15,15 @@ use super::ops::{AppendFlag, IMAP_VERBS, ImapOp, Part};
 use super::{Credentials, ImapConnector, ImapError, Io, ServerEndpoint, TlsMode, utf7};
 
 const MAX_LINE: usize = 64 * 1024;
-/// Line cap for responses that list UIDs on one line (`SEARCH`, `VANISHED`).
-const BIG_LINE: usize = 32 * 1024 * 1024;
+/// Most UIDs kept from the `SEARCH` responses of one command.
+pub const MAX_SEARCH_UIDS: usize = 1_000_000;
+/// Line cap for `* SEARCH` and `* VANISHED`, the only responses that may be longer than [`MAX_LINE`] (they are parsed
+/// from bytes and never tokenized): [`MAX_SEARCH_UIDS`] UIDs of up to ten digits and a space each.
+const BIG_LINE: usize = 11 * MAX_SEARCH_UIDS + 64;
+/// Memory one command may keep from its responses beyond its largest literal: tokens, FETCH metadata, UIDs.
+const RETAINED: usize = 32 * 1024 * 1024;
+/// Estimated memory of one token beyond its payload (the enum and the allocation), charged against [`RETAINED`].
+const TOK_COST: usize = 48;
 /// Literal cap for responses that carry no message content (LIST names, flags).
 const SMALL_LITERAL: usize = 64 * 1024;
 /// Upper bound for the number of untagged responses collected for one command.
@@ -23,6 +32,9 @@ const MAX_UNTAGGED: usize = 200_000;
 const COMMAND_OVERHEAD: usize = 16 * 1024 * 1024;
 /// Nesting depth of parenthesized lists in one response.
 const MAX_DEPTH: usize = 32;
+/// Most UID ranges kept from the `VANISHED` responses of one command. Ranges stay `(lo, hi)` pairs and are never
+/// expanded; beyond this many the set is reported incomplete and the caller falls back to the UID diff.
+pub const MAX_VANISHED_RANGES: usize = 50_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -92,8 +104,44 @@ pub struct FetchedMeta {
 pub struct Changes {
     /// Messages whose flags (or existence) changed since the given mod-sequence.
     pub changed: Vec<FetchedMeta>,
-    /// UIDs expunged since then; `None` when QRESYNC is not enabled (the caller diffs `UID SEARCH ALL` instead).
-    pub vanished: Option<Vec<u32>>,
+    /// UIDs expunged since then, as ranges (a server may include UIDs that never existed, RFC 7162 3.2.10). `None`
+    /// when QRESYNC is not enabled or the server sent more than [`MAX_VANISHED_RANGES`] ranges: the caller then
+    /// diffs `UID SEARCH ALL` instead.
+    pub vanished: Option<UidRanges>,
+}
+
+/// A set of UIDs as sorted, disjoint, inclusive ranges. Memory is proportional to the number of ranges, never to
+/// their width; callers intersect it with the UIDs they know instead of listing it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UidRanges(Vec<(u32, u32)>);
+
+impl UidRanges {
+    /// Sorts and merges overlapping or adjacent ranges.
+    pub fn from_ranges(mut v: Vec<(u32, u32)>) -> Self {
+        v.sort_unstable();
+        let mut out: Vec<(u32, u32)> = Vec::with_capacity(v.len());
+        for (lo, hi) in v {
+            match out.last_mut() {
+                Some(last) if lo <= last.1.saturating_add(1) => last.1 = last.1.max(hi),
+                _ => out.push((lo, hi)),
+            }
+        }
+        out.shrink_to_fit();
+        Self(out)
+    }
+
+    pub fn contains(&self, uid: u32) -> bool {
+        let i = self.0.partition_point(|(_, hi)| *hi < uid);
+        self.0.get(i).is_some_and(|(lo, _)| *lo <= uid)
+    }
+
+    pub fn ranges(&self) -> &[(u32, u32)] {
+        &self.0
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,16 +209,26 @@ enum Seg {
 }
 
 /// Tokenizes one response (text segments and literals). Lenient: unbalanced input ends the current list.
-/// `None` when lists nest deeper than [`MAX_DEPTH`] (a hostile server must not exhaust the stack).
-fn tokenize(segs: Vec<Seg>) -> Option<Vec<Tok>> {
+/// Fails when lists nest deeper than [`MAX_DEPTH`] (a hostile server must not exhaust the stack) or the tokens would
+/// need more than `mem` bytes (estimated as [`TOK_COST`] plus payload each); `mem` is reduced by what they use.
+fn tokenize(segs: Vec<Seg>, mem: &mut usize) -> Result<Vec<Tok>, ImapError> {
     struct Cur {
         segs: std::vec::IntoIter<Seg>,
         text: Vec<u8>,
         pos: usize,
         pending_lit: Option<Vec<u8>>,
         too_deep: bool,
+        mem: usize,
+        over: bool,
     }
     impl Cur {
+        fn charge(&mut self, n: usize) -> bool {
+            match self.mem.checked_sub(n) {
+                Some(m) => self.mem = m,
+                None => self.over = true,
+            }
+            !self.over
+        }
         fn peek(&mut self) -> Option<u8> {
             loop {
                 if self.pending_lit.is_some() {
@@ -196,19 +254,28 @@ fn tokenize(segs: Vec<Seg>) -> Option<Vec<Tok>> {
             return out;
         }
         while let Some(b) = c.peek() {
+            if c.too_deep || c.over {
+                return out;
+            }
             if let Some(l) = c.pending_lit.take() {
-                out.push(Tok::Str(l));
+                if c.charge(TOK_COST + l.len()) {
+                    out.push(Tok::Str(l));
+                }
                 continue;
             }
             match b {
                 b' ' => c.pos += 1,
                 b'(' => {
                     c.pos += 1;
-                    out.push(Tok::List(list(c, b')', depth + 1)));
+                    if c.charge(TOK_COST) {
+                        out.push(Tok::List(list(c, b')', depth + 1)));
+                    }
                 }
                 b'[' => {
                     c.pos += 1;
-                    out.push(Tok::Code(list(c, b']', depth + 1)));
+                    if c.charge(TOK_COST) {
+                        out.push(Tok::Code(list(c, b']', depth + 1)));
+                    }
                 }
                 b')' | b']' => {
                     c.pos += 1;
@@ -231,7 +298,9 @@ fn tokenize(segs: Vec<Seg>) -> Option<Vec<Tok>> {
                             _ => s.push(ch),
                         }
                     }
-                    out.push(Tok::Str(s));
+                    if c.charge(TOK_COST + s.len()) {
+                        out.push(Tok::Str(s));
+                    }
                 }
                 _ => {
                     let mut a = Vec::new();
@@ -249,15 +318,124 @@ fn tokenize(segs: Vec<Seg>) -> Option<Vec<Tok>> {
                         a.push(ch);
                         c.pos += 1;
                     }
-                    out.push(Tok::Atom(String::from_utf8_lossy(&a).into_owned()));
+                    if c.charge(TOK_COST + a.len()) {
+                        out.push(Tok::Atom(String::from_utf8_lossy(&a).into_owned()));
+                    }
                 }
             }
         }
         out
     }
-    let mut c = Cur { segs: segs.into_iter(), text: Vec::new(), pos: 0, pending_lit: None, too_deep: false };
+    let mut c = Cur {
+        segs: segs.into_iter(),
+        text: Vec::new(),
+        pos: 0,
+        pending_lit: None,
+        too_deep: false,
+        mem: *mem,
+        over: false,
+    };
     let toks = list(&mut c, 0, 0);
-    (!c.too_deep).then_some(toks)
+    if c.too_deep {
+        return Err(ImapError::Protocol("response nested too deeply"));
+    }
+    if c.over {
+        return Err(ImapError::Protocol("response over the memory limit"));
+    }
+    *mem = c.mem;
+    Ok(toks)
+}
+
+/// The number-list responses parsed straight from bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NumLine {
+    Search,
+    Vanished,
+}
+
+/// `* SEARCH ...` or `* VANISHED ...`: the kind and the bytes after the keyword.
+fn number_line(line: &[u8]) -> Option<(NumLine, &[u8])> {
+    let rest = line.strip_prefix(b"* ")?;
+    let end = rest.iter().position(|b| *b == b' ').unwrap_or(rest.len());
+    let word = &rest[..end];
+    let kind = if word.eq_ignore_ascii_case(b"SEARCH") {
+        NumLine::Search
+    } else if word.eq_ignore_ascii_case(b"VANISHED") {
+        NumLine::Vanished
+    } else {
+        return None;
+    };
+    Some((kind, rest.get(end + 1..).unwrap_or_default()))
+}
+
+/// What one command keeps from its responses, charged against one memory budget ([`RETAINED`] plus its literal).
+struct Collected {
+    untagged: Vec<Untagged>,
+    /// Bytes still available for retained data.
+    mem: usize,
+    /// UIDs of `* SEARCH` lines, in arrival order (at most [`MAX_SEARCH_UIDS`]).
+    search: Vec<u32>,
+    /// Ranges of `* VANISHED` lines; incomplete once more than [`MAX_VANISHED_RANGES`] arrived.
+    vanished: Vec<(u32, u32)>,
+    vanished_complete: bool,
+    /// For flag/size fetches: FETCH responses converted on arrival (with whether `RFC822.SIZE` was present), so a
+    /// large result never exists as tokens.
+    metas: Option<Vec<(FetchedMeta, bool)>>,
+}
+
+impl Collected {
+    fn new(mem: usize, metas: bool) -> Self {
+        Self {
+            untagged: Vec::new(),
+            mem,
+            search: Vec::new(),
+            vanished: Vec::new(),
+            vanished_complete: true,
+            metas: metas.then(Vec::new),
+        }
+    }
+
+    fn charge(&mut self, n: usize) -> Result<(), ImapError> {
+        self.mem = self.mem.checked_sub(n).ok_or(ImapError::Protocol("response over the memory limit"))?;
+        Ok(())
+    }
+
+    /// `rest` of a `* SEARCH` line: numbers separated by spaces. Anything else (a CONDSTORE `(MODSEQ n)`) is skipped.
+    fn add_search(&mut self, rest: &[u8]) -> Result<(), ImapError> {
+        for w in rest.split(|b| *b == b' ') {
+            if w.is_empty() || w.len() > 10 || !w.iter().all(u8::is_ascii_digit) {
+                continue;
+            }
+            let Some(uid) = std::str::from_utf8(w).ok().and_then(|s| s.parse::<u32>().ok()) else { continue };
+            if self.search.len() >= MAX_SEARCH_UIDS {
+                return Err(ImapError::Protocol("too many UIDs in a SEARCH response"));
+            }
+            self.charge(std::mem::size_of::<u32>())?;
+            self.search.push(uid);
+        }
+        Ok(())
+    }
+
+    /// `rest` of a `* VANISHED` line: an optional `(EARLIER)`, then the UID set (kept as ranges).
+    fn add_vanished(&mut self, rest: &[u8]) {
+        let set = rest.rsplit(|b| *b == b' ').find(|w| !w.is_empty()).unwrap_or_default();
+        if self.vanished_complete
+            && let Ok(set) = std::str::from_utf8(set)
+        {
+            self.vanished_complete = parse_uid_ranges(set, &mut self.vanished, MAX_VANISHED_RANGES);
+        }
+    }
+
+    fn done(self, status: Status, code: Vec<Tok>) -> Done {
+        Done {
+            status,
+            code,
+            untagged: self.untagged,
+            search: self.search,
+            vanished: self.vanished_complete.then(|| UidRanges::from_ranges(self.vanished)),
+            metas: self.metas.unwrap_or_default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,6 +454,10 @@ struct Done {
     status: Status,
     code: Vec<Tok>,
     untagged: Vec<Untagged>,
+    search: Vec<u32>,
+    /// `None` when more ranges arrived than [`MAX_VANISHED_RANGES`].
+    vanished: Option<UidRanges>,
+    metas: Vec<(FetchedMeta, bool)>,
 }
 
 impl Done {
@@ -287,7 +469,8 @@ impl Done {
 /// Where a failed command stopped: needed to classify writes.
 struct ExecError {
     err: ImapError,
-    /// True when every byte of the command (including literals) was written.
+    /// True when the command may have taken effect: all of it was written, or a whole literal may have reached the
+    /// server (which can act on an APPEND before reading the final CRLF).
     sent_all: bool,
 }
 
@@ -340,27 +523,46 @@ pub(crate) fn parse_internal_date(s: &str) -> Option<i64> {
     Some(dt.assume_utc().unix_timestamp() - sign * (zh * 3600 + zm * 60))
 }
 
-fn parse_uid_set(s: &str) -> Vec<u32> {
-    let mut out = Vec::new();
+/// Parses a UID set (`1:3,7,9:8`) into `out` as `(lo, hi)` pairs without expanding ranges. Returns false (and stops)
+/// once `out` holds `max` ranges. Malformed parts are skipped.
+fn parse_uid_ranges(s: &str, out: &mut Vec<(u32, u32)>, max: usize) -> bool {
     for part in s.split(',') {
-        match part.split_once(':') {
-            Some((a, b)) => {
-                if let (Ok(a), Ok(b)) = (a.parse::<u32>(), b.parse::<u32>()) {
-                    let (lo, hi) = (a.min(b), a.max(b));
-                    // Bounded: a hostile server cannot make us allocate billions of entries.
-                    if hi - lo <= 1_000_000 {
-                        out.extend(lo..=hi);
-                    }
-                }
-            }
-            None => {
-                if let Ok(u) = part.parse() {
-                    out.push(u);
-                }
-            }
+        let range = match part.split_once(':') {
+            Some((a, b)) => match (a.parse::<u32>(), b.parse::<u32>()) {
+                (Ok(a), Ok(b)) => (a.min(b), a.max(b)),
+                _ => continue,
+            },
+            None => match part.parse::<u32>() {
+                Ok(u) => (u, u),
+                Err(_) => continue,
+            },
+        };
+        if out.len() >= max {
+            return false;
+        }
+        out.push(range);
+    }
+    true
+}
+
+/// A `FETCH` response (tokens after the `*`) as its UID and upper-cased item names with values; `None` for other
+/// responses and FETCHes without a UID.
+fn fetch_items(t: &[Tok]) -> Option<(u32, Vec<(String, Tok)>)> {
+    let (Some(Tok::Atom(_)), Some(Tok::Atom(f)), Some(Tok::List(items))) = (t.first(), t.get(1), t.get(2)) else {
+        return None;
+    };
+    if !f.eq_ignore_ascii_case("FETCH") {
+        return None;
+    }
+    let mut kv = Vec::new();
+    let mut it = items.iter();
+    while let (Some(k), Some(v)) = (it.next(), it.next()) {
+        if let Some(k) = k.atom() {
+            kv.push((k.to_ascii_uppercase(), v.clone()));
         }
     }
-    out
+    let uid = kv.iter().find(|(k, _)| k == "UID").and_then(|(_, v)| v.num())?;
+    Some((uid, kv))
 }
 
 // ------------------------------------------------------------------ session
@@ -632,15 +834,23 @@ impl ImapSession {
     // ------------------------------------------------------------------ wire
 
     async fn write(&mut self, bytes: &[u8]) -> Result<(), ImapError> {
+        self.write_staged(bytes).await.map_err(|(e, _)| e)
+    }
+
+    /// Writes and flushes. On failure, also whether every byte had been handed to the stream (only the flush failed):
+    /// the peer may then have received all of them.
+    async fn write_staged(&mut self, bytes: &[u8]) -> Result<(), (ImapError, bool)> {
         let w = self.io.get_mut();
-        match tokio::time::timeout(self.timeout, async {
+        let mut handed_over = false;
+        let r = tokio::time::timeout(self.timeout, async {
             w.write_all(bytes).await?;
+            handed_over = true;
             w.flush().await
         })
-        .await
-        {
+        .await;
+        match r {
             Ok(Ok(())) => Ok(()),
-            _ => Err(ImapError::Network),
+            _ => Err((ImapError::Network, handed_over)),
         }
     }
 
@@ -684,11 +894,14 @@ impl ImapSession {
 
     /// Sends one allowlisted command and collects its untagged responses until the tagged completion.
     async fn exec(&mut self, op: ImapOp<'_>, max_literal: usize) -> Result<Done, ExecError> {
-        let max_line = match op {
-            ImapOp::UidSearchAll | ImapOp::UidSearchFrom(_) | ImapOp::UidFetchChangedSince { .. } => BIG_LINE,
-            _ => MAX_LINE,
+        let (max_line, metas) = match op {
+            ImapOp::UidSearchAll | ImapOp::UidSearchFrom(_) => (BIG_LINE, false),
+            ImapOp::UidFetchChangedSince { .. } => (BIG_LINE, true),
+            ImapOp::UidFetchMeta { .. } => (MAX_LINE, true),
+            _ => (MAX_LINE, false),
         };
         let fail = |err| ExecError { err, sent_all: false };
+        let mut literal_sent = false;
         if self.idle.is_some() {
             // Only DONE may follow IDLE (`idle_done`); anything else would be read as the end of IDLE.
             return Err(fail(ImapError::Protocol("session is idling")));
@@ -699,7 +912,7 @@ impl ImapSession {
         if !IMAP_VERBS.contains(&cmd.verb) {
             return Err(fail(ImapError::Protocol("command not allowlisted")));
         }
-        let mut untagged = Vec::new();
+        let mut col = Collected::new(max_literal.saturating_add(RETAINED), metas);
         let mut budget = max_literal.saturating_add(max_line).saturating_add(COMMAND_OVERHEAD);
         let mut buf: Zeroizing<Vec<u8>> = Zeroizing::new(format!("{tag} ").into_bytes());
         let mut sasl = None;
@@ -710,19 +923,24 @@ impl ImapSession {
                     buf.extend_from_slice(format!("{{{}}}\r\n", bytes.len()).as_bytes());
                     self.write(&buf).await.map_err(fail)?;
                     buf.clear();
-                    if let Some(d) = self.await_continuation(&tag, &mut untagged, &mut budget).await.map_err(fail)? {
-                        return Ok(d);
+                    if let Some((st, code)) =
+                        self.await_continuation(&tag, &mut col, &mut budget).await.map_err(fail)?
+                    {
+                        return Ok(col.done(st, code));
                     }
-                    self.write(&bytes).await.map_err(fail)?;
+                    // Once a literal may have arrived in full, a server can commit the command (an APPEND) before
+                    // it reads the final CRLF: any later failure leaves the outcome unknown.
+                    self.write_staged(&bytes).await.map_err(|(err, all)| ExecError { err, sent_all: all })?;
+                    literal_sent = true;
                 }
                 Part::Sasl(line) => sasl = Some(line),
             }
         }
         buf.extend_from_slice(b"\r\n");
-        self.write(&buf).await.map_err(fail)?;
+        self.write(&buf).await.map_err(|err| ExecError { err, sent_all: literal_sent })?;
         if let Some(line) = sasl {
-            if let Some(d) = self.await_continuation(&tag, &mut untagged, &mut budget).await.map_err(fail)? {
-                return Ok(d);
+            if let Some((st, code)) = self.await_continuation(&tag, &mut col, &mut budget).await.map_err(fail)? {
+                return Ok(col.done(st, code));
             }
             let mut l = Zeroizing::new(line.as_bytes().to_vec());
             l.extend_from_slice(b"\r\n");
@@ -731,57 +949,82 @@ impl ImapSession {
         let sent = |err| ExecError { err, sent_all: true };
         loop {
             let segs = self.read_response(max_literal, max_line, &mut budget).await.map_err(sent)?;
-            match self.classify(&tag, segs).map_err(sent)? {
-                Resp::Untagged(u) => {
-                    if untagged.len() >= MAX_UNTAGGED {
-                        return Err(sent(ImapError::Protocol("too many responses")));
-                    }
-                    untagged.push(u)
-                }
+            match self.classify(&tag, segs, &mut col).map_err(sent)? {
+                Resp::Untagged => {}
                 Resp::Continuation => return Err(sent(ImapError::Protocol("unexpected continuation"))),
-                Resp::Tagged(status, code) => return Ok(Done { status, code, untagged }),
+                Resp::Tagged(status, code) => return Ok(col.done(status, code)),
             }
         }
     }
 
-    /// Waits for `+`. Returns `Some(done)` if the server answered the command (NO/BAD) instead.
+    /// Waits for `+`. Returns the completion if the server answered the command (NO/BAD) instead.
     async fn await_continuation(
         &mut self,
         tag: &str,
-        untagged: &mut Vec<Untagged>,
+        col: &mut Collected,
         budget: &mut usize,
-    ) -> Result<Option<Done>, ImapError> {
+    ) -> Result<Option<(Status, Vec<Tok>)>, ImapError> {
         loop {
             let segs = self.read_response(SMALL_LITERAL, MAX_LINE, budget).await?;
-            match self.classify(tag, segs)? {
+            match self.classify(tag, segs, col)? {
                 Resp::Continuation => return Ok(None),
-                Resp::Untagged(_) if untagged.len() >= MAX_UNTAGGED => {
-                    return Err(ImapError::Protocol("too many responses"));
-                }
-                Resp::Untagged(u) => untagged.push(u),
-                Resp::Tagged(status, code) => {
-                    return Ok(Some(Done { status, code, untagged: std::mem::take(untagged) }));
-                }
+                Resp::Untagged => {}
+                Resp::Tagged(status, code) => return Ok(Some((status, code))),
             }
         }
     }
 
-    fn classify(&self, tag: &str, segs: Vec<Seg>) -> Result<Resp, ImapError> {
+    /// Classifies one response and keeps what it carries in `col`: number lists parsed from bytes, FETCH metadata
+    /// in compact form (when `col` collects it), everything else as tokens. All of it is charged to `col.mem`.
+    fn classify(&self, tag: &str, segs: Vec<Seg>, col: &mut Collected) -> Result<Resp, ImapError> {
         let first = match segs.first() {
-            Some(Seg::Text(t)) => t.clone(),
+            Some(Seg::Text(t)) => t,
             _ => return Err(ImapError::Protocol("malformed response")),
         };
         if first.starts_with(b"+") {
             return Ok(Resp::Continuation);
         }
-        let toks = tokenize(segs).ok_or(ImapError::Protocol("response nested too deeply"))?;
-        let head = toks.first().and_then(Tok::atom).unwrap_or_default().to_string();
-        if head == "*" {
+        if segs.len() == 1
+            && let Some((kind, rest)) = number_line(first)
+        {
+            match kind {
+                NumLine::Search => col.add_search(rest)?,
+                NumLine::Vanished => col.add_vanished(rest),
+            }
+            return Ok(Resp::Untagged);
+        }
+        // Only number lists may be longer than an ordinary line.
+        if segs.iter().any(|s| matches!(s, Seg::Text(t) if t.len() > MAX_LINE)) {
+            return Err(ImapError::Protocol("response line too long"));
+        }
+        let before = col.mem;
+        let mut toks = tokenize(segs, &mut col.mem)?;
+        if matches!(toks.first(), Some(Tok::Atom(a)) if a == "*") {
             if toks.get(1).and_then(Tok::atom).is_some_and(|a| a.eq_ignore_ascii_case("BYE")) {
                 return Err(ImapError::Network);
             }
-            return Ok(Resp::Untagged(Untagged(toks[1..].to_vec())));
+            toks.remove(0);
+            if col.metas.is_some()
+                && let Some((uid, kv)) = fetch_items(&toks)
+            {
+                // The tokens are dropped; only the compact form is kept and charged.
+                let meta = Self::meta_of(uid, &kv);
+                let has_size = kv.iter().any(|(k, _)| k == "RFC822.SIZE");
+                col.mem = before;
+                col.charge(
+                    std::mem::size_of::<(FetchedMeta, bool)>()
+                        + meta.flags.iter().map(|f| TOK_COST + f.len()).sum::<usize>(),
+                )?;
+                col.metas.get_or_insert_default().push((meta, has_size));
+                return Ok(Resp::Untagged);
+            }
+            if col.untagged.len() >= MAX_UNTAGGED {
+                return Err(ImapError::Protocol("too many responses"));
+            }
+            col.untagged.push(Untagged(toks));
+            return Ok(Resp::Untagged);
         }
+        let head = toks.first().and_then(Tok::atom).unwrap_or_default().to_string();
         if head == tag {
             let status = match toks.get(1).and_then(Tok::atom).map(str::to_ascii_uppercase).as_deref() {
                 Some("OK") => Status::Ok,
@@ -839,7 +1082,7 @@ impl ImapSession {
             });
             let delimiter = if delim.is_nil() { None } else { delim.text().and_then(|d| d.chars().next()) };
             out.push(FolderInfo {
-                name_utf8: utf7::decode(&raw).unwrap_or_else(|| raw.clone()),
+                name_utf8: utf7::display_name(&raw),
                 raw_name: raw,
                 delimiter,
                 special,
@@ -903,13 +1146,8 @@ impl ImapSession {
         Ok(st)
     }
 
-    fn search_result(d: &Done) -> Vec<u32> {
-        let mut out = Vec::new();
-        for Untagged(t) in &d.untagged {
-            if t.first().and_then(Tok::atom).is_some_and(|a| a.eq_ignore_ascii_case("SEARCH")) {
-                out.extend(t[1..].iter().filter_map(Tok::num::<u32>));
-            }
-        }
+    fn search_result(d: Done) -> Vec<u32> {
+        let mut out = d.search;
         out.sort_unstable();
         out.dedup();
         out
@@ -919,7 +1157,7 @@ impl ImapSession {
     pub async fn uid_search_all(&mut self) -> Result<Vec<u32>, ImapError> {
         self.selected()?;
         let d = self.simple(ImapOp::UidSearchAll, SMALL_LITERAL).await?;
-        Ok(Self::search_result(&d))
+        Ok(Self::search_result(d))
     }
 
     /// UIDs `>= uid` in the selected folder.
@@ -927,32 +1165,12 @@ impl ImapSession {
         self.selected()?;
         let d = self.simple(ImapOp::UidSearchFrom(uid), SMALL_LITERAL).await?;
         // `n:*` always matches the highest UID, even below n.
-        Ok(Self::search_result(&d).into_iter().filter(|u| *u >= uid).collect())
+        Ok(Self::search_result(d).into_iter().filter(|u| *u >= uid).collect())
     }
 
     /// FETCH responses as (uid, key/value items).
     fn fetches(d: &Done) -> Vec<(u32, Vec<(String, Tok)>)> {
-        let mut out = Vec::new();
-        for Untagged(t) in &d.untagged {
-            let (Some(Tok::Atom(_)), Some(Tok::Atom(f)), Some(Tok::List(items))) = (t.first(), t.get(1), t.get(2))
-            else {
-                continue;
-            };
-            if !f.eq_ignore_ascii_case("FETCH") {
-                continue;
-            }
-            let mut kv = Vec::new();
-            let mut it = items.iter();
-            while let (Some(k), Some(v)) = (it.next(), it.next()) {
-                if let Some(k) = k.atom() {
-                    kv.push((k.to_ascii_uppercase(), v.clone()));
-                }
-            }
-            if let Some(uid) = kv.iter().find(|(k, _)| k == "UID").and_then(|(_, v)| v.num()) {
-                out.push((uid, kv));
-            }
-        }
-        out
+        d.untagged.iter().filter_map(|Untagged(t)| fetch_items(t)).collect()
     }
 
     fn meta_of(uid: u32, kv: &[(String, Tok)]) -> FetchedMeta {
@@ -979,13 +1197,13 @@ impl ImapSession {
         }
         let modseq = self.condstore();
         let d = self.simple(ImapOp::UidFetchMeta { uids, modseq }, SMALL_LITERAL).await?;
-        let mut out: Vec<FetchedMeta> = Vec::new();
-        for (uid, kv) in Self::fetches(&d) {
-            if !uids.contains(&uid) || !kv.iter().any(|(k, _)| k == "RFC822.SIZE") {
-                continue; // unsolicited flag updates
-            }
-            out.push(Self::meta_of(uid, &kv));
-        }
+        let mut out: Vec<FetchedMeta> = d
+            .metas
+            .into_iter()
+            // Unsolicited flag updates carry no size.
+            .filter(|(m, has_size)| *has_size && uids.contains(&m.uid))
+            .map(|(m, _)| m)
+            .collect();
         out.sort_by_key(|m| m.uid);
         out.dedup_by_key(|m| m.uid);
         Ok(out)
@@ -1029,22 +1247,10 @@ impl ImapSession {
         }
         let vanished = self.qresync;
         let d = self.simple(ImapOp::UidFetchChangedSince { modseq, vanished }, SMALL_LITERAL).await?;
-        let mut changes = Changes { vanished: vanished.then(Vec::new), ..Default::default() };
-        for (uid, kv) in Self::fetches(&d) {
-            changes.changed.push(Self::meta_of(uid, &kv));
-        }
-        if let Some(v) = changes.vanished.as_mut() {
-            for Untagged(t) in &d.untagged {
-                if t.first().and_then(Tok::atom).is_some_and(|a| a.eq_ignore_ascii_case("VANISHED"))
-                    && let Some(set) = t.iter().skip(1).rev().find_map(Tok::atom)
-                {
-                    v.extend(parse_uid_set(set));
-                }
-            }
-            v.sort_unstable();
-            v.dedup();
-        }
-        Ok(changes)
+        Ok(Changes {
+            changed: d.metas.into_iter().map(|(m, _)| m).collect(),
+            vanished: if vanished { d.vanished } else { None },
+        })
     }
 
     /// Appends to the Drafts or Sent folder and returns the new UID from `APPENDUID`. A connection lost after the
@@ -1115,17 +1321,17 @@ impl ImapSession {
         self.tag += 1;
         let tag = format!("d{}", self.tag);
         self.write(format!("{tag} {}\r\n", cmd.text()).as_bytes()).await?;
-        let mut untagged = Vec::new();
+        let mut col = Collected::new(RETAINED, false);
         let mut budget = SMALL_LITERAL + MAX_LINE + COMMAND_OVERHEAD;
-        if self.await_continuation(&tag, &mut untagged, &mut budget).await?.is_some() {
+        if self.await_continuation(&tag, &mut col, &mut budget).await?.is_some() {
             return Err(ImapError::Capability("IDLE"));
         }
-        let changed = untagged.iter().any(|Untagged(t)| {
-            let a = t.first().and_then(Tok::atom).unwrap_or_default();
-            let b = t.get(1).and_then(Tok::atom).unwrap_or_default();
-            a.eq_ignore_ascii_case("VANISHED")
-                || ["EXISTS", "EXPUNGE", "FETCH"].iter().any(|k| b.eq_ignore_ascii_case(k))
-        });
+        let changed = !col.vanished.is_empty()
+            || !col.vanished_complete
+            || col.untagged.iter().any(|Untagged(t)| {
+                let b = t.get(1).and_then(Tok::atom).unwrap_or_default();
+                ["EXISTS", "EXPUNGE", "FETCH"].iter().any(|k| b.eq_ignore_ascii_case(k))
+            });
         self.idle = Some(IdleState { tag, line: Vec::new(), skip: 0, cont: None });
         Ok(changed)
     }
@@ -1222,7 +1428,8 @@ impl ImapSession {
 }
 
 enum Resp {
-    Untagged(Untagged),
+    /// Kept in the command's [`Collected`].
+    Untagged,
     Continuation,
     Tagged(Status, Vec<Tok>),
 }
@@ -1232,7 +1439,7 @@ mod tests {
     use super::*;
 
     fn toks(s: &str) -> Vec<Tok> {
-        tokenize(vec![Seg::Text(s.as_bytes().to_vec())]).unwrap()
+        tokenize(vec![Seg::Text(s.as_bytes().to_vec())], &mut usize::MAX.clone()).unwrap()
     }
 
     #[test]
@@ -1246,15 +1453,21 @@ mod tests {
             t[2],
             Tok::Code(vec![Tok::Atom("APPENDUID".into()), Tok::Atom("38505".into()), Tok::Atom("3955".into())])
         );
-        let t = tokenize(vec![
-            Seg::Text(b"* 1 FETCH (UID 5 BODY[] ".to_vec()),
-            Seg::Lit(b"a)b\"c".to_vec()),
-            Seg::Text(b")".to_vec()),
-        ])
+        let t = tokenize(
+            vec![
+                Seg::Text(b"* 1 FETCH (UID 5 BODY[] ".to_vec()),
+                Seg::Lit(b"a)b\"c".to_vec()),
+                Seg::Text(b")".to_vec()),
+            ],
+            &mut usize::MAX.clone(),
+        )
         .unwrap();
         // Deep nesting from a hostile server is refused instead of recursing without bound.
-        assert!(tokenize(vec![Seg::Text(format!("* {}", "(".repeat(100_000)).into_bytes())]).is_none());
-        assert!(tokenize(vec![Seg::Text(format!("* {}", "[".repeat(100_000)).into_bytes())]).is_none());
+        let deep = |c: &str| {
+            tokenize(vec![Seg::Text(format!("* {}", c.repeat(100_000)).into_bytes())], &mut usize::MAX.clone())
+        };
+        assert_eq!(deep("(").unwrap_err(), ImapError::Protocol("response nested too deeply"));
+        assert_eq!(deep("[").unwrap_err(), ImapError::Protocol("response nested too deeply"));
         assert_eq!(
             t[3],
             Tok::List(vec![
@@ -1269,7 +1482,7 @@ mod tests {
         assert_eq!(t[4], Tok::Str(b"a\"b".to_vec()));
     }
 
-    fn over_stream(io: tokio::io::DuplexStream) -> ImapSession {
+    fn over_stream(io: impl Io + 'static) -> ImapSession {
         ImapSession {
             io: BufReader::new(Box::new(io)),
             tag: 0,
@@ -1356,13 +1569,200 @@ mod tests {
         assert!(!s.is_idling());
     }
 
+    /// VANISHED sets stay ranges: a range wider than any mailbox costs one pair (and is not dropped), and the number
+    /// of pairs kept per command is capped.
+    #[test]
+    fn uid_ranges_are_never_expanded() {
+        let mut v = Vec::new();
+        assert!(parse_uid_ranges("4294967295:1", &mut v, 1));
+        let r = UidRanges::from_ranges(v);
+        assert_eq!(r.ranges(), &[(1, u32::MAX)]);
+        assert!(r.contains(3_000_000) && r.contains(u32::MAX) && !r.contains(0));
+        let r = UidRanges::from_ranges(vec![(5, 9), (1, 3), (4, 4), (20, 30), (25, 26), (1, 2)]);
+        assert_eq!(r.ranges(), &[(1, 9), (20, 30)]);
+        assert!(r.contains(1) && r.contains(9) && !r.contains(10) && r.contains(20) && !r.contains(31));
+        let hostile = ["1:1000000"; 10].join(",");
+        let mut v = Vec::new();
+        assert!(!parse_uid_ranges(&hostile, &mut v, 4));
+        assert_eq!(v.len(), 4);
+    }
+
+    fn condstore_session(io: tokio::io::DuplexStream) -> ImapSession {
+        let mut s = over_stream(io);
+        s.caps = vec!["IMAP4REV1".into(), "CONDSTORE".into(), "QRESYNC".into()];
+        s.qresync = true;
+        s.selected = Some(("INBOX".into(), true, FolderStatus { uidvalidity: 1, ..Default::default() }));
+        s
+    }
+
+    /// A `VANISHED (EARLIER)` range wider than a million UIDs still names the UIDs inside it; more ranges than
+    /// [`MAX_VANISHED_RANGES`] make the set incomplete (`None`) instead of growing without bound.
+    #[tokio::test]
+    async fn vanished_ranges_are_kept_and_bounded() {
+        let (client, server) = tokio::io::duplex(1 << 20);
+        let mut s = condstore_session(client);
+        let (_sr, mut sw) = tokio::io::split(server);
+        sw.write_all(
+            b"* VANISHED (EARLIER) 7,1:3000000\r\n* 1 FETCH (UID 3000001 FLAGS () MODSEQ (9))\r\nd1 OK done\r\n",
+        )
+        .await
+        .unwrap();
+        let ch = s.changed_since(1).await.unwrap();
+        let v = ch.vanished.unwrap();
+        assert_eq!(v.ranges(), &[(1, 3_000_000)]);
+        assert!(v.contains(2_500_000) && !v.contains(3_000_001));
+        assert_eq!(ch.changed.len(), 1);
+
+        let many: Vec<String> = (0..=MAX_VANISHED_RANGES as u32).map(|i| (2 * i + 1).to_string()).collect();
+        let feed = tokio::spawn(async move {
+            sw.write_all(format!("* VANISHED (EARLIER) {}\r\nd2 OK done\r\n", many.join(",")).as_bytes())
+                .await
+                .unwrap();
+            sw
+        });
+        let ch = s.changed_since(1).await.unwrap();
+        assert_eq!(ch.vanished, None, "over the cap: incomplete, the caller diffs instead");
+        feed.await.unwrap();
+    }
+
+    /// A selected CONDSTORE/QRESYNC session whose server answers with `resp` (written up front) and ignores input.
+    fn answering(resp: Vec<u8>) -> ImapSession {
+        let (client, server) = tokio::io::duplex(1 << 20);
+        tokio::spawn(async move {
+            let (mut r, mut w) = tokio::io::split(server);
+            let _ = w.write_all(&resp).await;
+            let mut sink = vec![0u8; 4096];
+            while matches!(r.read(&mut sink).await, Ok(n) if n > 0) {}
+        });
+        condstore_session(client)
+    }
+
+    fn lines(body: impl IntoIterator<Item = String>, done: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        for l in body {
+            out.extend_from_slice(l.as_bytes());
+            out.extend_from_slice(b"\r\n");
+        }
+        out.extend_from_slice(done.as_bytes());
+        out
+    }
+
+    /// `* SEARCH` lines are parsed from bytes into at most [`MAX_SEARCH_UIDS`] UIDs; only number lists may be longer
+    /// than [`MAX_LINE`], and no line longer than [`BIG_LINE`] is read.
+    #[tokio::test]
+    async fn number_lists_are_parsed_from_bytes_and_bounded() {
+        let mut s = answering(b"* SEARCH 3 1 2 3 (MODSEQ 917162500)\r\nd1 OK done\r\n".to_vec());
+        assert_eq!(s.uid_search_all().await.unwrap(), vec![1, 2, 3]);
+
+        let over = format!("* SEARCH{}", " 1".repeat(MAX_SEARCH_UIDS + 1));
+        let mut s = answering(lines([over], "d1 OK done\r\n"));
+        assert_eq!(s.uid_search_all().await.unwrap_err(), ImapError::Protocol("too many UIDs in a SEARCH response"));
+
+        // A FETCH is tokenized, so it must fit an ordinary line even while a SEARCH may use a big one.
+        let fetch = format!("* 1 FETCH (FLAGS ({}))", "\\a ".repeat(30_000));
+        assert!(fetch.len() > MAX_LINE);
+        let mut s = answering(lines([fetch], "d1 OK done\r\n"));
+        assert_eq!(s.uid_search_all().await.unwrap_err(), ImapError::Protocol("response line too long"));
+
+        // 1M UIDs of up to ten digits need about 11 MB; a 12 MB line is refused before it is parsed.
+        let padded = format!("* SEARCH 1{}", " ".repeat(12_000_000));
+        let mut s = answering(lines([padded], "d1 OK done\r\n"));
+        assert_eq!(s.uid_search_all().await.unwrap_err(), ImapError::Protocol("response line too long"));
+    }
+
+    /// Tokens kept for one command are charged against [`RETAINED`]: many ordinary lines of short atoms fail the
+    /// command instead of growing the token list (each line, and all bytes together, are within their caps).
+    #[tokio::test]
+    async fn retained_tokens_are_bounded_per_command() {
+        let line = format!("* OK {}", "a ".repeat(30_000));
+        assert!(line.len() < MAX_LINE);
+        let n = RETAINED / (TOK_COST * 30_000) + 2;
+        assert!(n * line.len() < COMMAND_OVERHEAD);
+        let mut s = answering(lines(std::iter::repeat_n(line, n), "d1 OK done\r\n"));
+        assert_eq!(s.noop().await.unwrap_err(), ImapError::Protocol("response over the memory limit"));
+        let t = tokenize(vec![Seg::Text(b"* a b c".to_vec())], &mut (3 * TOK_COST));
+        assert_eq!(t.unwrap_err(), ImapError::Protocol("response over the memory limit"));
+    }
+
+    /// A large CHANGEDSINCE result (a mass flag change) fits because FETCH responses are kept as metadata, not as
+    /// tokens (as tokens the same responses exceed [`RETAINED`]).
+    #[tokio::test]
+    async fn changed_since_keeps_compact_metadata() {
+        let n = 150_000u32;
+        assert!((n as usize) * 11 * TOK_COST > RETAINED);
+        let body = (1..=n).map(|u| format!("* {u} FETCH (UID {u} FLAGS (\\Seen) MODSEQ (5))"));
+        let mut s = answering(lines(body, "d1 OK done\r\n"));
+        let ch = s.changed_since(1).await.unwrap();
+        assert_eq!(ch.changed.len(), n as usize);
+        assert_eq!(ch.changed[n as usize - 1].flags, vec!["\\Seen".to_string()]);
+        assert_eq!(ch.changed[0].modseq, Some(5));
+    }
+
+    /// A stream that fails any write of exactly `fail_on` (reads come from the duplex peer).
+    struct FailWrite {
+        inner: tokio::io::DuplexStream,
+        fail_on: &'static [u8],
+    }
+
+    impl tokio::io::AsyncRead for FailWrite {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for FailWrite {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let me = self.get_mut();
+            if buf == me.fail_on {
+                return std::task::Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
+            }
+            std::pin::Pin::new(&mut me.inner).poll_write(cx, buf)
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        }
+    }
+
+    /// The final CRLF of an APPEND comes after the whole message: a server may already have stored it, so failing to
+    /// write the CRLF is `OutcomeUnknown`. Failing inside the message itself is still `NotDispatched`.
+    #[tokio::test]
+    async fn append_failing_after_the_literal_is_outcome_unknown() {
+        for (fail_on, want) in [(&b"\r\n"[..], ImapError::OutcomeUnknown), (&b"hello"[..], ImapError::NotDispatched)] {
+            let (client, server) = tokio::io::duplex(1 << 16);
+            let mut s = over_stream(FailWrite { inner: client, fail_on });
+            s.set_append_targets(Some("Drafts".into()), None);
+            let (_sr, mut sw) = tokio::io::split(server);
+            sw.write_all(b"+ go ahead\r\n").await.unwrap();
+            assert_eq!(s.append(AppendTarget::Drafts, &[], b"hello").await.unwrap_err(), want, "{fail_on:?}");
+        }
+    }
+
     #[test]
     fn internal_dates_and_sets() {
         assert_eq!(parse_internal_date("17-Jul-1996 02:44:25 -0700"), Some(837596665));
         assert_eq!(parse_internal_date(" 1-Jan-2026 00:00:00 +0000"), Some(1767225600));
         assert_eq!(parse_internal_date("garbage"), None);
         assert_eq!(parse_internal_date("17-Jul-1996 02:44:25 -\u{e9}00"), None);
-        assert_eq!(parse_uid_set("1:3,7,9:8"), vec![1, 2, 3, 7, 8, 9]);
+        let mut v = Vec::new();
+        assert!(parse_uid_ranges("1:3,7,9:8,x,5:y", &mut v, 10));
+        assert_eq!(v, vec![(1, 3), (7, 7), (8, 9)]);
         assert_eq!(literal_len(b"* 1 FETCH (BODY[] {123}"), Some(123));
         assert_eq!(literal_len(b"* OK {weird}"), None);
     }

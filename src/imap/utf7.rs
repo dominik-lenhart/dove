@@ -44,13 +44,21 @@ pub fn decode(s: &str) -> Option<String> {
             return None;
         }
         let decoded = String::from_utf16(&units).ok()?;
-        // A run must not encode printable ASCII (it would have a direct form).
-        if decoded.chars().any(|c| (' '..='~').contains(&c)) {
+        // A run must not encode printable ASCII (it would have a direct form), nor control characters (C0, DEL, C1):
+        // a folder name is shown to agents as a one-line label.
+        if decoded.chars().any(|c| (' '..='~').contains(&c) || c.is_control()) {
             return None;
         }
         out.push_str(&decoded);
     }
     Some(out)
+}
+
+/// The agent-visible name of a folder: decoded, or the raw name when it is malformed. Never contains control
+/// characters: [`decode`] refuses them and the fallback replaces them with U+FFFD. The raw name stays the one used
+/// on the wire.
+pub fn display_name(raw: &str) -> String {
+    decode(raw).unwrap_or_else(|| raw.chars().map(|c| if c.is_control() { '\u{FFFD}' } else { c }).collect())
 }
 
 /// Encodes a UTF-8 name for use on the wire.
@@ -121,5 +129,16 @@ mod tests {
         assert_eq!(decode("&AGE-"), None); // encodes ASCII 'a'
         assert_eq!(decode("&A*w-"), None);
         assert_eq!(decode("Entw\u{fc}rfe"), None); // raw 8-bit
+    }
+
+    /// Encoded control characters (a line feed, CR, C1 NEL) would let a server forge lines inside a label.
+    #[test]
+    fn controls_never_reach_a_name() {
+        for raw in ["Evil&AAo-Folder", "a&AA0ACg-b", "x&AIU-y", "&AH8-"] {
+            assert_eq!(decode(raw), None, "{raw}");
+            assert_eq!(display_name(raw), raw);
+        }
+        assert_eq!(display_name("bad\r\nname\u{85}"), "bad\u{FFFD}\u{FFFD}name\u{FFFD}");
+        assert_eq!(display_name("Entw&APw-rfe"), "Entwürfe");
     }
 }

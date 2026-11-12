@@ -211,3 +211,19 @@ cargo fmt
   uses `debug = "line-tables-only"` and no debug info for dependencies: a fresh target with all test binaries is
   ~5 GB. Old target dirs grow past 30 GB; `cargo clean` them now and then. Copying a target dir to seed a worktree
   is slower than building.
+- 2026-11-12: IMAP response memory (`src/imap/session.rs`): `* SEARCH` / `* VANISHED` lines are parsed from bytes
+  (never tokenized) and are the only lines allowed past `MAX_LINE` (up to `BIG_LINE`). Everything a command keeps goes
+  into `Collected` and is charged to one budget (literal cap + `RETAINED`); flag/size FETCHes become `FetchedMeta` on
+  arrival. VANISHED stays `UidRanges` (never expand a range; look known UIDs up in it). Session unit tests fake a
+  server with `answering(bytes)` / `over_stream(io)`; a write failure can be injected with a wrapping `Io`.
+- 2026-11-12: Upstream priorities: `ImapPool::with_session` is interactive, `with_session_prio(.., Background, ..)`
+  (index sync) also takes the gateway's background slot. Tests exhaust it with
+  `app.google.gateway().background_limit().acquire_many_owned(..)`. One IMAP sync scan or fetch batch is bounded by
+  `index.imap_step_timeout_secs`; `Fault::Delay` on `EXAMINE` makes a scan slow without tripping the command timeout.
+- 2026-11-12: IMAP thread ids hash root Message-ID + `mail::thread_subject` (PLAN A47); changing the formula needs an
+  index migration that rebuilds IMAP generations (V5 pattern), since stored rows lack the References root. Every
+  server-provided label (folder, keyword) goes through `mail::label_text`; agent-visible folder names come only from
+  `utf7::display_name`.
+- 2026-11-12: A shell wait loop `until ! pgrep -f "<cmd>"` matches its own command line and never ends; wait on cargo
+  in the foreground instead. `cargo test --test a --test b` stops at the first failing binary, so a mutation run
+  over several files can skip the test meant to catch it: run that file alone (or `--no-fail-fast`).

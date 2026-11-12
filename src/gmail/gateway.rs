@@ -229,6 +229,11 @@ impl Gateway {
         self.global.clone()
     }
 
+    /// The background sub-limit of the global one, shared with the IMAP pool.
+    pub fn background_limit(&self) -> Arc<Semaphore> {
+        self.background.clone()
+    }
+
     fn mailbox_sem(&self, account_id: &str) -> Arc<Semaphore> {
         let mut map = self.per_mailbox.lock().expect("lock");
         map.entry(account_id.to_string()).or_insert_with(|| Arc::new(Semaphore::new(self.per_mailbox_limit))).clone()

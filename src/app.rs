@@ -76,7 +76,7 @@ impl App {
         );
         let imap =
             ImapPool::new(imap_connector, std::time::Duration::from_secs(cfg.limits.upstream_request_timeout_secs))
-                .with_global_limit(gateway.global_limit());
+                .with_global_limit(gateway.global_limit(), gateway.background_limit());
         Ok(Arc::new(Self {
             google: Google::new(gateway, tokens),
             imap,

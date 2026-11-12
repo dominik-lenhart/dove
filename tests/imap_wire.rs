@@ -130,6 +130,54 @@ async fn pool_discards_broken_session() {
     assert_eq!(f.connections(), 3);
 }
 
+/// Background work (index sync) holds a slot of the background sub-limit as well as a global one: with every
+/// background slot taken, more background work waits and gives up as not dispatched, while an interactive call still
+/// gets the reserved global slot.
+#[tokio::test]
+async fn pool_background_work_leaves_interactive_slots() {
+    use dove::gmail::gateway::Priority;
+    use std::sync::Arc;
+    use tokio::sync::Semaphore;
+    let f = FakeImap::start().await;
+    f.add_user(USER, PASS);
+    let (global, background) = (Arc::new(Semaphore::new(4)), Arc::new(Semaphore::new(3)));
+    let pool = Arc::new(
+        ImapPool::new(ImapConnector::plaintext_for_tests(), Duration::from_millis(400))
+            .with_global_limit(global, background),
+    );
+    let release = Arc::new(Semaphore::new(0));
+    let (held_tx, mut held_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut holders = Vec::new();
+    for i in 0..3 {
+        let (pool, release, held_tx, ep) = (pool.clone(), release.clone(), held_tx.clone(), ep(f.imap_addr));
+        holders.push(tokio::spawn(async move {
+            let acct = format!("sync{i}");
+            pool.with_session_prio(&acct, &ep, &creds(PASS), Priority::Background, move |s| {
+                Box::pin(async move {
+                    s.noop().await?;
+                    let _ = held_tx.send(());
+                    let _ = release.acquire_owned().await;
+                    Ok(())
+                })
+            })
+            .await
+        }));
+    }
+    for _ in 0..3 {
+        held_rx.recv().await.unwrap();
+    }
+    let noop = |prio, acct: &'static str| {
+        let (pool, ep) = (pool.clone(), ep(f.imap_addr));
+        async move { pool.with_session_prio(acct, &ep, &creds(PASS), prio, |s| Box::pin(s.noop())).await }
+    };
+    assert_eq!(noop(Priority::Background, "sync9").await.unwrap_err(), ImapError::NotDispatched);
+    noop(Priority::Interactive, "agent").await.unwrap();
+    release.add_permits(3);
+    for h in holders {
+        h.await.unwrap().unwrap();
+    }
+}
+
 async fn pool_fetch(pool: &ImapPool, f: &FakeImap, uid: u32) -> Result<Option<Vec<u8>>, ImapError> {
     pool.with_session("acct", &ep(f.imap_addr), &creds(PASS), |s| {
         Box::pin(async move {
@@ -239,6 +287,6 @@ async fn changed_since_reports_flags_and_vanished() {
     assert_eq!(ch.changed.len(), 1);
     assert_eq!(ch.changed[0].uid, a);
     assert!(ch.changed[0].flags.contains(&"\\Seen".to_string()));
-    assert_eq!(ch.vanished, Some(vec![b]));
+    assert_eq!(ch.vanished.unwrap().ranges(), &[(b, b)]);
     assert_eq!(s.uid_search_since_uid(b + 10).await.unwrap(), Vec::<u32>::new());
 }

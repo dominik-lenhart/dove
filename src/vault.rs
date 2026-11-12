@@ -124,8 +124,7 @@ impl Vault {
     fn open_kind(&self, account_id: &str, kind: &str, sealed: &SealedGrant) -> anyhow::Result<Zeroizing<String>> {
         let dek = self.unwrap_dek(account_id, sealed)?;
         let pt = open(&dek, &aad(kind, account_id, sealed.kek_version), &sealed.nonce, &sealed.ciphertext)?;
-        let s = String::from_utf8(pt.to_vec()).map_err(|_| anyhow!("sealed secret is not UTF-8"))?;
-        Ok(Zeroizing::new(s))
+        utf8_secret(pt)
     }
 
     /// Re-wraps a grant under the current KEK version (`dove keys rotate`). The DEK itself is kept; the refresh token
@@ -155,9 +154,31 @@ impl Vault {
     }
 }
 
+/// Turns decrypted bytes into a string without copying them: the buffer itself becomes the string, and invalid UTF-8
+/// hands it back to be wiped (a copy, or a dropped `FromUtf8Error`, would leave the secret in freed memory).
+fn utf8_secret(mut pt: Zeroizing<Vec<u8>>) -> anyhow::Result<Zeroizing<String>> {
+    match String::from_utf8(std::mem::take(&mut *pt)) {
+        Ok(s) => Ok(Zeroizing::new(s)),
+        Err(e) => {
+            drop(Zeroizing::new(e.into_bytes()));
+            bail!("sealed secret is not UTF-8")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The opened secret keeps the allocation it was decrypted into: no unwiped copy is made on the way to a string.
+    #[test]
+    fn utf8_secret_reuses_the_decrypted_buffer() {
+        let pt = Zeroizing::new(b"app password".to_vec());
+        let at = pt.as_ptr();
+        let s = utf8_secret(pt).unwrap();
+        assert_eq!((s.as_str(), s.as_ptr()), ("app password", at));
+        assert!(utf8_secret(Zeroizing::new(vec![b'a', 0xff])).is_err());
+    }
 
     fn vault() -> Vault {
         Vault::new(KeyRing::single(1, util::random_bytes()))

@@ -202,6 +202,9 @@ pub struct IndexConfig {
     pub imap_idle: bool,
     /// Seconds after which IDLE is ended and re-issued (clamped to 1..=1500, RFC 2177 asks for under 29 min).
     pub idle_renew_secs: u64,
+    /// Wall-clock limit of one IMAP sync step (a scan of all folders, or one fetch batch). Work finished before it is
+    /// kept; the job then fails and retries at the next poll.
+    pub imap_step_timeout_secs: u64,
 }
 
 impl Default for IndexConfig {
@@ -217,6 +220,7 @@ impl Default for IndexConfig {
             list_page_size: 500,
             imap_idle: true,
             idle_renew_secs: 1500,
+            imap_step_timeout_secs: 300,
         }
     }
 }

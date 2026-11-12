@@ -10,6 +10,7 @@ use super::session::{FolderInfo, ImapSession, Special};
 use super::{Credentials, ImapError, ServerEndpoint, utf7};
 use crate::app::App;
 use crate::error::{ToolError, internal_from};
+use crate::gmail::gateway::Priority;
 use crate::util;
 use crate::vault::SealedGrant;
 
@@ -66,7 +67,7 @@ pub fn load_folders(conn: &Connection, account_id: &str) -> anyhow::Result<Vec<F
         let special: Option<String> = r.get(2)?;
         Ok(Folder {
             folder_id: r.get(0)?,
-            name_utf8: utf7::decode(&name).unwrap_or_else(|| name.clone()),
+            name_utf8: utf7::display_name(&name),
             name,
             special: special.as_deref().and_then(Special::parse),
         })
@@ -228,11 +229,19 @@ pub async fn with_session<T, F>(app: &App, account_id: &str, f: F) -> Result<T, 
 where
     F: for<'s> FnOnce(&'s mut ImapSession) -> SessionFuture<'s, T>,
 {
+    with_session_prio(app, account_id, Priority::Interactive, f).await
+}
+
+/// [`with_session`] for background work (index sync): it also holds a slot of the background sub-limit.
+pub async fn with_session_prio<T, F>(app: &App, account_id: &str, prio: Priority, f: F) -> Result<T, ToolError>
+where
+    F: for<'s> FnOnce(&'s mut ImapSession) -> SessionFuture<'s, T>,
+{
     let (settings, creds) = load(app, account_id).await?;
     let (drafts, sent) = (settings.drafts_folder.clone(), settings.sent_folder.clone());
     let r = app
         .imap
-        .with_session(account_id, &settings.imap, &creds, move |s| {
+        .with_session_prio(account_id, &settings.imap, &creds, prio, move |s| {
             s.set_append_targets(drafts, sent);
             f(s)
         })
