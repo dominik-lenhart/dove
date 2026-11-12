@@ -304,6 +304,10 @@ pub fn with_quote(body: &str, orig: &Fetched) -> String {
         None => format!("{who} wrote:"),
     };
     let text = original_text(orig);
+    if text.is_empty() {
+        // Nothing to quote: no dangling attribution line.
+        return body.to_string();
+    }
     let (text, truncated) = cut(&text, QUOTE_MAX_BYTES);
     let mut quoted: Vec<String> =
         text.lines().map(|l| if l.is_empty() { ">".to_string() } else { format!("> {l}") }).collect();
@@ -367,8 +371,9 @@ Hallo,\r\n\r\nwie besprochen.\r\n> alt\r\n";
             "Danke!\n\nOn Tue, 14 Nov 2023 22:13:20 +0000, Jane Doe <jane@example.org> wrote:\n> Hallo,\n>\n\
 > wie besprochen.\n> > alt\n"
         );
-        // Empty agent text: the quote starts the body.
+        // Empty agent text: the quote starts the body. An original without text adds nothing.
         assert!(with_quote("", &f).starts_with("On Tue"));
+        assert_eq!(with_quote("Hi\n", &fetched("From: a@example.org\r\n\r\n \r\n")), "Hi\n");
         // An encoded CR/LF in the subject cannot become a header line.
         let s = forward_subject(f.parsed.subject.as_deref());
         assert!(!s.contains('\r') && !s.contains('\n'), "{s:?}");
