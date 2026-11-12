@@ -110,8 +110,8 @@ pub struct OwnDraftUid {
 }
 
 impl OwnDraftUid {
-    /// Only `tools::drafts` may call this, after checking the `own_drafts` record and a fresh content hash.
-    #[allow(dead_code)] // the IMAP drafts tools are the only caller
+    /// Only `tools::drafts_imap` may call this, after checking the `own_drafts` record, a fresh content hash and the
+    /// Drafts folder (`tests/imap_drafts_e2e.rs` enforces the single caller).
     pub(crate) fn new_for_drafts(uidvalidity: u32, uid: u32) -> Self {
         Self { uidvalidity, uid }
     }

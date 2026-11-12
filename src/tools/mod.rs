@@ -3,6 +3,7 @@
 pub mod attachments;
 pub mod batch;
 pub mod drafts;
+pub mod drafts_imap;
 pub mod read;
 pub mod search;
 

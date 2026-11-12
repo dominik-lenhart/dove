@@ -19,7 +19,7 @@ use crate::error::{ErrorCode, ToolError};
 use crate::gmail::WriteError;
 use crate::gmail::gateway::{GmailOp, Priority, SendPermit};
 use crate::mime::{self, Addr, DraftFields};
-use crate::policy::{Capability, Mailbox};
+use crate::policy::{Capability, Mailbox, Provider};
 use crate::util;
 
 /// Per-(account, draft) async locks so Dove operations on one draft never interleave.
@@ -113,7 +113,9 @@ pub fn defs() -> Vec<ToolDef> {
                 }, "required": ["account", "draft_id", "expected_revision"], "additionalProperties": false })
             },
             output_schema: || {
-                object_schema(json!({ "sent_message_id": {"type":"string"}, "thread_id": {"type":"string"} }))
+                object_schema(
+                    json!({ "sent_message_id": {"type":["string","null"]}, "thread_id": {"type":["string","null"]} }),
+                )
             },
             handler: |cx, args| Box::pin(send_draft(cx, args)),
         },
@@ -313,7 +315,7 @@ async fn create_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError>
     let result = dispatch_create(cx, &mb, to, cc, bcc, subject_arg, body, reply_to, from_arg).await;
     let (cid, aid, key) = (cx.client.client_id.clone(), mb.account_id.clone(), request_key.to_string());
     match result {
-        Ok((draft_id, message_id, thread_id)) => {
+        Ok(Created { draft_id, message_id, thread_id, content_hash }) => {
             let out = json!({ "account": mb.alias, "draft_id": draft_id, "message_id": message_id, "thread_id": thread_id, "revision": message_id });
             let (o2, pid, client_id) = (out.clone(), cx.client.project_id.clone(), cx.client.client_id.clone());
             let (d2, m2, t2) = (draft_id.clone(), message_id.clone(), thread_id.clone());
@@ -324,9 +326,9 @@ async fn create_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError>
                     let tx = c.transaction()?;
                     let now = util::now_unix();
                     tx.execute(
-                        "INSERT INTO own_drafts(account_id, draft_id, message_id, thread_id, project_id, client_id, created_at, updated_at, state) \
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, 'active')",
-                        params![aid, d2, m2, t2, pid, client_id, now],
+                        "INSERT INTO own_drafts(account_id, draft_id, message_id, thread_id, project_id, client_id, created_at, updated_at, state, content_hash) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, 'active', ?8)",
+                        params![aid, d2, m2, t2, pid, client_id, now, content_hash],
                     )?;
                     tx.execute(
                         "UPDATE create_operations SET state = 'succeeded', result_ids = ?1, updated_at = ?2 \
@@ -338,7 +340,7 @@ async fn create_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError>
                 })
                 .await;
             if commit.is_err() {
-                // Google created the draft but Dove could not record it: the caller must verify the mailbox.
+                // The provider created the draft but Dove could not record it: the caller must verify the mailbox.
                 return Err(ToolError::new(ErrorCode::OutcomeUnknown, "the draft may exist but could not be recorded"));
             }
             crate::index::wake(&cx.app, &mb.account_id);
@@ -381,7 +383,15 @@ async fn create_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError>
     }
 }
 
-/// Builds and posts the draft. The bool in the error says whether the create request may have reached Google.
+/// A created draft as recorded in `own_drafts`. `content_hash` is set for IMAP drafts only.
+pub(super) struct Created {
+    pub draft_id: String,
+    pub message_id: String,
+    pub thread_id: String,
+    pub content_hash: Option<Vec<u8>>,
+}
+
+/// Builds and posts the draft. The bool in the error says whether the create request may have reached the provider.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_create(
     cx: &ToolCx,
@@ -393,9 +403,13 @@ async fn dispatch_create(
     body: String,
     reply_to: Option<String>,
     from_arg: Option<Addr>,
-) -> Result<(String, String, String), (ToolError, bool)> {
+) -> Result<Created, (ToolError, bool)> {
     let pre = |e: ToolError| (e, false);
-    let send_as = send_as_addresses(cx, mb).await.map_err(pre)?;
+    let send_as = match mb.provider {
+        Provider::Gmail => send_as_addresses(cx, mb).await.map_err(pre)?,
+        // No send-as aliases on IMAP: the mailbox address is the only sender (design "Send").
+        Provider::Imap => vec![Addr { email: mb.email.to_lowercase(), name: None }],
+    };
     let from = match from_arg {
         Some(f) => send_as
             .iter()
@@ -450,6 +464,9 @@ async fn dispatch_create(
         date: util::now_unix(),
     };
     let raw = mime::build_draft(&fields).map_err(|e| pre(mime_err(e)))?;
+    if mb.provider == Provider::Imap {
+        return super::drafts_imap::append_new(cx, mb, raw).await;
+    }
     let mut message = json!({ "raw": util::b64url(&raw) });
     if let Some(t) = &thread_id {
         message["threadId"] = json!(t);
@@ -466,14 +483,21 @@ async fn dispatch_create(
         .ok_or_else(|| (ToolError::new(ErrorCode::OutcomeUnknown, "unexpected Gmail response"), true))?;
     let message_id = v["message"]["id"].as_str().unwrap_or_default();
     let thread = v["message"]["threadId"].as_str().unwrap_or_default();
-    Ok((draft_id.to_string(), message_id.to_string(), thread.to_string()))
+    Ok(Created {
+        draft_id: draft_id.to_string(),
+        message_id: message_id.to_string(),
+        thread_id: thread.to_string(),
+        content_hash: None,
+    })
 }
 
 // ------------------------------------------------------------------ update / send common
 
-struct OwnRow {
-    message_id: String,
-    state: String,
+pub(super) struct OwnRow {
+    pub message_id: String,
+    pub state: String,
+    /// SHA-256 of the server's bytes (IMAP drafts only).
+    pub content_hash: Option<Vec<u8>>,
 }
 
 async fn own_row(cx: &ToolCx, mb: &Mailbox, draft_id: &str) -> Result<OwnRow, ToolError> {
@@ -483,9 +507,9 @@ async fn own_row(cx: &ToolCx, mb: &Mailbox, draft_id: &str) -> Result<OwnRow, To
         .store
         .call(move |c| {
             Ok(c.query_row(
-                "SELECT message_id, state FROM own_drafts WHERE account_id = ?1 AND draft_id = ?2 AND project_id = ?3",
+                "SELECT message_id, state, content_hash FROM own_drafts WHERE account_id = ?1 AND draft_id = ?2 AND project_id = ?3",
                 params![aid, did, pid],
-                |r| Ok(OwnRow { message_id: r.get(0)?, state: r.get(1)? }),
+                |r| Ok(OwnRow { message_id: r.get(0)?, state: r.get(1)?, content_hash: r.get(2)? }),
             )
             .optional()?)
         })
@@ -561,7 +585,13 @@ async fn update_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError>
     let _guard = lock.lock().await;
     // Re-read ownership under the lock: a concurrent Dove edit may have moved the revision.
     let own = own_row(cx, &mb, &draft_id).await?;
-    let f = fresh_checked(cx, &mb, &draft_id, &own, &expected).await?;
+    let (f, imap_id) = match mb.provider {
+        Provider::Gmail => (fresh_checked(cx, &mb, &draft_id, &own, &expected).await?, None),
+        Provider::Imap => {
+            let c = super::drafts_imap::fresh_checked(cx, &mb, &own, &expected).await?;
+            (c.fetched, Some(c.id))
+        }
+    };
     if !f.parsed.is_simple_text {
         return Err(conflict(&f, "the draft has parts Dove cannot preserve (HTML or attachments)"));
     }
@@ -587,44 +617,18 @@ async fn update_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError>
     }
     fields.date = util::now_unix();
     let raw = mime::build_draft(&fields).map_err(mime_err)?;
-    let mut message = json!({ "raw": util::b64url(&raw) });
-    if !f.meta.thread_id.is_empty() {
-        message["threadId"] = json!(f.meta.thread_id);
-    }
-    let body = json!({ "id": draft_id, "message": message });
-    let did = draft_id.clone();
-    let res = cx
-        .app
-        .google
-        .write(&mb.account_id, || GmailOp::UpdateDraft(&did), &body, cx.deadline)
-        .await
-        .map_err(|e| e.error);
+    let res = match imap_id {
+        None => gmail_update(cx, &mb, &draft_id, &f, raw).await,
+        Some(old) => super::drafts_imap::replace(cx, &mb, &draft_id, old, raw).await.map(|(r, t)| (r, json!(t))),
+    };
     let (aid, d2) = (mb.account_id.clone(), draft_id.clone());
     match res {
-        Ok(v) => {
-            let new_rev = v["message"]["id"].as_str().unwrap_or_default().to_string();
-            let nr = new_rev.clone();
-            let ok = cx
-                .app
-                .store
-                .call(move |c| {
-                    Ok(c.execute(
-                        "UPDATE own_drafts SET message_id = ?1, updated_at = ?2 WHERE account_id = ?3 AND draft_id = ?4",
-                        params![nr, util::now_unix(), aid, d2],
-                    )?)
-                })
-                .await;
-            if ok.is_err() {
-                return Err(ToolError::new(
-                    ErrorCode::OutcomeUnknown,
-                    "the draft was updated but the new revision could not be recorded",
-                ));
-            }
+        Ok((new_rev, thread_id)) => {
             crate::index::wake(&cx.app, &mb.account_id);
             Ok(ToolOutput {
                 extra: Vec::new(),
                 text: format!("Updated draft {draft_id} (revision {new_rev})."),
-                structured: json!({ "account": mb.alias, "draft_id": draft_id, "revision": new_rev, "message_id": new_rev, "thread_id": v["message"]["threadId"] }),
+                structured: json!({ "account": mb.alias, "draft_id": draft_id, "revision": new_rev, "message_id": new_rev, "thread_id": thread_id }),
                 audit: AuditInfo {
                     account: Some(mb.alias.clone()),
                     object_ids: vec![draft_id],
@@ -648,6 +652,46 @@ async fn update_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError>
         }
         Err(e) => Err(e),
     }
+}
+
+/// Gmail `drafts.update` and the new revision's record. Returns (new revision, thread id).
+async fn gmail_update(
+    cx: &ToolCx,
+    mb: &Mailbox,
+    draft_id: &str,
+    f: &super::read::Fetched,
+    raw: Vec<u8>,
+) -> Result<(String, Value), ToolError> {
+    let mut message = json!({ "raw": util::b64url(&raw) });
+    if !f.meta.thread_id.is_empty() {
+        message["threadId"] = json!(f.meta.thread_id);
+    }
+    let body = json!({ "id": draft_id, "message": message });
+    let v = cx
+        .app
+        .google
+        .write(&mb.account_id, || GmailOp::UpdateDraft(draft_id), &body, cx.deadline)
+        .await
+        .map_err(|e| e.error)?;
+    let new_rev = v["message"]["id"].as_str().unwrap_or_default().to_string();
+    let (nr, aid, d2) = (new_rev.clone(), mb.account_id.clone(), draft_id.to_string());
+    let ok = cx
+        .app
+        .store
+        .call(move |c| {
+            Ok(c.execute(
+                "UPDATE own_drafts SET message_id = ?1, updated_at = ?2 WHERE account_id = ?3 AND draft_id = ?4",
+                params![nr, util::now_unix(), aid, d2],
+            )?)
+        })
+        .await;
+    if ok.is_err() {
+        return Err(ToolError::new(
+            ErrorCode::OutcomeUnknown,
+            "the draft was updated but the new revision could not be recorded",
+        ));
+    }
+    Ok((new_rev, v["message"]["threadId"].clone()))
 }
 
 // ------------------------------------------------------------------ send
@@ -677,7 +721,14 @@ async fn send_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
             "this draft is already being sent or has an unknown outcome",
         ));
     }
-    let _f = fresh_checked(cx, &mb, &draft_id, &own, &expected).await?;
+    // IMAP: fresh check, envelope and credentials are prepared before the send is claimed.
+    let imap = match mb.provider {
+        Provider::Gmail => {
+            fresh_checked(cx, &mb, &draft_id, &own, &expected).await?;
+            None
+        }
+        Provider::Imap => Some(super::drafts_imap::prepare_send(cx, &mb, &own, &expected).await?),
+    };
 
     // Recheck policy immediately before dispatch from the durable store (spec 6.3).
     let (cid, aid) = (cx.client.client_id.clone(), mb.account_id.clone());
@@ -718,12 +769,21 @@ async fn send_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
     if claimed != 1 {
         return Err(ToolError::new(ErrorCode::DraftConflict, "the draft changed while preparing to send"));
     }
-    let body = json!({ "id": draft_id });
-    let res = cx.app.google.write(&mb.account_id, || GmailOp::SendDraft(SendPermit(())), &body, cx.deadline).await;
+    let res: Result<(Option<String>, Value), ToolError> = match &imap {
+        None => {
+            let body = json!({ "id": draft_id });
+            cx.app
+                .google
+                .write(&mb.account_id, || GmailOp::SendDraft(SendPermit(())), &body, cx.deadline)
+                .await
+                .map(|v| (v["id"].as_str().map(str::to_string), v["threadId"].clone()))
+                .map_err(|WriteError { error, .. }| error)
+        }
+        Some(p) => super::drafts_imap::submit(cx, &mb, p).await.map(|()| (None, json!(p.thread_id))),
+    };
     let (aid, did) = (mb.account_id.clone(), draft_id.clone());
     match res {
-        Ok(v) => {
-            let sent_id = v["id"].as_str().unwrap_or_default().to_string();
+        Ok((sent_id, thread_id)) => {
             let s2 = sent_id.clone();
             let _ = cx
                 .app
@@ -735,21 +795,31 @@ async fn send_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
                     )?)
                 })
                 .await;
+            // IMAP: the Sent copy and the draft's removal happen only after the send is recorded.
+            let sent_id = match imap {
+                Some(p) => super::drafts_imap::after_send(cx, &mb, &draft_id, p).await,
+                None => sent_id,
+            };
             crate::index::wake(&cx.app, &mb.account_id);
+            let mut ids = vec![draft_id.clone()];
+            ids.extend(sent_id.clone());
             Ok(ToolOutput {
                 extra: Vec::new(),
-                text: format!("Sent draft {draft_id} as message {sent_id}."),
-                structured: json!({ "account": mb.alias, "draft_id": draft_id, "sent_message_id": sent_id, "thread_id": v["threadId"] }),
+                text: match &sent_id {
+                    Some(s) => format!("Sent draft {draft_id} as message {s}."),
+                    None => format!("Sent draft {draft_id}."),
+                },
+                structured: json!({ "account": mb.alias, "draft_id": draft_id, "sent_message_id": sent_id, "thread_id": thread_id }),
                 audit: AuditInfo {
                     account: Some(mb.alias.clone()),
-                    object_ids: vec![draft_id, sent_id],
+                    object_ids: ids,
                     result_count: Some(1),
                     ..Default::default()
                 },
             })
         }
-        Err(WriteError { error: e, .. }) => {
-            // Not dispatched or definitively rejected (4xx): safe to retry. Anything uncertain blocks resubmission.
+        Err(e) => {
+            // Not dispatched or definitively rejected: safe to retry. Anything uncertain blocks resubmission.
             let definitive = e.code != ErrorCode::OutcomeUnknown;
             let state = if definitive { "active" } else { "send_unknown" };
             let _ = cx

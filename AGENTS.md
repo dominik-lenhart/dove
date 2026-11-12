@@ -174,3 +174,16 @@ cargo fmt
   store (`imap_folders`), not in the index.
 - 2026-11-12: `source:"gmail"` naming an IMAP mailbox is `invalid_argument`; without an account list IMAP mailboxes show
   up in `account_errors`. Index text operators are `terms`, `phrase`, `prefix` (there is no `contains`).
+- 2026-11-12: IMAP drafts (`src/tools/drafts_imap.rs`): `own_drafts.message_id` is the `f<folder>-<uidvalidity>-<uid>`
+  id (also the revision), `content_hash` the SHA-256 of the bytes the server returns after `APPEND` (never Dove's own
+  bytes: servers rewrite). Ownership needs record + same Drafts folder id + UID present + hash match; anything else is
+  `draft_conflict`. The previous UID is deleted only after the new revision is recorded, never after an unknown
+  `APPEND`. `OwnDraftUid::new_for_drafts` has exactly one caller (`drafts_imap.rs`), enforced by a source scan in
+  `tests/imap_drafts_e2e.rs`; its `deletions()` helper checks every `UID STORE`/`UID EXPUNGE` in the fake's log.
+  Non-owned IMAP drafts use their message id as `draft_id`; `list_drafts` pages by UID (`page_token` = next upper bound).
+- 2026-11-12: IMAP send: SMTP gets the draft's server bytes without `Bcc` (`mime::without_header`), envelope recipients
+  from To/Cc/Bcc, envelope sender the account address. Only a lost reply after the final `.` is `send_unknown`; any
+  SMTP refusal (code in `details.smtp_code`) returns the draft to `active`. After `sent` is recorded, Dove files the
+  draft's bytes (Bcc kept) in Sent with `\Seen` unless `save_sent_copy` is false, then deletes its draft; both are best
+  effort and reported once. SMTP framing always ends DATA with CRLF, so compare submitted bytes with that in mind.
+  Test SMTP-only auth failures with `smtp_fail_next("AUTH", SmtpFault::Reply(535))` (IMAP keeps working).
