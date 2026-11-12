@@ -816,6 +816,14 @@ fn connection_info(conn: &Connection, connection_id: &str) -> anyhow::Result<(St
     )?)
 }
 
+/// Whether `ip` may use the connection's grant (its `--allow-ip` list; empty allows any address). Checked before a
+/// code or refresh token is consumed, so a stolen token used from elsewhere neither works nor burns the family.
+fn connection_ip_allowed(conn: &Connection, connection_id: &str, ip: Option<IpAddr>) -> anyhow::Result<bool> {
+    let cidrs: String =
+        conn.query_row("SELECT allowed_cidrs FROM clients WHERE id = ?1", [connection_id], |r| r.get(0))?;
+    Ok(crate::policy::ip_allowed(&cidrs, ip))
+}
+
 struct Issued {
     access: String,
     refresh: String,
@@ -961,6 +969,10 @@ fn exchange_code(
     let audit = |code: &str| {
         audit_auth(tx, "oauth.token", &name, Some(&project), vec![name.clone(), client.client_id.clone()], code, ip)
     };
+    if !connection_ip_allowed(tx, &connection_id, ip)? {
+        audit("ip_not_allowed")?;
+        return Ok(TokenOutcome::Error("invalid_grant", "invalid authorization code"));
+    }
     if used_at.is_some() {
         // A replayed code: revoke everything issued from it (RFC 6749 4.1.2).
         revoke_connection(tx, &connection_id)?;
@@ -1033,6 +1045,10 @@ fn refresh(
     let audit = |code: &str| {
         audit_auth(tx, "oauth.refresh", &name, Some(&project), vec![name.clone(), client.client_id.clone()], code, ip)
     };
+    if !connection_ip_allowed(tx, &connection_id, ip)? {
+        audit("ip_not_allowed")?;
+        return Ok(TokenOutcome::Error("invalid_grant", "invalid refresh token"));
+    }
     if app_client_id != client.client_id {
         audit("wrong_client")?;
         return Ok(TokenOutcome::Error("invalid_grant", "invalid refresh token"));

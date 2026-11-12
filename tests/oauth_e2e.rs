@@ -656,6 +656,76 @@ async fn unused_registrations_are_capped_per_address() {
     assert!(registered(&o, &ids[1]).await);
 }
 
+/// Token request as forwarded by the proxy for client address `ip`.
+async fn token_from(o: &Oauth, ip: &str, form: &[(&str, &str)]) -> (u16, Value) {
+    let secret = o.h.app().proxy_secret.as_deref().unwrap().to_string();
+    let r = o
+        .web
+        .post(o.url("/oauth/dove/token"))
+        .header("host", HOST)
+        .header("x-forwarded-for", ip)
+        .header("x-dove-proxy-auth", secret)
+        .form(form)
+        .send()
+        .await
+        .unwrap();
+    (r.status().as_u16(), r.json().await.unwrap())
+}
+
+#[tokio::test]
+async fn token_endpoint_enforces_the_connection_ip_allowlist() {
+    let o = Oauth::new().await;
+    let inv =
+        o.h.admin(AdminRequest::ClientsInvite {
+            name: "office-host".into(),
+            project: "acme".into(),
+            accounts: vec!["info".into()],
+            capabilities: "read".into(),
+            expires: None,
+            allow_ip: vec!["192.0.2.0/24".into()],
+        })
+        .await
+        .unwrap()["invitation"]
+            .as_str()
+            .unwrap()
+            .to_string();
+    let client_id = o.register(REDIRECT).await;
+    let v = verifier();
+    let code = o.approve(&client_id, &challenge(&v), &inv, &["read.0"]).await;
+    let exchange = [
+        ("grant_type", "authorization_code"),
+        ("code", code.as_str()),
+        ("redirect_uri", REDIRECT),
+        ("client_id", client_id.as_str()),
+        ("code_verifier", v.as_str()),
+    ];
+    // From outside the allowlist: refused, and the code is not used up.
+    let (s, e) = token_from(&o, "198.51.100.1", &exchange).await;
+    assert_eq!((s, e["error"].as_str().unwrap()), (400, "invalid_grant"));
+    let (s, tok) = token_from(&o, "192.0.2.10", &exchange).await;
+    assert_eq!(s, 200, "{tok}");
+    let rt = tok["refresh_token"].as_str().unwrap().to_string();
+    let refresh = [("grant_type", "refresh_token"), ("refresh_token", rt.as_str()), ("client_id", client_id.as_str())];
+    // A stolen refresh token used elsewhere neither rotates nor revokes anything.
+    let (s, e) = token_from(&o, "198.51.100.1", &refresh).await;
+    assert_eq!((s, e["error"].as_str().unwrap()), (400, "invalid_grant"));
+    let (s, tok2) = token_from(&o, "192.0.2.10", &refresh).await;
+    assert_eq!(s, 200, "the refresh token was not consumed: {tok2}");
+    // Replaying the rotated token from outside does not trigger reuse revocation either.
+    let (s, _) = token_from(&o, "198.51.100.1", &refresh).await;
+    assert_eq!(s, 400);
+    let at = tok2["access_token"].as_str().unwrap();
+    let secret = o.h.app().proxy_secret.as_deref().unwrap().to_string();
+    let r =
+        o.h.post_mcp(
+            Some(at),
+            json!({"jsonrpc":"2.0","id":1,"method":"ping"}),
+            &[("x-forwarded-for", "192.0.2.10"), ("x-dove-proxy-auth", &secret)],
+        )
+        .await;
+    assert_eq!(r.status(), 200, "the connection is still alive");
+}
+
 #[tokio::test]
 async fn authorize_requests_are_bounded_per_ip() {
     let o = Oauth::with(|c| c.oauth.token_requests_per_minute = 1000).await;

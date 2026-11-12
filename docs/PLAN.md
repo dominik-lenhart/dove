@@ -177,6 +177,9 @@ hosts or reference hardware.
   older than 15 minutes (any bucket) is evicted, otherwise 503. Registrations with an open sign-in request are never
   evicted; each eviction is audited (`oauth.register`, result `evicted`). A host that cached an evicted client id
   must register again (host behaviour unverified, as with the 24 h prune).
+- A34. The token endpoint applies the connection's `--allow-ip` list (from the invitation) to both grants before
+  anything is consumed: from another address a code or refresh token gets `invalid_grant` and stays usable, and a
+  replayed rotated refresh token does not trigger reuse revocation. The approval page itself is not IP-bound.
 - A7. Licence is a placeholder (Apache-2.0) until the owner decides (spec 13.7).
 - A16. batch_read: budgets are assigned in input order (deterministic). Items that do not fit return
   `budget_exceeded` with a smaller-request hint instead of a continuation token. The wire budget counts the
