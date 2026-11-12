@@ -252,6 +252,8 @@ async fn approval_narrows_and_never_broadens() {
         .collect();
     // Aliases sort: billing (index 0), info (index 1).
     assert_eq!(got, vec![("billing".into(), "read,draft".into()), ("info".into(), "read".into())]);
+    let tools = o.h.rpc(at, "tools/list", json!({})).await;
+    assert_eq!(tools["result"]["tools"][0]["securitySchemes"], json!([{ "type": "oauth2", "scopes": ["mail"] }]));
     // The other project's mailbox is invisible.
     assert_eq!(o.h.err(at, "list_labels", json!({"account": "secret"})).await, "not_found");
     assert_eq!(o.h.err(at, "create_draft", json!({"account": "info", "request_key": uuid::Uuid::new_v4().to_string(), "to": ["a@b.test"], "subject": "x", "body_text": "y"})).await, "forbidden");

@@ -52,6 +52,28 @@ impl Harness {
         Self { env, google, base, http: reqwest::Client::new(), server }
     }
 
+    /// Like [`Harness::start_with`], but the public URL is `https://127.0.0.1:<port>` of the listener itself, so a
+    /// remote client can reach the server over plain loopback HTTP with a matching Host header (no TLS in tests).
+    /// `base` is then `http://127.0.0.1:<port>`.
+    pub async fn start_loopback_public(customize: impl FnOnce(&mut Config)) -> Self {
+        let google = FakeGoogle::start(CLIENT_ID, CLIENT_SECRET).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let env = TestEnv::with_upstream(Upstream::single_origin(&google.base_url), |c| {
+            c.public_url = format!("https://{addr}");
+            c.limits.tool_call_timeout_secs = 8;
+            c.limits.upstream_request_timeout_secs = 3;
+            c.limits.client_requests_per_minute = 10_000;
+            c.limits.client_burst = 10_000;
+            customize(c)
+        });
+        let app = env.app.clone();
+        let server = tokio::spawn(async move {
+            let _ = dove::http::serve(app, listener, std::future::pending()).await;
+        });
+        Self { env, google, base: format!("http://{addr}"), http: reqwest::Client::new(), server }
+    }
+
     pub fn app(&self) -> &Arc<App> {
         &self.env.app
     }

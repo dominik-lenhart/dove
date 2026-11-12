@@ -34,9 +34,18 @@ hosts or reference hardware.
    - [ ] Projections, keyset cursors (15 min TTL, bounded), count_only, live Gmail route
    - [ ] batch_read with budgets (AC21)
    - [ ] send_draft behind instance gate + send grant + ownership, at-most-once (6.3, AC3)
-   - [~] Client onboarding: invitations, `dove login`, remote CLI commands, `mcp install`, `mcp stdio` (5.6, AC22)
+   - [x] Client onboarding: invitations, `dove login`, remote CLI commands, `mcp install`, `mcp stdio` (5.6, AC22
+     local part). Guide: `docs/onboarding.md`.
      - [x] `dove clients invite` (admin socket): 256-bit `dovei_` secret, hash only, single use, 10 min, `all`
        expanded once, POST `/connect/redeem` rate-limited and atomic (`tests/invite_e2e.rs`)
+     - [x] `src/client/`: `login` (invitation from prompt/stdin only, `--token-stdin`), profiles, OS credential store
+       or explicit 0600 `--secret-file`, `status`, `logout [--revoke]`, `search`, `message get`, `thread get`,
+       `draft create|get|update|send`, `batch`, `mcp install` (Claude Code, Codex), `mcp stdio`, `connect-info`,
+       `doctor --profile`; no path to the admin socket (`tests/client_e2e.rs`, runs the real binary)
+     - [x] Log/audit/store canary for all onboarding and OAuth secrets (`tests/onboarding_logs.rs`)
+     - Unverified: real Claude Code and Codex reading the generated entries, macOS Keychain and Windows Credential
+       Manager (only the "no store available" path runs here), the 60 s setup target on clean machines, signed
+       release binaries for all platforms. `search` and `batch` depend on tools still being built in parallel.
    - [x] Downstream OAuth AS for ChatGPT/Claude (5.6, AC23 server side): PRM (both paths), RFC 8414 metadata,
      approval page with invitation + narrowing + CSRF, S256 PKCE, exact redirect, resource binding, single-use codes,
      rotating refresh with reuse detection, DCR (bounded, rate-limited, no authority), RFC 7009 revocation,
@@ -92,4 +101,22 @@ hosts or reference hardware.
   hour. Pre-registered (optionally confidential) clients are configured in `[[oauth.clients]]` with a secret file.
 - A16. Removing a mailbox from a project cancels the project's open invitations, so a re-add cannot resurrect
   rights through an old invitation. Accounts deleted before redemption are dropped from the invitation.
+- A17. Client profiles live in `$DOVE_CONFIG_DIR`, else `$XDG_CONFIG_HOME/dove`, else `~/.config/dove`
+  (`%APPDATA%\dove` on Windows) as `profiles.toml` (0600): server origin, connection name, credential reference
+  (`keyring` or `file:<path>`). Server URLs must be HTTPS; plain HTTP is accepted only for loopback hosts.
+- A18. The OS credential store is `keyring` 4 (Keychain, Windows Credential Manager, Secret Service). `login`
+  probes it before redeeming; when it is unavailable it stops and asks for `--secret-file`, so the invitation is
+  not consumed by a failed attempt.
+- A19. `mcp install` targets `~/.claude.json` / `.mcp.json` (`mcpServers`, honours `CLAUDE_CONFIG_DIR`) and
+  `~/.codex/config.toml` / `.codex/config.toml` (`mcp_servers`, honours `CODEX_HOME`). JSON is re-emitted with
+  two-space indentation, key order and all values kept (checked by re-reading before the atomic rename); TOML is
+  edited with `toml_edit`, keeping comments. Symlinked config files are written through to their target.
+  The entry names `dove-<profile>`. Host-side behaviour is unverified.
+- A20. `mcp stdio` retries only connect errors (the request never reached the server); anything that may have
+  reached the server is not replayed. Cancellation drops the local request and its response; the stateless server
+  has no cancel channel, so already dispatched upstream work may still finish.
+- A21. `dove doctor --profile <p>` runs the remote client checks and never opens the admin socket; plain
+  `dove doctor` stays the operator check.
+- A22. `tools/list` declares `securitySchemes: [{type: oauth2, scopes: [mail]}]` per tool for hosts that read it
+  (ChatGPT apps); unverified.
 - A7. Licence is a placeholder (Apache-2.0) until the owner decides (spec 13.7).

@@ -73,3 +73,8 @@ cargo fmt
   transaction; test it directly with a stale view (see `invite::tests`) or the mutation survives.
 - 2026-11-12: `cargo test --test a --lib foo::` applies the `foo::` filter to every target; run filtered lib
   tests and integration files in separate invocations when mutation-checking.
+- 2026-11-12: The shared `CARGO_TARGET_DIR` holds one `target/debug/dove` for all worktrees; another agent's build
+  can replace it between your build and test run. Tests that exec `CARGO_BIN_EXE_dove` (`tests/client_e2e.rs`)
+  need a private target dir, e.g. `CARGO_TARGET_DIR=/home/dominik/projects/.dove-worktrees/target-onboarding`.
+- 2026-11-12: Client tests run the binary with `env_clear()`, a temp HOME and
+  `DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent/...` so the real keychain and config are never touched.
