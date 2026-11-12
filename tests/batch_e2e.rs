@@ -145,3 +145,36 @@ async fn search_rows_share_one_budget() {
     assert!(items[1]["error"]["message"].as_str().unwrap().contains("40 remain"));
     assert_ne!(items[2]["error"]["code"], "budget_exceeded");
 }
+
+#[tokio::test]
+async fn denied_items_count_as_denials_and_audit_names_each_mailbox() {
+    let (h, token) = setup().await;
+    let a = msg(&h, "info@acme.test", "visible");
+    let hidden = msg(&h, "secret@acme.test", "hidden");
+    let mut items = vec![item("CALLER-ITEM-ID", "get_message", json!({"account":"info","message_id":a}))];
+    items.extend(
+        (0..19).map(|i| item(&format!("d{i}"), "get_message", json!({"account":"secret","message_id":hidden}))),
+    );
+    let v = h.ok(&token, "batch_read", json!({ "items": items })).await;
+    assert_eq!(v["error_count"], 19);
+    // 19 denied items plus one more denied standalone call reach the burst threshold of 20.
+    assert_eq!(h.err(&token, "get_message", json!({"account":"secret","message_id":hidden})).await, "not_found");
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let sent = h.app().notifier.sent.lock().unwrap().clone();
+    assert_eq!(sent.iter().filter(|m| m.contains("burst of denied calls")).count(), 1, "{sent:?}");
+    let rec = h
+        .app()
+        .store
+        .call(|c| {
+            Ok(c.query_row(
+                "SELECT account_alias, object_ids FROM audit WHERE tool_or_action = 'batch_read' ORDER BY seq DESC LIMIT 1",
+                [],
+                |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, String>(1)?)),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(rec.0.as_deref(), Some("info"));
+    assert!(rec.1.contains(&format!("info:{a}")) && rec.1.contains("!not_found"), "{}", rec.1);
+    assert!(!rec.1.contains("CALLER-ITEM-ID") && !rec.1.contains(&hidden), "{}", rec.1);
+}

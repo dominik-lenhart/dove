@@ -185,6 +185,7 @@ async fn batch_read(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
     let mut out_items = Vec::with_capacity(items.len());
     let mut text = String::new();
     let mut audit = AuditInfo::default();
+    let mut accounts = std::collections::BTreeSet::new();
     let (mut ok, mut failed) = (0usize, 0usize);
     for (it, p) in items.iter().zip(planned) {
         let entry = match p.and_then(|key| match results.get(&key) {
@@ -198,21 +199,24 @@ async fn batch_read(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
                 if cost <= budget + STATUS_RESERVE {
                     budget = (budget + STATUS_RESERVE).saturating_sub(cost);
                     text.push_str(&format!("[{}] {}\n", it.id, o.text));
-                    audit.object_ids.extend(o.audit.object_ids.iter().cloned());
-                    if audit.account.is_none() {
-                        audit.account.clone_from(&o.audit.account);
-                    }
+                    // Every object is recorded with its mailbox; caller-chosen item ids never reach the audit log.
+                    let alias = o.audit.account.as_deref().unwrap_or("-");
+                    audit.object_ids.extend(o.audit.object_ids.iter().map(|id| format!("{alias}:{id}")));
+                    accounts.insert(alias.to_string());
                     ok += 1;
                     v
                 } else {
                     failed += 1;
                     let e = budget_error(&it.op, "the result does not fit the 64 KiB batch response budget");
+                    audit.object_ids.push(format!("!{}", e.code.as_str()));
                     text.push_str(&format!("[{}] error: {}\n", it.id, e.code.as_str()));
                     item_error(&it.id, &e)
                 }
             }
             Err(e) => {
                 failed += 1;
+                crate::mcp::record_denial(&cx.app, &cx.client, e.code);
+                audit.object_ids.push(format!("!{}", e.code.as_str()));
                 text.push_str(&format!("[{}] error: {}\n", it.id, e.code.as_str()));
                 item_error(&it.id, &e)
             }
@@ -220,6 +224,11 @@ async fn batch_read(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
         out_items.push(entry);
     }
     audit.result_count = Some(ok as i64);
+    audit.account = match accounts.len() {
+        0 => None,
+        1 => accounts.pop_first(),
+        _ => Some(accounts.into_iter().collect::<Vec<_>>().join(",")),
+    };
     Ok(ToolOutput {
         structured: json!({ "items": out_items, "ok_count": ok, "error_count": failed }),
         text: format!("batch_read: {ok} ok, {failed} failed\n{text}"),

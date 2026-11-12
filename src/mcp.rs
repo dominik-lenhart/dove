@@ -258,6 +258,16 @@ const INSTRUCTIONS: &str = "Dove gives scoped access to the owner's mailboxes. E
 Use search_messages with a small JSON query and a narrow select, then read details with get_message or get_thread. \
 Drafts are reviewed and sent by the owner unless a send permission was explicitly granted.";
 
+/// Counts a denied call (also each denied item of a batch) and notifies the owner once per burst.
+pub fn record_denial(app: &Arc<App>, ctx: &ClientCtx, code: ErrorCode) {
+    if matches!(code, ErrorCode::NotFound | ErrorCode::Forbidden) && app.denials.record(&ctx.client_id) {
+        let (app2, name) = (app.clone(), ctx.client_name.clone());
+        tokio::spawn(async move {
+            app2.notifier.send(&format!("Client '{name}' had a burst of denied calls in the last minutes.")).await;
+        });
+    }
+}
+
 /// Runs one tool call with authorization, deadline and exactly one audit record.
 pub async fn call_tool(app: &Arc<App>, ctx: &ClientCtx, version: &str, name: &str, args: Value) -> Value {
     let started = Instant::now();
@@ -296,14 +306,7 @@ pub async fn call_tool(app: &Arc<App>, ctx: &ClientCtx, version: &str, name: &st
         }
         Err(e) => {
             rec.result_code = e.code.as_str().into();
-            if matches!(e.code, ErrorCode::NotFound | ErrorCode::Forbidden) && app.denials.record(&ctx.client_id) {
-                let (app2, name) = (app.clone(), ctx.client_name.clone());
-                tokio::spawn(async move {
-                    app2.notifier
-                        .send(&format!("Client '{name}' had a burst of denied calls in the last minutes."))
-                        .await;
-                });
-            }
+            record_denial(app, ctx, e.code);
             let ej = e.to_json();
             let mut r = json!({ "content": [{ "type": "text", "text": serde_json::to_string(&ej).unwrap_or_default() }], "isError": true });
             if structured {
@@ -312,6 +315,16 @@ pub async fn call_tool(app: &Arc<App>, ctx: &ClientCtx, version: &str, name: &st
             r
         }
     };
+    // Spec 8.3: one structured line per call, metadata only (no arguments, content or query text).
+    tracing::info!(
+        request_id = %rec.request_id,
+        client = %rec.actor,
+        tool = %rec.tool_or_action,
+        account = rec.account_alias.as_deref().unwrap_or(""),
+        duration_ms = rec.duration_ms,
+        result = %rec.result_code,
+        "tool call"
+    );
     let store = app.store.clone();
     if let Err(e) = store.call(move |c| audit::append(c, &rec).map(|_| ())).await {
         tracing::error!(error = %e, "audit write failed");
