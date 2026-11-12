@@ -308,6 +308,44 @@ async fn history_expiry_rebuilds_into_new_generation() {
     assert_eq!(gens, 1);
 }
 
+/// A message that arrives while history.list is paginating is not on the later (snapshotted) pages; the checkpoint
+/// must not move past it, so the next pass picks it up.
+#[tokio::test]
+async fn arrival_during_history_pagination_is_not_skipped() {
+    let fx = setup(500, 3).await;
+    let h = &fx.h;
+    let mb = "info@acme.test";
+    enable(h).await;
+    sync_account(h.app(), &fx.info).await.unwrap();
+    for id in &fx.ids {
+        h.google.set_labels(mb, id, &["STARRED"], &[]);
+    }
+    // Three records over two pages; the second page is held back while a new message arrives.
+    h.google.set_history_page_size(mb, 2);
+    h.google.fail_after("GET", "/history", 1, Fault::Delay(Duration::from_millis(800)));
+    h.google.clear_requests();
+    let (app, info) = (h.app().clone(), fx.info.clone());
+    let pass = tokio::spawn(async move { sync_account(&app, &info).await });
+    for _ in 0..500 {
+        if h.google.count("GET", "/history") >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(h.google.count("GET", "/history"), 2, "second history page requested");
+    let late = h.google.add_message(mb, msg("late@example.com", "Late arrival", "late text", 30));
+    let r = pass.await.unwrap().unwrap();
+    assert_eq!(r.error, None, "{r:?}");
+    let starred = search(&fx, json!({"where": {"field": "is_starred", "op": "eq", "value": true}, "count_only": true}));
+    assert_eq!(starred.await["count"], 3);
+
+    // The next pass replays from the first page's history id and finds the late message.
+    sync_account(h.app(), &fx.info).await.unwrap();
+    let v = search(&fx, json!({"select": ["message_id"], "limit": 100})).await;
+    assert!(col(&v, "message_id").contains(&json!(late)), "late arrival skipped: {v}");
+    h.google.assert_no_violations();
+}
+
 #[tokio::test]
 async fn admin_rebuild_cuts_over_and_fences_old_job() {
     let fx = setup(500, 4).await;

@@ -628,11 +628,14 @@ fn ids_in(rec: &Value, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Reads every history page from `start`, coalescing repeated message ids. Returns the newest history id seen.
+/// Reads every history page from `start`, coalescing repeated message ids. Returns the history id of the first page
+/// response: everything up to it is covered by this pass. Later pages may report a newer mailbox id while records
+/// appended during pagination are not on them; taking that id would let the checkpoint pass unseen records.
+/// Records newer than the first page's id that did show up are applied now and replayed next pass (idempotent).
 async fn collect_history(job: &Job, start: &str) -> anyhow::Result<History> {
     let mut changes: BTreeMap<String, Change> = BTreeMap::new();
     let mut token: Option<String> = None;
-    let mut latest = start.to_string();
+    let mut covered: Option<String> = None;
     loop {
         let mut q: Vec<(&str, String)> = vec![("startHistoryId", start.to_string()), ("maxResults", "500".into())];
         if let Some(t) = &token {
@@ -643,8 +646,9 @@ async fn collect_history(job: &Job, start: &str) -> anyhow::Result<History> {
             Err(e) if e.code == ErrorCode::NotFound => return Ok(History::Expired),
             Err(e) => return Err(e.into()),
         };
-        if let Some(h) = history_id_of(&resp) {
-            latest = h;
+        if token.is_none() {
+            // First page.
+            covered = history_id_of(&resp);
         }
         for rec in resp["history"].as_array().into_iter().flatten() {
             for id in ids_in(rec, "messagesAdded") {
@@ -667,7 +671,7 @@ async fn collect_history(job: &Job, start: &str) -> anyhow::Result<History> {
         }
     }
     changes.retain(|id, _| crate::gmail::gateway::valid_id(id));
-    Ok(History::Changes(changes, latest))
+    Ok(History::Changes(changes, covered.unwrap_or_else(|| start.to_string())))
 }
 
 /// Fetches canonical state for changed messages and writes it in fenced chunks.

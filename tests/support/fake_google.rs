@@ -101,6 +101,7 @@ struct Mailbox {
     history_id: u64,
     history: Vec<Rec>,
     history_floor: u64,
+    history_page_max: usize,
     send_as: Vec<String>,
     sent: Vec<String>,
 }
@@ -126,7 +127,8 @@ struct Inner {
     access: HashMap<String, String>,
     requests: Vec<RecordedRequest>,
     violations: Vec<String>,
-    faults: Vec<(String, String, Fault)>,
+    /// (method, path fragment, matching requests to let through first, fault)
+    faults: Vec<(String, String, usize, Fault)>,
     counter: u64,
 }
 
@@ -294,6 +296,7 @@ impl Mailbox {
             history_id: 1000,
             history: vec![],
             history_floor: 0,
+            history_page_max: 500,
             send_as: vec![],
             sent: vec![],
         }
@@ -787,14 +790,25 @@ fn gmail(mb: &mut Mailbox, c: &mut u64, method: &str, segs: &[&str], q: &Query, 
             if start < mb.history_floor {
                 return not_found();
             }
-            let recs: Vec<&Rec> = mb.history.iter().filter(|r| r.id > start).collect();
-            let (s, e) = page(recs.len(), q, 100, 500);
+            // Page tokens carry "offset:upper": later pages list the snapshot taken at the first page, while every
+            // response reports the mailbox's current history id (as Gmail documents it).
+            let (offset, upper) = match q.get("pageToken").and_then(|t| t.split_once(':')) {
+                Some((o, u)) => match (o.parse::<usize>(), u.parse::<u64>()) {
+                    (Ok(o), Ok(u)) => (o, u),
+                    _ => return bad_request(),
+                },
+                None if q.get("pageToken").is_some() => return bad_request(),
+                None => (0, mb.history_id),
+            };
+            let recs: Vec<&Rec> = mb.history.iter().filter(|r| r.id > start && r.id <= upper).collect();
+            let s = offset.min(recs.len());
+            let e = (s + q.usize("maxResults", 100).clamp(1, 500).min(mb.history_page_max)).min(recs.len());
             let mut out = json!({"historyId": mb.history_id.to_string()});
             if !recs.is_empty() {
                 out["history"] = Value::Array(recs[s..e].iter().map(|r| rec_json(r)).collect());
             }
             if e < recs.len() {
-                out["nextPageToken"] = Value::String(e.to_string());
+                out["nextPageToken"] = Value::String(format!("{e}:{upper}"));
             }
             (200, out)
         }
@@ -872,8 +886,15 @@ async fn handle(State(inner): State<Arc<Mutex<Inner>>>, req: Request<Body>) -> R
         let mut g = inner.lock().unwrap();
         let mailbox = g.bearer_email(auth.as_deref());
         g.requests.push(RecordedRequest { method: method.clone(), path: path.clone(), query: query.clone(), mailbox });
-        let idx = g.faults.iter().position(|(m, s, _)| *m == method && path.contains(s.as_str()));
-        idx.map(|i| g.faults.remove(i).2)
+        let idx = g.faults.iter().position(|(m, s, _, _)| *m == method && path.contains(s.as_str()));
+        match idx {
+            Some(i) if g.faults[i].2 > 0 => {
+                g.faults[i].2 -= 1;
+                None
+            }
+            Some(i) => Some(g.faults.remove(i).3),
+            None => None,
+        }
     };
     let mut drop_after = false;
     match fault {
@@ -1017,7 +1038,17 @@ impl FakeGoogle {
 
     /// Fault for the next request whose method matches and whose path contains `path_suffix`.
     pub fn fail_next(&self, method: &str, path_suffix: &str, fault: Fault) {
-        self.inner.lock().unwrap().faults.push((method.to_string(), path_suffix.to_string(), fault));
+        self.fail_after(method, path_suffix, 0, fault);
+    }
+
+    /// Like [`Self::fail_next`], but lets `skip` matching requests through first.
+    pub fn fail_after(&self, method: &str, path_suffix: &str, skip: usize, fault: Fault) {
+        self.inner.lock().unwrap().faults.push((method.to_string(), path_suffix.to_string(), skip, fault));
+    }
+
+    /// Caps history.list pages (Gmail allows up to 500 records per page) so tests can paginate small histories.
+    pub fn set_history_page_size(&self, email: &str, n: usize) {
+        self.with_mailbox(email, |mb, _| mb.history_page_max = n.max(1));
     }
 
     pub fn requests(&self) -> Vec<RecordedRequest> {
