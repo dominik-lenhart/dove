@@ -71,3 +71,7 @@ cargo fmt
 - 2026-11-12: Gmail writes go through `Google::write`, which classifies failures once: not dispatched or 4xx is
   definitive (safe to retry), 5xx / lost response / unreadable body is `outcome_unknown`. Never classify by
   matching error message text.
+- 2026-11-12: AC19 runs the real CLI as `nobody` (`cargo test --test agent_shell -- --ignored`, needs passwordless
+  `sudo -n -u nobody`). On this dev host agent sessions run as uid 1000 with passwordless sudo, so a deployment
+  here would give agents admin rights (operator uid or root). Production needs an agent uid that is neither the
+  operator uid nor able to sudo.
