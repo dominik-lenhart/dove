@@ -14,6 +14,7 @@
 pub mod admin;
 pub mod cursor;
 pub mod db;
+pub mod imap_idle;
 pub mod imap_sync;
 pub mod ingest;
 pub mod query;
@@ -57,6 +58,8 @@ pub struct Index {
     cancels: Mutex<HashMap<String, CancellationToken>>,
     woken: Mutex<HashSet<String>>,
     wake: Notify,
+    /// IMAP IDLE connections that are idling, and search freshness checks (`imap_idle`).
+    pub idle: imap_idle::Registry,
 }
 
 /// Raised inside a write transaction when the job's fence no longer matches: the account was purged, disabled
@@ -84,6 +87,7 @@ impl Index {
             cancels: Default::default(),
             woken: Default::default(),
             wake: Notify::new(),
+            idle: Default::default(),
         }
     }
 

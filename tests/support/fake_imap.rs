@@ -2,7 +2,8 @@
 //!
 //! Implements the subset Dove uses: CAPABILITY, LOGIN/AUTHENTICATE PLAIN, LIST (SPECIAL-USE), STATUS,
 //! SELECT/EXAMINE (CONDSTORE), UID SEARCH, UID FETCH (incl. CHANGEDSINCE/VANISHED), APPEND (APPENDUID), UID STORE,
-//! UID EXPUNGE, ENABLE QRESYNC, NOOP, LOGOUT; SMTP EHLO, AUTH PLAIN/LOGIN, MAIL, RCPT, DATA, RSET, QUIT.
+//! UID EXPUNGE, ENABLE QRESYNC, NOOP, LOGOUT, IDLE/DONE (pushes EXISTS, EXPUNGE/VANISHED and FETCH for the selected
+//! folder; optional server-side IDLE timeout with BYE; `kick_idle` drops idling connections); SMTP EHLO, AUTH PLAIN/LOGIN, MAIL, RCPT, DATA, RSET, QUIT.
 //! Non-PEEK body fetches set `\Seen` like a real server, so tests can prove Dove never sets it.
 
 use std::collections::{BTreeSet, HashMap};
@@ -35,6 +36,8 @@ pub const IMAP_VERBS: &[&str] = &[
     "NOOP",
     "LOGOUT",
     "ENABLE",
+    "IDLE",
+    "DONE",
 ];
 pub const SMTP_VERBS: &[&str] = &["EHLO", "STARTTLS", "AUTH", "MAIL", "RCPT", "DATA", "QUIT", "RSET"];
 
@@ -75,6 +78,10 @@ pub struct Opts {
     pub qresync: bool,
     pub auth_plain: bool,
     pub smtp_auth: &'static str,
+    /// Offer IDLE (RFC 2177).
+    pub idle: bool,
+    /// End IDLE with `* BYE` and close the connection after this long.
+    pub idle_timeout: Option<Duration>,
 }
 
 impl Default for Opts {
@@ -86,6 +93,8 @@ impl Default for Opts {
             qresync: true,
             auth_plain: false,
             smtp_auth: "PLAIN LOGIN",
+            idle: true,
+            idle_timeout: None,
         }
     }
 }
@@ -146,6 +155,13 @@ struct State {
     connections: usize,
     smtp_connections: usize,
     next_uidvalidity: u32,
+    /// IMAP connections open right now, and the most ever open at once.
+    open: usize,
+    max_open: usize,
+    /// Connections inside IDLE right now.
+    idling: usize,
+    /// Bumped by `kick_idle`: idling connections close without a word.
+    kick: u64,
 }
 
 #[derive(Clone)]
@@ -383,11 +399,17 @@ impl FakeImap {
         let st = state.clone();
         let t1 = tokio::spawn(async move {
             while let Ok((s, _)) = il.accept().await {
-                st.lock().unwrap().connections += 1;
+                {
+                    let mut g = st.lock().unwrap();
+                    g.connections += 1;
+                    g.open += 1;
+                    g.max_open = g.max_open.max(g.open);
+                }
                 let st = st.clone();
                 tokio::spawn(async move {
                     let (r, w) = s.into_split();
-                    imap_conn(st, BufReader::new(r), w).await;
+                    imap_conn(st.clone(), BufReader::new(r), w).await;
+                    st.lock().unwrap().open -= 1;
                 });
             }
         });
@@ -575,6 +597,30 @@ impl FakeImap {
         self.with(|st| st.connections)
     }
 
+    /// IMAP connections open right now.
+    pub fn open_connections(&self) -> usize {
+        self.with(|st| st.open)
+    }
+
+    /// Most IMAP connections open at the same time since the start or the last `reset_max_open`.
+    pub fn max_open_connections(&self) -> usize {
+        self.with(|st| st.max_open)
+    }
+
+    pub fn reset_max_open(&self) {
+        self.with(|st| st.max_open = st.open)
+    }
+
+    /// Connections inside IDLE right now.
+    pub fn idling(&self) -> usize {
+        self.with(|st| st.idling)
+    }
+
+    /// Closes every idling connection without `BYE` (a dropped network path).
+    pub fn kick_idle(&self) {
+        self.with(|st| st.kick += 1)
+    }
+
     pub fn smtp_connections(&self) -> usize {
         self.with(|st| st.smtp_connections)
     }
@@ -640,6 +686,9 @@ fn caps(o: &Opts) -> String {
     }
     if o.auth_plain {
         c.push("AUTH=PLAIN");
+    }
+    if o.idle {
+        c.push("IDLE");
     }
     c.join(" ")
 }
@@ -736,6 +785,19 @@ async fn imap_conn(st: Arc<Mutex<State>>, mut r: BufReader<OwnedReadHalf>, mut w
             Some(Fault::Drop) => return,
             _ => {}
         }
+        if verb == "IDLE" && conn.user.is_some() {
+            let idle = st.lock().unwrap().opts.idle;
+            if !idle {
+                if w.write_all(format!("{tag} BAD unknown command\r\n").as_bytes()).await.is_err() {
+                    return;
+                }
+                continue;
+            }
+            if !idle_conn(&st, &conn, &tag, &mut r, &mut w).await {
+                return;
+            }
+            continue;
+        }
         let (out, close) = handle(&st, &mut conn, &tag, &verb, &args, sasl);
         match fault {
             Some(Fault::DropAfterApply) => return,
@@ -760,6 +822,99 @@ async fn imap_conn(st: Arc<Mutex<State>>, mut r: BufReader<OwnedReadHalf>, mut w
         }
         if close {
             return;
+        }
+    }
+}
+
+/// Decrements the idling count however IDLE ends.
+struct Idling(Arc<Mutex<State>>);
+
+impl Drop for Idling {
+    fn drop(&mut self) {
+        self.0.lock().unwrap().idling -= 1;
+    }
+}
+
+/// What an idling client is told about: (uid, modseq) of every message in the selected folder.
+fn idle_view(st: &Arc<Mutex<State>>, conn: &Conn) -> Option<Vec<(u32, u64, Vec<String>)>> {
+    let s = st.lock().unwrap();
+    let (name, _) = conn.selected.as_ref()?;
+    let f = s.users.get(conn.user.as_ref()?)?.folders.iter().find(|f| &f.raw_name == name)?;
+    Some(f.msgs.iter().map(|m| (m.uid, m.modseq, m.flags.iter().cloned().collect())).collect())
+}
+
+/// One IDLE command: `+`, then untagged changes of the selected folder until `DONE` (tagged OK). Returns false
+/// when the connection is to be closed (kicked, server timeout, client gone).
+async fn idle_conn(
+    st: &Arc<Mutex<State>>,
+    conn: &Conn,
+    tag: &str,
+    r: &mut BufReader<OwnedReadHalf>,
+    w: &mut OwnedWriteHalf,
+) -> bool {
+    let Some(mut view) = idle_view(st, conn) else {
+        return w.write_all(format!("{tag} BAD no mailbox selected\r\n").as_bytes()).await.is_ok();
+    };
+    let (kick0, timeout) = {
+        let mut s = st.lock().unwrap();
+        s.idling += 1;
+        (s.kick, s.opts.idle_timeout)
+    };
+    let _idling = Idling(st.clone());
+    if w.write_all(b"+ idling\r\n").await.is_err() {
+        return false;
+    }
+    let started = tokio::time::Instant::now();
+    let mut line = Box::pin(read_line(r));
+    loop {
+        tokio::select! {
+            l = &mut line => {
+                let Some(l) = l else { return false };
+                let text = String::from_utf8_lossy(&l).into_owned();
+                st.lock().unwrap().commands.push(text.clone());
+                let reply = if text.eq_ignore_ascii_case("DONE") {
+                    format!("{tag} OK IDLE terminated\r\n")
+                } else {
+                    format!("{tag} BAD expected DONE\r\n")
+                };
+                return w.write_all(reply.as_bytes()).await.is_ok();
+            }
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {
+                if st.lock().unwrap().kick != kick0 {
+                    return false;
+                }
+                if timeout.is_some_and(|t| started.elapsed() >= t) {
+                    let _ = w.write_all(b"* BYE idle timeout\r\n").await;
+                    return false;
+                }
+                let Some(now) = idle_view(st, conn) else { return false };
+                let mut out = Out::default();
+                // Expunges first (sequence numbers of the old view), then new mail, then flag changes.
+                let mut seq_view: Vec<u32> = view.iter().map(|m| m.0).collect();
+                for (uid, _, _) in &view {
+                    if !now.iter().any(|m| m.0 == *uid) {
+                        let pos = seq_view.iter().position(|u| u == uid).unwrap();
+                        if conn.qresync {
+                            out.line(format!("* VANISHED {uid}"));
+                        } else {
+                            out.line(format!("* {} EXPUNGE", pos + 1));
+                        }
+                        seq_view.remove(pos);
+                    }
+                }
+                if now.len() != seq_view.len() || now.iter().any(|m| !view.iter().any(|v| v.0 == m.0)) {
+                    out.line(format!("* {} EXISTS", now.len()));
+                }
+                for (i, (uid, modseq, flags)) in now.iter().enumerate() {
+                    if view.iter().any(|v| v.0 == *uid && v.1 != *modseq) {
+                        out.line(format!("* {} FETCH (UID {uid} FLAGS ({}))", i + 1, flags.join(" ")));
+                    }
+                }
+                view = now;
+                if !out.0.is_empty() && w.write_all(&out.0).await.is_err() {
+                    return false;
+                }
+            }
         }
     }
 }

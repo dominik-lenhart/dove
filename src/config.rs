@@ -182,6 +182,10 @@ pub struct IndexConfig {
     pub max_body_chars: usize,
     /// Message ids per messages.list page during backfill (Gmail allows up to 500).
     pub list_page_size: u32,
+    /// IMAP IDLE push on INBOX for index-enabled IMAP mailboxes (one extra connection each, `index::imap_idle`).
+    pub imap_idle: bool,
+    /// Seconds after which IDLE is ended and re-issued (clamped to 1..=1500, RFC 2177 asks for under 29 min).
+    pub idle_renew_secs: u64,
 }
 
 impl Default for IndexConfig {
@@ -195,6 +199,8 @@ impl Default for IndexConfig {
             max_message_bytes: 22 * 1024 * 1024,
             max_body_chars: 200_000,
             list_page_size: 500,
+            imap_idle: true,
+            idle_renew_secs: 1500,
         }
     }
 }

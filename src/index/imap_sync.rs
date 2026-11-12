@@ -114,6 +114,48 @@ pub(super) async fn one_step(job: &Job, js: &mut JobState, report: &mut SyncRepo
     Ok(Step::Idle)
 }
 
+/// One bounded INBOX pass for search freshness (`imap_idle::ensure_fresh`): new mail, CONDSTORE flag changes and
+/// expunges of INBOX, then one fetch batch. Runs under the account lock, fence and cancellation like a job, only on
+/// a ready index, and never advances `last_success_at` (it did not look at the other folders), so `as_of` stays
+/// honest. Returns the number of messages indexed. Callers bound it with a timeout; dropping it is safe because no
+/// transaction spans network I/O.
+pub async fn quick_inbox(app: &Arc<App>, account_id: &str) -> anyhow::Result<usize> {
+    let cancel = app.index.cancel_token(account_id);
+    let lock = app.index.lock_for(account_id);
+    let _guard = lock.lock().await;
+    if sync::account_ready(app, account_id).await?.as_deref() != Some("imap") {
+        return Ok(0);
+    }
+    let aid = account_id.to_string();
+    let Some(st) = app.index.write(move |c| load_state(c, &aid)).await? else { return Ok(0) };
+    let (Some(gen_id), None) = (st.active_gen, st.building_gen) else { return Ok(0) };
+    let job = Job { app: app.clone(), account_id: account_id.to_string(), fence: st.fence };
+    let mut report = SyncReport::default();
+    let work = async {
+        let sc = Scanner { job: job.clone(), gen_id, stats: Arc::default() };
+        let r = account::with_session(app, account_id, move |s| {
+            Box::pin(async move {
+                match sc.inbox(s).await {
+                    Ok(()) => Ok(Ok(())),
+                    Err(ScanErr::Imap(e)) => Err(e),
+                    Err(ScanErr::Db(e)) => Ok(Err(e)),
+                }
+            })
+        })
+        .await;
+        match r {
+            Ok(inner) => inner?,
+            Err(e) => return Err(anyhow::Error::from(e)),
+        }
+        hydrate(&job, gen_id, &mut report).await
+    };
+    tokio::select! {
+        _ = cancel.cancelled() => {}
+        r = work => r?,
+    }
+    Ok(report.indexed)
+}
+
 // ------------------------------------------------------------------ id ranges
 
 /// Key range `[lo, hi)` of a folder's ids: all UIDVALIDITYs, or one. `-` sorts right before `.`, so the prefix
@@ -262,7 +304,7 @@ impl Scanner {
             };
             match cps.get(&f.folder_id) {
                 Some(cp) if cp.uidvalidity == st.uidvalidity && cp.enumerated => {
-                    self.incremental(s, f, *cp, st).await?
+                    self.incremental(s, f, *cp, st, true).await?
                 }
                 cp => self.enumerate(s, f, cp.copied(), st).await?,
             }
@@ -328,6 +370,23 @@ impl Scanner {
         self.write_checkpoint(f.folder_id, cp).await
     }
 
+    /// The quick INBOX pass of [`quick_inbox`]: INBOX only, from the folder list Dove already has (no `LIST`), and
+    /// only when its checkpoint is current. New folders and UIDVALIDITY resets are left to the full scan.
+    async fn inbox(&self, s: &mut ImapSession) -> Result<(), ScanErr> {
+        let aid = self.job.account_id.clone();
+        let folders = self.job.app.store.call(move |c| account::load_folders(c, &aid)).await?;
+        let Some(f) = folders.into_iter().find(|f| f.name.eq_ignore_ascii_case("INBOX")) else { return Ok(()) };
+        let (aid, g) = (self.job.account_id.clone(), self.gen_id);
+        let cps = self.job.app.index.write(move |c| load_checkpoints(c, &aid, g)).await?;
+        let Some(cp) = cps.get(&f.folder_id).copied().filter(|cp| cp.enumerated) else { return Ok(()) };
+        s.enable_qresync().await?;
+        let st = s.select(&f.name, true).await?;
+        if st.uidvalidity != cp.uidvalidity {
+            return Ok(());
+        }
+        self.incremental(s, &f, cp, st, false).await
+    }
+
     /// Records UIDs as pending (unless already indexed); `seq` grows with the rank, newest first.
     async fn add_pending(
         &self,
@@ -388,6 +447,7 @@ impl Scanner {
         f: &Folder,
         cp: Checkpoint,
         st: FolderStatus,
+        refresh_flags: bool,
     ) -> Result<(), ScanErr> {
         let uv = st.uidvalidity;
         let condstore = cp.highestmodseq.is_some()
@@ -432,7 +492,7 @@ impl Scanner {
         }
         // 4. Without CONDSTORE: bounded flag refresh (module docs).
         let mut flag_cursor = cp.flag_cursor;
-        if !condstore {
+        if !condstore && refresh_flags {
             let (window, next) = refresh_window(&indexed, cp.flag_cursor, RECENT_FLAGS, ROTATE_FLAGS);
             for chunk in window.chunks(FLAG_CHUNK) {
                 let metas = s.fetch_meta(chunk).await?;

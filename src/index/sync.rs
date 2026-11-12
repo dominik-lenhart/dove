@@ -186,7 +186,7 @@ impl Job {
 }
 
 /// The account's provider if it is active and index-enabled in the durable state store.
-async fn account_ready(app: &App, account_id: &str) -> anyhow::Result<Option<String>> {
+pub(super) async fn account_ready(app: &App, account_id: &str) -> anyhow::Result<Option<String>> {
     let aid = account_id.to_string();
     app.store
         .call(move |c| {
@@ -977,8 +977,17 @@ async fn tick(
         if !active {
             continue;
         }
-        let due = woken.contains(aid) || next_run.get(aid.as_str()).is_none_or(|t| *t <= now);
-        if !due || !running.lock().expect("lock").insert(aid.clone()) {
+        let was_woken = woken.contains(aid);
+        let due = was_woken || next_run.get(aid.as_str()).is_none_or(|t| *t <= now);
+        if !due {
+            continue;
+        }
+        if !running.lock().expect("lock").insert(aid.clone()) {
+            // A wake for a running job (IDLE push during a pass that already scanned INBOX) is kept for the next
+            // tick instead of being lost until the next poll.
+            if was_woken {
+                app.index.woken.lock().expect("lock").insert(aid.clone());
+            }
             continue;
         }
         let (app, sem, running, aid) = (app.clone(), sem.clone(), running.clone(), aid.clone());

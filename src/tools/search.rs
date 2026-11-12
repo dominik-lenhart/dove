@@ -278,6 +278,18 @@ async fn index_search(
         // Only the mailboxes the first page was bound to take part in later pages.
         mbs.retain(|m| p.bound.iter().any(|b| b.0 == m.account_id));
     }
+    if resumed.is_none() {
+        // IMAP mailboxes without a healthy IDLE connection get one bounded INBOX check first (new mail within
+        // seconds). Not on later pages: new rows would invalidate the cursor.
+        let imap: Vec<String> = mbs
+            .iter()
+            .filter(|m| m.provider == crate::policy::Provider::Imap && m.index_enabled)
+            .map(|m| m.account_id.clone())
+            .collect();
+        if !imap.is_empty() {
+            crate::index::imap_idle::ensure_fresh(&cx.app, imap, cx.deadline).await;
+        }
+    }
     let known = known_aliases(cx);
     let now = util::now_unix();
     let deadline = cx.deadline;
