@@ -155,6 +155,23 @@ async fn imap_list_labels_are_folders() {
     assert_eq!(v["message"]["labels"], json!(["Junk", "UNREAD", "SPAM"]));
 }
 
+/// A folder name that encodes control characters (`&AAo-` is a line feed) is shown by its raw wire name, so a server
+/// cannot forge lines inside the untrusted envelope through `labels`.
+#[tokio::test]
+async fn imap_folder_names_never_carry_controls() {
+    let Setup { h, u, token } = setup().await;
+    h.imap.add_folder(&u.user, "Evil\nFolder", None);
+    let v = h.ok(&token, "list_labels", json!({ "account": "info" })).await;
+    let names: Vec<&str> = v["labels"].as_array().unwrap().iter().map(|l| l["name"].as_str().unwrap()).collect();
+    assert!(names.contains(&"Evil&AAo-Folder"), "{names:?}");
+    assert!(names.iter().all(|n| !n.chars().any(char::is_control)), "{names:?}");
+    let uid = h.imap.add_message(&u.user, "Evil\nFolder", &mail("Hallo", "e1@example.org", "", &[]), &["\\Seen"]);
+    let id = imap_id(&h, &u, "Evil\nFolder", uid).await;
+    let v = h.ok(&token, "get_message", json!({ "account": "info", "message_id": id })).await;
+    assert_eq!(v["message"]["labels"], json!(["Evil&AAo-Folder"]));
+    assert!(!v.to_string().contains("Evil\\nFolder"), "{v}");
+}
+
 #[tokio::test]
 async fn imap_get_thread_without_index_is_single_with_marker() {
     let Setup { h, u, token } = setup().await;

@@ -116,7 +116,7 @@ pub fn imap_snippet(parsed: &ParsedMessage) -> String {
 /// and keywords.
 pub fn imap_labels(folder_path: &str, flags: &[String], special: Option<Special>) -> Vec<String> {
     let has = |f: &str| flags.iter().any(|x| x.eq_ignore_ascii_case(f));
-    let mut out = vec![folder_path.to_string()];
+    let mut out = vec![label_text(folder_path)];
     let mut add = |l: &str| {
         if !out.iter().any(|x| x == l) {
             out.push(l.to_string());
@@ -138,9 +138,15 @@ pub fn imap_labels(folder_path: &str, flags: &[String], special: Option<Special>
         _ => {}
     }
     for k in flags.iter().filter(|f| !f.starts_with('\\')) {
-        add(&content::clean_text(k));
+        add(&label_text(k));
     }
     out
+}
+
+/// A folder name or keyword as a label: cleaned like other untrusted text, and always on one line (an agent reads
+/// labels inside the untrusted envelope, where a line break could forge a line).
+pub fn label_text(s: &str) -> String {
+    content::clean_text(s).replace(['\n', '\t'], " ")
 }
 
 /// Derived thread id: the root of the `References` chain, else the first `In-Reply-To`, else the message's own
@@ -203,7 +209,7 @@ pub async fn list_labels(cx: &ToolCx, mb: &Mailbox) -> Result<Vec<Value>, ToolEr
             let mut out: Vec<Value> = folders
                 .iter()
                 .map(|f| {
-                    let name = content::clean_text(&f.name_utf8);
+                    let name = label_text(&f.name_utf8);
                     json!({ "id": name, "name": name, "type": "folder", "special_use": f.special.map(Special::as_str) })
                 })
                 .collect();
@@ -211,6 +217,22 @@ pub async fn list_labels(cx: &ToolCx, mb: &Mailbox) -> Result<Vec<Value>, ToolEr
                 out.push(json!({ "id": l, "name": l, "type": "system" }));
             }
             Ok(out)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Labels built from server data (folder path, keywords) are one line without control or invisible characters,
+    /// in message labels, index rows and `list_labels` alike.
+    #[test]
+    fn labels_are_single_clean_lines() {
+        let labels = imap_labels("Evil\r\nFolder\u{200B}", &["$kw\n\u{7}x".into(), "\\Seen".into()], None);
+        assert_eq!(labels, vec!["Evil Folder".to_string(), "$kw x".to_string()]);
+        for l in &labels {
+            assert!(!l.chars().any(|c| c.is_control()), "{l:?}");
         }
     }
 }

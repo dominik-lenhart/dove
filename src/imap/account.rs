@@ -67,7 +67,7 @@ pub fn load_folders(conn: &Connection, account_id: &str) -> anyhow::Result<Vec<F
         let special: Option<String> = r.get(2)?;
         Ok(Folder {
             folder_id: r.get(0)?,
-            name_utf8: utf7::decode(&name).unwrap_or_else(|| name.clone()),
+            name_utf8: utf7::display_name(&name),
             name,
             special: special.as_deref().and_then(Special::parse),
         })

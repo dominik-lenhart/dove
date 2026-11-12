@@ -1082,7 +1082,7 @@ impl ImapSession {
             });
             let delimiter = if delim.is_nil() { None } else { delim.text().and_then(|d| d.chars().next()) };
             out.push(FolderInfo {
-                name_utf8: utf7::decode(&raw).unwrap_or_else(|| raw.clone()),
+                name_utf8: utf7::display_name(&raw),
                 raw_name: raw,
                 delimiter,
                 special,
