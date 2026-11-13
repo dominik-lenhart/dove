@@ -63,6 +63,14 @@ impl Listener {
 pub fn bind(path: &Path) -> anyhow::Result<Listener> {
     use std::os::unix::fs::PermissionsExt;
     if path.exists() {
+        // Only a stale socket is removed: when something still answers there, this is a second instance, and
+        // unlinking would cut the running service off from its admin channel (L1).
+        if std::os::unix::net::UnixStream::connect(path).is_ok() {
+            anyhow::bail!(
+                "another Dove instance is already running with the admin socket {} (stop it first)",
+                path.display()
+            );
+        }
         std::fs::remove_file(path).with_context(|| format!("cannot remove stale socket {}", path.display()))?;
     }
     let listener =
@@ -179,6 +187,29 @@ mod pipe {
             bail!("the admin pipe {name} is served by another Windows user; refusing to use it");
         }
         Ok(Box::new(client))
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unix_tests {
+    use super::*;
+
+    /// A second bind on a live socket is refused and leaves the running listener reachable; a stale socket file (no
+    /// listener) is replaced (L1).
+    #[tokio::test]
+    async fn a_live_socket_is_never_unlinked() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("admin.sock");
+        let _live = bind(&path).unwrap();
+        let err = bind(&path).err().unwrap().to_string();
+        assert!(err.contains("already running"), "{err}");
+        tokio::net::UnixStream::connect(&path).await.expect("the first instance keeps its socket");
+
+        let stale = d.path().join("stale.sock");
+        drop(bind(&stale).unwrap());
+        assert!(stale.exists());
+        let _l = bind(&stale).unwrap();
+        tokio::net::UnixStream::connect(&stale).await.unwrap();
     }
 }
 

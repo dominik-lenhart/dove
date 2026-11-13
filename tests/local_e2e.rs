@@ -139,6 +139,13 @@ async fn local_init_start_admin_and_stop() {
     // The admin socket's directory is the private data directory.
     assert_eq!(mode(sock.parent().unwrap()), 0o700);
 
+    // A second start refuses and leaves the running instance's admin socket alone (L1).
+    let o = e.run(&["local", "start"], "").await;
+    assert_ne!(o.code, 0);
+    assert!(o.stderr.contains("already running"), "{}", o.stderr);
+    let o = e.ok(&["local", "status"], "").await;
+    assert!(o.stdout.contains("service:    running"), "{}", o.stdout);
+
     // Admin over the per-user socket, as the user who ran init.
     e.ok(&["projects", "create", "assistant", "--socket", &sock_s], "").await;
     let o = e.ok(&["projects", "list", "--json", "--socket", &sock_s], "").await;
