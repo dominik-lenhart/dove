@@ -81,7 +81,12 @@ fn browser_route(path: &str) -> bool {
 
 async fn guard(State(app): State<Arc<App>>, mut req: Request, next: Next) -> Response {
     let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0);
-    let ip = client_ip(app.proxy_secret.as_deref().map(|s| s.as_str()), req.headers(), peer);
+    // Local mode has no reverse proxy: X-Forwarded-For would only ever come from a local process forging it.
+    let ip = if app.cfg.is_local() {
+        peer.map(|p| p.ip())
+    } else {
+        client_ip(app.proxy_secret.as_deref().map(|s| s.as_str()), req.headers(), peer)
+    };
     // The proxy secret goes no further than this point: handlers, logs and responses never see it.
     req.headers_mut().remove(PROXY_AUTH_HEADER);
     req.extensions_mut().insert(ClientIp(ip));

@@ -98,3 +98,22 @@ async fn without_a_proxy_secret_loopback_is_trusted_as_before() {
     assert_eq!(mcp(&h, &token, &[]).await, 401);
     assert_eq!(mcp(&h, &token, &[("x-forwarded-for", PUBLIC_IP)]).await, 200);
 }
+
+/// Local mode has no reverse proxy (PLAN A58): X-Forwarded-For is ignored even with the proxy secret, and without one
+/// (the local-mode default) a local process cannot pick its address either.
+#[tokio::test]
+async fn local_mode_never_trusts_forwarded_for() {
+    let h = Harness::start_with(|c| c.mode = dove::config::Mode::Local).await;
+    let token = allow_ip_token(&h).await;
+    let secret = secret(&h);
+    assert_eq!(mcp(&h, &token, &[("x-forwarded-for", PUBLIC_IP)]).await, 401);
+    assert_eq!(mcp(&h, &token, &[("x-forwarded-for", PUBLIC_IP), ("x-dove-proxy-auth", &secret)]).await, 401);
+
+    let h = Harness::start_with(|c| {
+        c.mode = dove::config::Mode::Local;
+        c.secrets.proxy_secret_file = None;
+    })
+    .await;
+    let token = allow_ip_token(&h).await;
+    assert_eq!(mcp(&h, &token, &[("x-forwarded-for", PUBLIC_IP)]).await, 401);
+}

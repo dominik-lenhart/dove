@@ -11,7 +11,12 @@ use crate::secrets;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// Public HTTPS base URL, for example `https://dove.example.com`.
+    /// `server` (default): behind a TLS reverse proxy for remote MCP hosts. `local`: on the desktop user's own
+    /// computer for MCP hosts on the same machine (PLAN A58).
+    #[serde(default)]
+    pub mode: Mode,
+    /// Public HTTPS base URL, for example `https://dove.example.com`. In local mode also `http://127.0.0.1:<port>` or
+    /// `http://localhost:<port>` with the port of `listen`.
     pub public_url: String,
     /// Loopback listen address. Non-loopback addresses are refused.
     #[serde(default = "default_listen")]
@@ -40,6 +45,15 @@ pub struct Config {
     /// Downstream OAuth for MCP hosts and invitation redemption (spec 5.6).
     #[serde(default)]
     pub oauth: OAuthConfig,
+}
+
+/// Deployment mode (PLAN A58).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Mode {
+    #[default]
+    Server,
+    Local,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -90,9 +104,12 @@ pub struct PreregisteredClient {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdminConfig {
+    /// Unix socket path. On Windows the name of the admin pipe (`\\.\pipe\dove-admin-<user SID>` by default).
     #[serde(default = "default_socket")]
     pub socket_path: PathBuf,
-    /// The only non-root uid allowed to use the admin socket.
+    /// The only non-root uid allowed to use the admin socket. Not used on Windows, where the admin pipe accepts only
+    /// the user the service runs as.
+    #[cfg_attr(windows, serde(default))]
     pub operator_uid: u32,
 }
 
@@ -257,9 +274,17 @@ fn default_listen() -> SocketAddr {
 }
 
 fn default_socket() -> PathBuf {
-    PathBuf::from(DEFAULT_ADMIN_SOCKET)
+    #[cfg(unix)]
+    {
+        PathBuf::from(DEFAULT_ADMIN_SOCKET)
+    }
+    #[cfg(windows)]
+    {
+        PathBuf::from(crate::platform::paths::default_admin_pipe())
+    }
 }
 
+/// The admin socket of a server-mode installation (systemd `RuntimeDirectory=dove`).
 pub const DEFAULT_ADMIN_SOCKET: &str = "/run/dove/admin.sock";
 
 impl Config {
@@ -272,8 +297,13 @@ impl Config {
     /// Startup checks that do not need the secrets loaded (spec 8.4, AC15).
     pub fn validate(&self) -> anyhow::Result<()> {
         let url = url::Url::parse(&self.public_url).context("public_url is not a URL")?;
-        if url.scheme() != "https" {
-            bail!("public_url must use https");
+        match (self.mode, url.scheme()) {
+            (_, "https") => {}
+            (Mode::Local, "http") => self.check_local_http_url(&url)?,
+            (Mode::Local, _) => {
+                bail!("public_url must be http://127.0.0.1:<port> or http://localhost:<port> in local mode")
+            }
+            (Mode::Server, _) => bail!("public_url must use https"),
         }
         if url.host_str().is_none() || url.path() != "/" || url.query().is_some() {
             bail!("public_url must be an origin like https://dove.example.com");
@@ -309,6 +339,25 @@ impl Config {
             secrets::check_secret_file_mode(p)?;
         }
         Ok(())
+    }
+
+    /// Plain HTTP is allowed only in local mode, only for the loopback names `127.0.0.1` and `localhost`, and only
+    /// with the port Dove listens on: the Host check then accepts exactly that loopback origin (DNS rebinding).
+    fn check_local_http_url(&self, url: &url::Url) -> anyhow::Result<()> {
+        if !matches!(url.host_str(), Some("127.0.0.1" | "localhost")) {
+            bail!("plain http public_url must use the host 127.0.0.1 or localhost (local mode)");
+        }
+        if url.port() != Some(self.listen.port()) {
+            bail!(
+                "plain http public_url must name the listen port explicitly, for example http://127.0.0.1:{}",
+                self.listen.port()
+            );
+        }
+        Ok(())
+    }
+
+    pub fn is_local(&self) -> bool {
+        self.mode == Mode::Local
     }
 
     /// Host (with port when not default) that requests must carry (spec 6.2, DNS rebinding).
@@ -421,12 +470,23 @@ retention_days = 180
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
+    /// Writes a secret file. `mode` applies on Unix; on Windows a mode with group/other bits grants Everyone read.
     pub(crate) fn write_secret(dir: &Path, name: &str, content: &str, mode: u32) -> PathBuf {
         let p = dir.join(name);
         std::fs::write(&p, content).unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            crate::platform::restrict_file(&p).unwrap();
+            if mode & 0o077 != 0 {
+                crate::platform::windows::tests::grant_everyone_read(&p);
+            }
+        }
         p
     }
 
@@ -500,5 +560,65 @@ mod tests {
         cfg.google = None;
         cfg.validate().unwrap();
         assert!(cfg.google_client_id().unwrap_err().to_string().contains("[google]"));
+    }
+
+    /// A local-mode config with its own secrets directory (kept alive by the returned guard).
+    fn local(public_url: &str) -> (tempfile::TempDir, Config) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = config(dir.path(), public_url, 0o400);
+        cfg.mode = Mode::Local;
+        (dir, cfg)
+    }
+
+    fn server(public_url: &str) -> (tempfile::TempDir, Config) {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path(), public_url, 0o400);
+        (dir, cfg)
+    }
+
+    #[test]
+    fn mode_defaults_to_server_and_parses_local() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(config(dir.path(), "https://dove.example.com", 0o400).mode, Mode::Server);
+        let parsed: Config = toml::from_str(&format!("mode = \"local\"\n{EXAMPLE}")).unwrap();
+        assert_eq!(parsed.mode, Mode::Local);
+        assert!(toml::from_str::<Config>(&format!("mode = \"desktop\"\n{EXAMPLE}")).is_err());
+    }
+
+    /// Plain HTTP loopback URLs: accepted only in local mode, only for 127.0.0.1/localhost, only with the listen
+    /// port. Each refusal below is caught by exactly one rule.
+    #[test]
+    fn local_mode_allows_only_the_loopback_http_origin() {
+        for ok in
+            ["http://127.0.0.1:8787", "http://localhost:8787", "http://127.0.0.1:8787/", "https://dove.example.com"]
+        {
+            local(ok).1.validate().unwrap_or_else(|e| panic!("{ok}: {e}"));
+        }
+        // Server mode never accepts plain HTTP, loopback or not.
+        for url in ["http://127.0.0.1:8787", "http://localhost:8787"] {
+            let err = server(url).1.validate().unwrap_err().to_string();
+            assert_eq!(err, "public_url must use https", "{url}");
+        }
+        for (url, why) in [
+            ("http://dove.example.com:8787", "127.0.0.1 or localhost"),
+            ("http://192.168.1.20:8787", "127.0.0.1 or localhost"),
+            ("http://[::1]:8787", "127.0.0.1 or localhost"),
+            ("http://127.0.0.2:8787", "127.0.0.1 or localhost"),
+            ("http://localhost.example.com:8787", "127.0.0.1 or localhost"),
+            ("http://127.0.0.1:9999", "listen port"),
+            ("http://127.0.0.1", "listen port"),
+            ("http://127.0.0.1:8787/mcp", "must be an origin"),
+            ("ftp://127.0.0.1:8787", "in local mode"),
+        ] {
+            let err = local(url).1.validate().unwrap_err().to_string();
+            assert!(err.contains(why), "{url}: {err}");
+        }
+        // Local mode keeps the loopback-only listener.
+        let (_d, mut cfg) = local("http://127.0.0.1:8787");
+        cfg.listen = "0.0.0.0:8787".parse().unwrap();
+        assert!(cfg.validate().unwrap_err().to_string().contains("loopback"));
+        // The Host check then accepts exactly the configured loopback origin.
+        assert_eq!(local("http://localhost:8787").1.public_host(), "localhost:8787");
+        assert_eq!(local("http://127.0.0.1:8787").1.public_host(), "127.0.0.1:8787");
     }
 }
