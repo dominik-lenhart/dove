@@ -461,7 +461,7 @@ fn memchr(needle: u8, hay: &[u8], from: usize) -> Option<usize> {
 }
 
 /// Appends `s` with XML character references resolved (five predefined entities and numeric references).
-fn push_unescaped(s: &str, out: &mut String) {
+pub(crate) fn push_unescaped(s: &str, out: &mut String) {
     let mut rest = s;
     while let Some(p) = rest.find('&') {
         out.push_str(&rest[..p]);

@@ -40,7 +40,7 @@ impl MessageMeta {
             labels: crate::index::ingest::labels_of(v),
             internal_date_ms: v["internalDate"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0),
             size_estimate: v["sizeEstimate"].as_i64().unwrap_or(0),
-            snippet: v["snippet"].as_str().map(|s| content::clean_text(s).trim().to_string()),
+            snippet: v["snippet"].as_str().map(gmail_snippet),
         })
     }
 }
@@ -106,6 +106,13 @@ async fn fetch_imap(cx: &ToolCx, mb: &Mailbox, id: &str) -> Result<Fetched, Tool
 }
 
 /// Snippet of an IMAP message: the start of its body text with whitespace collapsed (Gmail computes its own).
+/// Gmail's `snippet` is HTML-escaped (`&#39;`, `&amp;`, ...): resolve the references, then clean it like any text.
+pub fn gmail_snippet(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    crate::attachment_text::push_unescaped(raw, &mut out);
+    content::clean_text(&out).trim().to_string()
+}
+
 pub fn imap_snippet(parsed: &ParsedMessage) -> String {
     let text = read::body_text(parsed);
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -261,6 +268,16 @@ pub async fn list_labels(cx: &ToolCx, mb: &Mailbox) -> Result<Vec<Value>, ToolEr
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gmail_snippets_are_unescaped() {
+        let m = MessageMeta::from_json(&serde_json::json!({
+            "id": "1a1d456be54939a3",
+            "snippet": "If you didn&#39;t allow it, check &quot;Security&quot; &amp; act &lt;now&gt;",
+        }))
+        .unwrap();
+        assert_eq!(m.snippet.as_deref(), Some("If you didn't allow it, check \"Security\" & act <now>"));
+    }
+
     use super::*;
 
     #[test]

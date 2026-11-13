@@ -5,6 +5,8 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-13
+
 ### Added
 
 - IMAP send-as aliases: `dove accounts aliases add|list|remove <mailbox> <address> [--name] [--envelope]`.
@@ -37,12 +39,6 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 - IMAP moves use `MOVE` where offered and otherwise `COPY` plus `\Deleted`/`UID EXPUNGE` of exactly the messages the
   server confirmed as copied.
 
-### Changed
-
-- Gmail connects also request `gmail.modify`. Mailboxes connected earlier keep reading, drafting and sending; run
-  `dove accounts reconnect <alias>` to use the organize and delete tools and `delete_draft` there.
-- The OAuth approval page shows a preset selector per mailbox; `organize` is pre-selected, `delete` and `send` are not,
-  and `send` only appears while `allow_send = true`.
 - `search_contacts`: who the mailbox actually corresponds with, ranked by exchanged mail and recency, without no-reply
   and other automated senders. Works on Gmail and IMAP mailboxes through the index.
 - `digest`: threads with new mail since a time, newest first, with snippets, per folder and category, paged with a
@@ -58,10 +54,18 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 
 ### Changed
 
+- Gmail connects also request `gmail.modify`. Mailboxes connected earlier keep reading, drafting and sending; run
+  `dove accounts reconnect <alias>` to use the organize and delete tools and `delete_draft` there.
+- The OAuth approval page shows a preset selector per mailbox; `organize` is pre-selected, `delete` and `send` are not,
+  and `send` only appears while `allow_send = true`.
 - The first start after upgrading rebuilds every indexed mailbox once, to compute categories and attachment text.
   The old index keeps answering searches until the new one is ready; results that need categories or attachment text
   are reported as partial until then.
 - New dependency: `lopdf` (PDF text extraction, no default features).
+
+### Fixed
+
+- Gmail snippets (digest, search results) no longer show HTML character references such as `&#39;`.
 
 ## [0.1.0] - 2026-11-13
 
@@ -87,5 +91,6 @@ First release.
   release only after verifying its minisign signature. The CLI hints at a new release at most once a day
   (`DOVE_NO_UPDATE_CHECK=1` turns it off); the server never checks for updates.
 
-[Unreleased]: https://github.com/dominik-lenhart/dove/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/dominik-lenhart/dove/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/dominik-lenhart/dove/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/dominik-lenhart/dove/releases/tag/v0.1.0
