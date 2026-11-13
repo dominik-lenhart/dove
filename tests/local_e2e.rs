@@ -190,13 +190,7 @@ async fn local_init_start_admin_and_stop() {
 /// invitation, the MCP stdio bridge, and `dove mcp install --client claude-desktop`.
 #[tokio::test]
 async fn mcp_client_against_local_mode() {
-    let h = Harness::start_loopback_public(|c| {
-        c.mode = dove::config::Mode::Local;
-        c.public_url = c.public_url.replace("https://", "http://");
-        c.listen = c.public_url.trim_start_matches("http://").parse().unwrap();
-        c.secrets.proxy_secret_file = None;
-    })
-    .await;
+    let h = Harness::start_local(|c| c.secrets.proxy_secret_file = None).await;
     assert!(h.app().cfg.is_local());
     h.imap_mailbox("personal", "me@home.test").await;
     h.project("assistant", &["personal"]).await;

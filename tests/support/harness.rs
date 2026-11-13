@@ -93,6 +93,18 @@ impl Harness {
         Self { env, google, imap, base: format!("http://{addr}"), http: reqwest::Client::new(), server }
     }
 
+    /// A local-mode server (PLAN A58): `public_url` is `http://<listen>` of the loopback listener itself.
+    #[allow(dead_code)]
+    pub async fn start_local(customize: impl FnOnce(&mut Config)) -> Self {
+        Self::start_loopback_public(|c| {
+            c.mode = dove::config::Mode::Local;
+            c.public_url = c.public_url.replace("https://", "http://");
+            c.listen = c.public_url.trim_start_matches("http://").parse().unwrap();
+            customize(c)
+        })
+        .await
+    }
+
     pub fn app(&self) -> &Arc<App> {
         &self.env.app
     }

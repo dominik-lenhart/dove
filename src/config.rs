@@ -15,8 +15,8 @@ pub struct Config {
     /// computer for MCP hosts on the same machine (PLAN A58).
     #[serde(default)]
     pub mode: Mode,
-    /// Public HTTPS base URL, for example `https://dove.example.com`. In local mode also `http://127.0.0.1:<port>` or
-    /// `http://localhost:<port>` with the port of `listen`.
+    /// Public HTTPS base URL, for example `https://dove.example.com`. In local mode exactly `http://<listen>`, for
+    /// example `http://127.0.0.1:8787` (an IP literal, never `localhost`).
     pub public_url: String,
     /// Loopback listen address. Non-loopback addresses are refused.
     #[serde(default = "default_listen")]
@@ -298,12 +298,11 @@ impl Config {
     pub fn validate(&self) -> anyhow::Result<()> {
         let url = url::Url::parse(&self.public_url).context("public_url is not a URL")?;
         match (self.mode, url.scheme()) {
-            (_, "https") => {}
-            (Mode::Local, "http") => self.check_local_http_url(&url)?,
-            (Mode::Local, _) => {
-                bail!("public_url must be http://127.0.0.1:<port> or http://localhost:<port> in local mode")
-            }
+            (Mode::Server, "https") => {}
             (Mode::Server, _) => bail!("public_url must use https"),
+            (Mode::Local, "http") => self.check_local_http_url(&url)?,
+            // HTTPS would mean a proxy in front, which local mode does not trust or expect (PLAN A58).
+            (Mode::Local, _) => bail!("public_url must be http://{} in local mode (the listen address)", self.listen),
         }
         if url.host_str().is_none() || url.path() != "/" || url.query().is_some() {
             bail!("public_url must be an origin like https://dove.example.com");
@@ -341,17 +340,17 @@ impl Config {
         Ok(())
     }
 
-    /// Plain HTTP is allowed only in local mode, only for the loopback names `127.0.0.1` and `localhost`, and only
-    /// with the port Dove listens on: the Host check then accepts exactly that loopback origin (DNS rebinding).
+    /// Local mode serves exactly `http://<listen ip>:<listen port>`. The host must be the IP literal Dove binds, never a
+    /// name: `localhost` resolves to `::1` first on Windows and macOS, where another local user could listen and
+    /// receive tokens while Dove holds only `127.0.0.1` (PLAN A58). The Host check then accepts exactly that origin.
     fn check_local_http_url(&self, url: &url::Url) -> anyhow::Result<()> {
-        if !matches!(url.host_str(), Some("127.0.0.1" | "localhost")) {
-            bail!("plain http public_url must use the host 127.0.0.1 or localhost (local mode)");
-        }
-        if url.port() != Some(self.listen.port()) {
-            bail!(
-                "plain http public_url must name the listen port explicitly, for example http://127.0.0.1:{}",
-                self.listen.port()
-            );
+        let ip = match url.host() {
+            Some(url::Host::Ipv4(ip)) => std::net::IpAddr::V4(ip),
+            Some(url::Host::Ipv6(ip)) => std::net::IpAddr::V6(ip),
+            _ => bail!("public_url must use the listen IP address, not a name, in local mode: http://{}", self.listen),
+        };
+        if ip != self.listen.ip() || url.port() != Some(self.listen.port()) {
+            bail!("public_url must be exactly the listen address in local mode: http://{}", self.listen);
         }
         Ok(())
     }
@@ -585,40 +584,46 @@ mod tests {
         assert!(toml::from_str::<Config>(&format!("mode = \"desktop\"\n{EXAMPLE}")).is_err());
     }
 
-    /// Plain HTTP loopback URLs: accepted only in local mode, only for 127.0.0.1/localhost, only with the listen
-    /// port. Each refusal below is caught by exactly one rule.
+    /// Local mode accepts exactly `http://<listen>`: an IP literal, the listen IP and port, never HTTPS. Server mode
+    /// never accepts plain HTTP. Each refusal below is caught by exactly one rule.
     #[test]
     fn local_mode_allows_only_the_loopback_http_origin() {
-        for ok in
-            ["http://127.0.0.1:8787", "http://localhost:8787", "http://127.0.0.1:8787/", "https://dove.example.com"]
-        {
+        for ok in ["http://127.0.0.1:8787", "http://127.0.0.1:8787/"] {
             local(ok).1.validate().unwrap_or_else(|e| panic!("{ok}: {e}"));
         }
+        // An IPv6 loopback listener with its own literal.
+        let (_d, mut cfg) = local("http://[::1]:8787");
+        cfg.listen = "[::1]:8787".parse().unwrap();
+        cfg.validate().unwrap();
         // Server mode never accepts plain HTTP, loopback or not.
         for url in ["http://127.0.0.1:8787", "http://localhost:8787"] {
             let err = server(url).1.validate().unwrap_err().to_string();
             assert_eq!(err, "public_url must use https", "{url}");
         }
         for (url, why) in [
-            ("http://dove.example.com:8787", "127.0.0.1 or localhost"),
-            ("http://192.168.1.20:8787", "127.0.0.1 or localhost"),
-            ("http://[::1]:8787", "127.0.0.1 or localhost"),
-            ("http://127.0.0.2:8787", "127.0.0.1 or localhost"),
-            ("http://localhost.example.com:8787", "127.0.0.1 or localhost"),
-            ("http://127.0.0.1:9999", "listen port"),
-            ("http://127.0.0.1", "listen port"),
+            // A name, even one that resolves to loopback: localhost may resolve to ::1, which Dove does not hold.
+            ("http://localhost:8787", "not a name"),
+            ("http://dove.example.com:8787", "not a name"),
+            ("http://localhost.example.com:8787", "not a name"),
+            ("http://192.168.1.20:8787", "exactly the listen address"),
+            ("http://[::1]:8787", "exactly the listen address"),
+            ("http://127.0.0.2:8787", "exactly the listen address"),
+            ("http://127.0.0.1:9999", "exactly the listen address"),
+            ("http://127.0.0.1", "exactly the listen address"),
             ("http://127.0.0.1:8787/mcp", "must be an origin"),
+            // No HTTPS in local mode: it would mean a proxy, whose X-Forwarded-For local mode ignores.
+            ("https://dove.example.com", "in local mode"),
+            ("https://127.0.0.1:8787", "in local mode"),
             ("ftp://127.0.0.1:8787", "in local mode"),
         ] {
             let err = local(url).1.validate().unwrap_err().to_string();
             assert!(err.contains(why), "{url}: {err}");
         }
         // Local mode keeps the loopback-only listener.
-        let (_d, mut cfg) = local("http://127.0.0.1:8787");
+        let (_d, mut cfg) = local("http://0.0.0.0:8787");
         cfg.listen = "0.0.0.0:8787".parse().unwrap();
         assert!(cfg.validate().unwrap_err().to_string().contains("loopback"));
         // The Host check then accepts exactly the configured loopback origin.
-        assert_eq!(local("http://localhost:8787").1.public_host(), "localhost:8787");
         assert_eq!(local("http://127.0.0.1:8787").1.public_host(), "127.0.0.1:8787");
     }
 }

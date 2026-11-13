@@ -371,9 +371,11 @@ hosts or reference hardware.
   (f) Cost: extraction runs in ingest on bytes already fetched, so it adds CPU and a transient copy per attachment,
   and no upstream traffic. Messages over `max_message_bytes` are metadata-only and get no attachment text.
 - A58. Local mode and the Windows port (design `docs/superpowers/specs/2026-11-13-local-mode-and-packaging-design.md`
-  section A, approved 2026-11-13). (a) `mode = "local"` (default `"server"`) allows a plain-HTTP `public_url` only for
-  the hosts `127.0.0.1` and `localhost` and only with the port of `listen`, which stays loopback-only; the Host check
-  then accepts exactly that origin. Server mode is unchanged and still refuses any non-HTTPS URL. In local mode the
+  section A, approved 2026-11-13). (a) `mode = "local"` (default `"server"`) requires `public_url` to be exactly `http://<listen>`
+  (an IP literal equal to the listen IP, the listen port; `listen` stays loopback-only), so the Host check accepts
+  exactly that origin. Deviation from the design (security review 2026-11-13): no `localhost` (it resolves to `::1`
+  first on Windows and macOS, which another local user could bind while Dove holds `127.0.0.1`) and no HTTPS (it would
+  mean a proxy, whose `X-Forwarded-For` local mode ignores). Server mode is unchanged and still refuses any non-HTTPS URL. In local mode the
   HTTP guard never reads `X-Forwarded-For` (there is no proxy, only local processes could send it), so no
   `proxy_secret_file` is needed and doctor does not ask for one. (b) Per-user paths (`platform::paths`): config
   `dove.toml` (not `config.toml`: the remote client's profiles share the directory on Linux and Windows) under
