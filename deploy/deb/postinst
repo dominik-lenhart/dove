@@ -1,0 +1,43 @@
+#!/bin/sh
+# Debian maintainer script. Creates the service account and /etc/dove; generates no secrets and does not enable or
+# start the service (it needs a config and secrets first, see docs/deployment.md).
+set -e
+
+case "$1" in
+configure)
+    # Service account: non-login, home is the state directory (same definition as dove.sysusers.conf).
+    if [ -x /usr/bin/systemd-sysusers ]; then
+        systemd-sysusers /usr/lib/sysusers.d/dove.conf
+    else
+        # No systemd tools (a minimal container): groupadd/useradd come from the essential `passwd` package.
+        getent group dove >/dev/null || groupadd --system dove
+        getent passwd dove >/dev/null || useradd --system --gid dove --home-dir /var/lib/dove --no-create-home \
+            --shell /usr/sbin/nologin --comment "Dove MCP server" dove
+    fi
+
+    # Same modes as dove.tmpfiles.conf. Only created when missing, so a later upgrade never resets an operator's setup.
+    [ -d /etc/dove ] || install -d -m 0750 -o root -g dove /etc/dove
+    [ -d /etc/dove/credentials ] || install -d -m 0700 -o root -g root /etc/dove/credentials
+
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload || true
+        # An upgrade restarts a service that is already running; it never starts one.
+        if [ -n "$2" ]; then
+            systemctl try-restart dove.service || true
+        fi
+    fi
+
+    if [ -z "$2" ]; then
+        cat <<'MSG'
+
+Dove is installed but not configured yet. Next steps (details: docs/deployment.md in
+https://github.com/dominik-lenhart/dove):
+  1. Write /etc/dove/config.toml and put the secrets in /etc/dove/credentials (root only).
+  2. sudo systemctl enable --now dove
+
+MSG
+    fi
+    ;;
+esac
+
+exit 0

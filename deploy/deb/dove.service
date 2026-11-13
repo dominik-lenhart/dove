@@ -1,0 +1,104 @@
+# Dove MCP server, unit shipped in the Debian/Ubuntu package (dove_<version>_<arch>.deb).
+# Derived from deploy/systemd/dove.service: only the path of the binary differs (/usr/bin/dove instead of
+# /usr/local/bin/dove); tests/packaging.rs checks that they stay equal otherwise. Edit that file, then copy the change here.
+# Secrets and config: see docs/deployment.md. The package creates the user and /etc/dove but no secrets, and it does
+# not enable or start the service: that fails the AssertPathExists= lines below until you have set it up.
+
+[Unit]
+Description=Dove MCP server (token-scoped Gmail access for AI agents)
+Documentation=https://github.com/dominik-lenhart/dove
+After=network-online.target
+Wants=network-online.target
+# Do not start without a config and the three key files. Missing secrets fail loudly here instead of in the service.
+AssertPathExists=/etc/dove/config.toml
+AssertPathExists=/etc/dove/credentials/kek
+AssertPathExists=/etc/dove/credentials/pepper
+AssertPathExists=/etc/dove/credentials/index_key
+AssertPathExists=/etc/dove/credentials/google_client_secret
+AssertPathExists=/etc/dove/credentials/proxy_secret
+
+[Service]
+Type=simple
+User=dove
+Group=dove
+ExecStart=/usr/bin/dove serve --config /etc/dove/config.toml
+
+# Secrets. The names match the paths in config.toml: /run/credentials/dove.service/<name>.
+# Keep the sources 0400 root:root. To store them encrypted at rest, use LoadCredentialEncrypted= instead
+# (systemd-creds encrypt); the service sees the same plain files either way.
+LoadCredential=kek:/etc/dove/credentials/kek
+LoadCredential=pepper:/etc/dove/credentials/pepper
+LoadCredential=index_key:/etc/dove/credentials/index_key
+LoadCredential=google_client_secret:/etc/dove/credentials/google_client_secret
+# Shared with the reverse proxy (X-Dove-Proxy-Auth); see docs/deployment.md, "Reverse proxy".
+LoadCredential=proxy_secret:/etc/dove/credentials/proxy_secret
+
+# Directories. StateDirectory creates /var/lib/dove (state.db, index.db and their WAL files) with mode 0700.
+# RuntimeDirectory creates /run/dove for the admin socket. Mode 0750 plus group dove means: only members of the
+# group "dove" can even reach the socket. The service still checks the peer uid against admin.operator_uid.
+StateDirectory=dove
+StateDirectoryMode=0700
+RuntimeDirectory=dove
+RuntimeDirectoryMode=0750
+UMask=0077
+
+# Restart and shutdown. The service drains in-flight requests for up to 10 s (spec 8.2) after SIGTERM, then exits.
+# The 5 s margin lets it exit on its own before systemd sends SIGKILL.
+Restart=on-failure
+RestartSec=2s
+TimeoutStartSec=30s
+TimeoutStopSec=15s
+KillSignal=SIGTERM
+
+# Resources. Reference profile: 512 MiB (spec 8.1a). For larger workloads or aggressive backfill use the 1 GiB
+# profile: MemoryHigh=900M, MemoryMax=1G. MemoryHigh throttles before the hard limit kills the process.
+MemoryHigh=450M
+MemoryMax=512M
+MemorySwapMax=0
+CPUQuota=200%
+TasksMax=256
+LimitNOFILE=4096
+LimitCORE=0
+
+# Privileges. No capabilities, no privilege gain.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# File system. The root is read-only; only the data directory and the admin socket directory are writable.
+# PrivateTmp gives the service its own /tmp. The index keeps SQL temporaries in memory, so nothing needs a shared tmp.
+ProtectSystem=strict
+ReadWritePaths=/var/lib/dove /run/dove
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProcSubset=pid
+
+# Kernel and namespaces.
+# Do NOT enable PrivateUsers=: inside a user namespace the kernel reports the operator's uid as unmapped
+# (SO_PEERCRED shows 65534) and the admin socket's peer check would reject the operator.
+# Do NOT enable PrivateNetwork=: the service must reach Google and the proxy must reach the loopback listener.
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+SystemCallErrorNumber=EPERM
+
+# Optional outbound restriction (spec 6.6): allow only Google's OAuth and Gmail API hosts. Google's address ranges
+# change, so this is better done with a hostname-aware firewall on the host than with IPAddressAllow= here.
+
+[Install]
+WantedBy=multi-user.target
