@@ -194,6 +194,21 @@ pub async fn load(app: &App, account_id: &str) -> Result<(ImapSettings, Credenti
     Ok((settings, creds))
 }
 
+/// Whether an IMAP account is in Gmail mode (PLAN A52), from its stored settings. Unknown accounts are `false`.
+pub async fn gmail_mode(app: &App, account_id: &str) -> Result<bool, ToolError> {
+    let id = account_id.to_string();
+    let s: Option<String> = app
+        .store
+        .call(move |c| {
+            Ok(c.query_row("SELECT imap_settings FROM accounts WHERE id = ?1", [id], |r| r.get(0))
+                .optional()?
+                .flatten())
+        })
+        .await
+        .map_err(internal_from)?;
+    Ok(s.and_then(|s| serde_json::from_str::<ImapSettings>(&s).ok()).is_some_and(|s| s.gmail))
+}
+
 /// Marks `reauth_required` only while the credential generation is unchanged (a late failure for an old password
 /// cannot touch a newer one) and notifies the owner once per generation.
 pub async fn mark_auth_failure(app: &App, account_id: &str, generation: i64, alias: &str) {

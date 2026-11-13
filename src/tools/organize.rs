@@ -5,6 +5,9 @@
 //! same `not_found`. Moving into Trash or Spam/Junk needs `delete` on top of `organize`; nothing is ever deleted
 //! permanently: Gmail only gets `messages.trash`, and on IMAP the only expunge outside Drafts is of the sources of a
 //! copy the server confirmed (`imap::CopiedUid`), which completes a move on servers without `MOVE`.
+//!
+//! Gmail over IMAP (PLAN A52) never expunges outside Drafts: labels, archive and inbox are `X-GM-LABELS` changes on the
+//! All Mail message (its id stays), Trash and Spam only `UID MOVE` (a server without `MOVE` is refused).
 
 use std::collections::BTreeMap;
 
@@ -19,7 +22,7 @@ use crate::gmail::gateway::{GmailOp, Priority, valid_id};
 use crate::gmail::{SCOPE_MODIFY, WriteError};
 use crate::imap::account::{self, Folder};
 use crate::imap::connect::{JUNK_NAMES, TRASH_NAMES};
-use crate::imap::{ImapMsgId, Keyword, MoveOutcome, Special, StoreFlag};
+use crate::imap::{GmLabel, ImapMsgId, Keyword, MoveOutcome, Special, StoreFlag, UserLabel};
 use crate::mail;
 use crate::policy::{Capability, Mailbox, Provider};
 
@@ -398,6 +401,9 @@ async fn imap_update(
     add_labels: &[String],
     remove_labels: &[String],
 ) -> Result<Vec<Outcome>, ToolError> {
+    if account::gmail_mode(&cx.app, &mb.account_id).await? {
+        return gmail_imap_update(cx, mb, ids, add_flags, remove_flags, add_labels, remove_labels).await;
+    }
     let (mut add, mut remove) = imap_flags(add_flags, add_labels, true)?;
     let (a2, r2) = imap_flags(remove_flags, remove_labels, false)?;
     add.extend(a2);
@@ -614,6 +620,9 @@ fn imap_target<'a>(folders: &'a [Folder], target: &Target) -> Result<&'a Folder,
 }
 
 async fn imap_move(cx: &ToolCx, mb: &Mailbox, ids: &[String], target: &Target) -> Result<Vec<Outcome>, ToolError> {
+    if account::gmail_mode(&cx.app, &mb.account_id).await? {
+        return gmail_imap_move(cx, mb, ids, target).await;
+    }
     let ImapGroups { folders, groups, mut outcomes } = imap_groups(cx, mb, ids).await?;
     let dest = imap_target(&folders, target)?.clone();
     if matches!(target, Target::Trash | Target::Spam) || is_trash_or_junk(&dest, &folders) {
@@ -633,33 +642,275 @@ async fn imap_move(cx: &ToolCx, mb: &Mailbox, ids: &[String], target: &Target) -
             committed = true;
         }
         let src = folder_of(&folders, folder_id).name.clone();
+        move_group(cx, mb, &src, uidvalidity, members, &dest, &mut outcomes).await;
+    }
+    Ok(outcomes.into_iter().map(|o| o.unwrap_or_else(|| Outcome::Failed(ToolError::internal()))).collect())
+}
+
+/// Moves one source folder's members (index into ids, UID) to `dest` and records each one's outcome.
+async fn move_group(
+    cx: &ToolCx,
+    mb: &Mailbox,
+    src: &str,
+    uidvalidity: u32,
+    members: Vec<(usize, u32)>,
+    dest: &Folder,
+    outcomes: &mut [Option<Outcome>],
+) {
+    let src = src.to_string();
+    let uids: Vec<u32> = members.iter().map(|(_, u)| *u).collect();
+    let dest_name = dest.name.clone();
+    let r: Result<MoveOutcome, ToolError> = account::with_session(&cx.app, &mb.account_id, move |s| {
+        Box::pin(async move { s.move_uids(&src, uidvalidity, &uids, &dest_name).await })
+    })
+    .await;
+    let new_id = |uv: Option<u32>, d: Option<u32>| match (uv, d) {
+        (Some(uidvalidity), Some(uid)) => Some(ImapMsgId { folder_id: dest.folder_id, uidvalidity, uid }.encode()),
+        _ => None,
+    };
+    for (i, uid) in members {
+        outcomes[i] = Some(match &r {
+            Ok(m) => {
+                if let Some((_, d)) = m.moved.iter().find(|(s, _)| *s == uid) {
+                    Outcome::Done { new_id: new_id(m.dest_uidvalidity, *d), labels: None }
+                } else if let Some((_, d)) = m.copied_kept.iter().find(|(s, _)| *s == uid) {
+                    Outcome::Failed(
+                        ToolError::new(
+                            ErrorCode::UpstreamError,
+                            "the message was copied but the original could not be removed; it is now in both folders",
+                        )
+                        .with_details(json!({ "copy_id": new_id(m.dest_uidvalidity, *d) })),
+                    )
+                } else {
+                    Outcome::Failed(ToolError::not_found())
+                }
+            }
+            Err(e) => Outcome::Failed(e.clone()),
+        });
+    }
+}
+
+// ------------------------------------------------------------------ Gmail over IMAP (PLAN A52)
+
+/// Where a message of a Gmail-mode mailbox can be organized from: All Mail (labels, archive, inbox, trash, spam) or
+/// Trash/Spam (moved out with `UID MOVE`). Label folders hold copies whose ids search never returns.
+fn gmail_source(f: &Folder) -> Result<(), ToolError> {
+    match f.special {
+        Some(Special::All | Special::Trash | Special::Junk) => Ok(()),
+        _ => Err(ToolError::invalid(
+            "on Gmail, organize messages by their All Mail, Spam or Trash id (as search_messages returns them)",
+        )),
+    }
+}
+
+/// `[Gmail]/` (or `[Google Mail]/`): the parent of the All Mail folder, under which Gmail lists its system folders.
+fn gmail_system_prefix(folders: &[Folder]) -> Option<String> {
+    let all = folders.iter().find(|f| f.special == Some(Special::All))?;
+    all.name.rsplit_once('/').map(|(p, _)| format!("{p}/"))
+}
+
+/// Whether `f` is a user label: no special use, not INBOX and not one of Gmail's system folders.
+fn is_gmail_user_label(f: &Folder, folders: &[Folder]) -> bool {
+    f.special.is_none()
+        && !f.name.eq_ignore_ascii_case("INBOX")
+        && !gmail_system_prefix(folders).is_some_and(|p| f.name.starts_with(&p))
+}
+
+/// A folder by the name an agent gave (its label text; exact, else the only case-insensitive match).
+fn folder_by_label<'a>(folders: &'a [Folder], name: &str) -> Option<&'a Folder> {
+    let label = mail::label_text(name);
+    folders.iter().find(|f| mail::label_text(&f.name_utf8) == label).or_else(|| {
+        let mut it = folders.iter().filter(|f| mail::label_text(&f.name_utf8).eq_ignore_ascii_case(&label));
+        match (it.next(), it.next()) {
+            (Some(f), None) => Some(f),
+            _ => None,
+        }
+    })
+}
+
+/// A user label for `X-GM-LABELS`: it must exist as a folder (Dove creates no labels) and not be a system folder.
+fn gmail_user_label(folders: &[Folder], name: &str) -> Result<GmLabel, ToolError> {
+    let short = || mail::label_text(name).chars().take(64).collect::<String>();
+    let f = folder_by_label(folders, name)
+        .ok_or_else(|| ToolError::invalid(format!("unknown label '{}' (Dove does not create labels)", short())))?;
+    if !is_gmail_user_label(f, folders) {
+        return Err(ToolError::invalid(format!(
+            "'{}' is a system label; use add_flags/remove_flags or move_messages",
+            short()
+        )));
+    }
+    UserLabel::new(&f.name)
+        .map(GmLabel::User)
+        .ok_or_else(|| ToolError::invalid(format!("unusable label '{}'", short())))
+}
+
+async fn gmail_imap_update(
+    cx: &ToolCx,
+    mb: &Mailbox,
+    ids: &[String],
+    add_flags: &[Flag],
+    remove_flags: &[Flag],
+    add_labels: &[String],
+    remove_labels: &[String],
+) -> Result<Vec<Outcome>, ToolError> {
+    let (mut add, mut remove) = imap_flags(add_flags, &[], true)?;
+    let (a2, r2) = imap_flags(remove_flags, &[], false)?;
+    add.extend(a2);
+    remove.extend(r2);
+    let ImapGroups { folders, groups, mut outcomes } = imap_groups(cx, mb, ids).await?;
+    let gadd: Vec<GmLabel> = add_labels.iter().map(|l| gmail_user_label(&folders, l)).collect::<Result<_, _>>()?;
+    let gremove: Vec<GmLabel> =
+        remove_labels.iter().map(|l| gmail_user_label(&folders, l)).collect::<Result<_, _>>()?;
+    let mut committed = false;
+    for ((folder_id, uidvalidity), members) in groups {
+        let f = folder_of(&folders, folder_id).clone();
+        let refused = gmail_source(&f).err().or_else(|| {
+            (f.special != Some(Special::All) && !(gadd.is_empty() && gremove.is_empty()))
+                .then(|| ToolError::invalid("labels cannot change in Trash or Spam; move the message out first"))
+        });
+        if let Some(e) = refused {
+            for (i, _) in members {
+                outcomes[i] = Some(Outcome::Failed(e.clone()));
+            }
+            continue;
+        }
+        if !committed {
+            cx.commit()?;
+            committed = true;
+        }
         let uids: Vec<u32> = members.iter().map(|(_, u)| *u).collect();
-        let dest_name = dest.name.clone();
-        let r: Result<MoveOutcome, ToolError> = account::with_session(&cx.app, &mb.account_id, move |s| {
-            Box::pin(async move { s.move_uids(&src, uidvalidity, &uids, &dest_name).await })
+        let (name, add, remove, gadd, gremove) =
+            (f.name.clone(), add.clone(), remove.clone(), gadd.clone(), gremove.clone());
+        let r = account::with_session(&cx.app, &mb.account_id, move |s| {
+            Box::pin(async move {
+                let mut metas = Vec::new();
+                if !add.is_empty() || !remove.is_empty() {
+                    metas = s.store_flags(&name, uidvalidity, &uids, &add, &remove).await?;
+                }
+                if !gadd.is_empty() || !gremove.is_empty() {
+                    metas = s.store_gm_labels(&name, uidvalidity, &uids, &gadd, &gremove).await?;
+                }
+                Ok(metas)
+            })
         })
         .await;
-        let new_id = |uv: Option<u32>, d: Option<u32>| match (uv, d) {
-            (Some(uidvalidity), Some(uid)) => Some(ImapMsgId { folder_id: dest.folder_id, uidvalidity, uid }.encode()),
-            _ => None,
-        };
         for (i, uid) in members {
             outcomes[i] = Some(match &r {
-                Ok(m) => {
-                    if let Some((_, d)) = m.moved.iter().find(|(s, _)| *s == uid) {
-                        Outcome::Done { new_id: new_id(m.dest_uidvalidity, *d), labels: None }
-                    } else if let Some((_, d)) = m.copied_kept.iter().find(|(s, _)| *s == uid) {
-                        Outcome::Failed(
-                            ToolError::new(
-                                ErrorCode::UpstreamError,
-                                "the message was copied but the original could not be removed; it is now in both folders",
-                            )
-                            .with_details(json!({ "copy_id": new_id(m.dest_uidvalidity, *d) })),
-                        )
-                    } else {
-                        Outcome::Failed(ToolError::not_found())
+                Ok(metas) => match metas.iter().find(|m| m.uid == uid) {
+                    Some(m) => {
+                        Outcome::Done { new_id: Some(ids[i].clone()), labels: Some(mail::message_labels(&f, m, true)) }
                     }
-                }
+                    None => Outcome::Failed(ToolError::not_found()),
+                },
+                Err(e) => Outcome::Failed(e.clone()),
+            });
+        }
+    }
+    Ok(outcomes.into_iter().map(|o| o.unwrap_or_else(|| Outcome::Failed(ToolError::internal()))).collect())
+}
+
+/// Where a Gmail-mode move goes.
+enum GmailDest {
+    Archive,
+    Inbox,
+    Label(Folder, GmLabel),
+    /// Trash or Spam: reached only with `UID MOVE`.
+    Bin(Folder),
+}
+
+fn gmail_dest(folders: &[Folder], target: &Target) -> Result<GmailDest, ToolError> {
+    let by_special = |sp: Special, what: &str| {
+        folders.iter().find(|f| f.special == Some(sp)).cloned().ok_or_else(|| {
+            ToolError::invalid(format!(
+                "this Gmail mailbox shows no {what} folder in IMAP; turn on \"Show in IMAP\" for it"
+            ))
+        })
+    };
+    match target {
+        Target::Archive => Ok(GmailDest::Archive),
+        Target::Inbox => Ok(GmailDest::Inbox),
+        Target::Trash => Ok(GmailDest::Bin(by_special(Special::Trash, "Trash")?)),
+        Target::Spam => Ok(GmailDest::Bin(by_special(Special::Junk, "Spam")?)),
+        Target::Named(n) => {
+            let f = folder_by_label(folders, n).ok_or_else(|| {
+                ToolError::invalid(format!(
+                    "unknown label '{}'; see list_labels",
+                    mail::label_text(n).chars().take(64).collect::<String>()
+                ))
+            })?;
+            match f.special {
+                Some(Special::All) => Ok(GmailDest::Archive),
+                Some(Special::Trash | Special::Junk) => Ok(GmailDest::Bin(f.clone())),
+                _ if f.name.eq_ignore_ascii_case("INBOX") => Ok(GmailDest::Inbox),
+                _ => Ok(GmailDest::Label(f.clone(), gmail_user_label(folders, n)?)),
+            }
+        }
+    }
+}
+
+async fn gmail_imap_move(
+    cx: &ToolCx,
+    mb: &Mailbox,
+    ids: &[String],
+    target: &Target,
+) -> Result<Vec<Outcome>, ToolError> {
+    let ImapGroups { folders, groups, mut outcomes } = imap_groups(cx, mb, ids).await?;
+    let dest = gmail_dest(&folders, target)?;
+    if matches!(dest, GmailDest::Bin(_)) {
+        require_delete(cx, mb)?;
+    }
+    let missing = |what: &str| ToolError::invalid(format!("this Gmail mailbox shows no {what} folder in IMAP"));
+    let all = folders.iter().find(|f| f.special == Some(Special::All)).cloned().ok_or_else(|| missing("All Mail"))?;
+    let inbox = folders.iter().find(|f| f.name.eq_ignore_ascii_case("INBOX")).cloned();
+    let mut committed = false;
+    for ((folder_id, uidvalidity), members) in groups {
+        let f = folder_of(&folders, folder_id).clone();
+        if let Err(e) = gmail_source(&f) {
+            for (i, _) in members {
+                outcomes[i] = Some(Outcome::Failed(e.clone()));
+            }
+            continue;
+        }
+        // What to do: a label change on All Mail (the id stays), or a MOVE into or out of Trash/Spam.
+        let in_all = f.special == Some(Special::All);
+        let (gadd, gremove, move_to): (Vec<GmLabel>, Vec<GmLabel>, Option<Folder>) = match (&dest, in_all) {
+            (GmailDest::Archive, true) => (vec![], vec![GmLabel::Inbox], None),
+            (GmailDest::Inbox, true) => (vec![GmLabel::Inbox], vec![], None),
+            (GmailDest::Label(_, l), true) => (vec![l.clone()], vec![GmLabel::Inbox], None),
+            (GmailDest::Bin(b), _) => (vec![], vec![], Some(b.clone())),
+            // Out of Trash/Spam: UID MOVE to All Mail, INBOX or the label's folder.
+            (GmailDest::Archive, false) => (vec![], vec![], Some(all.clone())),
+            (GmailDest::Inbox, false) => (vec![], vec![], Some(inbox.clone().ok_or_else(|| missing("INBOX"))?)),
+            (GmailDest::Label(lf, _), false) => (vec![], vec![], Some(lf.clone())),
+        };
+        if move_to.as_ref().is_some_and(|d| d.folder_id == folder_id) {
+            for (i, _) in members {
+                outcomes[i] = Some(Outcome::Done { new_id: Some(ids[i].clone()), labels: None });
+            }
+            continue;
+        }
+        if !committed {
+            cx.commit()?;
+            committed = true;
+        }
+        if let Some(d) = move_to {
+            move_group(cx, mb, &f.name, uidvalidity, members, &d, &mut outcomes).await;
+            continue;
+        }
+        let uids: Vec<u32> = members.iter().map(|(_, u)| *u).collect();
+        let name = f.name.clone();
+        let r = account::with_session(&cx.app, &mb.account_id, move |s| {
+            Box::pin(async move { s.store_gm_labels(&name, uidvalidity, &uids, &gadd, &gremove).await })
+        })
+        .await;
+        for (i, uid) in members {
+            outcomes[i] = Some(match &r {
+                Ok(metas) => match metas.iter().find(|m| m.uid == uid) {
+                    Some(m) => {
+                        Outcome::Done { new_id: Some(ids[i].clone()), labels: Some(mail::message_labels(&f, m, true)) }
+                    }
+                    None => Outcome::Failed(ToolError::not_found()),
+                },
                 Err(e) => Outcome::Failed(e.clone()),
             });
         }

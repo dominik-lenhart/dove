@@ -46,7 +46,11 @@ struct Fx {
 
 /// Connects `me@gmail.com` on a Gmail-mode fake server through the real admin verb.
 async fn setup_with(opts: Opts) -> Fx {
-    let mut h = Harness::start().await;
+    setup_cfg(opts, |_| {}).await
+}
+
+async fn setup_cfg(opts: Opts, customize: impl FnOnce(&mut dove::config::Config)) -> Fx {
+    let mut h = Harness::start_with(customize).await;
     h.imap = FakeImap::start_with(opts).await;
     let user = "me@gmail.com";
     h.imap.gmail_user(user, PW);
@@ -58,7 +62,8 @@ async fn setup_with(opts: Opts) -> Fx {
         .await
         .unwrap();
     h.project("p", &["me"]).await;
-    let token = h.token("p", "agent", vec![g("me", "full")]).await;
+    let actions = if h.app().cfg.allow_send { "full,send" } else { "full" };
+    let token = h.token("p", "agent", vec![g("me", actions)]).await;
     let u = FakeImapUser { alias: "me".into(), email: user.into(), user: user.into(), password: PW.into(), account_id };
     Fx { h, u, token }
 }
@@ -392,4 +397,223 @@ async fn idle_and_quick_pass_use_all_mail() {
     let cmds = fx.h.imap.commands();
     let idle = cmds.iter().position(|c| c == "IDLE").expect("IDLE sent");
     assert_eq!(selected(&cmds[..idle]).last().map(String::as_str), Some(ALL), "{cmds:?}");
+}
+
+// ------------------------------------------------------------------ organize
+
+/// Folders of a Gmail message, sorted wire names.
+fn places(fx: &Fx, gm: u64) -> Vec<String> {
+    let mut v = fx.h.imap.gm_folders(&fx.u.user, gm);
+    v.sort();
+    v
+}
+
+fn result(v: &Value) -> &Value {
+    assert_eq!(v["results"].as_array().unwrap().len(), 1, "{v}");
+    &v["results"][0]
+}
+
+/// Flags, labels, archive, inbox and label moves change `X-GM-LABELS` on the All Mail message (its id stays); Trash
+/// and Spam are reached and left only with `UID MOVE`. Nothing is ever flagged `\Deleted` or expunged, no COPY.
+#[tokio::test]
+async fn organize_uses_labels_and_move_only() {
+    let fx = setup().await;
+    let m1 = fx.add(&["INBOX", "Work"], "one", &[]);
+    let m2 = fx.add(&["INBOX"], "two", &[]);
+    let m3 = fx.add(&["INBOX"], "three", &[]);
+    let m4 = fx.add(&["Work"], "four", &["\\Seen"]);
+    fx.sync().await;
+    let (id1, id2, id3, id4) = (fx.id(ALL, m1).await, fx.id(ALL, m2).await, fx.id(ALL, m3).await, fx.id(ALL, m4).await);
+    fx.h.imap.clear_commands();
+    let call = |tool: &'static str, args: Value| {
+        let fx = &fx;
+        async move { fx.h.ok(&fx.token, tool, args).await }
+    };
+
+    let v = call(
+        "update_messages",
+        json!({"account": "me", "ids": [id1], "add_flags": ["STARRED"], "remove_flags": ["UNREAD"],
+               "add_labels": ["privat/kunden"], "remove_labels": ["Work"]}),
+    )
+    .await;
+    let r = result(&v);
+    assert_eq!((r["ok"].as_bool(), r["new_id"].as_str()), (Some(true), Some(id1.as_str())), "{v}");
+    let mut labels: Vec<String> = serde_json::from_value(r["labels"].clone()).unwrap();
+    labels.sort();
+    assert_eq!(labels, sorted(&["INBOX", "Privat/Kunden", "STARRED"]));
+    assert_eq!(places(&fx, m1), sorted(&[ALL, "INBOX", "Privat/Kunden"]));
+    let mut flags = fx.h.imap.gm_flags(&fx.u.user, m1);
+    flags.sort();
+    assert_eq!(flags, sorted(&["\\Flagged", "\\Seen"]));
+
+    // Archive, label move, inbox: label changes only, ids unchanged.
+    let v = call("move_messages", json!({"account": "me", "ids": [id2], "to": "archive"})).await;
+    assert_eq!(result(&v)["new_id"], id2.as_str(), "{v}");
+    assert_eq!(places(&fx, m2), sorted(&[ALL]));
+    let v = call("move_messages", json!({"account": "me", "ids": [id3], "to": "Work"})).await;
+    assert_eq!(result(&v)["new_id"], id3.as_str(), "{v}");
+    assert_eq!(places(&fx, m3), sorted(&[ALL, "Work"]));
+    let v = call("move_messages", json!({"account": "me", "ids": [id4], "to": "inbox"})).await;
+    assert_eq!(result(&v)["new_id"], id4.as_str(), "{v}");
+    assert_eq!(places(&fx, m4), sorted(&[ALL, "INBOX", "Work"]));
+    let stores: Vec<String> = fx.h.imap.commands().into_iter().filter(|c| c.starts_with("UID STORE")).collect();
+    assert!(stores.iter().any(|c| c.ends_with("-X-GM-LABELS (\\Inbox)")), "{stores:?}");
+    assert!(stores.iter().any(|c| c.ends_with("+X-GM-LABELS (\\Inbox)")), "{stores:?}");
+    assert!(stores.iter().any(|c| c.ends_with("+X-GM-LABELS (\"Work\")")), "{stores:?}");
+    assert!(!fx.h.imap.commands().iter().any(|c| verb_of(c) == "UID MOVE"));
+
+    // Trash: UID MOVE, a new Trash id; out again to the inbox: UID MOVE to INBOX (All Mail follows on Gmail).
+    let v = call("move_messages", json!({"account": "me", "ids": [id2], "to": "trash"})).await;
+    let trash_id = result(&v)["new_id"].as_str().unwrap().to_string();
+    assert_eq!(trash_id, fx.id(TRASH, m2).await);
+    assert_eq!(places(&fx, m2), sorted(&[TRASH]));
+    // In Trash flags still change, labels do not (move it out first).
+    let v = call("update_messages", json!({"account": "me", "ids": [trash_id], "add_labels": ["Work"]})).await;
+    assert_eq!(result(&v)["error"]["code"], "invalid_argument", "{v}");
+    let v = call("update_messages", json!({"account": "me", "ids": [trash_id], "add_flags": ["STARRED"]})).await;
+    assert_eq!(result(&v)["labels"], json!([TRASH, "UNREAD", "STARRED", "TRASH"]), "{v}");
+    assert_eq!(places(&fx, m2), sorted(&[TRASH]));
+    let v = call("move_messages", json!({"account": "me", "ids": [trash_id], "to": "inbox"})).await;
+    assert_eq!(result(&v)["new_id"].as_str().unwrap(), fx.id("INBOX", m2).await, "{v}");
+    assert_eq!(places(&fx, m2), sorted(&[ALL, "INBOX"]));
+    // Spam and back to the archive (All Mail).
+    let v = call("move_messages", json!({"account": "me", "ids": [id3], "to": "spam"})).await;
+    let spam_id = result(&v)["new_id"].as_str().unwrap().to_string();
+    assert_eq!(places(&fx, m3), sorted(&[SPAM]));
+    let v = call("move_messages", json!({"account": "me", "ids": [spam_id], "to": "archive"})).await;
+    assert_eq!(result(&v)["new_id"].as_str().unwrap(), fx.id(ALL, m3).await, "{v}");
+    assert_eq!(places(&fx, m3), sorted(&[ALL]));
+    let moves: Vec<String> = fx.h.imap.commands().into_iter().filter(|c| verb_of(c) == "UID MOVE").collect();
+    assert_eq!(moves.len(), 4, "{moves:?}");
+
+    assert_eq!(fx.h.imap.assert_gmail_deletes_only_in_drafts(), 0);
+    fx.h.imap.assert_only_allowlisted();
+    // The index follows: still one row per message.
+    fx.sync().await;
+    let rows = fx.rows().await;
+    assert_eq!(rows.len(), 4, "{rows:?}");
+    assert_eq!(fx.subjects("INBOX").await, sorted(&["four", "one", "two"]));
+}
+
+/// Without MOVE, Trash and Spam are refused: never the COPY + `\Deleted` + EXPUNGE fallback. Label changes still work.
+#[tokio::test]
+async fn trash_without_move_is_refused() {
+    let fx = setup_with(Opts { move_cap: false, ..gmail() }).await;
+    let m = fx.add(&["INBOX"], "keep me", &[]);
+    fx.sync().await;
+    let id = fx.id(ALL, m).await;
+    fx.h.imap.clear_commands();
+    let v = fx.h.ok(&fx.token, "move_messages", json!({"account": "me", "ids": [id], "to": "trash"})).await;
+    let r = result(&v);
+    assert_eq!(r["ok"], false, "{v}");
+    assert_eq!(r["error"]["code"], "upstream_error", "{v}");
+    assert_eq!(places(&fx, m), sorted(&[ALL, "INBOX"]));
+    let cmds = fx.h.imap.commands();
+    assert!(
+        !cmds.iter().any(|c| matches!(verb_of(c).as_str(), "UID STORE" | "UID COPY" | "UID MOVE" | "UID EXPUNGE")),
+        "{cmds:?}"
+    );
+    let v = fx.h.ok(&fx.token, "move_messages", json!({"account": "me", "ids": [id], "to": "archive"})).await;
+    assert_eq!(result(&v)["ok"], true, "{v}");
+    assert_eq!(places(&fx, m), sorted(&[ALL]));
+    assert_eq!(fx.h.imap.assert_gmail_deletes_only_in_drafts(), 0);
+}
+
+/// Unknown labels, system folders and ids of label folders are refused before any IMAP command: Dove creates no
+/// labels and reaches system labels only through flags and move targets.
+#[tokio::test]
+async fn unknown_and_system_labels_are_refused_before_any_command() {
+    let fx = setup().await;
+    let m = fx.add(&["INBOX"], "x", &[]);
+    fx.sync().await;
+    let id = fx.id(ALL, m).await;
+    let inbox_copy = fx.id("INBOX", m).await;
+    fx.h.imap.clear_commands();
+    for (tool, args, needle) in [
+        ("update_messages", json!({"account": "me", "ids": [id], "add_labels": ["Nope"]}), "unknown label"),
+        ("update_messages", json!({"account": "me", "ids": [id], "remove_labels": ["[Gmail]/Important"]}), "system"),
+        ("update_messages", json!({"account": "me", "ids": [id], "add_labels": ["INBOX"]}), "system"),
+        ("update_messages", json!({"account": "me", "ids": [id], "add_labels": ["\\Trash"]}), "unknown label"),
+        ("move_messages", json!({"account": "me", "ids": [id], "to": "[Gmail]/Sent Mail"}), "system"),
+        ("move_messages", json!({"account": "me", "ids": [id], "to": "Nope"}), "unknown label"),
+    ] {
+        let (is_error, v) = fx.h.call(&fx.token, tool, args).await;
+        assert!(is_error, "{v}");
+        assert_eq!(v["error"]["code"], "invalid_argument", "{v}");
+        assert!(v.to_string().contains(needle), "{needle}: {v}");
+    }
+    // A label folder's copy is no organize source.
+    let v = fx.h.ok(&fx.token, "move_messages", json!({"account": "me", "ids": [inbox_copy], "to": "archive"})).await;
+    assert_eq!(result(&v)["error"]["code"], "invalid_argument", "{v}");
+    assert!(fx.h.imap.commands().is_empty(), "{:?}", fx.h.imap.commands());
+    assert_eq!(places(&fx, m), sorted(&[ALL, "INBOX"]));
+}
+
+/// Drafts and send work as on other IMAP servers: APPEND to Gmail's Drafts, own-draft deletion there only, no Sent
+/// copy from Dove (Gmail files it); the index then holds the sent message once.
+#[tokio::test]
+async fn drafts_and_send_on_gmail() {
+    let fx = setup_cfg(gmail(), |c| c.allow_send = true).await;
+    fx.sync().await;
+    fx.h.imap.clear_commands();
+    let c = fx
+        .h
+        .ok(
+            &fx.token,
+            "create_draft",
+            json!({ "account": "me", "request_key": "4b0c2a3e-1f7d-4c55-9a51-0d6e2f1a7b11", "to": ["Ann <ann@example.net>"],
+                    "subject": "Angebot", "body_text": "Hallo Ann" }),
+        )
+        .await;
+    let (d, rev) = (c["draft_id"].clone(), c["revision"].clone());
+    fx.h.ok(&fx.token, "send_draft", json!({ "account": "me", "draft_id": d, "expected_revision": rev })).await;
+    assert_eq!(fx.h.imap.sent_mails().len(), 1);
+    let cmds = fx.h.imap.commands();
+    let appends: Vec<&String> = cmds.iter().filter(|c| verb_of(c) == "APPEND").collect();
+    assert_eq!(appends.len(), 1, "{cmds:?}");
+    assert!(appends[0].starts_with("APPEND \"[Gmail]/Drafts\""), "{cmds:?}");
+    assert!(fx.h.imap.assert_gmail_deletes_only_in_drafts() >= 2, "{cmds:?}");
+    fx.h.imap.assert_only_allowlisted();
+    fx.sync().await;
+    assert_eq!(fx.subjects("SENT").await, vec!["Angebot".to_string()]);
+    assert_eq!(fx.rows().await.len(), 1, "the draft is gone, the sent message indexed once");
+}
+
+/// Source scan: the Gmail-mode organize code can neither delete nor copy (no `\Deleted`, no expunge, no COPY, no
+/// own-draft deletion), the session refuses the COPY fallback and the confirmed-copy expunge in Gmail mode, and the
+/// label STORE is built only in `ops.rs` and sent only from `store_gm_labels`.
+#[test]
+fn gmail_mode_code_cannot_delete() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let organize = std::fs::read_to_string(root.join("src/tools/organize.rs")).unwrap();
+    let start = organize.find("------ Gmail over IMAP (PLAN A52)").unwrap();
+    let end = organize[start..].find("#[cfg(test)]").map(|i| i + start).unwrap();
+    let gmail = &organize[start..end];
+    for banned in ["Deleted", "xpunge", "delete_own", "UidCopy", "Copied", "copy"] {
+        assert!(!gmail.contains(banned), "Gmail organize code mentions {banned}");
+    }
+    assert!(gmail.contains("move_group(") && gmail.contains("store_gm_labels("));
+    let session = std::fs::read_to_string(root.join("src/imap/session.rs")).unwrap();
+    let fn_body = |name: &str| {
+        let s = session.find(name).unwrap_or_else(|| panic!("{name}"));
+        let e =
+            session[s + 1..].find("\n    pub async fn ").or_else(|| session[s + 1..].find("\n    async fn ")).unwrap();
+        session[s..s + 1 + e].to_string()
+    };
+    let mv = fn_body("pub async fn move_uids(");
+    let guard = mv.find("if self.gmail && !self.has_cap(\"MOVE\")").expect("MOVE-only guard in move_uids");
+    assert!(guard < mv.find("UidCopy").unwrap(), "the guard comes before any COPY");
+    assert!(fn_body("async fn expunge_copied(").contains("if self.gmail {"), "expunge_copied refuses Gmail mode");
+    let mut builders = Vec::new();
+    for f in ["src/imap/ops.rs", "src/imap/session.rs", "src/tools/organize.rs", "src/index/imap_sync.rs"] {
+        let text = std::fs::read_to_string(root.join(f)).unwrap();
+        let n = text.matches("ImapOp::UidStoreGmLabels {").count();
+        if n > 0 {
+            builders.push((f, n));
+        }
+    }
+    assert_eq!(builders.iter().find(|(f, _)| *f == "src/imap/session.rs").map(|b| b.1), Some(2), "{builders:?}");
+    assert!(builders.iter().all(|(f, _)| matches!(*f, "src/imap/ops.rs" | "src/imap/session.rs")), "{builders:?}");
+    let store = fn_body("pub async fn store_gm_labels(");
+    assert_eq!(store.matches("ImapOp::UidStoreGmLabels {").count(), 2);
 }
