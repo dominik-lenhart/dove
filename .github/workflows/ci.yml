@@ -1,9 +1,13 @@
 name: CI
 
+# Docs-only changes (Markdown anywhere, docs/) skip every job. paths-ignore applies to push and pull_request only, so
+# the weekly schedule below still runs the audit and the secret scan over the whole history, docs-only commits included.
 on:
   push:
     branches: [main]
+    paths-ignore: ["**.md", "docs/**"]
   pull_request:
+    paths-ignore: ["**.md", "docs/**"]
   # Advisories appear independently of commits, so audit the dependencies weekly too.
   schedule:
     - cron: "17 4 * * 1"
@@ -67,7 +71,8 @@ jobs:
           toolchain: "1.100.0"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # Integration tests run against the fake Google server in tests/support/. CI never talks to real Google.
-      - run: cargo test --locked -- --test-threads=2
+      # Hosted runners have 4 cores (the dev host runs the suite with 2 threads because it is shared).
+      - run: cargo test --locked -- --test-threads=4
 
   secrets:
     name: secret scan
