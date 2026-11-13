@@ -859,9 +859,11 @@ sudo journalctl -u dove -n 50        # look for migration errors
 dove doctor
 ```
 
-`dove upgrade [--check] [--version X.Y.Z]` downloads the release archive, checks its SHA-256 and verifies the
-minisign signature of `SHA256SUMS` with the public key embedded in the binary before replacing itself. Use
-`--version` to install a specific release, including an older one (an older binary will refuse a newer schema).
+`dove upgrade [--check] [--version X.Y.Z [--allow-downgrade]]` downloads the release archive, checks its SHA-256 and
+verifies the minisign signature of `SHA256SUMS` with the public key embedded in the binary before replacing itself.
+Use `--version` to install a specific release. A release older than the running binary is refused unless you add
+`--allow-downgrade`, which prints a warning first: older releases may lack security fixes, and an older binary refuses
+a state store that a newer release has already migrated.
 If you installed from source, rebuild and `install -m 0755 target/release/dove /usr/local/bin/dove` instead.
 
 ### Compose

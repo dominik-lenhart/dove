@@ -268,8 +268,10 @@ hosts or reference hardware.
   (glibc baseline of Ubuntu 22.04) and macOS, a multi-arch image on GHCR from the same Linux binaries, and an
   `install.sh`. The trust root is one minisign key (public half in `deploy/release/minisign.pub`, secret half only in
   the repository's Actions secrets and the owner's backup). `dove upgrade` refuses anything whose `SHA256SUMS`
-  signature or trusted comment (`dove <tag>`) does not verify, refuses downgrades unless a version is named, and
-  never runs inside `serve`. The update hint lives in the CLI only (spec 13a amended); the service keeps its outbound
+  signature or trusted comment (`dove <tag>`) does not verify, refuses downgrades unless a version is named
+  together with `--allow-downgrade` (warned; security review 2026-11-13), and never runs inside `serve`. `install.sh`
+  and `install.ps1` require the exact minisign line `Trusted comment: dove <tag>` (a substring match accepted another
+  release's signature, such as `dove <tag>-rc.1`), and the wget fallback of `install.sh` is `--https-only`. The update hint lives in the CLI only (spec 13a amended); the service keeps its outbound
   allowlist and reports its version over the admin socket so the CLI can say when a restart is due.
 - A51. Tailscale publishing (design 0.2 section 6, owner request 2026-11-13): `dove tailscale setup` runs as the
   operator and does not use the admin socket; it reads `listen` and `public_url` from the config file, asks

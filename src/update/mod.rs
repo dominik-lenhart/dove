@@ -163,15 +163,27 @@ pub enum Decision {
     UpToDate { latest: Version },
     /// The explicitly requested version is the installed one.
     AlreadyInstalled,
-    /// Install this release (newer, or an explicitly requested older one).
+    /// Install this release (newer than the installed one).
     Install(Version),
+    /// Install this older release: requested explicitly together with `--allow-downgrade`.
+    Downgrade(Version),
+    /// An older release was requested without `--allow-downgrade`.
+    DowngradeRefused(Version),
 }
 
-/// Upgrades only to newer releases; a downgrade happens only when that version is requested explicitly.
-pub fn decide(current: &Version, latest: Option<&Version>, requested: Option<&Version>) -> Decision {
+/// Upgrades only to newer releases. An older release is installed only when it is requested explicitly and the
+/// downgrade is allowed (`--allow-downgrade`): older releases may lack security fixes.
+pub fn decide(
+    current: &Version,
+    latest: Option<&Version>,
+    requested: Option<&Version>,
+    allow_downgrade: bool,
+) -> Decision {
     match (requested, latest) {
         (Some(r), _) if r == current => Decision::AlreadyInstalled,
-        (Some(r), _) => Decision::Install(r.clone()),
+        (Some(r), _) if r > current => Decision::Install(r.clone()),
+        (Some(r), _) if allow_downgrade => Decision::Downgrade(r.clone()),
+        (Some(r), _) => Decision::DowngradeRefused(r.clone()),
         (None, Some(l)) if l > current => Decision::Install(l.clone()),
         (None, Some(l)) => Decision::UpToDate { latest: l.clone() },
         (None, None) => Decision::AlreadyInstalled,
@@ -494,6 +506,8 @@ pub fn current_exe() -> anyhow::Result<PathBuf> {
 pub struct UpgradeOpts {
     pub check: bool,
     pub version: Option<String>,
+    /// Allow `version` to be older than the running binary.
+    pub allow_downgrade: bool,
     /// The admin socket asked for the running version (`None`: no hint).
     pub socket: Option<PathBuf>,
 }
@@ -507,7 +521,7 @@ pub async fn run_upgrade(opts: UpgradeOpts) -> anyhow::Result<u8> {
     }
     let http = http_client(Duration::from_secs(300))?;
     let latest = if requested.is_none() { Some(latest_release(&src, &http).await?) } else { None };
-    let decision = decide(&src.current, latest.as_ref(), requested.as_ref());
+    let decision = decide(&src.current, latest.as_ref(), requested.as_ref(), opts.allow_downgrade);
     let installed = tag(&src.current);
     if opts.check {
         return Ok(match decision {
@@ -519,7 +533,7 @@ pub async fn run_upgrade(opts: UpgradeOpts) -> anyhow::Result<u8> {
                 println!("Dove {installed} is up to date (latest release {}).", tag(&latest));
                 0
             }
-            Decision::AlreadyInstalled => 0,
+            Decision::AlreadyInstalled | Decision::Downgrade(_) | Decision::DowngradeRefused(_) => 0,
         });
     }
     let version = match decision {
@@ -530,6 +544,11 @@ pub async fn run_upgrade(opts: UpgradeOpts) -> anyhow::Result<u8> {
         Decision::AlreadyInstalled => {
             println!("Dove {installed} is already installed.");
             return Ok(0);
+        }
+        Decision::DowngradeRefused(v) => bail!("{}", downgrade_refusal(&v, &src.current)),
+        Decision::Downgrade(v) => {
+            eprintln!("{}", downgrade_warning(&v, &src.current));
+            v
         }
         Decision::Install(v) => v,
     };
@@ -546,6 +565,26 @@ pub async fn run_upgrade(opts: UpgradeOpts) -> anyhow::Result<u8> {
         println!("{line}");
     }
     Ok(0)
+}
+
+/// Why an older release is not installed without `--allow-downgrade`.
+pub fn downgrade_refusal(requested: &Version, current: &Version) -> String {
+    format!(
+        "Dove {} is older than the installed {}; refusing to downgrade. Older releases may lack security fixes. If you \
+         really want it, run again with --allow-downgrade",
+        tag(requested),
+        tag(current)
+    )
+}
+
+/// Printed before an allowed downgrade.
+pub fn downgrade_warning(requested: &Version, current: &Version) -> String {
+    format!(
+        "WARNING: downgrading Dove from {} to {}. The older release may lack security fixes, and it refuses to start \
+         on a state store that a newer release has already migrated.",
+        tag(current),
+        tag(requested)
+    )
 }
 
 /// After an upgrade: a restart hint when a local service answers on the admin socket and runs another version.
@@ -610,14 +649,21 @@ mod tests {
     }
 
     #[test]
-    fn downgrades_only_when_requested() {
+    fn downgrades_only_when_requested_and_allowed() {
         let v = |s: &str| Version::parse(s).unwrap();
         let cur = v("0.3.0");
-        assert_eq!(decide(&cur, Some(&v("0.2.0")), None), Decision::UpToDate { latest: v("0.2.0") });
-        assert_eq!(decide(&cur, Some(&v("0.3.0")), None), Decision::UpToDate { latest: v("0.3.0") });
-        assert_eq!(decide(&cur, Some(&v("0.3.1")), None), Decision::Install(v("0.3.1")));
-        assert_eq!(decide(&cur, None, Some(&v("0.2.0"))), Decision::Install(v("0.2.0")));
-        assert_eq!(decide(&cur, None, Some(&v("0.3.0"))), Decision::AlreadyInstalled);
+        for allow in [false, true] {
+            assert_eq!(decide(&cur, Some(&v("0.2.0")), None, allow), Decision::UpToDate { latest: v("0.2.0") });
+            assert_eq!(decide(&cur, Some(&v("0.3.0")), None, allow), Decision::UpToDate { latest: v("0.3.0") });
+            assert_eq!(decide(&cur, Some(&v("0.3.1")), None, allow), Decision::Install(v("0.3.1")));
+            assert_eq!(decide(&cur, None, Some(&v("0.3.0")), allow), Decision::AlreadyInstalled);
+            assert_eq!(decide(&cur, None, Some(&v("0.4.0")), allow), Decision::Install(v("0.4.0")));
+        }
+        assert_eq!(decide(&cur, None, Some(&v("0.2.0")), false), Decision::DowngradeRefused(v("0.2.0")));
+        assert_eq!(decide(&cur, None, Some(&v("0.2.9")), false), Decision::DowngradeRefused(v("0.2.9")));
+        assert_eq!(decide(&cur, None, Some(&v("0.2.0")), true), Decision::Downgrade(v("0.2.0")));
+        assert!(downgrade_refusal(&v("0.2.0"), &cur).contains("--allow-downgrade"));
+        assert!(downgrade_warning(&v("0.2.0"), &cur).starts_with("WARNING"));
     }
 
     #[test]

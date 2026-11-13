@@ -184,9 +184,13 @@ pub struct UpgradeArgs {
     /// Only report whether a newer release exists (exit code 10 if so, 0 if up to date).
     #[arg(long, conflicts_with = "version")]
     pub check: bool,
-    /// Install this release (X.Y.Z) instead of the latest; also allows going back to an older one.
+    /// Install this release (X.Y.Z) instead of the latest.
     #[arg(long, value_name = "X.Y.Z")]
     pub version: Option<String>,
+    /// Allow --version to name a release older than this binary (prints a warning; older releases may lack
+    /// security fixes).
+    #[arg(long, requires = "version")]
+    pub allow_downgrade: bool,
     /// Admin socket of a local service, asked for its version after the upgrade (failures are ignored).
     #[arg(long, env = "DOVE_ADMIN_SOCKET", hide = true)]
     pub socket: Option<PathBuf>,
@@ -869,6 +873,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<u8> {
             let opts = crate::update::UpgradeOpts {
                 check: a.check,
                 version: a.version,
+                allow_downgrade: a.allow_downgrade,
                 // Best effort: an ambiguous setup only skips the restart hint.
                 socket: resolve_admin_socket(a.socket).ok().map(|t| t.path().to_path_buf()),
             };
@@ -993,6 +998,13 @@ mod tests {
         let Command::Upgrade(a) = parse(&["update", "--check"]).unwrap().command else { panic!("alias") };
         assert!(a.check && a.version.is_none());
         assert!(parse(&["upgrade", "--check", "--version", "0.2.0"]).is_err());
+        assert!(!a.allow_downgrade);
+        let Command::Upgrade(a) = parse(&["upgrade", "--version", "0.2.0", "--allow-downgrade"]).unwrap().command
+        else {
+            panic!()
+        };
+        assert!(a.allow_downgrade);
+        assert!(parse(&["upgrade", "--allow-downgrade"]).is_err(), "only together with --version");
         // The top-level --version still prints the binary version.
         assert_eq!(parse(&["--version"]).err().map(|e| e.kind()), Some(clap::error::ErrorKind::DisplayVersion));
     }
