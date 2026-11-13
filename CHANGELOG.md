@@ -5,6 +5,17 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 
 ## [Unreleased]
 
+### Added
+
+- `deploy/nginx/dove-restricted.conf`, `dove-allowlist.py` and a systemd timer: an nginx/Angie site that lets only
+  Claude's and ChatGPT's servers (plus addresses you list) reach `/mcp` and the OAuth machine endpoints, with OpenAI's
+  published ranges refreshed hourly.
+
+### Fixed
+
+- `dove doctor` checked the public URL through `/healthz`, which the proxy allowlists never forward, so the check
+  always failed behind a proxy; it now fetches the protected-resource metadata.
+
 ## [0.3.0] - 2026-11-13
 
 ### Added

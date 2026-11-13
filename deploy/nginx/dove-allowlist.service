@@ -1,0 +1,14 @@
+# Refreshes the Claude/ChatGPT address allowlist for dove-restricted.conf (docs/deployment.md,
+# "Restrict to Claude and ChatGPT"). Install dove-allowlist.py as /usr/local/sbin/dove-allowlist.
+# For Angie, replace /etc/nginx with /etc/angie and "nginx -t" / "reload nginx" with the angie equivalents.
+[Unit]
+Description=Refresh Dove's Claude/ChatGPT address allowlist
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/dove-allowlist --out /etc/nginx/dove_allow.conf --extra /etc/dove/allow-extra.txt --test "nginx -t -q" --reload "systemctl reload nginx"
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes

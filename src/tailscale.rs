@@ -739,15 +739,19 @@ mod tests {
             .collect();
         assert_eq!(caddy_paths, want, "deploy/Caddyfile");
 
-        let nginx = include_str!("../deploy/nginx/dove.conf");
-        let nginx_paths: BTreeSet<String> = nginx
-            .lines()
-            .map(str::trim)
-            .filter_map(|l| l.strip_prefix("\"~^"))
-            .filter_map(|l| l.split_once(' ').map(|(_, rest)| rest))
-            .filter_map(|rest| rest.split_once('$').map(|(p, _)| p.replace("\\.", ".")))
-            .collect();
-        assert_eq!(nginx_paths, want, "deploy/nginx/dove.conf");
+        for (name, nginx) in [
+            ("deploy/nginx/dove.conf", include_str!("../deploy/nginx/dove.conf")),
+            ("deploy/nginx/dove-restricted.conf", include_str!("../deploy/nginx/dove-restricted.conf")),
+        ] {
+            let nginx_paths: BTreeSet<String> = nginx
+                .lines()
+                .map(str::trim)
+                .filter_map(|l| l.strip_prefix("\"~^"))
+                .filter_map(|l| l.split_once(' ').map(|(_, rest)| rest))
+                .filter_map(|rest| rest.split_once('$').map(|(p, _)| p.replace("\\.", ".")))
+                .collect();
+            assert_eq!(nginx_paths, want, "{name}");
+        }
 
         let mut routes = BTreeSet::new();
         for src in [include_str!("http.rs"), include_str!("mcp.rs"), include_str!("oauth.rs")] {

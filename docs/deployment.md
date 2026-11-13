@@ -282,6 +282,47 @@ count as `127.0.0.1` (IP-bound tokens fail, per-IP limits are shared), nothing e
 Caddy's `path` matcher ignores case, so `/MCP` is forwarded; Dove matches routes exactly and answers 404. The nginx
 file matches case-sensitively and answers 404 itself.
 
+### Restrict to Claude and ChatGPT
+
+If only Claude and ChatGPT (and your own machines) should talk to Dove, `deploy/nginx/dove-restricted.conf` adds an
+address gate in front of the same path allowlist:
+
+- **Machine endpoints** (`POST /mcp`, the three `/.well-known/...` documents, `POST /oauth/dove/token`, `register`,
+  `revoke`) answer only addresses in a `geo` allowlist and give everyone else 403. The list holds Anthropic's
+  published outbound ranges, OpenAI's `chatgpt-connectors.json` and the extra addresses in
+  `/etc/dove/allow-extra.txt` (for example the Dove host itself, so the `dove` CLI and `dove mcp stdio` on it keep
+  working).
+- **Browser endpoints** (`/oauth/dove/authorize`, `/oauth/google/callback`, `POST /connect/redeem`) stay reachable
+  from anywhere, because you open them in your own browser or CLI. They do nothing without a one-time invitation or a
+  valid OAuth state, and the proxy limits them to 30 requests a minute per address on top of Dove's own limits.
+- Everything else is 404, as with `dove.conf`.
+
+Set it up (nginx paths; Angie uses `/etc/angie` and `angie` instead):
+
+```sh
+sudo install -m 755 deploy/nginx/dove-allowlist.py /usr/local/sbin/dove-allowlist
+printf '203.0.113.10/32\n' | sudo tee /etc/dove/allow-extra.txt     # your server's own public addresses
+sudo /usr/local/sbin/dove-allowlist --out /etc/nginx/dove_allow.conf --extra /etc/dove/allow-extra.txt
+sudo sh -c 'umask 077; printf "proxy_set_header X-Dove-Proxy-Auth \"%s\";\n" \
+  "$(tr -d "\n" < /etc/dove/credentials/proxy_secret)" > /etc/nginx/dove_proxy_auth.conf'
+sudo cp deploy/nginx/dove-restricted.conf /etc/nginx/conf.d/dove.conf   # then set server_name and certificates
+sudo cp deploy/nginx/dove-allowlist.service deploy/nginx/dove-allowlist.timer /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now dove-allowlist.timer
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+The timer refreshes OpenAI's list every hour: OpenAI publishes it as best effort and changes it without notice, and
+the script keeps the previous file whenever the download, the validation (no prefix wider than /12 or /24, public
+ranges only) or `nginx -t` fails. Anthropic's ranges are built into the script; update it when Anthropic announces a
+change. Give the DNS name a DNS-only record if you use Cloudflare: a proxied record would make Cloudflare terminate
+TLS (and see the mail in every response) and would hide the caller's address from the allowlist.
+
+An address allowlist says where a request comes from, not who sent it: anyone with a Claude or ChatGPT account can
+point a connector at your URL. It cuts out the rest of the internet and every leaked token used from elsewhere; the
+invitation, the OAuth approval and the token's grants remain what protects your mail. For a second layer inside Dove,
+create the web invitation with the same ranges (`dove clients invite ... --allow-ip 160.79.104.0/21 --allow-ip
+153.61.208.0/20` for Claude), which binds the client's tokens to them.
+
 ## Tailscale
 
 Instead of Caddy or nginx you can publish Dove on your tailnet with Tailscale Serve. Tailscale terminates TLS with a
