@@ -8,8 +8,10 @@ use anyhow::Context;
 use crate::app::App;
 use crate::config::Config;
 
-/// Disables core dumps so decrypted secrets cannot end up on disk (spec 6.4).
+/// Disables core dumps so decrypted secrets cannot end up on disk (spec 6.4). Windows has no per-process switch for
+/// Windows Error Reporting dumps; local mode's threat model accepts that (docs/deployment.md).
 pub fn harden_process() -> anyhow::Result<()> {
+    #[cfg(unix)]
     nix::sys::resource::setrlimit(nix::sys::resource::Resource::RLIMIT_CORE, 0, 0)
         .context("cannot disable core dumps")?;
     #[cfg(target_os = "linux")]
@@ -18,7 +20,19 @@ pub fn harden_process() -> anyhow::Result<()> {
 }
 
 pub async fn run(config_path: &Path) -> anyhow::Result<()> {
-    crate::logging::init_service_logging();
+    run_with_log(config_path, None).await
+}
+
+/// [`run`] with the service log going to `log` instead of stderr (local mode's login items have no journal).
+pub async fn run_with_log(config_path: &Path, log: Option<std::fs::File>) -> anyhow::Result<()> {
+    match log {
+        Some(f) => {
+            let filter = tracing_subscriber::EnvFilter::try_from_env("DOVE_LOG")
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+            crate::logging::install_service_logging(f, filter);
+        }
+        None => crate::logging::init_service_logging(),
+    }
     harden_process()?;
     let cfg = Config::load(config_path)?;
     let app = App::from_config(cfg)?;
@@ -26,11 +40,11 @@ pub async fn run(config_path: &Path) -> anyhow::Result<()> {
     // Startup self-check of the encrypted index: SQLCipher, key, FTS5, memory-only temp storage (spec 7.9).
     let (_, index_key) = app.index_key.current();
     crate::index::db::open(&app.cfg.index_db_path(), index_key, &app.cfg.index).context("index self-check failed")?;
-    let uid = nix::unistd::getuid().as_raw();
-    if uid == app.cfg.admin.operator_uid {
+    #[cfg(unix)]
+    if !app.cfg.is_local() && nix::unistd::getuid().as_raw() == app.cfg.admin.operator_uid {
         tracing::warn!("the service runs as the operator uid; run it as a dedicated service user (spec FR-C1)");
     }
-    if app.proxy_secret.is_none() {
+    if app.proxy_secret.is_none() && !app.cfg.is_local() {
         tracing::warn!(
             "secrets.proxy_secret_file is not set: any local process can forge X-Forwarded-For and bypass allow_ip \
              lists and per-IP rate limits (docs/deployment.md, reverse proxy)"
@@ -51,16 +65,37 @@ async fn run_until_shutdown(app: Arc<App>) -> anyhow::Result<()> {
         tracing::warn!(count = recovered, "sends interrupted by a restart are marked outcome-unknown");
     }
     let listener = tokio::net::TcpListener::bind(app.cfg.listen).await.context("cannot bind listen address")?;
-    let signal = async {
+    let signal = shutdown_signal();
+    // Graceful shutdown finishes in-flight requests for up to 10 seconds (spec 8.2).
+    serve_until(app.clone(), listener, signal, std::time::Duration::from_secs(10)).await
+}
+
+/// SIGINT or SIGTERM (Unix); Ctrl+C, Ctrl+Break, console close, logoff or shutdown (Windows).
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
         let mut term =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("signal handler");
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {},
             _ = term.recv() => {},
         }
-    };
-    // Graceful shutdown finishes in-flight requests for up to 10 seconds (spec 8.2).
-    serve_until(app.clone(), listener, signal, std::time::Duration::from_secs(10)).await
+    }
+    #[cfg(windows)]
+    {
+        use tokio::signal::windows;
+        let mut brk = windows::ctrl_break().expect("signal handler");
+        let mut close = windows::ctrl_close().expect("signal handler");
+        let mut logoff = windows::ctrl_logoff().expect("signal handler");
+        let mut shutdown = windows::ctrl_shutdown().expect("signal handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = brk.recv() => {},
+            _ = close.recv() => {},
+            _ = logoff.recv() => {},
+            _ = shutdown.recv() => {},
+        }
+    }
 }
 
 /// Serves HTTP until `signal` resolves, then stops accepting and gives in-flight requests at most `grace` to finish.
