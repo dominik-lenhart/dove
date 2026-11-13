@@ -515,7 +515,16 @@ async fn authorize_get(State(app): State<Arc<App>>, req: Request) -> Response {
     if state.as_ref().is_some_and(|s| s.len() > 512) {
         return error_page(StatusCode::BAD_REQUEST, "The state parameter is too long.");
     }
-    let fail = |e: &str, d: &str| redirect_error(&app, &redirect_uri, state.as_deref(), e, d);
+    // Anyone can register a dynamic client with any HTTPS redirect URI, so redirecting its errors would make this
+    // endpoint an open redirector (RFC 9700 4.11.2): before the owner approves, they get an error page instead.
+    let dynamic = a.dynamic;
+    let fail = |e: &str, d: &str| {
+        if dynamic {
+            error_page(StatusCode::BAD_REQUEST, &format!("The application sent an invalid request ({e}: {d})."))
+        } else {
+            redirect_error(&app, &redirect_uri, state.as_deref(), e, d)
+        }
+    };
     if q.get("response_type").map(String::as_str) != Some("code") {
         return fail("unsupported_response_type", "only response_type=code is supported");
     }
@@ -630,6 +639,14 @@ async fn authorize_post(State(app): State<Arc<App>>, req: Request) -> Response {
         );
     };
     if get("action") == "cancel" {
+        // Dynamic clients get no redirect before approval (see `authorize_get`), denial included.
+        if p.app.dynamic {
+            return html(
+                StatusCode::OK,
+                page("Access denied", "<p>Nothing was approved. You can close this window.</p>"),
+                None,
+            );
+        }
         return redirect_error(&app, &p.redirect_uri, p.state.as_deref(), "access_denied", "the user denied access");
     }
     let put_back = |p: Pending| {

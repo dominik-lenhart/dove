@@ -361,9 +361,22 @@ async fn approval_narrows_and_never_broadens() {
     }
 }
 
+/// `params` with its `client_id` replaced.
+fn with_client<'a>(params: &[(&'a str, &'a str)], client_id: &'a str) -> Vec<(&'a str, &'a str)> {
+    params.iter().map(|&(k, v)| if k == "client_id" { (k, client_id) } else { (k, v) }).collect()
+}
+
 #[tokio::test]
 async fn pkce_redirect_and_resource_checks() {
-    let o = Oauth::new().await;
+    let o = Oauth::with(|c| {
+        c.oauth.clients.push(dove::config::PreregisteredClient {
+            client_id: "pre-public".into(),
+            client_name: "Operator app".into(),
+            redirect_uris: vec![REDIRECT.into()],
+            secret_file: None,
+        })
+    })
+    .await;
     let client_id = o.register(REDIRECT).await;
     let v = verifier();
     let chal = challenge(&v);
@@ -376,20 +389,27 @@ async fn pkce_redirect_and_resource_checks() {
     // Unknown client: error page.
     let r = o.authorize_get(&Oauth::params("dcr-unknown", &chal)).await;
     assert_eq!(r.status(), 400);
-    // plain PKCE and missing PKCE are refused via redirect.
-    for (k, val) in [("code_challenge_method", "plain"), ("code_challenge", "")] {
-        let mut p = Oauth::params(&client_id, &chal);
+    // plain PKCE, missing PKCE, a wrong response type and a wrong resource (audience) are refused: a dynamically
+    // registered client gets an error page (no open redirect, RFC 9700 4.11.2), a pre-registered one a redirect.
+    let mut bad: Vec<(Vec<(&str, &str)>, &str)> = Vec::new();
+    for (k, val) in [("code_challenge_method", "plain"), ("code_challenge", ""), ("response_type", "token")] {
+        let mut p = Oauth::params("", &chal);
         p.retain(|(x, _)| *x != k);
         p.push((k, val));
-        let r = o.authorize_get(&p).await;
-        assert_eq!(r.status(), 303);
-        assert_eq!(query_of(r.headers()["location"].to_str().unwrap())["error"], "invalid_request");
+        bad.push((p, if k == "response_type" { "unsupported_response_type" } else { "invalid_request" }));
     }
-    // Wrong resource (audience) is refused.
-    let mut p = Oauth::params(&client_id, &chal);
+    let mut p = Oauth::params("", &chal);
     p[6] = ("resource", "https://other.example/mcp");
-    let r = o.authorize_get(&p).await;
-    assert_eq!(query_of(r.headers()["location"].to_str().unwrap())["error"], "invalid_target");
+    bad.push((p, "invalid_target"));
+    for (p, error) in &bad {
+        let r = o.authorize_get(&with_client(p, &client_id)).await;
+        assert_eq!(r.status(), 400, "{error}");
+        assert!(r.headers().get("location").is_none(), "{error}");
+        assert!(r.text().await.unwrap().contains(error), "{error}");
+        let r = o.authorize_get(&with_client(p, "pre-public")).await;
+        assert_eq!(r.status(), 303, "{error}");
+        assert_eq!(query_of(r.headers()["location"].to_str().unwrap())["error"], *error);
+    }
     // Repeated parameters are refused.
     let mut p = Oauth::params(&client_id, &chal);
     p.push(("state", "again"));
@@ -607,11 +627,22 @@ async fn approval_page_csrf_and_invitation_rules() {
     let (_, _, _, html) = o.enter_invitation(&client_id, &chal, &inv).await;
     assert!(html.contains("invalid, expired or already used"));
 
-    // Deny redirects with access_denied.
+    // Deny shows a page for a dynamically registered client (no redirect before approval) and does not approve.
     let inv = o.invite("deny-host", &["info"], "read").await;
     let (cookie, rid, csrf, _) = o.enter_invitation(&client_id, &chal, &inv).await;
     let r = o.post_form(&cookie, &[("rid", &rid), ("csrf", &csrf), ("step", "approve"), ("action", "cancel")]).await;
-    assert_eq!(query_of(r.headers()["location"].to_str().unwrap())["error"], "access_denied");
+    assert_eq!(r.status(), 200);
+    assert!(r.headers().get("location").is_none());
+    assert!(r.text().await.unwrap().contains("Nothing was approved"));
+    // Cancelling the invitation step does not redirect either.
+    let r = o.authorize_get(&Oauth::params(&client_id, &chal)).await;
+    let cookie3 = r.headers()["set-cookie"].to_str().unwrap().split(';').next().unwrap().to_string();
+    let html = r.text().await.unwrap();
+    let (rid3, csrf3) = (field(&html, "rid"), field(&html, "csrf"));
+    let r =
+        o.post_form(&cookie3, &[("rid", &rid3), ("csrf", &csrf3), ("step", "invitation"), ("action", "cancel")]).await;
+    assert_eq!(r.status(), 200);
+    assert!(r.headers().get("location").is_none());
     // Denying does not consume the invitation.
     let r = o
         .web
