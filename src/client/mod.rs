@@ -896,6 +896,12 @@ fn mcp_install(name: Option<&str>, client: HostClient, scope: Scope, entry_name:
     println!("{verb} MCP server '{}' in {}", entry.name, path.display());
     println!("Command: {} {}", entry.command, entry.args.join(" "));
     println!("No credential is written to this file; the bridge reads it from the profile's credential store.");
+    if client == HostClient::Codex && scope == Scope::Project {
+        println!(
+            "Codex reads a project's .codex/config.toml only when the project is trusted: accept the trust prompt on \
+             the next start, or use --scope user."
+        );
+    }
     Ok(())
 }
 

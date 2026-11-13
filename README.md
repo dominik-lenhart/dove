@@ -201,9 +201,11 @@ running against a real mailbox since the first release. Before you rely on it:
 | Area | State |
 | --- | --- |
 | IMAP: connect, read, search, attachments, drafts, replies, forwards, IDLE push | checked against real Strato |
-| Organize, watches, contacts, digest, categories, attachment text, aliases, signatures | done against fake servers; real-world checks in progress |
-| SMTP send behind both gates | done against fake SMTP |
-| Gmail API | done against fake Google; first real connection in progress |
+| Organize, digest, watches | checked against real Gmail and Strato (watch creation; event delivery against fake servers) |
+| Contacts, categories, attachment text, aliases, signatures | done against fake servers |
+| Claude Code and Codex, through `dove mcp install` and direct HTTP | checked |
+| SMTP send behind both gates | checked against real Strato SMTP and the Gmail API |
+| Gmail API | checked against a real account: connect, read, search, digest, organize, drafts, send, watches |
 | ChatGPT and Claude web connectors, iCloud, very large mailboxes, benchmarks | open |
 
 What was checked on real systems is listed in the
