@@ -418,7 +418,7 @@ hosts or reference hardware.
   Moving out of Spam/Junk needs `delete` like moving in (Gmail: a message with `SPAM` moved to the inbox or a label;
   IMAP: a source folder that is Junk by flag, name, stem or parent; Gmail over IMAP: the `\Junk` folder). One such
   id refuses the whole call before any write. Out of Trash stays `organize`. (c) Trash/Junk names are matched
-  Unicode-case-insensitively on the decoded name in 15 languages (`imap::connect::{TRASH_NAMES, JUNK_NAMES}`); for the
+  Unicode-case-insensitively on the decoded name in 17 languages (`imap::connect::{TRASH_NAMES, JUNK_NAMES}`); for the
   `delete` gate any trash/junk word stem in the name counts too (`TRASH_STEMS`, `JUNK_STEMS`; a false hit only asks
   for more permission). Stored `imap_folders.special` values change only at connect/reconnect (no migration): the
   gate and the trash/spam targets read the names at call time.
