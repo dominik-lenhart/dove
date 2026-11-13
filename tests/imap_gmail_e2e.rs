@@ -556,9 +556,8 @@ async fn drafts_and_send_on_gmail() {
     let fx = setup_cfg(gmail(), |c| c.allow_send = true).await;
     fx.sync().await;
     fx.h.imap.clear_commands();
-    let c = fx
-        .h
-        .ok(
+    let c =
+        fx.h.ok(
             &fx.token,
             "create_draft",
             json!({ "account": "me", "request_key": uuid::Uuid::new_v4().to_string(), "to": ["Ann <ann@example.net>"],
