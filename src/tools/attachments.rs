@@ -164,8 +164,9 @@ async fn attachment_text(
     };
     let lim = Limits {
         max_chars,
-        max_decompressed: (cx.app.cfg.limits.attachment_bytes as usize).saturating_mul(4).clamp(1 << 20, 32 << 20),
-        deadline: std::time::Instant::now() + TEXT_BUDGET.min(cx.deadline.saturating_duration_since(std::time::Instant::now())),
+        max_decompressed: cx.app.cfg.limits.attachment_bytes.saturating_mul(4).clamp(1 << 20, 32 << 20),
+        deadline: std::time::Instant::now()
+            + TEXT_BUDGET.min(cx.deadline.saturating_duration_since(std::time::Instant::now())),
     };
     let t = tokio::task::spawn_blocking(move || extract(&bytes, kind, &lim))
         .await

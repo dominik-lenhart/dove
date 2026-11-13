@@ -38,7 +38,8 @@ pub enum Category {
 }
 
 impl Category {
-    pub const ALL: [Category; 4] = [Category::Personal, Category::Newsletter, Category::Notification, Category::Calendar];
+    pub const ALL: [Category; 4] =
+        [Category::Personal, Category::Newsletter, Category::Notification, Category::Calendar];
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -237,9 +238,9 @@ fn body_text(part: &MessagePart<'_>, max: usize) -> (String, bool) {
 
 /// Header value as trimmed, lower-cased text (folding whitespace collapsed); `None` when the header is absent.
 fn header_lc(hdr: &mail_parser::Headers<'_>, name: &str) -> Option<String> {
-    hdr.iter().find(|h| h.raw_name().trim().eq_ignore_ascii_case(name)).map(|h| {
-        String::from_utf8_lossy(h.raw_value()).split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
-    })
+    hdr.iter()
+        .find(|h| h.raw_name().trim().eq_ignore_ascii_case(name))
+        .map(|h| String::from_utf8_lossy(h.raw_value()).split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase())
 }
 
 /// Category of a message (first match wins): calendar part, then newsletter, notification, personal.
@@ -400,13 +401,13 @@ pub fn attachment_bytes(
     Ok(Some((meta, bytes)))
 }
 
+/// Callback of [`visit_attachments`]: attachment metadata and a lazy decoder of its bytes.
+pub type AttachmentVisitor<'a> = dyn FnMut(&AttachmentMeta, &dyn Fn() -> Vec<u8>) -> std::ops::ControlFlow<()> + 'a;
+
 /// Calls `f` for every attachment of `raw` (same part numbering and attachment rule as [`parse`]) with its metadata
 /// and a function that decodes its bytes on demand, so attachments the caller does not want are never copied.
 /// `f` returns `Break` to stop. Used by ingest-time attachment text extraction.
-pub fn visit_attachments(
-    raw: &[u8],
-    f: &mut dyn FnMut(&AttachmentMeta, &dyn Fn() -> Vec<u8>) -> std::ops::ControlFlow<()>,
-) -> Result<(), MimeError> {
+pub fn visit_attachments(raw: &[u8], f: &mut AttachmentVisitor<'_>) -> Result<(), MimeError> {
     let limits = Limits::default();
     if raw.len() > limits.max_raw_bytes {
         return Err(MimeError::TooLarge);

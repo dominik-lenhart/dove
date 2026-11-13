@@ -48,12 +48,20 @@ Dove sits in between:
 | Tool | What it does |
 | --- | --- |
 | `list_accounts`, `list_labels` | Mailboxes this token may use, their folders and labels |
-| `search_messages` | Typed search over a local encrypted full-text index: sender, recipient, subject, text, date, folder, unread, attachments |
-| `get_message`, `get_thread`, `batch_read` | Read mail and threads. HTML becomes clean text, nothing is marked as read |
-| `get_attachment` | Fetch an attachment as an MCP resource (up to 10 MiB) |
+| `search_messages` | Typed search over a local encrypted full-text index: sender, recipient, subject, text, attachment text, date, folder, unread, attachments, category |
+| `search_contacts` | Who does this mailbox actually correspond with? Ranked by how much and how recently you exchanged mail; automated senders are left out |
+| `digest` | Threads with new mail since a time, newest first, with a short snippet: the inbox catch-up |
+| `get_message`, `get_thread`, `batch_read` | Read mail and threads. HTML becomes clean text, nothing is marked as read. Messages carry a category and calendar invitations an event summary |
+| `get_attachment` | Fetch an attachment as an MCP resource (up to 10 MiB), or with `as_text` its extracted text (PDF, DOCX, ODT, text, CSV) |
 | `list_drafts`, `get_draft` | Drafts in the mailbox's Drafts folder |
 | `create_draft`, `update_draft` | New mail, replies (threaded and quoted) and forwards (with attachments). Attach files by reference or inline. Revision-checked: a draft you edited yourself is never overwritten |
 | `send_draft` | Only when both send gates are open, only drafts Dove created and nobody changed |
+
+The index classifies every message at ingest as `personal`, `newsletter`, `notification` or `calendar` (from headers
+such as `List-Unsubscribe`, `Auto-Submitted`, `Precedence`, no-reply senders and calendar parts) and, unless you turn
+it off, reads the text of PDF, DOCX, ODT, text and CSV attachments into the full-text index so a search finds a word
+inside an invoice. That costs some CPU at ingest and no extra mail-server traffic; see
+[docs/deployment.md](docs/deployment.md) for the limits and `index.attachment_text`.
 
 New INBOX mail is indexed within seconds through IMAP IDLE. Mail content always reaches the model inside a clearly
 marked envelope; hidden HTML and invisible Unicode are stripped and Dove never loads remote content.

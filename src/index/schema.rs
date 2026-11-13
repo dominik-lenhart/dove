@@ -511,7 +511,9 @@ mod tests {
         assert_eq!(one("SELECT CAST(att_fts AS TEXT) FROM generations WHERE id = 5"), Some("0".into()));
         // The old generation still answers text queries on its two-column table.
         let hits: i64 = c
-            .query_row(&format!("SELECT count(*) FROM {t} WHERE {t} MATCH 'oldposting'", t = fts_table(5)), [], |r| r.get(0))
+            .query_row(&format!("SELECT count(*) FROM {t} WHERE {t} MATCH 'oldposting'", t = fts_table(5)), [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(hits, 1);
         // Every mailbox rebuilds into a new generation with the three-column table; the old one keeps serving.
@@ -523,16 +525,21 @@ mod tests {
                 .unwrap();
             assert_eq!(stage, "rebuilding", "{aid}");
             assert!(active.is_some() && building > 6, "{aid}: {active:?} {building}");
-            let flag: i64 = c.query_row("SELECT att_fts FROM generations WHERE id = ?1", [building], |r| r.get(0)).unwrap();
+            let flag: i64 =
+                c.query_row("SELECT att_fts FROM generations WHERE id = ?1", [building], |r| r.get(0)).unwrap();
             assert_eq!(flag, 1);
             c.execute(
-                &format!("INSERT INTO {}(rowid, subject, body, att) VALUES (9, 's', 'b', 'attachmenttext')", fts_table(building)),
+                &format!(
+                    "INSERT INTO {}(rowid, subject, body, att) VALUES (9, 's', 'b', 'attachmenttext')",
+                    fts_table(building)
+                ),
                 [],
             )
             .unwrap();
         }
         // The planner statistics of the new index are loaded.
-        let n: i64 = c.query_row("SELECT count(*) FROM sqlite_stat1 WHERE idx = 'addrs_name'", [], |r| r.get(0)).unwrap();
+        let n: i64 =
+            c.query_row("SELECT count(*) FROM sqlite_stat1 WHERE idx = 'addrs_name'", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 1);
     }
 }

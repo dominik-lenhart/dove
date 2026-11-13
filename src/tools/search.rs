@@ -315,11 +315,10 @@ pub(crate) fn field_coverage(
 ) -> anyhow::Result<()> {
     for t in targets {
         if category {
-            let n: i64 = tx.query_row(
-                "SELECT count(*) FROM messages WHERE gen = ?1 AND category IS NULL",
-                [t.gen_id],
-                |r| r.get(0),
-            )?;
+            let n: i64 =
+                tx.query_row("SELECT count(*) FROM messages WHERE gen = ?1 AND category IS NULL", [t.gen_id], |r| {
+                    r.get(0)
+                })?;
             if n > 0 {
                 exceptions.push(json!({ "account": t.alias, "stage": "ready", "reason": "category unknown for some messages", "count": n }));
             }

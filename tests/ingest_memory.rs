@@ -69,7 +69,8 @@ fn peak_for(raw_size: usize, max_message_bytes: usize) -> (usize, usize, usize) 
         max_message_bytes,
         200_000,
         &dove::config::IndexConfig::default().attachment_cfg(),
-    ).unwrap();
+    )
+    .unwrap();
     assert!(doc.meta_complete, "parsed, not metadata-only");
     drop(doc);
     (raw_len, body_len, PEAK.load(Relaxed) - base)

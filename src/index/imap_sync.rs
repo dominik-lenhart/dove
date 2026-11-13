@@ -816,8 +816,8 @@ async fn fetch_groups_inner(
                 let att = att.clone();
                 move || Doc::from_imap(meta, raw.as_deref(), max_bytes, max_chars, &att)
             })
-                .await
-                .map_err(|_| ImapError::Protocol("message could not be processed"))?;
+            .await
+            .map_err(|_| ImapError::Protocol("message could not be processed"))?;
             out.lock().expect("lock").current = None;
             push(id, Fetched::Doc(Box::new(doc)));
         }

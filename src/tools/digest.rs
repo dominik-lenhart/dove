@@ -64,8 +64,9 @@ pub fn defs() -> Vec<ToolDef> {
 fn parse_req(args: &Value) -> Result<DigestReq, ToolError> {
     only_keys(args, &["since", "accounts", "folders", "category", "limit"])?;
     let since = arg_str(args, "since")?;
-    let since_ms = util::parse_rfc3339_ms(since)
-        .ok_or_else(|| ToolError::invalid("'since' takes an RFC 3339 instant with offset, e.g. 2026-11-01T00:00:00Z"))?;
+    let since_ms = util::parse_rfc3339_ms(since).ok_or_else(|| {
+        ToolError::invalid("'since' takes an RFC 3339 instant with offset, e.g. 2026-11-01T00:00:00Z")
+    })?;
     if since_ms < util::now_unix_ms() - intel::MAX_WINDOW_DAYS * 86_400_000 {
         return Err(ToolError::invalid(format!("'since' may be at most {} days back", intel::MAX_WINDOW_DAYS)));
     }
@@ -154,12 +155,14 @@ async fn digest(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
     let allowed = recheck(cx, resumed.is_some(), true).await?;
     for t in &targets {
         if !allowed.contains(&t.account_id) {
-            account_errors.push(json!({ "account": t.alias, "code": crate::error::ErrorCode::AccountUnavailable.as_str() }));
+            account_errors
+                .push(json!({ "account": t.alias, "code": crate::error::ErrorCode::AccountUnavailable.as_str() }));
         }
     }
     let partial = !exceptions.is_empty() || !account_errors.is_empty();
     let as_of = states.values().filter_map(|(s, _)| s.last_success_at).min().map(util::rfc3339);
-    let alias_of = |aid: &str| targets.iter().find(|t| t.account_id == aid).map(|t| t.alias.clone()).unwrap_or_default();
+    let alias_of =
+        |aid: &str| targets.iter().find(|t| t.account_id == aid).map(|t| t.alias.clone()).unwrap_or_default();
     let next_key = rows.last().map(|r| (r.newest_ms, r.account_id.clone(), r.thread_id.clone()));
     let threads: Vec<Value> = rows
         .iter()
@@ -187,8 +190,7 @@ async fn digest(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
         "account_errors": account_errors,
     });
     if let Some(p) = &resumed {
-        let changed =
-            p.bound.iter().any(|(aid, _, _, seq)| states.get(aid).is_some_and(|(s, _)| s.data_seq != *seq));
+        let changed = p.bound.iter().any(|(aid, _, _, seq)| states.get(aid).is_some_and(|(s, _)| s.data_seq != *seq));
         out["changed_since_first_page"] = json!(changed);
     }
     if more && let Some(key) = next_key {

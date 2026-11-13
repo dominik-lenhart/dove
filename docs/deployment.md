@@ -179,6 +179,16 @@ from metadata only),
 `imap_step_timeout_secs` 300 (wall-clock limit of one IMAP sync scan or fetch batch; IMAP sync also counts against
 the background share of `upstream_total_inflight`, like Gmail sync).
 
+Attachment text (`search_messages` on `attachment_text`, `text`): `attachment_text` true (reads PDF, DOCX, ODT, text
+and CSV attachments into the full-text index while a message is ingested), `attachment_text_max_bytes` 8 MiB (larger
+attachments are skipped), `attachment_text_max_chars` 100000 (per message), `attachment_text_timeout_secs` 10 (per
+message). The cost is CPU and a short-lived decoded copy of one attachment at a time during ingest, plus index size
+for the extracted text; there is no extra Gmail or IMAP traffic, because the message is fetched anyway. A message
+above `max_message_bytes` is indexed from metadata only and gets no attachment text. A skipped or unreadable
+attachment never stops the message from being indexed; searches that use attachment text report it as incomplete.
+Set `attachment_text = false` to turn it off. Upgrading to 0.2 rebuilds every indexed mailbox once (categories and
+attachment text need the original messages); the old generation keeps serving until the new one is ready.
+
 The service refuses to start when: a secret file is readable by group or others, a secret file is missing (including
 the KEK), `public_url` is not an HTTPS origin, `listen` is not loopback, the data directory is not mode 0700, or the
 index self-check (SQLCipher, key, FTS5, in-memory temp storage) fails. It logs a warning if it runs as the operator

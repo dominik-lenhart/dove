@@ -92,9 +92,11 @@ impl Doc {
             category: Some(p.category.as_str()),
             att_text: String::new(),
             // Refined by `with_attachments`; without it a supported attachment counts as not read.
-            att_complete: Some(!p.attachments.iter().any(|a| {
-                crate::attachment_text::kind_of(&a.mime_type, a.filename.as_deref()).is_some()
-            })),
+            att_complete: Some(
+                !p.attachments
+                    .iter()
+                    .any(|a| crate::attachment_text::kind_of(&a.mime_type, a.filename.as_deref()).is_some()),
+            ),
         }
     }
 

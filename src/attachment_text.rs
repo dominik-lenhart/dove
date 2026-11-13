@@ -34,7 +34,12 @@ pub struct Cfg {
 
 impl Default for Cfg {
     fn default() -> Self {
-        Cfg { enabled: true, max_attachment_bytes: 8 * 1024 * 1024, max_chars: 100_000, budget: Duration::from_secs(10) }
+        Cfg {
+            enabled: true,
+            max_attachment_bytes: 8 * 1024 * 1024,
+            max_chars: 100_000,
+            budget: Duration::from_secs(10),
+        }
     }
 }
 
@@ -233,7 +238,7 @@ fn text_file(bytes: &[u8], max_chars: usize) -> Result<String, ExtractError> {
 }
 
 fn utf16(bytes: &[u8], word: fn([u8; 2]) -> u16) -> String {
-    let units = bytes.chunks_exact(2).map(|c| word([c[0], c[1]]));
+    let units = bytes.as_chunks::<2>().0.iter().map(|c| word(*c));
     char::decode_utf16(units).map(|r| r.unwrap_or('\u{FFFD}')).collect()
 }
 
@@ -384,7 +389,7 @@ fn xml_text(xml: &[u8], flavor: Flavor, lim: &Limits) -> Result<String, ExtractE
     let mut steps = 0u32;
     while i < b.len() && out.len() < budget {
         steps += 1;
-        if steps % 1024 == 0 && Instant::now() >= lim.deadline {
+        if steps.is_multiple_of(1024) && Instant::now() >= lim.deadline {
             return Err(ExtractError::Timeout);
         }
         if b[i] != b'<' {
@@ -643,9 +648,7 @@ mod tests {
     }
 
     pub(crate) fn docx(body_xml: &str, deflate: bool) -> Vec<u8> {
-        let xml = format!(
-            "<?xml version=\"1.0\"?><w:document xmlns:w=\"x\"><w:body>{body_xml}</w:body></w:document>"
-        );
+        let xml = format!("<?xml version=\"1.0\"?><w:document xmlns:w=\"x\"><w:body>{body_xml}</w:body></w:document>");
         zip_of(&[("[Content_Types].xml", b"<Types/>", false), ("word/document.xml", xml.as_bytes(), deflate)])
     }
 
@@ -680,7 +683,10 @@ mod tests {
     fn odt_text() {
         let xml = "<office:document-content><office:body><office:text><text:h>Title</text:h><text:p>One<text:s/>two<text:tab/>three</text:p>\
                    <text:p>A &lt;b&gt;<text:line-break/>c</text:p></office:text></office:body></office:document-content>";
-        let z = zip_of(&[("mimetype", b"application/vnd.oasis.opendocument.text", false), ("content.xml", xml.as_bytes(), true)]);
+        let z = zip_of(&[
+            ("mimetype", b"application/vnd.oasis.opendocument.text", false),
+            ("content.xml", xml.as_bytes(), true),
+        ]);
         assert_eq!(extract(&z, Kind::Odt, &lim(1000)).unwrap().text, "Title\nOne two\tthree\nA <b>\nc");
     }
 
@@ -700,12 +706,20 @@ mod tests {
         let big = vec![b'a'; 64 * 1024 * 1024];
         let mut z = zip_of(&[("word/document.xml", &big, true)]);
         assert!(z.len() < 200_000, "the bomb is small: {}", z.len());
-        let l = Limits { max_chars: 1000, max_decompressed: 1024 * 1024, deadline: Instant::now() + Duration::from_secs(10) };
+        let l = Limits {
+            max_chars: 1000,
+            max_decompressed: 1024 * 1024,
+            deadline: Instant::now() + Duration::from_secs(10),
+        };
         assert_eq!(extract(&z, Kind::Docx, &l).unwrap_err(), ExtractError::TooLarge, "declared size over the cap");
         // Patch the declared sizes in the central directory to claim 10 bytes: inflating must still stop.
         let cd = z.windows(4).position(|w| w == [0x50, 0x4B, 0x01, 0x02]).unwrap();
         z[cd + 24..cd + 28].copy_from_slice(&10u32.to_le_bytes());
-        assert_eq!(extract(&z, Kind::Docx, &l).unwrap_err(), ExtractError::TooLarge, "inflation is bounded, not trusted");
+        assert_eq!(
+            extract(&z, Kind::Docx, &l).unwrap_err(),
+            ExtractError::TooLarge,
+            "inflation is bounded, not trusted"
+        );
     }
 
     #[test]
@@ -748,7 +762,10 @@ mod tests {
         assert_eq!(extract(&u16le, Kind::Text, &l).unwrap().text, "Name,Wert\nÄ,1");
         // Binary content posing as text is refused, not indexed as noise.
         assert_eq!(extract(&[0u8; 400], Kind::Text, &l).unwrap_err(), ExtractError::Invalid);
-        assert_eq!(extract(&(0..=255u8).cycle().take(3000).collect::<Vec<_>>(), Kind::Text, &l).unwrap_err(), ExtractError::Invalid);
+        assert_eq!(
+            extract(&(0..=255u8).cycle().take(3000).collect::<Vec<_>>(), Kind::Text, &l).unwrap_err(),
+            ExtractError::Invalid
+        );
     }
 
     #[test]
@@ -762,12 +779,17 @@ mod tests {
 
     #[test]
     fn deadline_is_honoured() {
-        let past = Limits { max_chars: 100, max_decompressed: 1 << 20, deadline: Instant::now() - Duration::from_secs(1) };
+        let past =
+            Limits { max_chars: 100, max_decompressed: 1 << 20, deadline: Instant::now() - Duration::from_secs(1) };
         assert_eq!(extract(b"x", Kind::Text, &past).unwrap_err(), ExtractError::Timeout);
         // An XML with many tags notices an expired deadline mid-way.
         let xml = format!("<w:document>{}</w:document>", "<w:p><w:t>a</w:t></w:p>".repeat(5000));
         let z = zip_of(&[("word/document.xml", xml.as_bytes(), true)]);
-        let soon = Limits { max_chars: 1_000_000, max_decompressed: 1 << 24, deadline: Instant::now() + Duration::from_millis(0) };
+        let soon = Limits {
+            max_chars: 1_000_000,
+            max_decompressed: 1 << 24,
+            deadline: Instant::now() + Duration::from_millis(0),
+        };
         assert!(matches!(extract(&z, Kind::Docx, &soon), Err(ExtractError::Timeout)));
     }
 
@@ -816,7 +838,10 @@ mod tests {
         for ty in ["ObjStm", "Obj#53tm", "#4fbj#53t#6d", "XRef"] {
             let mut pdf = b"%PDF-1.5\n".to_vec();
             for i in 0..300 {
-                pdf.extend(format!("{i} 0 obj\n<< /Type /{ty} /N 0 /First 0 /Length 0 >>\nstream\n\nendstream\nendobj\n").bytes());
+                pdf.extend(
+                    format!("{i} 0 obj\n<< /Type /{ty} /N 0 /First 0 /Length 0 >>\nstream\n\nendstream\nendobj\n")
+                        .bytes(),
+                );
             }
             assert_eq!(extract(&pdf, Kind::Pdf, &lim(1000)).unwrap_err(), ExtractError::TooLarge, "{ty}");
         }
@@ -827,7 +852,9 @@ mod tests {
         assert_eq!(count_pdf_names(b"/Type /ObjStm\0/N 1 /Type/XRef\0", &[b"ObjStm", b"XRef"]), 2);
         let mut pdf = b"%PDF-1.5\n".to_vec();
         for i in 0..300 {
-            pdf.extend(format!("{i} 0 obj\n<< /Type /ObjStm\0/N 0 /Length 0 >>\nstream\n\nendstream\nendobj\n").bytes());
+            pdf.extend(
+                format!("{i} 0 obj\n<< /Type /ObjStm\0/N 0 /Length 0 >>\nstream\n\nendstream\nendobj\n").bytes(),
+            );
         }
         assert_eq!(extract(&pdf, Kind::Pdf, &lim(1000)).unwrap_err(), ExtractError::TooLarge);
     }
@@ -835,7 +862,9 @@ mod tests {
     #[test]
     fn pdf_garbage_is_an_error_not_a_panic() {
         let l = lim(1000);
-        for bad in [&b""[..], b"%PDF-1.4\n", b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n<</Root 1 0 R>>\n%%EOF", b"not a pdf"] {
+        for bad in
+            [&b""[..], b"%PDF-1.4\n", b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n<</Root 1 0 R>>\n%%EOF", b"not a pdf"]
+        {
             assert!(extract(bad, Kind::Pdf, &l).is_err());
         }
         let mut junk = b"%PDF-1.7\n".to_vec();
@@ -919,7 +948,11 @@ mod tests {
         doc.trailer.set("Root", catalog_id);
         let mut pdf = Vec::new();
         doc.save_to(&mut pdf).unwrap();
-        let l = Limits { max_chars: 1000, max_decompressed: 1024 * 1024, deadline: Instant::now() + Duration::from_secs(20) };
+        let l = Limits {
+            max_chars: 1000,
+            max_decompressed: 1024 * 1024,
+            deadline: Instant::now() + Duration::from_secs(20),
+        };
         assert!(extract(&pdf, Kind::Pdf, &l).is_err(), "the bomb page yields no text");
     }
 

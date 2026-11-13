@@ -113,7 +113,9 @@ is always delivered in the untrusted-content envelope from section 6.5.
 | `list_accounts` | read | Effective mailbox aliases, addresses, status and actions for this token. |
 | `search_messages` | read | Filter, project, order and page authorized mail; optional native Gmail search. |
 | `batch_read` | read | Issue bounded independent search/message/thread reads in one MCP call. |
-| `get_message` | read | One message: headers, plain-text body, attachment metadata. |
+| `search_contacts` | read | Correspondents of the authorized, indexed mailboxes, ranked by exchange count and recency (§5.3a). |
+| `digest` | read | Threads with mail since a time, newest first, with snippets (§5.3a). |
+| `get_message` | read | One message: headers, plain-text body, category, calendar event, attachment metadata. |
 | `get_thread` | read | All messages of a thread, oldest first, bodies as in `get_message`. |
 | `list_labels` | read | Labels of an account (system and user), for building queries. |
 | `list_drafts` | read | Drafts of an account. `own_only` (default true) limits it to drafts this project created. |
@@ -152,7 +154,9 @@ The default source is `index`. A search returns messages at the authorized index
 | `is_unread`, `is_starred`, `is_draft`, `has_attachment` | Boolean `eq`. Gmail labels supply flags. Attachment means a MIME part marked attachment or carrying a nonempty filename, excluding inline resources with a Content-ID unless explicitly marked attachment. |
 | `received_at`, `size_bytes` | `eq`, `lt`, `lte`, `gt`, `gte`. Use RFC 3339 instants with offsets and Gmail internalDate; size is Gmail's size estimate. Date examples use inclusive start, exclusive end. |
 | `subject`, `body_text`, `text` | `terms` (all complete tokens), `phrase` (adjacent tokens), `prefix` (one token). `text` covers subject or normalized body. Case-insensitive Unicode tokenization; no stemming in v1. |
-| `attachment_name`, `attachment_mime` | Case-insensitive `eq`, `in`; name additionally supports literal `ends_with` (e.g. `.pdf`). Attachment contents are excluded. |
+| `attachment_name`, `attachment_mime` | Case-insensitive `eq`, `in`; name additionally supports literal `ends_with` (e.g. `.pdf`). |
+| `attachment_text` | `terms`, `phrase`, `prefix` over text extracted from PDF, DOCX, ODT, text and CSV attachments at ingest (§7.9). `text` covers subject, body and attachment text; `body_text` stays body only. Messages whose attachments were not read (too large, unreadable, extraction off, ingested by an older version) make the result `partial` with an exception; `require_complete` answers `index_incomplete`. |
+| `category` | `eq`, `in` over `personal`, `newsletter`, `notification`, `calendar`. A message without a category (indexed by an older version until its mailbox rebuilds) never matches; the result is `partial` with an exception. Selectable as a column. |
 
 - Combine predicates with `all`, `any` and unary `not`. Empty `where` matches all visible rows; exclude SPAM/TRASH unless `include_spam_trash:true`. Missing scalar or header values do not match a positive predicate; negation complements within the already-authorized candidate set. Normalize addresses consistently at ingest and lookup. Reject unsupported combinations, empty Boolean groups, depth >4, >32 predicates, >100 list values or >256 characters per filter string. Bind values; whitelist columns/operators and encode FTS token literals.
 - `select` returns exactly its requested columns. Default: `ref,received_at,from,subject`. `ref` is an opaque account/message handle usable by read tools, with authorization on resolution. Allowed extra columns: account, message_id, thread_id, to, cc, bcc, labels, snippet, size_bytes, attachment names/MIME types, and the filter flags. Wire names for attachment lists are `attachment_names` and `attachment_mime_types`. Subject-only really returns just subjects. Body and raw headers require a detail read. For compact multirow results return `columns` once and positional `rows`; do not repeat the table as prose. Legacy text-only clients receive one compact serialized result.
@@ -174,7 +178,39 @@ The default source is `index`. A search returns messages at the authorized index
 - Output: the fields of a search result plus `reply_to`, `message_id_header`, `body_text`, `body_truncated`,
   `attachments[]` (`attachment_id`, `filename`, `mime_type`, `size_bytes`). The body is the text/plain part if one
   exists, otherwise text converted from text/html (section 6.5).
-- Attachment content is not returned in v1. Apply an aggregate response byte limit to threads as well as a per-message text limit; return an explicit truncation marker and remaining message IDs.
+- Output also carries `category` and, for a message with a `text/calendar` (or `application/ics`) part that parses, `calendar`:
+  `method`, `summary`, `start`, `end`, `timezone` (the TZID name; local times carry no offset because Dove ships no
+  time zone database), `all_day` (end exclusive, as in iCalendar), `location`, `organizer` (`Name <address>`),
+  `attendees_count` (attendee addresses are counted, never listed) and `uid`. Only the first VEVENT is read; input,
+  line and field sizes are bounded; a part that does not parse leaves `calendar` out and the category `calendar`.
+- Attachment content is not returned by these tools; `get_attachment` fetches it (§5.3a). Apply an aggregate response byte limit to threads as well as a per-message text limit; return an explicit truncation marker and remaining message IDs.
+
+### 5.3a Mail intelligence tools (0.2)
+
+All three work on indexed mailboxes (Gmail and IMAP alike), follow the grants of the token and return their data
+inside the untrusted-content envelope. Each call is one audit record; queries and results never reach the audit log.
+
+- **`search_contacts`**: `query` (optional, 2 to 100 characters, matched case-insensitively against address and display
+  name as a literal substring, never as a pattern; shorter is `query_too_broad`), `account` (optional alias), `limit`
+  (1 to 50, default 20), `include_automated` (default false: no-reply, donotreply, mailer-daemon, postmaster and
+  bounce addresses are left out, as are the mailbox's own addresses). Output: `contacts[]` with `address`, `name`,
+  `received` (mails from the address), `sent` (mails the mailbox sent to it, To/Cc/Bcc), `last_contact`, `accounts`.
+  Only exchanged mail counts: a Cc on mail between third parties does not make a contact. Ranking is
+  `ln(1 + 2*sent + received)` times a 90 day half-life on the last contact. Computed at query time from the index over
+  at most 2 000 candidate addresses (matching ones, or those of the newest 2 000 messages) and reports `truncated`.
+  An aggregate cannot be split by mailbox, so a grant lost mid-call answers `forbidden`.
+- **`digest`**: `since` (RFC 3339, required, at most 366 days back), `accounts` (default all readable), `folders`
+  (labels, default `INBOX`, at most 10), `category`, `limit` (1 to 50, default 20), `cursor` (alone). One entry per
+  thread with a matching message, newest first: `account`, `ref` of the newest message, `thread_id`, `subject`,
+  `participants` (up to 5 distinct senders), `count`, `newest_received_at`, `unread`, `category`, `snippet` (one
+  cleaned line, at most 160 characters). Spam and trash are excluded. Paging uses the keyset cursor contract of
+  `search_messages`, bound to the digest query; a search cursor is `cursor_invalid` here and the other way round.
+  Coverage and exceptions are reported as for search.
+- **`get_attachment` with `as_text: true`**: same arguments and authorization as the byte route (`ref` or
+  `account` + `message_id`, `attachment_id`) plus `max_chars` (default 50 000, max 200 000; without `as_text` it is
+  `invalid_argument`). Returns the bounded plain text of a PDF, DOCX, ODT, text or CSV attachment instead of the bytes,
+  with `text_truncated`; other types are `invalid_argument`, encrypted or unreadable documents `invalid_argument`,
+  attachments above `limits.attachment_bytes` `too_large`, a blown 10 second extraction budget `upstream_error`.
 
 #### `create_draft`
 
@@ -533,7 +569,7 @@ One Cargo package and one `dove` binary with service and local CLI subcommands. 
 
 **Storage and lifecycle.** One rebuildable SQLCipher database with FTS5, hosted in the same Rust process. Keep the durable grants and admin state in their existing store. At startup verify SQLCipher, the correct independent index key, FTS5 and memory-only temp storage; refuse plaintext fallback. Restrict files to the service identity. Indexing is an explicit local operator choice per mailbox: `dove index enable|disable|status|rebuild <alias>`. Disabled is the default until enabled; the live Gmail mode works immediately. The initial policy is full mailbox history on enabled accounts, including spam/trash for opted-in queries. Give recent mail a bounded priority pass, then enumerate all pages. Until full coverage is established, expose partial results.
 
-**Data.** Store mailbox ID + provider message ID as a unique key, thread ID, Gmail internalDate, size estimate, normalized visible address roles and domains, subject, sanitized searchable body, label IDs and attachment names/types. Use ordinary compound B-tree indexes for mailbox/date, participant/domain, labels and common filter/order pairs. FTS5 indexes the subject and normalized body using unicode61. Keep one text source for FTS, with FTS and metadata updates in the same transaction. No raw MIME or attachment binaries in the persistent index. MIME parsing has per-message byte, nesting and text limits. If body text exceeds limits or is unavailable, record incomplete content coverage so a body query cannot claim exact absence. MIME metadata that could not be extracted is marked unknown. Missing optional headers alone do not imply incomplete indexing.
+**Data.** Store mailbox ID + provider message ID as a unique key, thread ID, Gmail internalDate, size estimate, normalized visible address roles and domains, subject, sanitized searchable body, label IDs and attachment names/types. Use ordinary compound B-tree indexes for mailbox/date, participant/domain, labels and common filter/order pairs. FTS5 indexes the subject, the normalized body and the extracted attachment text (three columns; generations created before 0.2 keep two and serve until their mailbox rebuilds) using unicode61. Each message also stores its category (§5.3a) and whether every supported attachment was read. Keep one text source for FTS, with FTS and metadata updates in the same transaction. No raw MIME or attachment binaries in the persistent index. Attachment text is extracted while the message is ingested, from bytes already in memory: PDF (lopdf, no heavy features), DOCX and ODT (a hand-written bounded ZIP and XML reader), text and CSV. Extraction is bounded by `index.attachment_text_max_bytes` per attachment, `attachment_text_max_chars` of text per message, a wall-clock budget, a decompression cap that does not trust the archive's declared sizes, no entity expansion, page and stream limits for PDF, and panic containment. Failure of any kind leaves the message indexed with its attachments marked unread. MIME parsing has per-message byte, nesting and text limits. If body text exceeds limits or is unavailable, record incomplete content coverage so a body query cannot claim exact absence. MIME metadata that could not be extracted is marked unknown. Missing optional headers alone do not imply incomplete indexing.
 
 **Full and incremental sync.**
 1. Capture the account's current Gmail history ID before enumeration. Backfill into a fresh generation in bounded pages, with durable progress and idempotent upserts. Restart or replay safely; restart enumeration if its page token is invalid. Reconcile arrivals, label changes and deletions since the starting ID with history.list before publishing complete. A GET returning 404 for a vanished message removes that candidate. Record skipped/transiently failed messages for retry.

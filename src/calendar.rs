@@ -244,7 +244,7 @@ fn days_in_month(y: u32, m: u32) -> u32 {
     match m {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
-        _ if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 => 29,
+        _ if (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400) => 29,
         _ => 28,
     }
 }
@@ -280,7 +280,10 @@ fn time_value(l: &Line) -> Option<(String, bool)> {
 fn organizer(l: &Line) -> Option<String> {
     let v = l.value.trim();
     let addr = v.get(..7).filter(|p| p.eq_ignore_ascii_case("mailto:")).map_or(v, |_| v[7..].trim());
-    if addr.is_empty() || addr.len() > 254 || !addr.contains('@') || addr.chars().any(|c| c.is_whitespace() || c.is_control() || matches!(c, '<' | '>' | '"'))
+    if addr.is_empty()
+        || addr.len() > 254
+        || !addr.contains('@')
+        || addr.chars().any(|c| c.is_whitespace() || c.is_control() || matches!(c, '<' | '>' | '"'))
     {
         return None;
     }
@@ -296,7 +299,9 @@ mod tests {
     use super::*;
 
     fn wrap(event: &str) -> String {
-        format!("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\n{event}END:VEVENT\r\nEND:VCALENDAR\r\n")
+        format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\n{event}END:VEVENT\r\nEND:VCALENDAR\r\n"
+        )
     }
 
     #[test]
@@ -320,8 +325,11 @@ mod tests {
 
     #[test]
     fn tzid_all_day_and_floating() {
-        let e = parse(&wrap("DTSTART;TZID=Europe/Berlin:20261113T140000\r\nDTEND;TZID=Europe/Berlin:20261113T153000\r\n"), None)
-            .unwrap();
+        let e = parse(
+            &wrap("DTSTART;TZID=Europe/Berlin:20261113T140000\r\nDTEND;TZID=Europe/Berlin:20261113T153000\r\n"),
+            None,
+        )
+        .unwrap();
         assert_eq!(e.start.as_deref(), Some("2026-11-13T14:00:00"));
         assert_eq!(e.end.as_deref(), Some("2026-11-13T15:30:00"));
         assert_eq!(e.timezone.as_deref(), Some("Europe/Berlin"));
@@ -357,11 +365,18 @@ mod tests {
         assert!(parse("hello world, not a calendar", None).is_none());
         assert!(parse("BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n", None).is_none(), "no VEVENT");
         assert!(parse("SUMMARY:x\r\nBEGIN:VEVENT\r\nEND:VEVENT\r\n", None).is_none(), "event outside a calendar");
-        let e = parse(&wrap("DTSTART:20261313T140000Z\r\nDTEND:20260230T000000\r\nORGANIZER:mailto:not an address\r\n"), None)
-            .unwrap();
+        let e = parse(
+            &wrap("DTSTART:20261313T140000Z\r\nDTEND:20260230T000000\r\nORGANIZER:mailto:not an address\r\n"),
+            None,
+        )
+        .unwrap();
         assert_eq!((e.start, e.end, e.organizer), (None, None, None), "month 13, Feb 30 and a bad organizer");
         // Mismatched nesting stops reading instead of misattributing properties.
-        let e = parse("BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nSUMMARY:kept\r\nEND:VALARM\r\nSUMMARY:late\r\nEND:VEVENT\r\n", None).unwrap();
+        let e = parse(
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nSUMMARY:kept\r\nEND:VALARM\r\nSUMMARY:late\r\nEND:VEVENT\r\n",
+            None,
+        )
+        .unwrap();
         assert_eq!(e.summary.as_deref(), Some("kept"));
         // Binary junk.
         assert!(parse(&"\u{0}\u{1}BEGIN:VEVENT\r\n".repeat(10), None).is_none());
@@ -370,7 +385,9 @@ mod tests {
     #[test]
     fn text_is_sanitized_and_bounded() {
         let long = "x".repeat(5_000);
-        let e = parse(&wrap(&format!("SUMMARY:ab\u{202e}cd\u{200b}\\n\u{7}ef\r\nLOCATION:{long}\r\nUID:{long}\r\n")), None).unwrap();
+        let e =
+            parse(&wrap(&format!("SUMMARY:ab\u{202e}cd\u{200b}\\n\u{7}ef\r\nLOCATION:{long}\r\nUID:{long}\r\n")), None)
+                .unwrap();
         assert_eq!(e.summary.as_deref(), Some("abcd ef"));
         assert!(e.location.unwrap().chars().count() <= MAX_TEXT_CHARS);
         assert!(e.uid.unwrap().chars().count() <= MAX_TEXT_CHARS);

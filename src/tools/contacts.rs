@@ -100,13 +100,7 @@ async fn search_contacts(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolErr
                         "reason": "contact names and counts incomplete for some messages", "count": n }));
                 }
             }
-            let req = ContactReq {
-                query: q2.as_deref(),
-                include_automated,
-                limit,
-                own,
-                now_ms: util::now_unix_ms(),
-            };
+            let req = ContactReq { query: q2.as_deref(), include_automated, limit, own, now_ms: util::now_unix_ms() };
             let res = intel::contacts(&tx, &targets, &req)?;
             let as_of = states.values().filter_map(|(s, _)| s.last_success_at).min();
             Ok((targets, exceptions, as_of, res))

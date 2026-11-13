@@ -75,7 +75,6 @@ fn zip_entries(entries: Vec<(&str, Vec<u8>, bool)>) -> Vec<u8> {
     out
 }
 
-
 fn with_docx(from: &str, subject: &str, text: &str) -> Vec<u8> {
     let xml = format!("<w:document><w:body><w:p><w:r><w:t>{text}</w:t></w:r></w:p></w:body></w:document>");
     let z = zip_stored(&[("[Content_Types].xml", b"<Types/>"), ("word/document.xml", xml.as_bytes())]);
@@ -112,11 +111,19 @@ async fn imap_mailboxes_get_categories_contacts_digest_and_attachment_text() {
     let now = dove::util::now_unix_ms() / 1000;
     let add = |folder: &str, raw: &[u8], flags: &[&str]| h.imap.add_message_at(&u.user, folder, raw, flags, now - 3600);
 
-    let news = add("INBOX", &mail("News <news@shop.example>", "info@example.org", "Deals", "List-Unsubscribe: <mailto:u@x>\r\n", "deals"), &["\\Seen"]);
+    let news = add(
+        "INBOX",
+        &mail("News <news@shop.example>", "info@example.org", "Deals", "List-Unsubscribe: <mailto:u@x>\r\n", "deals"),
+        &["\\Seen"],
+    );
     let pers = add("INBOX", &mail("Anna Berger <anna@example.com>", "info@example.org", "Lunch", "", "hi"), &[]);
     let note = add("INBOX", &mail("noreply@bank.example", "info@example.org", "Statement", "", "stmt"), &["\\Seen"]);
     let inv = add("INBOX", &invite("Standup"), &["\\Seen"]);
-    let doc = add("INBOX", &with_docx("Anna Berger <anna@example.com>", "Contract", "quarterly zeppelin forecast"), &["\\Seen"]);
+    let doc = add(
+        "INBOX",
+        &with_docx("Anna Berger <anna@example.com>", "Contract", "quarterly zeppelin forecast"),
+        &["\\Seen"],
+    );
     add("Sent", &mail("info@example.org", "Carl <carl@example.org>", "Plan", "", "sent body"), &["\\Seen"]);
     add("Junk", &mail("spam@bad.example", "info@example.org", "Win", "", "junk"), &[]);
 
@@ -133,14 +140,26 @@ async fn imap_mailboxes_get_categories_contacts_digest_and_attachment_text() {
                 let (a, n) = (u.account_id.clone(), support::fake_imap::encode_utf7(&folder));
                 h.app()
                     .store
-                    .call(move |c| Ok(c.query_row("SELECT folder_id FROM imap_folders WHERE account_id = ?1 AND name = ?2", [a, n], |r| r.get(0))?))
+                    .call(move |c| {
+                        Ok(c.query_row(
+                            "SELECT folder_id FROM imap_folders WHERE account_id = ?1 AND name = ?2",
+                            [a, n],
+                            |r| r.get(0),
+                        )?)
+                    })
                     .await
                     .unwrap()
             };
             format!("f{f}-{}-{uid}", h.imap.uidvalidity(&u.user, &folder))
         }
     };
-    let (news, pers, note, inv, doc) = (id("INBOX", news).await, id("INBOX", pers).await, id("INBOX", note).await, id("INBOX", inv).await, id("INBOX", doc).await);
+    let (news, pers, note, inv, doc) = (
+        id("INBOX", news).await,
+        id("INBOX", pers).await,
+        id("INBOX", note).await,
+        id("INBOX", inv).await,
+        id("INBOX", doc).await,
+    );
 
     // Categories at ingest and the filter.
     let v = h.ok(&token, "search_messages", json!({"select": ["message_id", "category"], "limit": 50})).await;
@@ -150,7 +169,13 @@ async fn imap_mailboxes_get_categories_contacts_digest_and_attachment_text() {
     assert_eq!(cat_of(&pers), "personal");
     assert_eq!(cat_of(&note), "notification");
     assert_eq!(cat_of(&inv), "calendar");
-    let v = h.ok(&token, "search_messages", json!({"where": {"field": "category", "op": "eq", "value": "newsletter"}, "select": ["message_id"]})).await;
+    let v = h
+        .ok(
+            &token,
+            "search_messages",
+            json!({"where": {"field": "category", "op": "eq", "value": "newsletter"}, "select": ["message_id"]}),
+        )
+        .await;
     assert_eq!(v["rows"], json!([[news]]));
 
     // Calendar through get_message (the live IMAP fetch path).
@@ -165,7 +190,13 @@ async fn imap_mailboxes_get_categories_contacts_digest_and_attachment_text() {
     assert_eq!(v["rows"], json!([[doc]]), "{v}");
     let m = h.ok(&token, "get_message", json!({"account": "info", "message_id": doc})).await;
     let part = m["message"]["attachments"][0]["attachment_id"].as_str().unwrap().to_string();
-    let t = h.ok(&token, "get_attachment", json!({"account": "info", "message_id": doc, "attachment_id": part, "as_text": true})).await;
+    let t = h
+        .ok(
+            &token,
+            "get_attachment",
+            json!({"account": "info", "message_id": doc, "attachment_id": part, "as_text": true}),
+        )
+        .await;
     assert_eq!(t["text"], "quarterly zeppelin forecast");
 
     // Contacts: sent to Carl, received from Anna; no-reply and junk excluded.
@@ -174,7 +205,12 @@ async fn imap_mailboxes_get_categories_contacts_digest_and_attachment_text() {
     let addrs: Vec<&str> = list.iter().map(|x| x["address"].as_str().unwrap()).collect();
     assert_eq!(addrs[0], "anna@example.com", "{addrs:?}");
     assert!(addrs.contains(&"carl@example.org") && addrs.contains(&"news@shop.example"), "{addrs:?}");
-    assert!(!addrs.contains(&"noreply@bank.example") && !addrs.contains(&"spam@bad.example") && !addrs.contains(&"info@example.org"), "{addrs:?}");
+    assert!(
+        !addrs.contains(&"noreply@bank.example")
+            && !addrs.contains(&"spam@bad.example")
+            && !addrs.contains(&"info@example.org"),
+        "{addrs:?}"
+    );
     assert_eq!(list[0]["received"], 2);
     assert_eq!(list[0]["name"], "Anna Berger");
     let carl = list.iter().find(|x| x["address"] == "carl@example.org").unwrap();
