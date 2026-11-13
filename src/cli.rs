@@ -271,7 +271,8 @@ pub struct ConnectImapArgs {
     /// Drafts folder name, when the server marks none and none is called Drafts/Entwürfe/Draft.
     #[arg(long)]
     drafts_folder: Option<String>,
-    /// Known provider settings: strato or icloud (chosen from the address when possible).
+    /// Known provider settings: strato, icloud or gmail (chosen from the address when possible; gmail for Google
+    /// Workspace domains).
     #[arg(long)]
     preset: Option<String>,
     /// Read the password from stdin (one line) instead of prompting.

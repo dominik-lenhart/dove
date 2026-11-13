@@ -26,11 +26,11 @@ use zeroize::Zeroizing;
 use crate::error::{ErrorCode, ToolError};
 
 pub use ids::ImapMsgId;
-pub use ops::{AppendFlag, Keyword, StoreFlag};
+pub use ops::{AppendFlag, GmLabel, Keyword, StoreFlag, UserLabel};
 pub use pool::ImapPool;
 pub use session::{
-    AppendTarget, AppendUid, Changes, CopiedUid, FetchedMeta, FolderInfo, FolderStatus, IdleEvent, ImapSession,
-    MAX_VANISHED_RANGES, MoveOutcome, OwnDraftUid, Special, UidRanges,
+    AppendTarget, AppendUid, Changes, CopiedUid, FetchedMeta, FolderInfo, FolderStatus, GMAIL_CAP, IdleEvent,
+    ImapSession, MAX_VANISHED_RANGES, MoveOutcome, OwnDraftUid, Special, UidRanges,
 };
 pub use smtp::SmtpError;
 

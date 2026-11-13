@@ -184,7 +184,8 @@ fn connect_with_preset_fills_hosts() {
         // iCloud files sent mail itself.
         assert!(!i.save_sent_copy);
     }
-    assert!(presets::for_email("x@gmail.com").is_none());
+    // Gmail (app password over IMAP) has its own preset since 0.3 (tests/imap_gmail_e2e.rs).
+    assert_eq!(presets::for_email("x@gmail.com").map(|p| p.name), Some("gmail"));
     assert!(presets::for_email("x@notstrato.de").is_none());
     assert_eq!(presets::by_name("ICLOUD").map(|p| p.name), Some("icloud"));
     assert!(presets::by_name("gmx").is_none());

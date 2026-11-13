@@ -204,7 +204,7 @@ async fn run_account(app: Arc<App>, aid: String, generation: i64, cancel: Cancel
     }
 }
 
-/// One connection: login, `EXAMINE INBOX`, IDLE cycles until cancelled or an error.
+/// One connection: login, `EXAMINE INBOX` (All Mail in Gmail mode), IDLE cycles until cancelled or an error.
 async fn connection(app: &Arc<App>, aid: &str, generation: i64, cancel: &CancellationToken) -> End {
     let (settings, creds) = match account::load(app, aid).await {
         Ok(v) => v,
@@ -236,7 +236,12 @@ async fn connection(app: &Arc<App>, aid: &str, generation: i64, cancel: &Cancell
         let _ = tokio::time::timeout(timeout, s.logout()).await;
         return End::Stop;
     }
-    let end = idle_loop(app, aid, &mut s, cancel).await;
+    // Gmail mode idles on All Mail, where new inbox mail lands too (PLAN A57).
+    let folder = match (settings.gmail, settings.all_folder.clone()) {
+        (true, Some(all)) => all,
+        _ => "INBOX".to_string(),
+    };
+    let end = idle_loop(app, aid, &mut s, &folder, cancel).await;
     if matches!(end, End::Cancelled | End::Stop) {
         // Polite close; the connection is dropped either way.
         let _ = tokio::time::timeout(timeout, async move {
@@ -249,9 +254,9 @@ async fn connection(app: &Arc<App>, aid: &str, generation: i64, cancel: &Cancell
     end
 }
 
-async fn idle_loop(app: &Arc<App>, aid: &str, s: &mut ImapSession, cancel: &CancellationToken) -> End {
+async fn idle_loop(app: &Arc<App>, aid: &str, s: &mut ImapSession, folder: &str, cancel: &CancellationToken) -> End {
     let renew = Duration::from_secs(app.cfg.index.idle_renew_secs.clamp(1, MAX_RENEW_SECS));
-    match tokio::select! { _ = cancel.cancelled() => return End::Cancelled, r = s.select("INBOX", true) => r } {
+    match tokio::select! { _ = cancel.cancelled() => return End::Cancelled, r = s.select(folder, true) => r } {
         Ok(_) => {}
         Err(_) => return End::Retry,
     }

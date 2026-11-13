@@ -1,5 +1,6 @@
 //! Compiled-in server presets by email domain (design "Account model and connect"). No network autodiscovery.
-//! Strato and iCloud are decided in the design; further presets are deliberately left out until verified.
+//! Strato, iCloud and Gmail (app password, PLAN A57) are decided in the designs; further presets are deliberately left
+//! out until verified.
 
 use super::{ServerEndpoint, TlsMode};
 
@@ -16,7 +17,11 @@ fn ep(host: &str, port: u16, tls: TlsMode) -> ServerEndpoint {
     ServerEndpoint { host: host.into(), port, tls }
 }
 
-/// A preset by name (`--preset strato|icloud`), for custom domains hosted by that provider.
+/// Names accepted by `--preset`.
+pub const NAMES: &str = "strato, icloud, gmail";
+
+/// A preset by name (`--preset strato|icloud|gmail`), for custom domains hosted by that provider (Google Workspace
+/// for `gmail`).
 pub fn by_name(name: &str) -> Option<Preset> {
     match name.trim().to_ascii_lowercase().as_str() {
         "strato" => Some(Preset {
@@ -32,6 +37,13 @@ pub fn by_name(name: &str) -> Option<Preset> {
             // iCloud is expected to file submitted mail into Sent itself (unverified until the first real send).
             save_sent_copy: false,
         }),
+        "gmail" => Some(Preset {
+            name: "gmail",
+            imap: ep("imap.gmail.com", 993, TlsMode::Implicit),
+            smtp: ep("smtp.gmail.com", 465, TlsMode::Implicit),
+            // Gmail files every message submitted over SMTP in Sent itself.
+            save_sent_copy: false,
+        }),
         _ => None,
     }
 }
@@ -42,6 +54,7 @@ pub fn for_email(email: &str) -> Option<Preset> {
     match domain.as_str() {
         "strato.de" => by_name("strato"),
         "icloud.com" | "me.com" | "mac.com" => by_name("icloud"),
+        "gmail.com" | "googlemail.com" => by_name("gmail"),
         _ => None,
     }
 }

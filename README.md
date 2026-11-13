@@ -52,8 +52,9 @@ your normal Drafts folder, so your mail client is the review step.
 
 ## Highlights
 
-- **Works with the mail you have.** Any IMAP/SMTP account with password or app-password login (presets for Strato
-  and iCloud), and Gmail through your own Google Cloud project. Send-as aliases and per-mailbox signatures.
+- **Works with the mail you have.** Any IMAP/SMTP account with password or app-password login (presets for Strato,
+  iCloud and Gmail). Gmail works with just an app password, labels included; the Gmail API through your own Google
+  Cloud project stays available. Send-as aliases and per-mailbox signatures.
 - **Search that understands mail.** Typed search over sender, recipient, subject, body, folder, unread, date and
   attachment text (PDF, DOCX, ODT, CSV). Every message is classified as personal, newsletter, notification or
   calendar, so "what's important" works without reading everything.
@@ -102,7 +103,10 @@ at rest.
 dove accounts connect-imap --alias work --email me@example.com
 ```
 
-Gmail uses your own Google Cloud OAuth client instead: see [Google Cloud setup](docs/deployment.md#google-cloud-setup).
+For Gmail, turn on 2-Step Verification, create an app password at <https://myaccount.google.com/apppasswords> and use
+it here (`--email you@gmail.com`; Google Workspace addresses add `--preset gmail`); see
+[Gmail with an app password](docs/deployment.md#gmail-with-an-app-password). The Gmail API through your own Google
+Cloud OAuth client is the alternative: [Google Cloud setup](docs/deployment.md#google-cloud-setup).
 
 **4. Give an agent a token**
 

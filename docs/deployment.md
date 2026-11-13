@@ -401,8 +401,9 @@ dove accounts connect-imap --alias own --email me@mail.example \
   --imap-host imap.mail.example --smtp-host smtp.mail.example --smtp-port 587 --smtp-tls starttls
 ```
 
-- Presets: `strato` (`imap.strato.de:993`, `smtp.strato.de:465`) and `icloud` (`imap.mail.me.com:993`,
-  `smtp.mail.me.com:587` STARTTLS). A port or TLS flag without a host overrides only that part of the preset.
+- Presets: `strato` (`imap.strato.de:993`, `smtp.strato.de:465`), `icloud` (`imap.mail.me.com:993`,
+  `smtp.mail.me.com:587` STARTTLS) and `gmail` (`imap.gmail.com:993`, `smtp.gmail.com:465`, see
+  [below](#gmail-with-an-app-password)). A port or TLS flag without a host overrides only that part of the preset.
 - iCloud and many other providers need an app password, not the account password.
 - `--username` / `--smtp-username` when the login name is not the address; `--drafts-folder` when the server marks no
   Drafts folder and none is called Drafts, Entwürfe or Draft.
@@ -412,6 +413,39 @@ dove accounts connect-imap --alias own --email me@mail.example \
 - Dove never deletes or moves mail in these mailboxes. It removes only drafts it wrote itself (the previous revision
   after `update_draft`, the draft after `send_draft`), and only after checking that the draft on the server is still
   byte-identical to what it wrote.
+
+### Gmail with an app password
+
+Gmail and Google Workspace mailboxes connect over IMAP with an app password: no Google Cloud project, no OAuth client,
+no "unverified app" screen.
+
+1. Turn on 2-Step Verification for the Google account (an app password needs it). Workspace admins must allow it.
+2. Create an app password at <https://myaccount.google.com/apppasswords> (any name, for example `Dove`). Google shows
+   16 letters once; spaces do not matter.
+3. In Gmail's settings, under *Forwarding and POP/IMAP*, IMAP is on for most accounts; under *Labels*, keep
+   *Show in IMAP* on for **All Mail**, Spam and Trash (Dove refuses to connect without All Mail).
+4. Connect it:
+
+```sh
+dove accounts connect-imap --alias me --email you@gmail.com                       # gmail.com and googlemail.com
+dove accounts connect-imap --alias work --email you@company.example --preset gmail  # Google Workspace domain
+```
+
+Dove recognises Gmail by its IMAP extension (`X-GM-EXT-1`) and puts the mailbox in Gmail mode; `connect-imap` prints
+`"gmail": true`. What differs from other IMAP mailboxes and from the Gmail API path:
+
+- Gmail shows every label as a folder, so one message appears in INBOX, All Mail and each label folder. Dove indexes
+  only All Mail, Spam and Trash, so every message has one id (its All Mail id) and its Gmail labels: `INBOX`, your
+  labels by name, `IMPORTANT`, `SENT`, `DRAFT`, `STARRED`, `UNREAD`. `folders: ["INBOX"]` and the digest work as
+  usual. Label changes made in Gmail reach the index on the next sync; IDLE watches All Mail.
+- Organize keeps the id: labels, archive (`-INBOX`), inbox and moving to a label are Gmail label changes. Trash and
+  Spam use IMAP `MOVE`, which Gmail treats like its own Trash and Spam (recoverable for 30 days). Dove never sets
+  `\Deleted` or expunges outside its own drafts, because on Gmail that can delete mail for good depending on the
+  account's IMAP settings. Dove creates no labels: `add_labels` takes existing user labels only.
+- Gmail files sent mail in Sent itself, so Dove stores no Sent copy (`save_sent_copy` is off in Gmail mode).
+- Gmail limits IMAP to 15 connections per account and about 2,500 MB of downloads per day; the first index of a large
+  mailbox can take a few days on that budget. Thread ids are Dove's own (References and subject), not Gmail's.
+- `accounts reconnect <alias>` takes a new app password. Revoking the app password at Google stops Dove at once.
 
 ### Send-as aliases and signatures
 

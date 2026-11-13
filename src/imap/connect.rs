@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
 use super::account::{self, ImapSettings};
-use super::session::{FolderInfo, ImapSession, Special};
+use super::session::{FolderInfo, GMAIL_CAP, ImapSession, Special};
 use super::{Credentials, ImapError, ServerEndpoint, presets, smtp};
 use crate::admin::ops::{self, valid_alias};
 use crate::admin::server::AdminCall;
@@ -78,11 +78,13 @@ fn find<'a>(folders: &'a [FolderInfo], role: Special, names: &[&str]) -> Option<
         .or_else(|| names.iter().find_map(|n| usable().find(|f| leaf(f).eq_ignore_ascii_case(n))))
 }
 
-/// Resolves Drafts, Sent, Junk and Trash. `drafts_override` matches the decoded or the wire name exactly.
+/// Resolves Drafts, Sent, Junk and Trash, and in Gmail mode the `\All` folder (required, special-use flag only).
+/// `drafts_override` matches the decoded or the wire name exactly.
 pub fn resolve_specials(
     folders: &[FolderInfo],
     drafts_override: Option<&str>,
     need_sent: bool,
+    gmail: bool,
 ) -> anyhow::Result<Vec<(String, Special)>> {
     let drafts = match drafts_override {
         Some(name) => folders
@@ -109,6 +111,18 @@ pub fn resolve_specials(
             _ => {}
         }
     }
+    if gmail {
+        let all = folders.iter().find(|f| f.selectable && f.special == Some(Special::All)).ok_or_else(|| {
+            anyhow!(
+                "this is a Gmail server, but it lists no All Mail folder (\\All): in Gmail's settings under Labels, \
+                 turn on \"Show in IMAP\" for All Mail, then connect again"
+            )
+        })?;
+        if out.iter().any(|(n, _)| *n == all.raw_name) {
+            bail!("the All Mail folder cannot also be the Drafts, Sent, Spam or Trash folder");
+        }
+        out.push((all.raw_name.clone(), Special::All));
+    }
     Ok(out)
 }
 
@@ -116,14 +130,16 @@ fn timeout(app: &App) -> Duration {
     Duration::from_secs(app.cfg.limits.upstream_request_timeout_secs.max(5))
 }
 
-/// IMAP login, capabilities and folder list on a fresh (unpooled) connection.
-async fn verify_imap(app: &App, s: &ImapSettings, creds: &Credentials) -> anyhow::Result<Vec<FolderInfo>> {
+/// IMAP login, capabilities and folder list on a fresh (unpooled) connection. Also returns whether the server
+/// offers [`GMAIL_CAP`].
+async fn verify_imap(app: &App, s: &ImapSettings, creds: &Credentials) -> anyhow::Result<(Vec<FolderInfo>, bool)> {
     let mut session = ImapSession::connect(app.imap.connector(), &s.imap, creds, timeout(app))
         .await
         .map_err(|e| step_error("IMAP", &s.imap, &e))?;
+    let gmail = session.has_cap(GMAIL_CAP);
     let folders = session.list_folders().await.map_err(|e| step_error("IMAP", &s.imap, &e))?;
     session.logout().await;
-    Ok(folders)
+    Ok((folders, gmail))
 }
 
 async fn verify_smtp(app: &App, s: &ImapSettings, creds: &Credentials) -> anyhow::Result<()> {
@@ -139,7 +155,10 @@ fn endpoint_or_preset(
     which: &str,
 ) -> anyhow::Result<ServerEndpoint> {
     let ep = explicit.or_else(|| preset.cloned()).ok_or_else(|| {
-        anyhow!("unknown mail provider for this address: pass --{which}-host (and port/TLS) or --preset strato|icloud")
+        anyhow!(
+            "unknown mail provider for this address: pass --{which}-host (and port/TLS) or --preset {}",
+            presets::NAMES
+        )
     })?;
     ep.validate().map_err(|e| anyhow!("--{which}-host: {e}"))?;
     Ok(ep)
@@ -158,17 +177,19 @@ pub async fn connect(call: &mut AdminCall<'_>, req: ConnectImap) -> anyhow::Resu
         bail!("the password is empty");
     }
     let preset = match req.preset.as_deref() {
-        Some(p) => Some(presets::by_name(p).ok_or_else(|| anyhow!("unknown preset (known: strato, icloud)"))?),
+        Some(p) => Some(presets::by_name(p).ok_or_else(|| anyhow!("unknown preset (known: {})", presets::NAMES))?),
         None => presets::for_email(&email),
     };
-    let settings = ImapSettings {
+    let mut settings = ImapSettings {
         imap: endpoint_or_preset(req.imap, preset.as_ref().map(|p| &p.imap), "imap")?,
         smtp: endpoint_or_preset(req.smtp, preset.as_ref().map(|p| &p.smtp), "smtp")?,
         username: req.username.clone().filter(|u| !u.trim().is_empty()).unwrap_or_else(|| email.clone()),
         smtp_username: req.smtp_username.clone().filter(|u| !u.trim().is_empty()),
         save_sent_copy: preset.as_ref().is_none_or(|p| p.save_sent_copy),
+        gmail: false,
         drafts_folder: None,
         sent_folder: None,
+        all_folder: None,
         generation: 1,
         alias: req.alias.clone(),
         email: email.clone(),
@@ -190,8 +211,13 @@ pub async fn connect(call: &mut AdminCall<'_>, req: ConnectImap) -> anyhow::Resu
         })
         .await?;
     let creds = Credentials { username: settings.username.clone(), password: req.password.clone() };
-    let folders = verify_imap(&app, &settings, &creds).await?;
-    let specials = resolve_specials(&folders, req.drafts_folder.as_deref(), settings.save_sent_copy)?;
+    let (folders, gmail) = verify_imap(&app, &settings, &creds).await?;
+    if gmail {
+        // Gmail mode (PLAN A57), fixed from now on. Gmail files submitted mail in Sent itself, whatever the preset.
+        settings.gmail = true;
+        settings.save_sent_copy = false;
+    }
+    let specials = resolve_specials(&folders, req.drafts_folder.as_deref(), settings.save_sent_copy, gmail)?;
     verify_smtp(&app, &settings, &creds).await?;
 
     let id = util::new_id();
@@ -232,6 +258,8 @@ pub async fn connect(call: &mut AdminCall<'_>, req: ConnectImap) -> anyhow::Resu
         "drafts_folder": name_of(Special::Drafts),
         "sent_folder": name_of(Special::Sent),
         "save_sent_copy": settings.save_sent_copy,
+        "gmail": settings.gmail,
+        "all_mail_folder": name_of(Special::All),
         "index": "enabled",
     }))
 }
