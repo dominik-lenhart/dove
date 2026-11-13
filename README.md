@@ -246,7 +246,9 @@ running against a real mailbox since the first release. Before you rely on it:
 | SMTP send behind both gates | checked against real Strato SMTP and the Gmail API |
 | Gmail API | checked against a real account: connect, read, search, digest, organize, drafts, send, watches |
 | Gmail over IMAP (app password) | checked against a real account: connect, labels, search, digest, organize, Trash and back, drafts |
-| ChatGPT and Claude web connectors, iCloud, very large mailboxes, benchmarks | open |
+| ChatGPT connector through the OAuth approval page | checked: approval, token refresh, `list_accounts`, `digest` and `search_messages` across 11 mailboxes, reading messages and threads |
+| iCloud over IMAP | checked: connect, index, search, read |
+| Claude web connector, iCloud drafts and send, very large mailboxes, benchmarks | open |
 
 What was checked on real systems is listed in the
 [deployment guide](docs/deployment.md#what-has-been-verified); decisions and evidence are in
