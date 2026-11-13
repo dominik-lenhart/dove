@@ -96,11 +96,12 @@ fn like_contains(s: &str) -> String {
     out
 }
 
-/// Rank: messages weighted by direction (mail you sent counts double) with a 90 day half-life on the last contact,
-/// so a recent correspondent outranks a prolific but long-silent one.
+/// Rank: the logarithm of the message count (mail you sent counts double, so one more message matters less the more
+/// there already are) times a 90 day half-life on the last contact, so a recent correspondent outranks a prolific
+/// but long-silent one.
 pub fn score(sent: i64, received: i64, last_ms: i64, now_ms: i64) -> f64 {
     let age_days = ((now_ms - last_ms).max(0) as f64) / 86_400_000.0;
-    (2 * sent + received) as f64 * 0.5f64.powf(age_days / 90.0)
+    ((2 * sent + received) as f64).ln_1p() * 0.5f64.powf(age_days / 90.0)
 }
 
 /// Candidate addresses: those matching `query` in the address or a display name, or (no query) those of the newest
@@ -305,14 +306,12 @@ pub struct ThreadRow {
 /// The filter shared by the thread query and the per-thread detail query: window, folders, category.
 fn filter(sql: &mut String, params: &mut Vec<SqlValue>, req: &DigestReq, t: &[Target]) {
     sql.push_str(&format!(
-        " AND m.spam_trash = 0 AND m.received_at >= ? AND m.id IN \
-         (SELECT msg FROM labels WHERE label IN {} AND gen IN {})",
+        " AND m.spam_trash = 0 AND m.received_at >= ? AND EXISTS \
+         (SELECT 1 FROM labels l WHERE l.msg = m.id AND l.gen = m.gen AND l.label IN {})",
         marks(req.folders.len()),
-        marks(t.len())
     ));
     params.push(SqlValue::Integer(req.since_ms));
     params.extend(req.folders.iter().map(|f| SqlValue::Text(f.clone())));
-    params.extend(gens(t));
     if let Some(c) = req.category {
         sql.push_str(" AND IFNULL(m.category = ?, 0)");
         params.push(SqlValue::Text(c.as_str().to_string()));

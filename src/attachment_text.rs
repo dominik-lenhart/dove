@@ -486,20 +486,60 @@ fn push_unescaped(s: &str, out: &mut String) {
 
 /// Pages read from one PDF, at most.
 const MAX_PDF_PAGES: usize = 300;
-/// Object streams a PDF may declare. Real documents within the attachment size cap have a few dozen; every one is
-/// inflated and parsed eagerly while the document loads, so a crafted file with thousands is refused before that.
-const MAX_PDF_OBJECT_STREAMS: usize = 256;
+/// Object and cross-reference streams a PDF may declare together. Real documents within the attachment size cap have
+/// a few dozen; every one is inflated and parsed eagerly while the document loads, so a crafted file with thousands
+/// is refused before that.
+const MAX_PDF_LOAD_STREAMS: usize = 128;
 /// Most bytes one PDF stream may inflate to (object, cross-reference and page content streams alike).
-const MAX_PDF_STREAM_BYTES: usize = 16 * 1024 * 1024;
+const MAX_PDF_STREAM_BYTES: usize = 8 * 1024 * 1024;
+
+/// Number of name tokens in `pdf` equal to one of `wanted` after resolving `#XX` escapes (`/Obj#53tm` is
+/// `/ObjStm`). Names are plain text even in encrypted or compressed documents; a count that is too high only makes
+/// the check stricter, so strings and stream data containing a slash do no harm.
+fn count_pdf_names(pdf: &[u8], wanted: &[&[u8]]) -> usize {
+    let is_delim = |b: u8| b.is_ascii_whitespace() || b"()<>[]{}/%".contains(&b);
+    let mut count = 0usize;
+    let mut i = 0usize;
+    let mut name: Vec<u8> = Vec::with_capacity(16);
+    while i < pdf.len() {
+        if pdf[i] != b'/' {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        name.clear();
+        while i < pdf.len() && !is_delim(pdf[i]) {
+            let b = pdf[i];
+            let hex = |c: u8| (c as char).to_digit(16);
+            if b == b'#' && i + 2 < pdf.len() && hex(pdf[i + 1]).is_some() && hex(pdf[i + 2]).is_some() {
+                name.push((hex(pdf[i + 1]).unwrap_or(0) * 16 + hex(pdf[i + 2]).unwrap_or(0)) as u8);
+                i += 3;
+            } else {
+                name.push(b);
+                i += 1;
+            }
+            if name.len() > 32 {
+                // Longer than any name we look for: skip the rest of this token.
+                while i < pdf.len() && !is_delim(pdf[i]) {
+                    i += 1;
+                }
+                break;
+            }
+        }
+        if wanted.contains(&name.as_slice()) {
+            count += 1;
+        }
+    }
+    count
+}
 
 fn pdf_text(bytes: &[u8], lim: &Limits) -> Result<String, ExtractError> {
     if !bytes.get(..1024.min(bytes.len())).is_some_and(|h| h.windows(5).any(|w| w == b"%PDF-")) {
         return Err(ExtractError::Invalid);
     }
     // lopdf loads the whole document eagerly and cannot be interrupted, so the work is bounded by what goes in: the
-    // attachment size cap, the number of object streams, and the inflated size of every stream and page.
-    let objstms = bytes.windows(7).filter(|w| *w == b"/ObjStm").count();
-    if objstms > MAX_PDF_OBJECT_STREAMS {
+    // attachment size cap, the number of object and cross-reference streams, and the inflated size of every stream and page.
+    if count_pdf_names(bytes, &[b"ObjStm", b"XRef"]) > MAX_PDF_LOAD_STREAMS {
         return Err(ExtractError::TooLarge);
     }
     let stream_cap = lim.max_decompressed.min(MAX_PDF_STREAM_BYTES);
@@ -749,11 +789,17 @@ mod tests {
 
     #[test]
     fn pdf_with_many_object_streams_is_refused() {
-        let mut pdf = b"%PDF-1.5\n".to_vec();
-        for i in 0..300 {
-            pdf.extend(format!("{i} 0 obj\n<< /Type /ObjStm /N 0 /First 0 /Length 0 >>\nstream\n\nendstream\nendobj\n").bytes());
+        // The type name can be written with #XX escapes: /Obj#53tm is /ObjStm.
+        for ty in ["ObjStm", "Obj#53tm", "#4fbj#53t#6d", "XRef"] {
+            let mut pdf = b"%PDF-1.5\n".to_vec();
+            for i in 0..300 {
+                pdf.extend(format!("{i} 0 obj\n<< /Type /{ty} /N 0 /First 0 /Length 0 >>\nstream\n\nendstream\nendobj\n").bytes());
+            }
+            assert_eq!(extract(&pdf, Kind::Pdf, &lim(1000)).unwrap_err(), ExtractError::TooLarge, "{ty}");
         }
-        assert_eq!(extract(&pdf, Kind::Pdf, &lim(1000)).unwrap_err(), ExtractError::TooLarge);
+        // Ordinary escapes in other names, and a few object streams, are fine to count.
+        assert_eq!(count_pdf_names(b"/BaseFont /Arial#20Bold /Type/ObjStm /Type /ObjStm>>/ObjStmX", &[b"ObjStm"]), 2);
+        assert_eq!(count_pdf_names(b"/Obj#5", &[b"ObjStm"]), 0, "a truncated escape is not an escape");
     }
 
     #[test]
