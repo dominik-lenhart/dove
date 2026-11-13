@@ -62,6 +62,7 @@ async fn no_onboarding_secret_reaches_logs_audit_or_store() {
             capabilities: "read".into(),
             expires: None,
             allow_ip: vec![],
+            redact_secrets: false,
         })
     };
     let mut secrets: Vec<String> = Vec::new();

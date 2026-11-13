@@ -402,3 +402,7 @@ cargo fmt
   sync pass (`next_retry_at` = later of `next_attempt_at` and `sync_state.next_run_at`). Tests move those times with
   `UPDATE pending/sync_state` and compare against the stored values, not wall-clock guesses. The tool-description text
   about `resolves` is the `coverage_note!` macro in `src/tools/mod.rs`.
+- 2026-11-13: Secret redaction (PLAN A60, `src/redact.rs`) applies only at the output step through
+  `ToolCx::redact_table` / `redact_objects`; a new list or overview tool with subjects or snippets must call one of
+  them, targeted reads must not. Test fixtures that look like keys (`ghp_…`, PEM headers, `API key: …`) trip CI's
+  gitleaks: build them at run time (`format!("gh{}", "p_…")`) and check with the docker command above.

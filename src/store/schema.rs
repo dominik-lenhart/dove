@@ -1,6 +1,7 @@
 //! Versioned schema migrations for the durable state store. Never edit a released migration; append a new one.
 
-pub const MIGRATIONS: &[&str] = &[V1, V2, V3, V_SEND_IDENTITIES, V_WATCHES, V_GMAIL_IMAP, V_SINK_PROJECTS];
+pub const MIGRATIONS: &[&str] =
+    &[V1, V2, V3, V_SEND_IDENTITIES, V_WATCHES, V_GMAIL_IMAP, V_SINK_PROJECTS, V_REDACT_SECRETS];
 
 const V1: &str = r#"
 CREATE TABLE accounts (
@@ -333,4 +334,11 @@ const V_SINK_PROJECTS: &str = r#"
 ALTER TABLE sinks ADD COLUMN project_id TEXT REFERENCES projects(id) ON DELETE SET NULL;
 ALTER TABLE sinks ADD COLUMN url_sealed BLOB;
 CREATE INDEX sinks_project ON sinks(project_id);
+"#;
+
+/// Secret redaction in overview results (PLAN A60): a per-connection switch, off by default, set by the operator. An
+/// invitation carries it to the connection it creates.
+const V_REDACT_SECRETS: &str = r#"
+ALTER TABLE clients ADD COLUMN redact_secrets INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE invitations ADD COLUMN redact_secrets INTEGER NOT NULL DEFAULT 0;
 "#;

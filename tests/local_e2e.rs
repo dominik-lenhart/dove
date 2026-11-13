@@ -229,6 +229,7 @@ async fn mcp_client_against_local_mode() {
             capabilities: "read".into(),
             expires: None,
             allow_ip: vec![],
+            redact_secrets: false,
         })
         .await
         .unwrap();

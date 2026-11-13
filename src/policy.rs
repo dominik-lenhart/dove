@@ -204,6 +204,8 @@ pub struct ClientCtx {
     pub mailboxes: Vec<Mailbox>,
     /// Instance send gate at load time (spec 6.3).
     pub allow_send: bool,
+    /// Hide secrets in overview results (`clients set-redaction`, PLAN A60).
+    pub redact_secrets: bool,
 }
 
 impl ClientCtx {
@@ -340,8 +342,8 @@ pub fn authenticate(
     };
     let row = conn
         .query_row(
-            "SELECT c.name, c.project_id, p.name, c.auth_epoch, c.allowed_cidrs, c.expires_at, c.revoked_at, c.last_ip \
-             FROM clients c JOIN projects p ON p.id = c.project_id WHERE c.id = ?1",
+            "SELECT c.name, c.project_id, p.name, c.auth_epoch, c.allowed_cidrs, c.expires_at, c.revoked_at, c.last_ip, \
+             c.redact_secrets FROM clients c JOIN projects p ON p.id = c.project_id WHERE c.id = ?1",
             [&client_id],
             |r| {
                 Ok((
@@ -353,11 +355,13 @@ pub fn authenticate(
                     r.get::<_, Option<i64>>(5)?,
                     r.get::<_, Option<i64>>(6)?,
                     r.get::<_, Option<String>>(7)?,
+                    r.get::<_, bool>(8)?,
                 ))
             },
         )
         .optional()?;
-    let Some((name, project_id, project_name, epoch, cidrs, expires_at, revoked_at, last_ip)) = row else {
+    let Some((name, project_id, project_name, epoch, cidrs, expires_at, revoked_at, last_ip, redact_secrets)) = row
+    else {
         return Ok(Err(AuthFailure::Unauthorized));
     };
     if revoked_at.is_some() || expires_at.is_some_and(|e| e <= now) || !ip_allowed(&cidrs, ip) {
@@ -380,6 +384,7 @@ pub fn authenticate(
             source_ip: ip,
             mailboxes,
             allow_send,
+            redact_secrets,
         },
         new_ip,
     }))
@@ -494,6 +499,7 @@ mod tests {
                 mb("6", "bin", "read,organize,delete", "active"),
             ],
             allow_send,
+            redact_secrets: false,
         }
     }
 

@@ -215,6 +215,7 @@ impl Harness {
                 grants,
                 expires: None,
                 allow_ip: vec![],
+                redact_secrets: false,
             })
             .await
             .unwrap();

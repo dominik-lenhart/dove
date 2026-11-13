@@ -111,6 +111,7 @@ async fn invite(h: &Harness, name: &str, accounts: &[&str], caps: &str) -> Strin
             capabilities: caps.into(),
             expires: None,
             allow_ip: vec![],
+            redact_secrets: false,
         })
         .await
         .unwrap();

@@ -132,6 +132,7 @@ async fn presets_expand_and_tools_follow_grants() {
                 grants: vec![bad(actions)],
                 expires: None,
                 allow_ip: vec![],
+                redact_secrets: false,
             })
             .await
             .unwrap_err();

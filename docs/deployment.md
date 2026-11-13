@@ -709,8 +709,10 @@ Presets are shorthands: `reader` = `read`, `drafter` = `read,draft`, `assistant`
 exactly what it was given; tokens created before 0.2 keep their `read`/`draft`/`send` grants and gain nothing. Adding a
 mailbox to a project gives existing tokens no new access. Other commands:
 `clients set-grants <name> --grant ...` (replaces the whole set atomically), `clients rotate <name>`,
-`clients revoke <name>`, `clients show <name>`, `clients list`, `projects list|show|remove-account`. Changes take
-effect on the next request, without a restart. `--expires` takes `90d`, `12h`, `30m`, `45s` or `2w`.
+`clients revoke <name>`, `clients show <name>`, `clients list`, `projects list|show|remove-account`,
+`clients set-redaction <name> on|off` (hide passwords, keys and one-time codes in the subjects and snippets of
+search, digest and draft lists; full reads stay intact; also `--redact-secrets` on `create` and `invite`, spec 6.5a).
+Changes take effect on the next request, without a restart. `--expires` takes `90d`, `12h`, `30m`, `45s` or `2w`.
 
 Connect an MCP host with the bearer token, for example:
 
