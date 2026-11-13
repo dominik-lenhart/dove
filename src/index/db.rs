@@ -4,7 +4,6 @@
 //! correct, FTS5 is available and temporary storage stays in memory. A plaintext file is refused, never migrated.
 
 use std::io::Read;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use anyhow::{Context, bail};
@@ -72,7 +71,7 @@ pub fn open(path: &Path, key: &[u8; 32], cfg: &IndexConfig) -> anyhow::Result<Co
     for suffix in ["", "-wal", "-shm"] {
         let p = std::path::PathBuf::from(format!("{}{suffix}", path.display()));
         if p.exists() {
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))?;
+            crate::platform::restrict_file(&p)?;
         }
     }
     Ok(conn)
@@ -110,7 +109,7 @@ mod tests {
     #[test]
     fn refuses_plaintext_file() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        crate::platform::restrict_dir(dir.path()).unwrap();
         let path = dir.path().join("index.db");
         Connection::open(&path).unwrap().execute_batch("CREATE TABLE x(a)").unwrap();
         let err = open(&path, &[1; 32], &IndexConfig::default()).unwrap_err();

@@ -10,6 +10,8 @@
 //! archive, and the running binary is replaced by an atomic rename in its own directory.
 
 pub mod notice;
+#[cfg(windows)]
+pub mod windows;
 
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -397,6 +399,9 @@ fn extract_zip_binary(archive: &[u8], tag: &str, target: &str) -> anyhow::Result
 }
 
 fn sudo_hint(dir: &Path) -> String {
+    if cfg!(windows) {
+        return format!("{} is not writable by this Windows user; reinstall Dove with install.ps1", dir.display());
+    }
     format!("{} is not writable by this user; run `sudo dove upgrade`", dir.display())
 }
 
@@ -424,12 +429,16 @@ pub fn check_writable(exe: &Path) -> anyhow::Result<()> {
 
 /// Replaces the file at `path` with `binary`: a temporary file in the same directory (mode 0755, synced) is renamed
 /// over it, so readers see either the old or the new file, never a partial one. On any error the temporary file is
-/// removed and `path` is untouched.
+/// removed and `path` is untouched. On Windows a running `.exe` cannot be overwritten: it is renamed aside first and
+/// deleted on the next start ([`windows::swap_in`]).
 pub fn replace_binary(path: &Path, binary: &[u8]) -> anyhow::Result<()> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let dir = parent_dir(path)?;
     let tmp = temp_path(dir);
-    let mut f = match std::fs::OpenOptions::new().write(true).create_new(true).mode(0o700).open(&tmp) {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o700);
+    let mut f = match opts.open(&tmp) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return Err(anyhow!(sudo_hint(dir))),
         Err(e) => return Err(anyhow!("cannot write in {}: {e}", dir.display())),
@@ -437,10 +446,15 @@ pub fn replace_binary(path: &Path, binary: &[u8]) -> anyhow::Result<()> {
     let result = (|| -> anyhow::Result<()> {
         f.write_all(binary)?;
         // Explicit chmod: the creation mode is subject to the umask.
-        f.set_permissions(std::fs::Permissions::from_mode(0o755))?;
+        #[cfg(unix)]
+        f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
         f.sync_all()?;
         drop(f);
-        std::fs::rename(&tmp, path).map_err(|e| match e.kind() {
+        #[cfg(unix)]
+        let swapped = std::fs::rename(&tmp, path);
+        #[cfg(windows)]
+        let swapped = windows::swap_in(&tmp, path);
+        swapped.map_err(|e| match e.kind() {
             std::io::ErrorKind::PermissionDenied => anyhow!(sudo_hint(dir)),
             _ => anyhow!("cannot replace {}: {e}", path.display()),
         })?;
@@ -545,14 +559,16 @@ async fn service_hint(socket: &Path, installed: &Version) -> Option<String> {
 
 /// The restart hint for an admin `version` reply (`None`: the service answered without a version).
 pub fn restart_hint(reply: Option<&serde_json::Value>, installed: &Version) -> Option<String> {
-    const RESTART: &str = "sudo systemctl restart dove";
+    // A local-mode service (PLAN A58) restarts through its login item.
+    let local = reply.is_some_and(|r| r["mode"] == "local");
+    let restart = if local { "dove local install" } else { "sudo systemctl restart dove" };
     let new = tag(installed);
     match reply.and_then(|r| r["version"].as_str()) {
         Some(v) if v == installed.to_string() => None,
-        Some(v) => Some(format!("The Dove service still runs v{v}; restart it to use {new}: {RESTART}")),
+        Some(v) => Some(format!("The Dove service still runs v{v}; restart it to use {new}: {restart}")),
         None => Some(format!(
             "Could not read the version of the running Dove service (it may run an older release); restart it to \
-             use {new}: {RESTART}"
+             use {new}: {restart}"
         )),
     }
 }
@@ -619,6 +635,8 @@ mod tests {
         let h = restart_hint(Some(&serde_json::json!({ "version": "0.1.0" })), &v).unwrap();
         assert!(h.contains("still runs v0.1.0") && h.contains("sudo systemctl restart dove"), "{h}");
         assert!(restart_hint(None, &v).unwrap().contains("older release"));
+        let local = restart_hint(Some(&serde_json::json!({ "version": "0.1.0", "mode": "local" })), &v).unwrap();
+        assert!(local.ends_with("dove local install"), "{local}");
     }
 
     /// Builds a tar.gz from (path, entry type, data). The signed fixtures in tests/ cover traversal and symlinks;

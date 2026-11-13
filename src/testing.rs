@@ -2,7 +2,6 @@
 //! Used by unit and integration tests. Never used by the service binary.
 #![doc(hidden)]
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -18,8 +17,26 @@ pub struct TestEnv {
 fn write_secret(dir: &Path, name: &str, content: &str) -> PathBuf {
     let p = dir.join(name);
     std::fs::write(&p, content).unwrap();
-    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o400)).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o400)).unwrap();
+    }
+    #[cfg(windows)]
+    crate::platform::restrict_file(&p).unwrap();
     p
+}
+
+/// The current Unix uid (0 on Windows, where `admin.operator_uid` is not used).
+pub fn current_uid() -> u32 {
+    #[cfg(unix)]
+    {
+        nix::unistd::getuid().as_raw()
+    }
+    #[cfg(windows)]
+    {
+        0
+    }
 }
 
 /// Builds a config whose secrets live in `dir/secrets` and data in `dir/data`.
@@ -65,8 +82,7 @@ impl TestEnv {
     /// Environment whose Google traffic goes to `upstream` (a fake server in tests).
     pub fn with_upstream(upstream: crate::gmail::gateway::Upstream, customize: impl FnOnce(&mut Config)) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let uid = nix::unistd::getuid().as_raw();
-        let mut cfg = test_config(dir.path(), uid);
+        let mut cfg = test_config(dir.path(), current_uid());
         customize(&mut cfg);
         let app = App::from_config_with(cfg, upstream, crate::imap::ImapConnector::plaintext_for_tests()).unwrap();
         Self { dir, app }

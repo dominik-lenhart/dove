@@ -4,6 +4,9 @@
 //! Needs a real second uid: runs the actual `dove` binary as `nobody` via passwordless `sudo -n -u nobody`.
 //! Ignored by default; run with `cargo test --test agent_shell -- --ignored` on a host that allows it.
 
+// Unix only: needs a second uid through sudo.
+#![cfg(unix)]
+
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;

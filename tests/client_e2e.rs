@@ -4,6 +4,9 @@
 //! user configuration and keychain are never touched. The OS credential store is therefore unavailable here, which
 //! is exactly the case where `dove login` must refuse instead of silently falling back to a file.
 
+// Unix only for now: checks file modes and fakes the admin socket with a Unix listener.
+#![cfg(unix)]
+
 mod support;
 
 use std::os::unix::fs::PermissionsExt;

@@ -39,8 +39,17 @@ pub struct Ids {
 }
 
 impl Ids {
+    /// On Windows an elevated (administrator) token counts as root: `euid` 0.
     pub fn current() -> Self {
-        Self { uid: nix::unistd::getuid().as_raw(), euid: nix::unistd::geteuid().as_raw() }
+        #[cfg(unix)]
+        {
+            Self { uid: nix::unistd::getuid().as_raw(), euid: nix::unistd::geteuid().as_raw() }
+        }
+        #[cfg(windows)]
+        {
+            let euid = if crate::platform::windows::is_elevated() { 0 } else { 1 };
+            Self { uid: euid, euid }
+        }
     }
 }
 
@@ -57,8 +66,13 @@ pub fn enabled(var: impl Fn(&str) -> Option<OsString>, stderr_is_terminal: bool,
         && !var("DOVE_NO_UPDATE_CHECK").is_some_and(|v| !v.is_empty() && v != "0")
 }
 
-/// The cache directory: `~/Library/Caches/dove` on macOS, else `$XDG_CACHE_HOME/dove` or `~/.cache/dove`.
+/// The cache directory: `~/Library/Caches/dove` on macOS, `%LOCALAPPDATA%\Dove\cache` on Windows, else
+/// `$XDG_CACHE_HOME/dove` or `~/.cache/dove`.
 pub fn cache_dir(var: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    if cfg!(windows) {
+        let local = var("LOCALAPPDATA").map(PathBuf::from).filter(|p| p.is_absolute());
+        return local.map(|d| d.join("Dove").join("cache"));
+    }
     let home = var("HOME").map(PathBuf::from).filter(|p| p.is_absolute());
     if cfg!(target_os = "macos") {
         return home.map(|h| h.join("Library").join("Caches").join("dove"));
@@ -74,11 +88,36 @@ pub fn cache_file(var: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
     cache_dir(var).map(|d| d.join(CACHE_FILE))
 }
 
+/// Opens `path` for reading without following a symlink (Unix `O_NOFOLLOW`) or reparse point (Windows: the link
+/// itself is opened and then refused).
+fn open_nofollow(path: &Path) -> Option<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut opts, nix::libc::O_NOFOLLOW);
+    #[cfg(windows)]
+    std::os::windows::fs::OpenOptionsExt::custom_flags(
+        &mut opts,
+        windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
+    );
+    let f = opts.open(path).ok()?;
+    #[cfg(windows)]
+    if is_reparse_point(&f.metadata().ok()?) {
+        return None;
+    }
+    Some(f)
+}
+
+#[cfg(windows)]
+fn is_reparse_point(m: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    m.file_attributes() & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
 /// Reads the cache; anything unreadable counts as no cache. A symlink at `path` is not followed.
 pub fn read_cache(path: &Path) -> Option<CacheEntry> {
-    use std::os::unix::fs::OpenOptionsExt;
     let mut text = String::new();
-    let f = std::fs::OpenOptions::new().read(true).custom_flags(nix::libc::O_NOFOLLOW).open(path).ok()?;
+    let f = open_nofollow(path)?;
     f.take(MAX_CACHE_BYTES).read_to_string(&mut text).ok()?;
     serde_json::from_str(&text).ok()
 }
@@ -87,34 +126,56 @@ pub fn read_cache(path: &Path) -> Option<CacheEntry> {
 ///
 /// Symlinks are never followed: the cache directory must be a real directory owned by the effective user, the data
 /// goes to a new file with a random name (`O_EXCL | O_NOFOLLOW`), and the rename replaces whatever sits at `path`
-/// (a symlink included) instead of writing through it.
+/// (a symlink included) instead of writing through it. On Windows the same holds for reparse points (symlinks,
+/// junctions), and the directory must be private to the current user.
 pub fn write_cache(path: &Path, entry: &CacheEntry) {
     use std::io::Write;
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
     let Some(dir) = path.parent() else { return };
-    if std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).is_err() {
+    if !cache_dir_ok(dir) {
         return;
-    }
-    let euid = nix::unistd::geteuid().as_raw();
-    match std::fs::symlink_metadata(dir) {
-        Ok(m) if m.file_type().is_dir() && m.uid() == euid => {}
-        _ => return,
     }
     let Ok(data) = serde_json::to_vec(entry) else { return };
     let tmp = dir.join(format!(".update-check.{}.tmp", crate::util::new_id()));
-    let Ok(mut f) = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(nix::libc::O_NOFOLLOW)
-        .open(&tmp)
-    else {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut opts, nix::libc::O_NOFOLLOW);
+    #[cfg(windows)]
+    std::os::windows::fs::OpenOptionsExt::custom_flags(
+        &mut opts,
+        windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
+    );
+    let Ok(mut f) = opts.open(&tmp) else {
         return;
     };
     let written = f.write_all(&data).and_then(|()| f.sync_all());
     drop(f);
     if written.and_then(|()| std::fs::rename(&tmp, path)).is_err() {
         let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// Creates the cache directory if needed and checks it is a real directory (not a symlink or reparse point) of the
+/// current user.
+fn cache_dir_ok(dir: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+        if std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).is_err() {
+            return false;
+        }
+        let euid = nix::unistd::geteuid().as_raw();
+        matches!(std::fs::symlink_metadata(dir), Ok(m) if m.file_type().is_dir() && m.uid() == euid)
+    }
+    #[cfg(windows)]
+    {
+        if !dir.exists() && crate::platform::create_private_dir_all(dir).is_err() {
+            return false;
+        }
+        matches!(std::fs::symlink_metadata(dir), Ok(m) if m.file_type().is_dir() && !is_reparse_point(&m))
+            && crate::platform::windows::check_private(dir).is_ok()
     }
 }
 
@@ -189,6 +250,7 @@ mod tests {
         assert!(!enabled(env(&[("SUDO_UID", "1000")]), true, Ids { uid: 1001, euid: 1001 }), "sudo -u someone");
     }
 
+    #[cfg(unix)]
     #[test]
     fn cache_writes_do_not_follow_symlinks() {
         use std::os::unix::fs::symlink;
@@ -219,7 +281,42 @@ mod tests {
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "no temporary file left");
     }
 
-    #[cfg(not(target_os = "macos"))]
+    /// Windows twin of `cache_writes_do_not_follow_symlinks`. Creating symlinks needs a privilege (developer mode or
+    /// an elevated token); without it the test has nothing to check and returns.
+    #[cfg(windows)]
+    #[test]
+    fn cache_writes_do_not_follow_reparse_points() {
+        use std::os::windows::fs::symlink_file;
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("real");
+        crate::platform::create_private_dir_all(&dir).unwrap();
+        let victim = d.path().join("victim");
+        let precious = br#"{"checked_at":1,"latest":"v9.9.9"}"#;
+        std::fs::write(&victim, precious).unwrap();
+        let path = dir.join(CACHE_FILE);
+        if let Err(e) = symlink_file(&victim, &path) {
+            eprintln!("skipped: cannot create a symlink here ({e})");
+            return;
+        }
+        assert_eq!(read_cache(&path), None, "a symlinked cache file is not read");
+        let entry = CacheEntry { checked_at: 7, latest: Some("v1.0.0".into()) };
+        write_cache(&path, &entry);
+        assert_eq!(std::fs::read(&victim).unwrap(), precious);
+        assert!(!std::fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
+        assert_eq!(read_cache(&path), Some(entry));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_cache_location() {
+        assert_eq!(
+            cache_file(env(&[("LOCALAPPDATA", r"C:\U\a\AppData\Local"), ("HOME", "/h")])),
+            Some(PathBuf::from(r"C:\U\a\AppData\Local\Dove\cache\update-check.json"))
+        );
+        assert_eq!(cache_file(env(&[("HOME", r"C:\U\a")])), None);
+    }
+
+    #[cfg(not(any(target_os = "macos", windows)))]
     #[test]
     fn cache_location() {
         assert_eq!(
@@ -254,6 +351,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn cache_files_are_private_and_corruption_is_tolerated() {
         use std::os::unix::fs::PermissionsExt;

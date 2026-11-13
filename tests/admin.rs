@@ -1,6 +1,10 @@
 //! Step 1 acceptance: admin socket authority, grants intersection, token lifecycle and audit (AC1, AC2, AC11,
 //! AC16, AC19 partial).
 
+// Unix only: drives the admin Unix socket and its peer-uid check (the Windows pipe is tested in
+// `dove::admin::transport`).
+#![cfg(unix)]
+
 use std::net::IpAddr;
 use std::sync::Arc;
 
