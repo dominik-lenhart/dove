@@ -494,7 +494,8 @@ pub fn current_exe() -> anyhow::Result<PathBuf> {
 pub struct UpgradeOpts {
     pub check: bool,
     pub version: Option<String>,
-    pub socket: PathBuf,
+    /// The admin socket asked for the running version (`None`: no hint).
+    pub socket: Option<PathBuf>,
 }
 
 /// `dove upgrade` / `dove update`. Returns the process exit code.
@@ -539,7 +540,9 @@ pub async fn run_upgrade(opts: UpgradeOpts) -> anyhow::Result<u8> {
     eprintln!("Downloading Dove {} (installed {installed}) ...", tag(&version));
     install(&src, &http, &version, &exe).await?;
     println!("Dove {} installed at {}.", tag(&version), exe.display());
-    if let Some(line) = service_hint(&opts.socket, &version).await {
+    if let Some(socket) = &opts.socket
+        && let Some(line) = service_hint(socket, &version).await
+    {
         println!("{line}");
     }
     Ok(0)

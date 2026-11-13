@@ -436,7 +436,9 @@ dove local status
 ```
 
 `dove local init` refuses to run when a config or key already exists, so it never replaces a key that encrypts your
-stored credentials. Then connect a mailbox and an agent as usual. Admin commands find the local service on their own:
+stored credentials. Then connect a mailbox and an agent as usual. Admin commands find the local service on their own
+and name the instance that answered on stderr; on a machine that also runs a server-mode Dove they refuse to guess and
+ask for `--socket`:
 
 ```sh
 dove accounts connect-imap personal --email you@example.com
