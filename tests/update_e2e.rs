@@ -1,12 +1,14 @@
 //! `dove upgrade` and the new-version notice against a local fake release server.
 //!
 //! Fixtures (`tests/fixtures/update/`): release archives built by `build.py` and signed with a throwaway minisign key
-//! made for these tests only (`test.pub`; the secret key was not kept). To rebuild: run `python3 build.py <dir>`, then
-//! `minisign -S -s <key> -m <dir>/<tag>/SHA256SUMS -t "dove <tag>"` per tag, plus `SHA256SUMS.wrong-comment.minisig`
-//! for v0.2.0 with `-t "dove v0.1.0"`, and replace `test.pub`.
-//!   v0.2.0: valid release (x86_64-unknown-linux-gnu and aarch64-apple-darwin)
+//! made for these tests only (`test.pub`; the secret key was not kept). To rebuild: run `python3 -I build.py <dir>`,
+//! then `minisign -S -s <key> -m <dir>/<tag>/SHA256SUMS -t "dove <tag>"` per tag, plus
+//! `SHA256SUMS.wrong-comment.minisig` for v0.2.0 with `-t "dove v0.1.0"`, and replace `test.pub`. The tar fixtures are
+//! byte-for-byte reproducible, so only the signatures change with a new key.
+//!   v0.2.0: valid release (linux gnu and musl, aarch64-apple-darwin, and the x86_64-pc-windows-msvc `.zip`)
 //!   v0.3.0: signed, but the archive also holds `dove-v0.3.0-<target>/../../evil`
 //!   v0.4.0: signed, but `dove` is a symlink to /bin/sh
+//!   v0.5.0: signed Windows zip that also holds `dove-v0.5.0-<target>/../../evil.exe`
 
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
@@ -22,6 +24,8 @@ use dove::update::{self, Decision, Source};
 use semver::Version;
 
 const TARGET: &str = "x86_64-unknown-linux-gnu";
+const MUSL: &str = "x86_64-unknown-linux-musl";
+const WINDOWS: &str = "x86_64-pc-windows-msvc";
 const NEW_BINARY: &[u8] = b"#!/bin/sh\necho 'dove 0.2.0'\n";
 const OLD_BINARY: &[u8] = b"old dove binary\n";
 
@@ -173,6 +177,44 @@ async fn valid_upgrade_replaces_the_binary() {
     );
 }
 
+/// A musl build keeps getting musl assets: the target decides the archive, and the gnu archive is never touched.
+#[tokio::test]
+async fn musl_target_installs_the_musl_archive() {
+    let fake = FakeReleases::start().await;
+    fake.publish("v0.2.0");
+    let mut src = fake.source("0.1.0");
+    src.target = Some(MUSL.into());
+    let (dir, exe) = installed();
+    update::install(&src, &http(), &Version::new(0, 2, 0), &exe).await.unwrap();
+    let out = std::process::Command::new(&exe).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "dove 0.2.0 (musl)\n");
+    assert_eq!(dir_names(dir.path()), ["dove"]);
+    let paths: Vec<String> = fake.requests().into_iter().map(|r| r.0).collect();
+    assert!(paths.contains(&FakeReleases::asset_path("v0.2.0", "dove-v0.2.0-x86_64-unknown-linux-musl.tar.gz")));
+    assert!(paths.iter().all(|p| !p.contains("linux-gnu")), "{paths:?}");
+}
+
+/// Windows releases are `.zip` archives with `dove.exe`; the binary comes out of the zip after the same signature
+/// and checksum checks (the file is replaced through the same path as on Unix, here only to see the bytes).
+#[tokio::test]
+async fn windows_target_reads_the_zip_archive() {
+    let fake = FakeReleases::start().await;
+    fake.publish("v0.2.0");
+    let mut src = fake.source("0.1.0");
+    src.target = Some(WINDOWS.into());
+    let bytes = update::fetch_binary(&src, &http(), &Version::new(0, 2, 0)).await.unwrap();
+    assert_eq!(bytes, b"MZ dove 0.2.0 (windows)\n");
+    let paths: Vec<String> = fake.requests().into_iter().map(|r| r.0).collect();
+    assert_eq!(
+        paths,
+        [
+            FakeReleases::asset_path("v0.2.0", "SHA256SUMS"),
+            FakeReleases::asset_path("v0.2.0", "SHA256SUMS.minisig"),
+            FakeReleases::asset_path("v0.2.0", "dove-v0.2.0-x86_64-pc-windows-msvc.zip"),
+        ]
+    );
+}
+
 /// Each case changes one thing about an otherwise valid release; every one must be refused with the installed binary
 /// untouched and no temporary file left behind.
 #[tokio::test]
@@ -221,6 +263,19 @@ async fn tampered_or_unusable_releases_are_refused() {
             "checksum mismatch",
         ),
         ("path traversal entry", "0.3.0", Box::new(|_, _| {}), "unsafe path"),
+        ("path traversal entry in a zip", "0.5.0", Box::new(|_, s| s.target = Some(WINDOWS.into())), "unsafe path"),
+        (
+            "zip does not match the signed checksum",
+            "0.2.0",
+            Box::new(|f, s| {
+                s.target = Some(WINDOWS.into());
+                let name = "dove-v0.2.0-x86_64-pc-windows-msvc.zip";
+                let mut a = std::fs::read(fixtures().join("v0.2.0").join(name)).unwrap();
+                a[30] ^= 0x01;
+                f.put("v0.2.0", name, a);
+            }),
+            "checksum mismatch",
+        ),
         ("dove is a symlink", "0.4.0", Box::new(|_, _| {}), "link or special file"),
         (
             "no build for this target",
@@ -235,7 +290,7 @@ async fn tampered_or_unusable_releases_are_refused() {
     ];
     for (name, version, setup, expected) in cases {
         let fake = FakeReleases::start().await;
-        for tag in ["v0.2.0", "v0.3.0", "v0.4.0"] {
+        for tag in ["v0.2.0", "v0.3.0", "v0.4.0", "v0.5.0"] {
             fake.publish(tag);
         }
         let mut src = fake.source("0.1.0");
