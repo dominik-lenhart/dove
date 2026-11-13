@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 
 use crate::app::App;
 use crate::audit::{self, AuditRecord};
+use crate::content;
 use crate::error::{ErrorCode, ToolError};
 use crate::policy::{self, AuthFailure, ClientCtx};
 use crate::tools::{self, ToolCx};
@@ -98,6 +99,16 @@ impl RateLimiter {
         self.check_rate(key, f64::from(per_minute.max(1)) / 60.0, burst)
     }
 
+    /// Like [`RateLimiter::check`], but only reports whether the bucket is used up, without taking a token.
+    pub fn exhausted(&self, key: &str, per_minute: u32, burst: u32) -> Option<u64> {
+        let rate = f64::from(per_minute.max(1)) / 60.0;
+        let cap = f64::from(burst.max(1));
+        let b = self.inner.lock().expect("lock");
+        let tokens = b.map.get(key)?;
+        let left = (tokens.tokens + Instant::now().duration_since(tokens.last).as_secs_f64() * rate).min(cap);
+        (left < 1.0).then(|| ((1.0 - left) / rate).ceil() as u64)
+    }
+
     /// Token bucket refilling `per_hour` tokens per hour, holding at most `burst`.
     pub fn check_hourly(&self, key: &str, per_hour: u32, burst: u32) -> Option<u64> {
         self.check_rate(key, f64::from(per_hour.max(1)) / 3600.0, burst)
@@ -173,13 +184,29 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
     if bearer.is_empty() {
         return unauthorized(&app);
     }
+    // Each attempt costs a keyed hash and a store lookup: an address that keeps failing is refused before both.
+    // Unknown and loopback addresses are not limited: they stand for every caller at once (local mode, Tailscale
+    // Serve, a proxy without the shared secret), so one bucket would let any caller lock out all the others.
+    let fail_key = ip
+        .map(|i| i.to_canonical())
+        .filter(|i| !i.is_loopback())
+        .map(|i| format!("mcp-auth-fail:{}", crate::oauth::ip_bucket(Some(i))));
+    let fail_limit = app.cfg.limits.auth_failures_per_minute;
+    if let Some(wait) = fail_key.as_deref().and_then(|k| app.rate_limiter.exhausted(k, fail_limit, fail_limit)) {
+        return too_many(wait);
+    }
     let resource = resource_url(&app);
     let allow_send = app.cfg.allow_send;
     let pepper = app.pepper.clone();
     let auth = app.store.call(move |c| policy::authenticate(c, &pepper, &bearer, ip, allow_send, &resource)).await;
     let authed = match auth {
         Ok(Ok(a)) => a,
-        Ok(Err(AuthFailure::Unauthorized)) => return unauthorized(&app),
+        Ok(Err(AuthFailure::Unauthorized)) => {
+            if let Some(k) = &fail_key {
+                app.rate_limiter.check(k, fail_limit, fail_limit);
+            }
+            return unauthorized(&app);
+        }
         Err(e) => {
             tracing::error!(error = %e, "authentication failed internally");
             return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
@@ -212,9 +239,7 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
     }
     let limits = &app.cfg.limits;
     if let Some(wait) = app.rate_limiter.check(&ctx.client_id, limits.client_requests_per_minute, limits.client_burst) {
-        let mut r = (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response();
-        r.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from(wait));
-        return r;
+        return too_many(wait);
     }
     let mut versions = headers.get_all("mcp-protocol-version").iter();
     let header_version = versions.next().map(|v| v.to_str().unwrap_or("").to_string());
@@ -259,6 +284,12 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
             None => StatusCode::ACCEPTED.into_response(),
         },
     }
+}
+
+fn too_many(wait: u64) -> Response {
+    let mut r = (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response();
+    r.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from(wait));
+    r
 }
 
 fn json_response(v: Value) -> Response {
@@ -347,14 +378,30 @@ pub async fn call_tool(app: &Arc<App>, ctx: &ClientCtx, version: &str, name: &st
         ..Default::default()
     };
     let response = match result {
-        Ok(out) => {
+        Ok(mut out) => {
             rec.result_code = "ok".into();
             rec.account_alias = out.audit.account.clone();
             rec.object_ids = out.audit.object_ids.clone();
             rec.result_count = out.audit.result_count;
             rec.query_len = out.audit.query.as_ref().map(|q| q.len() as i64);
             rec.query_hash = out.audit.query.as_ref().map(|q| app.pepper.fingerprint(q));
-            let text = if structured { out.text } else { serde_json::to_string(&out.structured).unwrap_or_default() };
+            // Mail content is marked untrusted in both items: the structured object carries a notice field, and the
+            // text item is the tool's enveloped rendering or, for clients before structured output (also every
+            // client that sends no MCP-Protocol-Version), the JSON inside the envelope.
+            let untrusted = tools::carries_mail_content(name);
+            if untrusted {
+                tools::mark_untrusted(&mut out.structured);
+            }
+            let text = if structured {
+                out.text
+            } else {
+                let json = serde_json::to_string(&out.structured).unwrap_or_default();
+                if untrusted {
+                    format!("{}{}", content::envelope(name, "result", &json), tools::UNTRUSTED_NOTE)
+                } else {
+                    json
+                }
+            };
             let mut content = vec![json!({ "type": "text", "text": text })];
             content.extend(out.extra);
             let mut r = json!({ "content": content, "isError": false });

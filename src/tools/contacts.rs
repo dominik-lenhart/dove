@@ -28,6 +28,7 @@ pub fn defs() -> Vec<ToolDef> {
         capability: Capability::Read,
         read_only: true,
         destructive: false,
+        mail_content: true,
         input_schema: || {
             json!({ "type": "object", "properties": {
                 "query": { "type": "string", "minLength": intel::MIN_QUERY_CHARS, "maxLength": intel::MAX_QUERY_CHARS,

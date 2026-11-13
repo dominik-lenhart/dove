@@ -14,7 +14,10 @@ dove clients invite web-claude --project acme --accounts info,billing --capabili
 
 `all` expands to the project's current mailboxes once; mailboxes added later are not included. The command prints a
 `dovei_...` invitation once. It is valid for 10 minutes and for one redemption. Hand it over on a trusted channel.
-`--expires` and `--allow-ip` apply to the connection that the invitation creates. Removing a mailbox from the
+`--expires` and `--allow-ip` apply to the connection that the invitation creates. With `--allow-ip`, `dove login` must
+redeem the invitation from an allowed address (from elsewhere it fails like an invalid invitation and stays usable).
+The OAuth approval page is not bound to the list, since the browser is not the host that will use the connection;
+the token endpoint applies it instead. Removing a mailbox from the
 project cancels the project's open invitations. Each redemption creates a normal connection that shows up in
 `dove clients list` and is revoked with `dove clients revoke <name>`.
 
@@ -46,6 +49,12 @@ discovers Dove through `/.well-known/oauth-protected-resource` and `/.well-known
 registers itself dynamically and opens Dove's approval page. Enter the invitation there, check the project,
 mailboxes and application, untick anything you do not want, and approve. The host then refreshes its tokens on its
 own. Registering an application grants nothing; only the invitation does.
+
+The approval page shows where access goes: the full redirect URI, and for a dynamically registered application when
+and from which network it registered. Anyone can register an application under any name, so if the redirect URI is not
+on `claude.ai`, `claude.com`, `chatgpt.com` or `chat.openai.com` (or a loopback address of a native client), the page
+shows a warning and approval needs an extra confirmation box. Only tick it if you started the sign-in yourself; a
+sign-in link that someone sent you, together with a request for an invitation, is a phishing attempt.
 
 Pre-registered applications (for hosts or policies that do not use dynamic registration) go into the server
 configuration; restart the service afterwards:

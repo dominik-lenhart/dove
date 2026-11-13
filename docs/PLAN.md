@@ -195,7 +195,10 @@ hosts or reference hardware.
   `pending_invitations_cancelled`.
 - A34. The token endpoint applies the connection's `--allow-ip` list (from the invitation) to both grants before
   anything is consumed: from another address a code or refresh token gets `invalid_grant` and stays usable, and a
-  replayed rotated refresh token does not trigger reuse revocation. The approval page itself is not IP-bound.
+  replayed rotated refresh token does not trigger reuse revocation. The approval page itself is not IP-bound: the
+  owner's browser is not the host (an invitation limited to Claude's egress ranges is approved from the owner's own
+  address). `/connect/redeem` issues the token to the redeeming machine itself, so it checks the list before consuming
+  the invitation and answers `invalid_invitation` from other addresses (audit code `ip_not_allowed`).
 - A7. Licence: Apache-2.0, decided by the owner on 2026-11-13 (spec 13.7); `LICENSE` holds the full text.
 - A16. batch_read: budgets are assigned in input order (deterministic). Items that do not fit return
   `budget_exceeded` with a smaller-request hint instead of a continuation token. The wire budget counts the

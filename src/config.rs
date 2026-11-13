@@ -140,6 +140,10 @@ pub struct Limits {
     pub client_requests_per_minute: u32,
     pub client_burst: u32,
     pub client_sends_per_hour: u32,
+    /// Failed bearer authentications on `/mcp` per source address (IPv6 by /64) and minute, also the burst. Once
+    /// used up, further bearer requests from that address get 429 before any token lookup; successful requests are
+    /// not counted, so hosts sharing egress addresses keep working.
+    pub auth_failures_per_minute: u32,
     pub upstream_total_inflight: usize,
     pub upstream_per_mailbox: usize,
     pub upstream_search_mailboxes: usize,
@@ -171,6 +175,7 @@ impl Default for Limits {
             client_requests_per_minute: 120,
             client_burst: 40,
             client_sends_per_hour: 20,
+            auth_failures_per_minute: 60,
             upstream_total_inflight: 16,
             upstream_per_mailbox: 4,
             upstream_search_mailboxes: 8,

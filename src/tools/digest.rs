@@ -31,6 +31,7 @@ pub fn defs() -> Vec<ToolDef> {
         capability: Capability::Read,
         read_only: true,
         destructive: false,
+        mail_content: true,
         input_schema: || {
             json!({ "type": "object", "properties": {
                 "since": { "type": "string", "description": "RFC 3339 instant with offset; threads with mail since then." },

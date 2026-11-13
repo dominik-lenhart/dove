@@ -506,3 +506,45 @@ async fn legacy_batches_are_bounded_and_charged_per_message() {
     let limited = v.as_array().unwrap().iter().filter(|r| r["error"]["message"] == "rate limited").count();
     assert_eq!(limited, 1, "{v}");
 }
+
+/// Failed bearer authentication is limited per client address; successful requests are not counted, and other
+/// addresses are unaffected.
+#[tokio::test]
+async fn failed_bearer_authentication_is_limited_per_address() {
+    let h = Harness::start_with(|c| c.limits.auth_failures_per_minute = 3).await;
+    h.mailbox("info", "info@acme.test");
+    h.project("acme", &["info"]).await;
+    let token = h.token("acme", "agent", vec![g("info", "read")]).await;
+    let secret = h.app().proxy_secret.as_deref().unwrap().to_string();
+    let ping = json!({"jsonrpc":"2.0","id":1,"method":"ping"});
+    let from = |ip: &'static str, t: Option<String>| {
+        let (h, ping, secret) = (&h, ping.clone(), secret.clone());
+        async move {
+            let r = h
+                .post_mcp(t.as_deref(), ping, &[("x-forwarded-for", ip), ("x-dove-proxy-auth", secret.as_str())])
+                .await;
+            (r.status().as_u16(), r.headers().get("retry-after").is_some())
+        }
+    };
+    let bad = || Some(format!("dovec_{}", "x".repeat(43)));
+    // Successful requests and requests without a token do not use up the budget.
+    for _ in 0..5 {
+        assert_eq!(from("192.0.2.7", Some(token.clone())).await.0, 200);
+        assert_eq!(from("192.0.2.7", None).await.0, 401);
+    }
+    for _ in 0..3 {
+        assert_eq!(from("192.0.2.7", bad()).await.0, 401);
+    }
+    assert_eq!(from("192.0.2.7", bad()).await, (429, true), "the address used up its failures");
+    assert_eq!(from("192.0.2.7", Some(token.clone())).await.0, 429, "refused before the token is looked up");
+    // Another address keeps its own budget.
+    assert_eq!(from("198.51.100.9", bad()).await.0, 401);
+    assert_eq!(from("198.51.100.9", Some(token.clone())).await.0, 200);
+    // Loopback stands for every caller behind Tailscale Serve or in local mode: never limited as one address.
+    for _ in 0..5 {
+        let r = h.post_mcp(bad().as_deref(), json!({"jsonrpc":"2.0","id":1,"method":"ping"}), &[]).await;
+        assert_eq!(r.status(), 401);
+    }
+    let r = h.post_mcp(Some(&token), json!({"jsonrpc":"2.0","id":1,"method":"ping"}), &[]).await;
+    assert_eq!(r.status(), 200);
+}

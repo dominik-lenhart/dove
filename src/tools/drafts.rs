@@ -69,6 +69,7 @@ pub fn defs() -> Vec<ToolDef> {
             capability: Capability::Draft,
             read_only: false,
             destructive: false,
+            mail_content: false,
             input_schema: || {
                 let r = json!({ "type": "array", "items": { "type": "string" }, "maxItems": 50 });
                 json!({ "type": "object", "properties": {
@@ -105,6 +106,7 @@ pub fn defs() -> Vec<ToolDef> {
             capability: Capability::Draft,
             read_only: false,
             destructive: true,
+            mail_content: false,
             input_schema: || {
                 let r = json!({ "type": "array", "items": { "type": "string" }, "maxItems": 50 });
                 json!({ "type": "object", "properties": {
@@ -130,6 +132,7 @@ pub fn defs() -> Vec<ToolDef> {
             capability: Capability::Send,
             read_only: false,
             destructive: true,
+            mail_content: false,
             input_schema: || {
                 json!({ "type": "object", "properties": {
                     "account": account_schema(), "draft_id": { "type": "string" }, "expected_revision": { "type": "string" }
@@ -153,6 +156,7 @@ pub fn defs() -> Vec<ToolDef> {
             capability: Capability::Draft,
             read_only: false,
             destructive: true,
+            mail_content: false,
             input_schema: || {
                 json!({ "type": "object", "properties": {
                     "account": account_schema(), "draft_id": { "type": "string" }, "expected_revision": { "type": "string" }

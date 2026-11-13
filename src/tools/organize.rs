@@ -69,6 +69,7 @@ pub fn defs() -> Vec<ToolDef> {
             capability: Capability::Organize,
             read_only: false,
             destructive: false,
+            mail_content: false,
             input_schema: || {
                 let flags = json!({ "type": "array", "items": { "type": "string", "enum": ["UNREAD", "STARRED"] }, "maxItems": 2 });
                 json!({ "type": "object", "properties": {
@@ -92,6 +93,7 @@ pub fn defs() -> Vec<ToolDef> {
             capability: Capability::Organize,
             read_only: false,
             destructive: true,
+            mail_content: false,
             input_schema: || {
                 json!({ "type": "object", "properties": {
                     "account": account_schema(), "ids": ids_schema(),

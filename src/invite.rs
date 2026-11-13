@@ -326,6 +326,21 @@ pub async fn redeem(State(app): State<Arc<App>>, req: Request) -> Response {
                 audit_auth(c, "invite.redeem", "anonymous", None, vec![], "invalid_invitation", ip)?;
                 return Ok(None);
             };
+            // The connection would refuse every request from here anyway (`--allow-ip`); refusing now keeps the
+            // invitation for the address it was meant for. Same generic error as an unknown invitation.
+            if !crate::policy::ip_allowed(&inv.allowed_cidrs, ip) {
+                drop(tx);
+                audit_auth(
+                    c,
+                    "invite.redeem",
+                    &inv.connection_name,
+                    Some(&inv.project_name),
+                    vec![],
+                    "ip_not_allowed",
+                    ip,
+                )?;
+                return Ok(None);
+            }
             let grants = inv.grants.clone();
             if grants.is_empty() {
                 drop(tx);

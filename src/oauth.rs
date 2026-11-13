@@ -91,6 +91,9 @@ pub struct OAuthApp {
     pub redirect_uris: Vec<String>,
     pub secret: Option<Arc<Zeroizing<String>>>,
     pub dynamic: bool,
+    /// Dynamic registrations: when (unix seconds) and from which source bucket ([`ip_bucket`]) they were made.
+    pub registered_at: Option<i64>,
+    pub registered_from: Option<String>,
 }
 
 /// An authorization request waiting for the user's decision on the approval page. Memory only, bounded.
@@ -139,6 +142,8 @@ impl OAuthState {
                 redirect_uris: c.redirect_uris.clone(),
                 secret,
                 dynamic: false,
+                registered_at: None,
+                registered_from: None,
             });
         }
         Ok(Self { pending: Mutex::default(), preregistered, registrations: Mutex::default() })
@@ -161,17 +166,27 @@ fn find_app(app: &App, conn: &Connection, client_id: &str) -> anyhow::Result<Opt
     }
     let row = conn
         .query_row(
-            "SELECT client_name, redirect_uris FROM oauth_apps WHERE client_id = ?1 AND registered_via = 'dynamic'",
+            "SELECT client_name, redirect_uris, created_at, registered_from FROM oauth_apps \
+             WHERE client_id = ?1 AND registered_via = 'dynamic'",
             [client_id],
-            |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, String>(1)?)),
+            |r| {
+                Ok((
+                    r.get::<_, Option<String>>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                ))
+            },
         )
         .optional()?;
-    Ok(row.map(|(name, uris)| OAuthApp {
+    Ok(row.map(|(name, uris, created_at, from)| OAuthApp {
         client_id: client_id.to_string(),
         client_name: name.unwrap_or_else(|| "Unnamed application".into()),
         redirect_uris: serde_json::from_str(&uris).unwrap_or_default(),
         secret: None,
         dynamic: true,
+        registered_at: Some(created_at),
+        registered_from: from.filter(|f| !f.is_empty()),
     }))
 }
 
@@ -393,16 +408,64 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     })
 }
 
+/// Hosts of the MCP clients Dove is commonly connected to. Their HTTPS redirect URIs need no extra confirmation.
+pub const KNOWN_REDIRECT_HOSTS: &[&str] = &["claude.ai", "claude.com", "chatgpt.com", "chat.openai.com"];
+
+/// Whether a redirect URI goes to a known host over HTTPS (exact host match, no subdomains) or back to this
+/// computer (loopback, native clients such as CLI hosts).
+pub fn known_redirect(redirect_uri: &str) -> bool {
+    let Ok(u) = url::Url::parse(redirect_uri) else { return false };
+    let host = u.host_str().unwrap_or("").to_ascii_lowercase();
+    let loopback = matches!(host.as_str(), "localhost" | "127.0.0.1" | "[::1]");
+    match u.scheme() {
+        "https" => loopback || KNOWN_REDIRECT_HOSTS.contains(&host.as_str()),
+        "http" => loopback,
+        _ => false,
+    }
+}
+
+/// Whether the approval needs the owner's explicit trust in the redirect target: anyone can register a dynamic
+/// client with any redirect URI and send the owner a sign-in link (phishing for an invitation). Pre-registered
+/// clients were configured by the operator.
+fn needs_redirect_confirmation(a: &OAuthApp, redirect_uri: &str) -> bool {
+    a.dynamic && !known_redirect(redirect_uri)
+}
+
+fn redirect_host(redirect_uri: &str) -> String {
+    url::Url::parse(redirect_uri).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_default()
+}
+
 fn app_description(a: &OAuthApp, redirect_uri: &str) -> String {
-    let host = url::Url::parse(redirect_uri).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_default();
+    let registered = if a.dynamic {
+        format!(
+            "automatically by the application, {} from network <code>{}</code>",
+            a.registered_at.map(util::rfc3339).unwrap_or_else(|| "at an unknown time".into()),
+            html_escape(a.registered_from.as_deref().unwrap_or("unknown")),
+        )
+    } else {
+        "by the operator".into()
+    };
+    let warning = if needs_redirect_confirmation(a, redirect_uri) {
+        format!(
+            "<div role=\"alert\" style=\"border:3px solid #b00020;padding:0 1rem;margin:1rem 0\">\
+             <p><b>Unknown destination.</b> Approving hands mail access to <code>{}</code>, which is not Claude, \
+             ChatGPT or an application on this computer. The application name above is chosen by whoever registered \
+             it and proves nothing. Continue only if you started this sign-in yourself, in an application you trust \
+             that really uses this address. If someone sent you this link, deny.</p></div>",
+            html_escape(&redirect_host(redirect_uri))
+        )
+    } else {
+        String::new()
+    };
     format!(
-        "<p>Application: <b>{}</b><br>Client ID: <code>{}</code><br>Returns to: <code>{}</code><br>Registered: {}</p>\
+        "<p>Application: <b>{}</b><br>Client ID: <code>{}</code><br>Returns to: \
+         <code style=\"word-break:break-all\">{}</code><br>Registered: {}</p>{warning}\
          <p>Registering an application grants nothing. Access comes only from an invitation issued by the operator \
          of this Dove server, and this page can only keep or reduce the rights in it.</p>",
         html_escape(&a.client_name),
         html_escape(&a.client_id),
-        html_escape(&host),
-        if a.dynamic { "automatically by the application" } else { "by the operator" }
+        html_escape(redirect_uri),
+        registered,
     )
 }
 
@@ -466,11 +529,20 @@ fn approval_page(p: &Pending, rid: &str, inv: &invite::Invitation, allow_send: b
         }
         rows.push_str("</li>");
     }
+    let confirm = if needs_redirect_confirmation(&p.app, &p.redirect_uri) {
+        format!(
+            "<p><label><input type=\"checkbox\" name=\"confirm_redirect\"> I started this sign-in myself and trust \
+             <code>{}</code> with access to these mailboxes.</label></p>",
+            html_escape(&redirect_host(&p.redirect_uri))
+        )
+    } else {
+        String::new()
+    };
     let body = format!(
         "{app}{err}<p>Project: <b>{project}</b><br>Connection name: <b>{conn}</b></p>\
          <form method=\"post\" action=\"{AUTHORIZE_PATH}\">{hidden}\
          <p>Mailboxes and actions this application may use. A preset other than custom replaces the checkboxes \
-         (send stays a separate choice).</p><ul>{rows}</ul>\
+         (send stays a separate choice).</p><ul>{rows}</ul>{confirm}\
          <p><button name=\"action\" value=\"approve\">Approve</button> \
          <button name=\"action\" value=\"cancel\">Deny</button></p></form>",
         app = app_description(&p.app, &p.redirect_uri),
@@ -515,7 +587,16 @@ async fn authorize_get(State(app): State<Arc<App>>, req: Request) -> Response {
     if state.as_ref().is_some_and(|s| s.len() > 512) {
         return error_page(StatusCode::BAD_REQUEST, "The state parameter is too long.");
     }
-    let fail = |e: &str, d: &str| redirect_error(&app, &redirect_uri, state.as_deref(), e, d);
+    // Anyone can register a dynamic client with any HTTPS redirect URI, so redirecting its errors would make this
+    // endpoint an open redirector (RFC 9700 4.11.2): before the owner approves, they get an error page instead.
+    let dynamic = a.dynamic;
+    let fail = |e: &str, d: &str| {
+        if dynamic {
+            error_page(StatusCode::BAD_REQUEST, &format!("The application sent an invalid request ({e}: {d})."))
+        } else {
+            redirect_error(&app, &redirect_uri, state.as_deref(), e, d)
+        }
+    };
     if q.get("response_type").map(String::as_str) != Some("code") {
         return fail("unsupported_response_type", "only response_type=code is supported");
     }
@@ -630,6 +711,14 @@ async fn authorize_post(State(app): State<Arc<App>>, req: Request) -> Response {
         );
     };
     if get("action") == "cancel" {
+        // Dynamic clients get no redirect before approval (see `authorize_get`), denial included.
+        if p.app.dynamic {
+            return html(
+                StatusCode::OK,
+                page("Access denied", "<p>Nothing was approved. You can close this window.</p>"),
+                None,
+            );
+        }
         return redirect_error(&app, &p.redirect_uri, p.state.as_deref(), "access_denied", "the user denied access");
     }
     let put_back = |p: Pending| {
@@ -678,11 +767,15 @@ async fn authorize_post(State(app): State<Arc<App>>, req: Request) -> Response {
 }
 
 enum Approval {
-    Done { code: String },
+    Done {
+        code: String,
+    },
     InvitationGone,
     AppGone,
     Changed,
     NothingSelected(invite::Invitation),
+    /// The redirect target is unknown and the owner did not tick the confirmation.
+    NotConfirmed(invite::Invitation),
 }
 
 async fn approve(
@@ -697,6 +790,7 @@ async fn approve(
     let (app_client_id, redirect_uri, challenge, resource) =
         (p.app.client_id.clone(), p.redirect_uri.clone(), p.code_challenge.clone(), p.resource.clone());
     let dynamic = p.app.dynamic;
+    let needs_confirm = needs_redirect_confirmation(&p.app, &p.redirect_uri);
     let shown = p.shown.clone();
     let code_ttl = app.cfg.oauth.code_ttl_secs;
     let allow_send = app.cfg.allow_send;
@@ -724,6 +818,9 @@ async fn approve(
             // different list, so the decision is not applied to this one.
             if inv.grants != shown {
                 return Ok(Approval::Changed);
+            }
+            if needs_confirm && !checked("confirm_redirect".into()) {
+                return Ok(Approval::NotConfirmed(inv));
             }
             let mut selected = BTreeMap::new();
             for g in &inv.grants {
@@ -787,6 +884,17 @@ async fn approve(
         }
         Ok(Approval::NothingSelected(inv)) => {
             let r = approval_page(&p, &rid, &inv, app.cfg.allow_send, Some("Select at least one mailbox, or deny."));
+            app.oauth.pending.lock().expect("lock").insert(rid, p);
+            r
+        }
+        Ok(Approval::NotConfirmed(inv)) => {
+            let r = approval_page(
+                &p,
+                &rid,
+                &inv,
+                app.cfg.allow_send,
+                Some("Confirm that you trust the destination shown above, or deny."),
+            );
             app.oauth.pending.lock().expect("lock").insert(rid, p);
             r
         }
@@ -1465,6 +1573,8 @@ mod tests {
                 redirect_uris: vec![],
                 secret: None,
                 dynamic: true,
+                registered_at: None,
+                registered_from: None,
             },
             redirect_uri: String::new(),
             state: None,

@@ -84,7 +84,7 @@ async fn no_onboarding_secret_reaches_logs_audit_or_store() {
     secrets.extend([inv, token]);
 
     // OAuth: register, approve, exchange, refresh, replay the old refresh token (family revocation).
-    let redirect = "https://host.example/cb";
+    let redirect = "https://claude.ai/api/mcp/auth_callback";
     let reg: Value = web
         .post(url("/oauth/dove/register"))
         .header("host", HOST)
