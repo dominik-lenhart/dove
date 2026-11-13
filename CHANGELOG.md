@@ -10,6 +10,22 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 - `deploy/nginx/dove-restricted.conf`, `dove-allowlist.py` and a systemd timer: an nginx/Angie site that lets only
   Claude's and ChatGPT's servers (plus addresses you list) reach `/mcp` and the OAuth machine endpoints, with OpenAI's
   published ranges refreshed hourly.
+- Static Linux builds for `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`. `install.sh` picks them on
+  musl systems such as Alpine (`DOVE_LIBC=gnu|musl` overrides), and `dove upgrade` keeps the libc the running binary
+  was built for. The `-gnu` assets stay.
+- Debian and Ubuntu packages (`dove_<version>_amd64.deb`, `_arm64.deb`) with the binary, the hardened systemd unit and
+  the service account. Installing creates `/etc/dove` (0750) but no secrets and starts nothing.
+- Homebrew formula `dove` in the tap `dominik-lenhart/homebrew-tap` (`brew install dominik-lenhart/tap/dove`),
+  updated by the release workflow for every stable release. It installs the macOS and Linux binaries.
+- `install.ps1` for Windows (SHA-256 and signature check, per-user install, no administrator rights), and `dove upgrade`
+  reads Windows `.zip` releases. The Windows release build itself stays off until the Windows port lands.
+
+### Changed
+
+- Release builds are faster: `x86_64-apple-darwin` is cross-compiled on the arm64 macOS runner (it took 21 minutes on
+  the Intel runner), and a cache warmed on `main` lets tag builds skip the vendored OpenSSL/SQLCipher compile.
+- CI runs the tests with four threads, skips documentation-only changes, cancels superseded runs and checks the code
+  on macOS (when Rust code changed) and on Windows (allowed to fail until the port is merged).
 
 ### Fixed
 

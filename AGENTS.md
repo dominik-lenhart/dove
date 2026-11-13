@@ -324,3 +324,8 @@ cargo fmt
   this host is public at `https://dove.verge-one.com` through Angie (`deploy/nginx/dove-restricted.conf`, files under
   `/etc/angie/`, allowlist timer `dove-allowlist.timer`); `/mcp` and the OAuth machine endpoints answer only Claude's and
   ChatGPT's ranges plus the host's own IPs. The tailscale serve on 43395 is gone; 43361 and 43380 belong to other services.
+- 2026-11-13: Packaging lives in `deploy/` (`deb/`, `homebrew/`, `release/`) and `.github/workflows/release*.yml`. The Homebrew
+  formula is generated (`deploy/homebrew/render.sh`, tested in `tests/packaging.rs`, which runs the real script) and pushed to
+  `dominik-lenhart/homebrew-tap` by the `homebrew` release job with a write deploy key (secret `HOMEBREW_TAP_DEPLOY_KEY`); never
+  edit the tap by hand. Workflow YAML check: `docker run --rm -v $PWD:/repo -w /repo rhysd/actionlint:latest`. The Windows release
+  (`WINDOWS_RELEASE` in `release.yml`) and the Windows CI job (`continue-on-error`) stay gated until the Windows port is merged.
