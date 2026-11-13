@@ -26,8 +26,8 @@ RUN cargo build --release --locked --bin dove \
 # Distroless: glibc and libgcc only. No shell, no package manager, no curl. UID/GID 65532 is the "nonroot" user.
 FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f AS runtime
 LABEL org.opencontainers.image.title="dove-mcp" \
-      org.opencontainers.image.description="Self-hosted MCP server giving AI agents token-scoped read/draft access to Gmail" \
-      org.opencontainers.image.source="https://github.com/dove-mcp/dove-mcp" \
+      org.opencontainers.image.description="Self-hosted MCP server giving AI agents token-scoped read/draft access to Gmail and IMAP/SMTP mailboxes" \
+      org.opencontainers.image.source="https://github.com/dominik-lenhart/dove" \
       org.opencontainers.image.licenses="Apache-2.0"
 COPY --from=build /out/ /
 USER 65532:65532

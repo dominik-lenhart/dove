@@ -1,0 +1,295 @@
+name: Release
+
+# Runs when a tag vX.Y.Z is pushed. See docs/releasing.md.
+on:
+  push:
+    tags: ["v*"]
+
+# Every job declares its own minimal permissions.
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  IMAGE: ghcr.io/dominik-lenhart/dove
+
+# Actions are pinned to full commit SHAs (the tag is in the comment), as in ci.yml.
+jobs:
+  verify:
+    name: verify tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Tag must equal v + Cargo.toml version
+        id: meta
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME}"
+          version=$(awk '/^\[package\]/{p=1; next} /^\[/{p=0} p && /^version[[:space:]]*=/{gsub(/^[^"]*"|".*$/, ""); print; exit}' Cargo.toml)
+          if [ -z "$version" ]; then echo "::error::cannot read version from Cargo.toml"; exit 1; fi
+          if [ "$tag" != "v$version" ]; then
+            echo "::error::tag $tag does not match Cargo.toml version $version (expected v$version)"
+            exit 1
+          fi
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "::error::version $version is not X.Y.Z or X.Y.Z-pre"
+            exit 1
+          fi
+          prerelease=false
+          case "$version" in *-*) prerelease=true ;; esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+      - name: Release notes from CHANGELOG.md
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -eu
+          # The section "## [VERSION]"; a prerelease may fall back to "## [Unreleased]".
+          section() {
+            awk -v h="## [$1]" 'index($0, h) == 1 {p=1; next} /^## \[/{p=0} p' CHANGELOG.md
+          }
+          notes=$(section "$VERSION")
+          if [ -z "$(printf '%s' "$notes" | tr -d '[:space:]')" ]; then
+            case "$VERSION" in
+              *-*) notes=$(section "Unreleased") ;;
+            esac
+          fi
+          if [ -z "$(printf '%s' "$notes" | tr -d '[:space:]')" ]; then
+            echo "::error::CHANGELOG.md has no notes for $VERSION"
+            exit 1
+          fi
+          printf '%s\n' "$notes" > release-notes.md
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-notes
+          path: release-notes.md
+          if-no-files-found: error
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: verify
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # ubuntu-22.04 (glibc 2.35) keeps the binaries runnable on older distributions and inside the distroless
+          # debian12 image (glibc 2.36). Native arm64 runner: no QEMU.
+          - { target: x86_64-unknown-linux-gnu, runner: ubuntu-22.04 }
+          - { target: aarch64-unknown-linux-gnu, runner: ubuntu-22.04-arm }
+          - { target: aarch64-apple-darwin, runner: macos-14 }
+          # Native Intel runner: the vendored OpenSSL/SQLCipher C build then needs no cross toolchain flags.
+          - { target: x86_64-apple-darwin, runner: macos-15-intel }
+    env:
+      TAG: ${{ github.ref_name }}
+      TARGET: ${{ matrix.target }}
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked --bin dove --target "$TARGET"
+      - name: Smoke test
+        run: |
+          set -eu
+          out=$("target/$TARGET/release/dove" --version)
+          echo "$out"
+          expected="dove ${TAG#v}"
+          if [ "$out" != "$expected" ]; then echo "::error::expected '$expected'"; exit 1; fi
+      - name: Package
+        run: |
+          set -eu
+          name="dove-${TAG}-${TARGET}"
+          mkdir -p "dist/$name"
+          install -m 0755 "target/$TARGET/release/dove" "dist/$name/dove"
+          install -m 0644 LICENSE README.md "dist/$name/"
+          COPYFILE_DISABLE=1 tar -C dist -czf "dist/$name.tar.gz" "$name"
+          tar -tzf "dist/$name.tar.gz"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: archive-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: sign and publish
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write # create the GitHub Release
+      id-token: write # attestations
+      attestations: write
+    env:
+      TAG: ${{ github.ref_name }}
+      PRERELEASE: ${{ needs.verify.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: archive-*
+          path: assets
+          merge-multiple: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-notes
+          path: notes
+      - name: Install minisign
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq minisign
+          minisign -v
+      - name: Checksums
+        working-directory: assets
+        run: |
+          set -eu
+          test "$(find . -name '*.tar.gz' | wc -l)" -eq 4
+          sha256sum ./*.tar.gz | sed 's#  \./#  #' > SHA256SUMS
+          cat SHA256SUMS
+          sha256sum -c SHA256SUMS
+      - name: Sign
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          set -eu
+          if [ -z "$MINISIGN_SECRET_KEY" ]; then echo "::error::secret MINISIGN_SECRET_KEY is not set"; exit 1; fi
+          umask 077
+          keyfile="$RUNNER_TEMP/minisign.key"
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$keyfile"
+          # The key has no password, so minisign does not prompt.
+          minisign -S -s "$keyfile" -m assets/SHA256SUMS -t "dove $TAG" < /dev/null
+          rm -f "$keyfile"
+      - name: Verify the signature with the committed public key
+        run: |
+          set -eu
+          minisign -V -p deploy/release/minisign.pub -m assets/SHA256SUMS -x assets/SHA256SUMS.minisig
+          if [ "$(sed -n 3p assets/SHA256SUMS.minisig)" != "trusted comment: dove $TAG" ]; then
+            echo "::error::unexpected trusted comment"
+            exit 1
+          fi
+      - name: Add the installer
+        run: install -m 0755 install.sh assets/install.sh
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: assets/*.tar.gz
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          if [ "$PRERELEASE" = true ]; then
+            pre=--prerelease
+          else
+            pre=--latest
+          fi
+          gh release create "$TAG" "$pre" \
+            --verify-tag --title "dove $TAG" --notes-file notes/release-notes.md \
+            assets/*.tar.gz assets/SHA256SUMS assets/SHA256SUMS.minisig assets/install.sh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: checksums
+          path: assets/SHA256SUMS
+          if-no-files-found: error
+
+  image:
+    name: container image
+    needs: [verify, release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+      id-token: write # attestations
+      attestations: write
+    env:
+      TAG: ${{ github.ref_name }}
+      VERSION: ${{ needs.verify.outputs.version }}
+      PRERELEASE: ${{ needs.verify.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: archive-*-linux-*
+          path: assets
+          merge-multiple: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: checksums
+          path: sums
+      - name: Extract the verified linux binaries
+        run: |
+          set -eu
+          # Only the two linux archives are present; check them against the checksum list that was signed.
+          (cd assets && grep -E ' dove-.*-linux-gnu\.tar\.gz$' ../sums/SHA256SUMS | sha256sum -c -)
+          for pair in x86_64-unknown-linux-gnu:amd64 aarch64-unknown-linux-gnu:arm64; do
+            target=${pair%%:*}
+            arch=${pair##*:}
+            name="dove-${TAG}-${target}"
+            mkdir -p "image-context/linux-$arch"
+            tar -xzf "assets/$name.tar.gz" -C "$RUNNER_TEMP" "$name/dove"
+            install -m 0755 "$RUNNER_TEMP/$name/dove" "image-context/linux-$arch/dove"
+          done
+          ls -l image-context/*
+      - name: Image tags
+        id: tags
+        run: |
+          set -eu
+          minor=${VERSION%.*}
+          {
+            echo "list<<EOF"
+            echo "$IMAGE:$VERSION"
+            # Prereleases never move X.Y or latest.
+            if [ "$PRERELEASE" != true ]; then
+              echo "$IMAGE:$minor"
+              echo "$IMAGE:latest"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: image-context
+          file: deploy/Containerfile.release
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: false # the GitHub attestation below covers provenance
+          tags: ${{ steps.tags.outputs.list }}
+          labels: |
+            org.opencontainers.image.version=${{ env.VERSION }}
+            org.opencontainers.image.revision=${{ github.sha }}
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
