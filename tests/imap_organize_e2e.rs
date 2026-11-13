@@ -263,14 +263,29 @@ async fn copy_without_copyuid_never_deletes() {
 async fn trash_and_junk_need_delete() {
     let s = setup().await;
     let (h, u) = (&s.h, &s.u);
-    // A trash folder known only by name (no special-use flag) counts as Trash too.
-    add_folder(&s, "Papierkorb", None).await;
+    // A trash folder known only by name (no special-use flag) counts as Trash too, in other languages and any case.
+    for name in ["Papierkorb", "Corbeille", "Indésirables", "КОРЗИНА", "Posta indesiderata", "Alte Spam-Regeln"]
+    {
+        add_folder(&s, name, None).await;
+    }
     // Below Trash is Trash too.
     add_folder(&s, "Trash/alt", None).await;
     let a = h.imap.add_message(&u.user, "INBOX", &raw("a"), &[]);
     let ia = imap_id(h, u, "INBOX", a).await;
     h.imap.clear_commands();
-    for to in ["trash", "spam", "Junk", "Trash", "Papierkorb", "Trash/alt"] {
+    for to in [
+        "trash",
+        "spam",
+        "Junk",
+        "Trash",
+        "Papierkorb",
+        "Trash/alt",
+        "corbeille",
+        "Indésirables",
+        "КОРЗИНА",
+        "Posta indesiderata",
+        "Alte Spam-Regeln",
+    ] {
         let e = h.err(&s.assistant, "move_messages", json!({ "account": "info", "ids": [ia], "to": to })).await;
         assert_eq!(e, "forbidden", "{to}");
     }
@@ -285,6 +300,23 @@ async fn trash_and_junk_need_delete() {
     assert_eq!(ok_ids(&r), vec![true]);
     assert_eq!(h.imap.uids(&u.user, "INBOX").len(), 1);
     assert!(h.imap.uids(&u.user, "Trash").is_empty());
+    // Out of Junk (or a junk folder known by name) needs delete: it promotes spam.
+    let j = h.imap.add_message(&u.user, "Junk", &raw("j"), &[]);
+    let ij = imap_id(h, u, "Junk", j).await;
+    let k = h.imap.add_message(&u.user, "Indésirables", &raw("k"), &[]);
+    let ik = imap_id(h, u, "Indésirables", k).await;
+    let b = h.imap.add_message(&u.user, "INBOX", &raw("b"), &[]);
+    let ib = imap_id(h, u, "INBOX", b).await;
+    h.imap.clear_commands();
+    for (ids, to) in [(vec![&ij], "inbox"), (vec![&ik], "INBOX"), (vec![&ib, &ij], "inbox")] {
+        let e = h.err(&s.assistant, "move_messages", json!({ "account": "info", "ids": ids, "to": to })).await;
+        assert_eq!(e, "forbidden", "{to}");
+    }
+    assert!(!h.imap.commands().iter().any(|c| matches!(verb_of(c).as_str(), "UID MOVE" | "UID COPY" | "UID STORE")));
+    assert_eq!((h.imap.uids(&u.user, "Junk").len(), h.imap.uids(&u.user, "Indésirables").len()), (1, 1));
+    let r = h.ok(&s.full, "move_messages", json!({ "account": "info", "ids": [ij, ik], "to": "inbox" })).await;
+    assert_eq!(ok_ids(&r), vec![true, true]);
+    assert!(h.imap.uids(&u.user, "Junk").is_empty() && h.imap.uids(&u.user, "Indésirables").is_empty());
     // A reader cannot organize at all.
     let reader = h.token("p", "reader", vec![g("info", "reader")]).await;
     assert_eq!(

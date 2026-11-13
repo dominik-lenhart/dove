@@ -95,16 +95,32 @@ impl RateLimiter {
 
     /// Returns `None` when allowed, or the seconds to wait.
     pub fn check(&self, key: &str, per_minute: u32, burst: u32) -> Option<u64> {
-        self.check_rate(key, f64::from(per_minute.max(1)) / 60.0, burst)
+        self.check_rate(key, f64::from(per_minute.max(1)) / 60.0, burst, 1)
     }
 
     /// Token bucket refilling `per_hour` tokens per hour, holding at most `burst`.
     pub fn check_hourly(&self, key: &str, per_hour: u32, burst: u32) -> Option<u64> {
-        self.check_rate(key, f64::from(per_hour.max(1)) / 3600.0, burst)
+        self.check_rate(key, f64::from(per_hour.max(1)) / 3600.0, burst, 1)
     }
 
-    fn check_rate(&self, key: &str, rate: f64, burst: u32) -> Option<u64> {
+    /// Takes `cost` tokens at once (all or nothing) from a bucket refilling `per_hour` tokens per hour and holding at
+    /// most `per_hour`. Returns `None` when taken, or the seconds until `cost` tokens are there (`cost` must not
+    /// exceed `per_hour`).
+    pub fn take_hourly(&self, key: &str, per_hour: u32, cost: u32) -> Option<u64> {
+        self.check_rate(key, f64::from(per_hour.max(1)) / 3600.0, per_hour, cost)
+    }
+
+    /// Gives back `cost` tokens taken with [`RateLimiter::take_hourly`] (for work that did not happen), up to the cap.
+    pub fn refund(&self, key: &str, cost: u32) {
+        let mut b = self.inner.lock().expect("lock");
+        if let Some(e) = b.map.get_mut(key) {
+            e.tokens = (e.tokens + f64::from(cost)).min(e.cap);
+        }
+    }
+
+    fn check_rate(&self, key: &str, rate: f64, burst: u32, cost: u32) -> Option<u64> {
         let cap = f64::from(burst.max(1));
+        let cost = f64::from(cost.max(1));
         let mut b = self.inner.lock().expect("lock");
         let now = Instant::now();
         if b.map.len() >= b.prune_at && !b.map.contains_key(key) {
@@ -117,11 +133,11 @@ impl RateLimiter {
         e.cap = cap;
         e.tokens = e.refilled(now);
         e.last = now;
-        if e.tokens >= 1.0 {
-            e.tokens -= 1.0;
+        if e.tokens >= cost {
+            e.tokens -= cost;
             None
         } else {
-            Some(((1.0 - e.tokens) / rate).ceil() as u64)
+            Some(((cost - e.tokens) / rate).ceil() as u64)
         }
     }
 
@@ -417,5 +433,25 @@ mod tests {
             rl.check(&format!("k{i}"), u32::MAX, 1);
         }
         assert!(rl.len() < 1000, "{}", rl.len());
+    }
+
+    #[test]
+    fn hourly_takes_are_all_or_nothing_and_refunds_are_capped() {
+        let rl = RateLimiter::default();
+        assert!(rl.take_hourly("k", 500, 300).is_none());
+        // 200 left: a take of 201 is refused whole (nothing taken), with the wait for the missing tokens.
+        let wait = rl.take_hourly("k", 500, 201).expect("over budget");
+        assert!((7..=9).contains(&wait), "one token per 7.2 s: {wait}");
+        assert!(rl.take_hourly("k", 500, 200).is_none(), "the refused take spent nothing");
+        assert!(rl.take_hourly("k", 500, 1).is_some());
+        rl.refund("k", 50);
+        assert!(rl.take_hourly("k", 500, 50).is_none());
+        assert!(rl.take_hourly("k", 500, 1).is_some());
+        // Refunds never lift a bucket over its cap.
+        rl.refund("k", 10_000);
+        assert!(rl.take_hourly("k", 500, 500).is_none());
+        assert!(rl.take_hourly("k", 500, 1).is_some());
+        // Other keys are separate.
+        assert!(rl.take_hourly("other", 500, 500).is_none());
     }
 }

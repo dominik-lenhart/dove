@@ -140,6 +140,8 @@ pub struct Limits {
     pub client_requests_per_minute: u32,
     pub client_burst: u32,
     pub client_sends_per_hour: u32,
+    /// Messages a client may change per hour with update_messages and move_messages (each id counts once).
+    pub client_organize_per_hour: u32,
     pub upstream_total_inflight: usize,
     pub upstream_per_mailbox: usize,
     pub upstream_search_mailboxes: usize,
@@ -171,6 +173,7 @@ impl Default for Limits {
             client_requests_per_minute: 120,
             client_burst: 40,
             client_sends_per_hour: 20,
+            client_organize_per_hour: 500,
             upstream_total_inflight: 16,
             upstream_per_mailbox: 4,
             upstream_search_mailboxes: 8,
@@ -328,6 +331,9 @@ impl Config {
             secrets::check_secret_file_mode(&g.client_secret_file)?;
         }
         self.validate_oauth()?;
+        if self.limits.client_organize_per_hour == 0 {
+            bail!("limits.client_organize_per_hour must be at least 1 (remove organize from grants to turn it off)");
+        }
         if self.limits.draft_attachment_bytes > MAX_DRAFT_ATTACHMENT_BYTES {
             bail!("limits.draft_attachment_bytes must be at most {MAX_DRAFT_ATTACHMENT_BYTES}");
         }

@@ -259,10 +259,21 @@ async fn move_needs_delete_for_trash_and_spam() {
     h.ok(&assistant, "move_messages", json!({ "account": "info", "ids": [a], "to": "inbox" })).await;
     assert_eq!(writes(&h), vec![format!("POST /messages/{a}/untrash"), format!("POST /messages/{a}/modify")]);
     assert_eq!(h.google.labels_of(INFO, &a).unwrap(), vec!["INBOX"]);
-    // Spam with delete, and out again with organize.
+    // Spam with delete, and out again only with delete too: leaving Spam promotes what Gmail classified as spam.
     h.ok(&full, "move_messages", json!({ "account": "info", "ids": [a], "to": "spam" })).await;
     assert_eq!(h.google.labels_of(INFO, &a).unwrap(), vec!["SPAM"]);
-    h.ok(&assistant, "move_messages", json!({ "account": "info", "ids": [a], "to": "inbox" })).await;
+    h.google.clear_requests();
+    for to in ["inbox", "Erledigt"] {
+        // One message in Spam refuses the whole call before any write, the other id included.
+        let e = h.err(&assistant, "move_messages", json!({ "account": "info", "ids": [b, a], "to": to })).await;
+        assert_eq!(e, "forbidden", "{to}");
+    }
+    assert!(writes(&h).is_empty(), "{:?}", writes(&h));
+    assert_eq!(h.google.labels_of(INFO, &a).unwrap(), vec!["SPAM"]);
+    // Archive leaves it in Spam (removes INBOX only), so organize suffices.
+    h.ok(&assistant, "move_messages", json!({ "account": "info", "ids": [a], "to": "archive" })).await;
+    assert_eq!(h.google.labels_of(INFO, &a).unwrap(), vec!["SPAM"]);
+    h.ok(&full, "move_messages", json!({ "account": "info", "ids": [a], "to": "inbox" })).await;
     assert_eq!(h.google.labels_of(INFO, &a).unwrap(), vec!["INBOX"]);
     assert_eq!(
         h.err(&assistant, "move_messages", json!({ "account": "info", "ids": [a], "to": "Nirgends" })).await,
@@ -398,4 +409,63 @@ async fn one_audit_record_per_call_without_content() {
     for r in &rows {
         assert!(!r.contains("Geheim") && !r.contains("kunde@") && !r.contains("Nirgends"), "{r}");
     }
+}
+
+/// Organize writes spend a per-client hourly budget counted in messages: a call that does not fit is refused whole
+/// before any write (and audited), ids that did not change are given back, and other clients are unaffected.
+#[tokio::test]
+async fn organize_budget_counts_changed_messages_per_client() {
+    let h = Harness::start_with(|c| c.limits.client_organize_per_hour = 5).await;
+    h.mailbox("info", INFO);
+    h.project("acme", &["info"]).await;
+    let t = h.token("acme", "agent", vec![g("info", "full")]).await;
+    let other = h.token("acme", "other", vec![g("info", "full")]).await;
+    let ids: Vec<String> = (0..6).map(|i| h.google.add_message(INFO, msg(&format!("m{i}"), &["INBOX"]))).collect();
+    let star = |ids: &[String]| json!({ "account": "info", "ids": ids, "add_flags": ["STARRED"] });
+
+    // More ids than the hourly budget can ever hold: a clear invalid_argument, nothing spent.
+    assert_eq!(h.err(&t, "update_messages", star(&ids)).await, "invalid_argument");
+    // Two unknown ids fail and are given back; a pre-write refusal (unknown folder) gives everything back.
+    let r = h
+        .ok(
+            &t,
+            "update_messages",
+            json!({ "account": "info", "ids": [ids[0], "nope1", "nope2"], "add_flags": ["STARRED"] }),
+        )
+        .await;
+    assert_eq!((r["succeeded"].as_i64(), r["failed"].as_i64()), (Some(1), Some(2)));
+    let to_nowhere = json!({ "account": "info", "ids": ids[1..5], "to": "Nirgends" });
+    assert_eq!(h.err(&t, "move_messages", to_nowhere).await, "invalid_argument");
+    // 4 of 5 left: 3 messages fit, then 2 more do not; the refused call writes nothing.
+    h.ok(&t, "move_messages", json!({ "account": "info", "ids": ids[1..4], "to": "archive" })).await;
+    h.google.clear_requests();
+    let (is_err, v) = h.call(&t, "update_messages", star(&ids[4..6])).await;
+    assert!(is_err, "{v}");
+    assert_eq!(v["error"]["code"], "rate_limited", "{v}");
+    assert_eq!(v["error"]["details"]["budget"], "organize", "{v}");
+    assert!(v["error"]["retry_after_seconds"].as_u64().is_some_and(|s| s > 0), "{v}");
+    assert!(writes(&h).is_empty(), "{:?}", writes(&h));
+    // The last unit is still there; afterwards the budget is used up, for both tools.
+    h.ok(&t, "update_messages", star(&ids[4..5])).await;
+    assert_eq!(h.err(&t, "update_messages", star(&ids[5..6])).await, "rate_limited");
+    assert_eq!(
+        h.err(&t, "move_messages", json!({ "account": "info", "ids": [ids[5]], "to": "inbox" })).await,
+        "rate_limited"
+    );
+    // Another client has its own budget.
+    h.ok(&other, "update_messages", star(&ids[..5])).await;
+    // Refusals are audited like any other call.
+    let refused: i64 = h
+        .app()
+        .store
+        .call(|c| {
+            Ok(c.query_row(
+                "SELECT count(*) FROM audit WHERE result_code = 'rate_limited' AND tool_or_action IN ('update_messages', 'move_messages')",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(refused, 3);
 }

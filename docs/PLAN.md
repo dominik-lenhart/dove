@@ -329,7 +329,7 @@ hosts or reference hardware.
   labels are never created, system labels only through flags and move targets. IMAP labels are keywords (RFC 3501
   atoms, no system flags); `archive` is a folder named Archive/Archives/Archiv (no special-use role is stored for it).
   A destination counts as Trash/Junk (needs `delete`) when it has that special-use role, has a well-known Trash/Junk
-  name in any path segment (including Strato's `Spamverdacht`), or lies below a Trash/Junk folder. On IMAP without
+  name in any path segment (including Strato's `Spamverdacht`; localized names, A59), or lies below a Trash/Junk folder. On IMAP without
   `MOVE`, an OK `COPY` without `COPYUID` leaves the original in place and reports an error for that id; a failed
   `\Deleted`/`EXPUNGE` after a confirmed copy does the same. The approval page applies a selected preset instead of
   the checkboxes (send stays its own checkbox, shown only with `allow_send`); the result is always narrowed to the
@@ -411,3 +411,14 @@ hosts or reference hardware.
   service excludes its executable from Windows Error Reporting per user at every start (`WerAddExcludedApplication`,
   best effort), machine-wide dump settings stay out of reach. Not available on Windows: Tailscale setup, the systemd hardening and service-user checks; the doctor's
   mode checks become a `data_dir_private` ACL check.
+- A59. Security review 2026-11-13 (organize, sinks, upgrade, installers). (a) Organize writes spend a per-client
+  hourly budget counted in messages (`limits.client_organize_per_hour`, default 500): a call reserves one unit per
+  distinct id before its first write and refunds the ids that did not change; a call that does not fit is refused
+  whole with `rate_limited` (`retry_after_seconds`, `details.budget = "organize"`) and audited like any refusal. (b)
+  Moving out of Spam/Junk needs `delete` like moving in (Gmail: a message with `SPAM` moved to the inbox or a label;
+  IMAP: a source folder that is Junk by flag, name, stem or parent; Gmail over IMAP: the `\Junk` folder). One such
+  id refuses the whole call before any write. Out of Trash stays `organize`. (c) Trash/Junk names are matched
+  Unicode-case-insensitively on the decoded name in 15 languages (`imap::connect::{TRASH_NAMES, JUNK_NAMES}`); for the
+  `delete` gate any trash/junk word stem in the name counts too (`TRASH_STEMS`, `JUNK_STEMS`; a false hit only asks
+  for more permission). Stored `imap_folders.special` values change only at connect/reconnect (no migration): the
+  gate and the trash/spam targets read the names at call time.

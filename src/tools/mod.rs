@@ -84,7 +84,7 @@ impl ToolCx {
         self.gate.0.compare_exchange(OPEN, ABANDONED, Ordering::SeqCst, Ordering::SeqCst) == Err(COMMITTED)
     }
 
-    fn committed(&self) -> bool {
+    pub(crate) fn committed(&self) -> bool {
         self.gate.0.load(Ordering::SeqCst) == COMMITTED
     }
 }

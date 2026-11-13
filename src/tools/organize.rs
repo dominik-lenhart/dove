@@ -2,7 +2,8 @@
 //!
 //! Both are write tools: detached, `cx.commit()` right before the first upstream write, one audit record with ids and
 //! counts. Every id gets its own result; unknown ids, ids of folders this mailbox does not have and stale ids are the
-//! same `not_found`. Moving into Trash or Spam/Junk needs `delete` on top of `organize`; nothing is ever deleted
+//! same `not_found`. Moving into Trash or Spam/Junk, or out of Spam/Junk, needs `delete` on top of `organize`; each
+//! call also spends the client's hourly organize budget (`limits.client_organize_per_hour`); nothing is ever deleted
 //! permanently: Gmail only gets `messages.trash`, and on IMAP the only expunge outside Drafts is of the sources of a
 //! copy the server confirmed (`imap::CopiedUid`), which completes a move on servers without `MOVE`.
 //!
@@ -21,7 +22,7 @@ use crate::error::{ErrorCode, ToolError};
 use crate::gmail::gateway::{GmailOp, Priority, valid_id};
 use crate::gmail::{SCOPE_MODIFY, WriteError};
 use crate::imap::account::{self, Folder};
-use crate::imap::connect::{JUNK_NAMES, TRASH_NAMES};
+use crate::imap::connect::{JUNK_NAMES, JUNK_STEMS, TRASH_NAMES, TRASH_STEMS, has_stem, same_name};
 use crate::imap::{GmLabel, ImapMsgId, Keyword, MoveOutcome, Special, StoreFlag, UserLabel};
 use crate::mail;
 use crate::policy::{Capability, Mailbox, Provider};
@@ -85,7 +86,7 @@ pub fn defs() -> Vec<ToolDef> {
             title: "Move messages",
             description: concat!(
                 "Move messages to a folder (IMAP) or label (Gmail), or to one of: archive, inbox, trash, spam. Moving ",
-                "into Trash or Spam needs the delete permission; moving out of them only organize. Trash is ",
+                "into Trash or Spam, or out of Spam, needs the delete permission; out of Trash only organize. Trash is ",
                 "recoverable; Dove never deletes permanently. IMAP message ids change on a move: use new_id. At most ",
                 "100 ids per call."
             ),
@@ -191,6 +192,51 @@ fn output(mb: &Mailbox, verb: &str, ids: &[String], outcomes: Vec<Outcome>) -> T
             ..Default::default()
         },
         extra: Vec::new(),
+    }
+}
+
+// ------------------------------------------------------------------ budget
+
+/// Messages reserved from the client's hourly organize budget (`limits.client_organize_per_hour`, security review
+/// 2026-11-13): a prompt-injected agent cannot relabel or move a whole mailbox at 100 ids per call.
+struct Budget {
+    key: String,
+    reserved: u32,
+}
+
+impl Budget {
+    /// Reserves one unit per (distinct) id before any upstream call; refused whole when it does not fit.
+    fn take(cx: &ToolCx, ids: &[String]) -> Result<Self, ToolError> {
+        let per_hour = cx.app.cfg.limits.client_organize_per_hour;
+        let reserved = u32::try_from(ids.len()).unwrap_or(u32::MAX);
+        if reserved > per_hour {
+            return Err(ToolError::invalid(format!(
+                "this server allows at most {per_hour} message changes per hour; pass fewer ids"
+            )));
+        }
+        let key = format!("organize:{}", cx.client.client_id);
+        if let Some(wait) = cx.app.rate_limiter.take_hourly(&key, per_hour, reserved) {
+            return Err(ToolError {
+                retry_after_seconds: Some(wait),
+                ..ToolError::new(
+                    ErrorCode::RateLimited,
+                    format!("the hourly organize budget ({per_hour} messages) is used up; retry later with fewer ids"),
+                )
+                .with_details(json!({ "budget": "organize", "limit_per_hour": per_hour }))
+            });
+        }
+        Ok(Self { key, reserved })
+    }
+
+    /// Gives back what did not change: everything when the call failed before its first write, else the failed ids.
+    fn settle(self, cx: &ToolCx, r: Result<Vec<Outcome>, ToolError>) -> Result<Vec<Outcome>, ToolError> {
+        let unused = match &r {
+            Ok(outcomes) => outcomes.iter().filter(|o| matches!(o, Outcome::Failed(_))).count() as u32,
+            Err(_) if !cx.committed() => self.reserved,
+            Err(_) => 0,
+        };
+        cx.app.rate_limiter.refund(&self.key, unused.min(self.reserved));
+        r
     }
 }
 
@@ -319,10 +365,12 @@ async fn update_messages(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolErr
     if add_flags.iter().any(|f| remove_flags.contains(f)) || add_labels.iter().any(|l| remove_labels.contains(l)) {
         return Err(ToolError::invalid("the same flag or label is both added and removed"));
     }
-    let outcomes = match mb.provider {
-        Provider::Gmail => gmail_update(cx, &mb, &ids, &add_flags, &remove_flags, &add_labels, &remove_labels).await?,
-        Provider::Imap => imap_update(cx, &mb, &ids, &add_flags, &remove_flags, &add_labels, &remove_labels).await?,
+    let budget = Budget::take(cx, &ids)?;
+    let r = match mb.provider {
+        Provider::Gmail => gmail_update(cx, &mb, &ids, &add_flags, &remove_flags, &add_labels, &remove_labels).await,
+        Provider::Imap => imap_update(cx, &mb, &ids, &add_flags, &remove_flags, &add_labels, &remove_labels).await,
     };
+    let outcomes = budget.settle(cx, r)?;
     crate::index::wake(&cx.app, &mb.account_id);
     Ok(output(&mb, "Updated", &ids, outcomes))
 }
@@ -465,19 +513,32 @@ async fn move_messages(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError
     let mb = account_arg(cx, &args, Capability::Organize)?.clone();
     let ids = ids_arg(&args)?;
     let target = target_arg(&args)?;
-    let outcomes = match mb.provider {
-        Provider::Gmail => gmail_move(cx, &mb, &ids, &target).await?,
-        Provider::Imap => imap_move(cx, &mb, &ids, &target).await?,
+    let budget = Budget::take(cx, &ids)?;
+    let r = match mb.provider {
+        Provider::Gmail => gmail_move(cx, &mb, &ids, &target).await,
+        Provider::Imap => imap_move(cx, &mb, &ids, &target).await,
     };
+    let outcomes = budget.settle(cx, r)?;
     crate::index::wake(&cx.app, &mb.account_id);
     Ok(output(&mb, "Moved", &ids, outcomes))
 }
 
-/// Moving into Trash or Spam/Junk hides mail and providers purge it: that needs `delete` (design section 1).
-fn require_delete(cx: &ToolCx, mb: &Mailbox) -> Result<(), ToolError> {
+/// Why a move needs `delete`.
+#[derive(Debug, Clone, Copy)]
+enum NeedsDelete {
+    /// Into Trash or Spam/Junk: hides mail, and providers purge it (design section 1).
+    Into,
+    /// Out of Spam/Junk: promotes mail the provider classified as spam into view (security review 2026-11-13).
+    OutOfSpam,
+}
+
+fn require_delete(cx: &ToolCx, mb: &Mailbox, why: NeedsDelete) -> Result<(), ToolError> {
     cx.client.authorize_id(Capability::Delete, &mb.account_id).map(|_| ()).map_err(|e| {
         if e.code == ErrorCode::Forbidden {
-            ToolError::forbidden("moving to Trash or Spam needs the delete permission on this mailbox")
+            ToolError::forbidden(match why {
+                NeedsDelete::Into => "moving to Trash or Spam needs the delete permission on this mailbox",
+                NeedsDelete::OutOfSpam => "moving messages out of Spam needs the delete permission on this mailbox",
+            })
         } else {
             e
         }
@@ -486,7 +547,7 @@ fn require_delete(cx: &ToolCx, mb: &Mailbox) -> Result<(), ToolError> {
 
 async fn gmail_move(cx: &ToolCx, mb: &Mailbox, ids: &[String], target: &Target) -> Result<Vec<Outcome>, ToolError> {
     if matches!(target, Target::Trash | Target::Spam) {
-        require_delete(cx, mb)?;
+        require_delete(cx, mb, NeedsDelete::Into)?;
     }
     require_gmail_modify(cx, mb).await?;
     let label = match target {
@@ -521,6 +582,10 @@ async fn gmail_move(cx: &ToolCx, mb: &Mailbox, ids: &[String], target: &Target) 
     } else {
         vec![Some(vec![]); ids.len()]
     };
+    // Into the inbox or a label removes SPAM: that needs `delete`, decided for the whole call before any write.
+    if current.iter().flatten().any(|labels| labels.iter().any(|l| l == "SPAM")) {
+        require_delete(cx, mb, NeedsDelete::OutOfSpam)?;
+    }
     cx.commit()?;
     let (label, current) = (&label, &current);
     Ok(gmail_each(ids, move |id| {
@@ -569,26 +634,42 @@ fn leaf(name: &str) -> &str {
     name.rsplit(['/', '.']).next().unwrap_or(name)
 }
 
-/// Whether moving into `f` counts as deleting: it is the Trash or Junk folder (special-use or a well-known name),
-/// or lies anywhere below one (`Trash/alt`, `INBOX.Spam`), since providers purge those with their parent.
+/// Whether `f` lies below `parent` (`Trash/alt`, `INBOX.Spam` below `INBOX`).
+fn is_under(f: &Folder, parent: &str) -> bool {
+    f.name_utf8.len() > parent.len()
+        && f.name_utf8.is_char_boundary(parent.len())
+        && same_name(&f.name_utf8[..parent.len()], parent)
+        && f.name_utf8[parent.len()..].starts_with(['/', '.'])
+}
+
+/// Whether `f` is a Trash or Junk folder, or lies anywhere below one: by special-use flag, by a well-known name in
+/// any path segment (localized, any case), or by a trash/junk word stem in its decoded name. Providers purge these
+/// folders, and moving into one counts as deleting.
 fn is_trash_or_junk(f: &Folder, folders: &[Folder]) -> bool {
-    let purging_name = |seg: &str| TRASH_NAMES.iter().chain(JUNK_NAMES).any(|n| seg.trim().eq_ignore_ascii_case(n));
-    let under = |parent: &str| {
-        f.name_utf8.len() > parent.len()
-            && f.name_utf8[..parent.len()].eq_ignore_ascii_case(parent)
-            && f.name_utf8[parent.len()..].starts_with(['/', '.'])
-    };
+    let purging_name = |seg: &str| TRASH_NAMES.iter().chain(JUNK_NAMES).any(|n| same_name(seg, n));
     matches!(f.special, Some(Special::Trash | Special::Junk))
         || f.name_utf8.split(['/', '.']).any(purging_name)
-        || folders.iter().any(|p| matches!(p.special, Some(Special::Trash | Special::Junk)) && under(&p.name_utf8))
+        || has_stem(&f.name_utf8, TRASH_STEMS)
+        || has_stem(&f.name_utf8, JUNK_STEMS)
+        || folders
+            .iter()
+            .any(|p| matches!(p.special, Some(Special::Trash | Special::Junk)) && is_under(f, &p.name_utf8))
+}
+
+/// Whether `f` is a Junk folder or lies below one, by the same rules as [`is_trash_or_junk`] with the junk names and
+/// stems only: moving mail out of it promotes what the provider classified as spam.
+fn is_junk(f: &Folder, folders: &[Folder]) -> bool {
+    f.special == Some(Special::Junk)
+        || f.name_utf8.split(['/', '.']).any(|seg| JUNK_NAMES.iter().any(|n| same_name(seg, n)))
+        || has_stem(&f.name_utf8, JUNK_STEMS)
+        || folders.iter().any(|p| p.special == Some(Special::Junk) && is_under(f, &p.name_utf8))
 }
 
 const ARCHIVE_NAMES: &[&str] = &["Archive", "Archives", "Archiv"];
 
 fn imap_target<'a>(folders: &'a [Folder], target: &Target) -> Result<&'a Folder, ToolError> {
     let by_special = |s: Special| folders.iter().find(|f| f.special == Some(s));
-    let by_leaf =
-        |names: &[&str]| names.iter().find_map(|n| folders.iter().find(|f| leaf(&f.name_utf8).eq_ignore_ascii_case(n)));
+    let by_leaf = |names: &[&str]| names.iter().find_map(|n| folders.iter().find(|f| same_name(leaf(&f.name_utf8), n)));
     let missing = |what: &str| {
         ToolError::invalid(format!("this mailbox has no {what} folder; pass a folder name from list_labels"))
     };
@@ -626,7 +707,10 @@ async fn imap_move(cx: &ToolCx, mb: &Mailbox, ids: &[String], target: &Target) -
     let ImapGroups { folders, groups, mut outcomes } = imap_groups(cx, mb, ids).await?;
     let dest = imap_target(&folders, target)?.clone();
     if matches!(target, Target::Trash | Target::Spam) || is_trash_or_junk(&dest, &folders) {
-        require_delete(cx, mb)?;
+        require_delete(cx, mb, NeedsDelete::Into)?;
+    }
+    if groups.keys().any(|(folder_id, _)| is_junk(folder_of(&folders, *folder_id), &folders)) {
+        require_delete(cx, mb, NeedsDelete::OutOfSpam)?;
     }
     let mut committed = false;
     for ((folder_id, uidvalidity), members) in groups {
@@ -857,7 +941,10 @@ async fn gmail_imap_move(
     let ImapGroups { folders, groups, mut outcomes } = imap_groups(cx, mb, ids).await?;
     let dest = gmail_dest(&folders, target)?;
     if matches!(dest, GmailDest::Bin(_)) {
-        require_delete(cx, mb)?;
+        require_delete(cx, mb, NeedsDelete::Into)?;
+    }
+    if groups.keys().any(|(folder_id, _)| folder_of(&folders, *folder_id).special == Some(Special::Junk)) {
+        require_delete(cx, mb, NeedsDelete::OutOfSpam)?;
     }
     let missing = |what: &str| ToolError::invalid(format!("this Gmail mailbox shows no {what} folder in IMAP"));
     let all = folders.iter().find(|f| f.special == Some(Special::All)).cloned().ok_or_else(|| missing("All Mail"))?;
@@ -940,6 +1027,12 @@ mod tests {
             folder(9, "Archiv/Trash", None),
             folder(10, "Spam-Filter", None),
             folder(11, "Spam/alt", None),
+            folder(12, "Corbeille", None),
+            folder(13, "INBOX/Indésirables", None),
+            folder(14, "КОРЗИНА/2025", None),
+            folder(15, "Kunden", None),
+            folder(16, "Projekte/Alte Papelera", None),
+            folder(17, "Deleted Items/Spam-Ablage", None),
         ];
         assert_eq!(imap_target(&fs, &Target::Inbox).unwrap().folder_id, 1);
         // The special-use flag wins over a well-known name.
@@ -950,8 +1043,16 @@ mod tests {
         assert!(imap_target(&fs, &Target::Named("Nope".into())).is_err());
         // A trash folder by name only (no special-use flag) still needs delete.
         let purging: Vec<i64> = fs.iter().filter(|f| is_trash_or_junk(f, &fs)).map(|f| f.folder_id).collect();
-        // Subfolders of Trash/Junk and Strato's `Spamverdacht` count as well.
-        assert_eq!(purging, vec![2, 3, 6, 7, 8, 9, 11]);
+        // Subfolders of Trash/Junk, Strato's `Spamverdacht`, localized names in any case, and names with a
+        // trash/junk word stem (`Spam-Filter`, `Alte Papelera`) count as well.
+        assert_eq!(purging, vec![2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 17]);
+        // Moving out of these promotes spam (out of Trash or a trash-like name does not).
+        let junk: Vec<i64> = fs.iter().filter(|f| is_junk(f, &fs)).map(|f| f.folder_id).collect();
+        assert_eq!(junk, vec![3, 8, 10, 11, 13, 17]);
+        // Localized names resolve the trash/spam targets when there is no special-use flag.
+        let plain = vec![folder(1, "INBOX", None), folder(2, "Cestino", None), folder(3, "Posta indesiderata", None)];
+        assert_eq!(imap_target(&plain, &Target::Trash).unwrap().folder_id, 2);
+        assert_eq!(imap_target(&plain, &Target::Spam).unwrap().folder_id, 3);
         assert_eq!(target_arg(&json!({"to": "Junk"})).unwrap(), Target::Spam);
         assert!(target_arg(&json!({"to": "a\nb"})).is_err());
     }
