@@ -5,6 +5,8 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-13
+
 ### Added
 
 - Local mode (`mode = "local"`): Dove on your own computer as your user, for MCP hosts on the same machine, over
@@ -17,6 +19,14 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 - Windows support in the code: keys protected with DPAPI, private directories by access list, the admin channel as a
   per-user named pipe with a Windows account check, and `dove upgrade` replacing the running `dove.exe`.
 - `dove mcp install --client claude-desktop` adds Dove to Claude Desktop's `claude_desktop_config.json`.
+- Windows release: `dove-<tag>-x86_64-pc-windows-msvc.zip` (signed like every other asset), installed with
+  `install.ps1`. Every Windows release is smoke-tested on a Windows runner (install, local mode start and stop, upgrade).
+
+### Fixed
+
+- Index reads enforce their deadline with a SQLite progress handler. The previous timer interrupt was lost when the
+  deadline passed before the first statement started (a slow machine or a slow connection open), and the query then
+  ran without a time limit.
 
 ## [0.4.0] - 2026-11-13
 
@@ -156,7 +166,8 @@ First release.
   release only after verifying its minisign signature. The CLI hints at a new release at most once a day
   (`DOVE_NO_UPDATE_CHECK=1` turns it off); the server never checks for updates.
 
-[Unreleased]: https://github.com/dominik-lenhart/dove/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/dominik-lenhart/dove/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/dominik-lenhart/dove/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/dominik-lenhart/dove/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/dominik-lenhart/dove/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/dominik-lenhart/dove/compare/v0.1.0...v0.2.0
