@@ -169,24 +169,25 @@ async fn read_line_bounded<R: tokio::io::AsyncBufRead + Unpin>(
 
 async fn forward(b: &Bridge, msg: Value, id: Option<Value>) {
     let is_initialize = msg.get("method").and_then(Value::as_str) == Some("initialize");
-    // Every request carries the bearer token: a plain-http loopback port must belong to this user (P1).
-    if let Err(e) = super::loopback::check_server(&b.server) {
-        eprintln!("dove: {e:#}");
-        if let Some(id) = id {
-            let _ = b
-                .out
-                .send(rpc_error(
-                    id,
-                    -32603,
-                    "Dove refused to send the credential: the local server port is not held by this user",
-                ))
-                .await;
-        }
-        return;
-    }
     let body = msg.to_string();
     let mut attempt = 0;
     let resp = loop {
+        // Every attempt carries the bearer token: a plain-http loopback port must belong to this user (P1). Checked
+        // again before each retry, because a retry follows a refused connection, when the port was free to take.
+        if let Err(e) = super::loopback::check_server(&b.server) {
+            eprintln!("dove: {e:#}");
+            if let Some(id) = id {
+                let _ = b
+                    .out
+                    .send(rpc_error(
+                        id,
+                        -32603,
+                        "Dove refused to send the credential: the local server port is not held by this user",
+                    ))
+                    .await;
+            }
+            return;
+        }
         let mut req = b
             .http
             .post(&b.url)
@@ -265,6 +266,30 @@ async fn forward(b: &Bridge, msg: Value, id: Option<Value>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P1: the bridge checks the loopback port's owner before an attempt carries the token. Nothing listening is a
+    /// refusal with its own message, not a connect error that is retried and reported as "could not be reached".
+    #[cfg(any(target_os = "linux", windows))]
+    #[tokio::test]
+    async fn the_bridge_refuses_a_loopback_port_it_cannot_attribute() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let (tx, mut rx) = mpsc::channel(4);
+        let server = format!("http://127.0.0.1:{port}");
+        let b = Bridge {
+            http: remote::http_client().unwrap(),
+            url: format!("{server}/mcp"),
+            server,
+            token: zeroize::Zeroizing::new("dove_test".into()),
+            version: Mutex::new(None),
+            out: tx,
+        };
+        let started = std::time::Instant::now();
+        forward(&b, json!({"jsonrpc": "2.0", "id": 7, "method": "ping"}), Some(json!(7))).await;
+        let reply: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(reply["id"], 7);
+        assert!(reply["error"]["message"].as_str().unwrap().contains("refused to send the credential"), "{reply}");
+        assert!(started.elapsed() < std::time::Duration::from_millis(400), "no connect retries");
+    }
 
     #[tokio::test]
     async fn bounded_line_reader() {
