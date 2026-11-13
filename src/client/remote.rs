@@ -55,6 +55,7 @@ impl Remote {
 
     /// One JSON-RPC request to `/mcp` (stateless Streamable HTTP). Returns the JSON-RPC response object.
     pub async fn rpc(&self, method: &str, params: Value) -> anyhow::Result<Value> {
+        super::loopback::check_server(&self.server)?;
         let body = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
         let resp = self
             .http
@@ -122,6 +123,7 @@ impl Remote {
 
     /// Revokes this connection on the server (RFC 7009 endpoint, possession of the token suffices).
     pub async fn revoke_self(&self) -> anyhow::Result<()> {
+        super::loopback::check_server(&self.server)?;
         let resp = self
             .http
             .post(format!("{}/oauth/dove/revoke", self.server))
@@ -138,6 +140,7 @@ impl Remote {
 
 /// POST `/connect/redeem`. The invitation travels only in the body.
 pub async fn redeem(server: &str, invitation: &str) -> anyhow::Result<Value> {
+    super::loopback::check_server(server)?;
     let http = http_client()?;
     let resp = http
         .post(format!("{server}/connect/redeem"))

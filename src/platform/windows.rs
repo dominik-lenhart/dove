@@ -202,6 +202,56 @@ pub fn process_user_sid(pid: u32) -> io::Result<Sid> {
     token_user(&process_token(pid)?)
 }
 
+/// Listening TCP sockets (IPv4 and IPv6) with their owning process id, for the client's loopback owner check (P1).
+pub fn tcp_listeners() -> io::Result<Vec<(std::net::SocketAddr, u32)>> {
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+    use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GetExtendedTcpTable, MIB_TCP6ROW_OWNER_PID, MIB_TCPROW_OWNER_PID, TCP_TABLE_OWNER_PID_LISTENER,
+    };
+    const AF_INET: u32 = 2;
+    const AF_INET6: u32 = 23;
+    // The table: a u32 entry count, then the rows (aligned like the row type, at most 8 bytes).
+    fn table(af: u32) -> io::Result<Vec<u64>> {
+        let mut size = 0u32;
+        for _ in 0..5 {
+            let mut buf = vec![0u64; (size as usize).div_ceil(8).max(1)];
+            size = (buf.len() * 8) as u32;
+            let rc = unsafe {
+                GetExtendedTcpTable(buf.as_mut_ptr().cast(), &mut size, 0, af, TCP_TABLE_OWNER_PID_LISTENER, 0)
+            };
+            match rc {
+                0 => return Ok(buf),
+                ERROR_INSUFFICIENT_BUFFER => continue,
+                e => return Err(io::Error::from_raw_os_error(e as i32)),
+            }
+        }
+        Err(io::Error::other("the TCP table kept growing"))
+    }
+    // The port is in network order in the low 16 bits.
+    let port = |p: u32| u16::from_be(p as u16);
+    let mut out = Vec::new();
+    let v4 = table(AF_INET)?;
+    let n = unsafe { *(v4.as_ptr() as *const u32) } as usize;
+    // Rows follow the count at offset 4 (MIB_TCPROW_OWNER_PID is 4-byte aligned).
+    let rows = unsafe { (v4.as_ptr() as *const u8).add(4) as *const MIB_TCPROW_OWNER_PID };
+    assert!(4 + n * std::mem::size_of::<MIB_TCPROW_OWNER_PID>() <= v4.len() * 8, "TCP table size");
+    for r in unsafe { std::slice::from_raw_parts(rows, n) } {
+        out.push((
+            SocketAddr::new(Ipv4Addr::from(r.dwLocalAddr.to_ne_bytes()).into(), port(r.dwLocalPort)),
+            r.dwOwningPid,
+        ));
+    }
+    let v6 = table(AF_INET6)?;
+    let n = unsafe { *(v6.as_ptr() as *const u32) } as usize;
+    let rows = unsafe { (v6.as_ptr() as *const u8).add(4) as *const MIB_TCP6ROW_OWNER_PID };
+    assert!(4 + n * std::mem::size_of::<MIB_TCP6ROW_OWNER_PID>() <= v6.len() * 8, "TCP6 table size");
+    for r in unsafe { std::slice::from_raw_parts(rows, n) } {
+        out.push((SocketAddr::new(Ipv6Addr::from(r.ucLocalAddr).into(), port(r.dwLocalPort)), r.dwOwningPid));
+    }
+    Ok(out)
+}
+
 /// Excludes the executable `exe` from Windows Error Reporting for this user (P6): a crash then produces no WER
 /// report or dump that could hold decrypted secrets. Persistent (per-user registry), so calling it at every start is
 /// idempotent. Machine-wide WER settings an administrator made (LocalDumps under HKLM) are outside its reach.
