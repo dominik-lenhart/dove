@@ -2,36 +2,47 @@
 
 # Dove
 
-**Your AI agent's mail access, on your terms.**
+**One MCP server for all your mailboxes.**
 
-A self-hosted MCP server that lets Claude, ChatGPT, Codex or your own agents read, search, organize and draft
-email in your real mailboxes, with a scoped token per agent, drafts instead of silent sends, and nothing ever
-deleted for good.
+Connect your work Gmail, your private iCloud, the info@ mailbox at your hoster and whatever else you have, and let
+Claude, ChatGPT, Codex or your own agents search, read, organize and draft across all of them at once. Self-hosted,
+with a scoped token per agent, drafts instead of silent sends, and nothing ever deleted for good.
 
 [![CI](https://github.com/dominik-lenhart/dove/actions/workflows/ci.yml/badge.svg)](https://github.com/dominik-lenhart/dove/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/dominik-lenhart/dove?sort=semver)](https://github.com/dominik-lenhart/dove/releases)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
-[Quickstart](#quickstart) · [What agents can do](#what-agents-can-do) · [Permissions](#permissions) ·
+[Why Dove](#why-dove) · [Quickstart](#quickstart) · [What agents can do](#what-agents-can-do) · [Permissions](#permissions) ·
 [Security](#security-model) · [Deployment guide](docs/deployment.md)
 
 </div>
 
+## Why Dove
+
+Mail connectors for AI agents usually give the agent one Gmail account. Real mail rarely lives in one place: a work
+Google account, a private iCloud or GMX address, a domain mailbox at Strato or IONOS, a shared support inbox. With one
+connector per provider, an agent sees a slice of your mail and never the whole picture.
+
+Dove connects all of them, Gmail and any IMAP provider side by side, behind one MCP endpoint. One search covers every
+mailbox, the digest sorts them into one list, contacts are ranked across all of them, and replies are drafted in the
+mailbox the thread lives in. You still decide per agent which mailboxes it sees and what it may do in each.
+
 ## What it feels like
 
-> **You:** Anything important in my inbox since yesterday?
+> **You:** Anything important in my inboxes since yesterday?
 >
-> **Agent:** *(calls `digest`)* Three threads need you: Anna's offer for the Berlin project (the attached PDF says
-> 18,400 EUR), a calendar invite from Marco for Thursday 10:00, and your tax advisor asking for two receipts. The
-> other 14 are newsletters and notifications.
+> **Agent:** *(calls `digest` across work, private and info@)* Three threads need you: Anna's offer for the Berlin
+> project in your work mailbox (the attached PDF says 18,400 EUR), a calendar invite from Marco in your private
+> iCloud for Thursday 10:00, and your tax advisor asking for two receipts at info@. The other 14 are newsletters and
+> notifications.
 >
-> **You:** Draft a reply to Anna from my work address: we accept, start date 1 December. And tell me when she answers.
+> **You:** Draft a reply to Anna: we accept, start date 1 December. And tell me when she answers.
 >
-> **Agent:** *(calls `create_draft`, then `create_watch`)* The draft is in your Drafts folder, threaded and with your
-> signature. I'll get an event as soon as Anna replies.
+> **Agent:** *(calls `create_draft`, then `create_watch`)* The draft is in your work Drafts folder, threaded and with
+> your signature. I'll get an event as soon as Anna replies.
 
-You open the draft in Apple Mail, change a word, and press send yourself. The agent never had your password, never
-saw your other mailboxes, and could not have sent or deleted anything.
+You open the draft in Apple Mail, change a word, and press send yourself. The agent never had your passwords, saw only
+the mailboxes its token was granted, and could not have sent or deleted anything.
 
 ## How it works
 
@@ -52,6 +63,8 @@ your normal Drafts folder, so your mail client is the review step.
 
 ## Highlights
 
+- **All your mailboxes at once.** Gmail and any IMAP/SMTP provider behind one endpoint. Search, digest and contacts
+  span every mailbox a token may use; one slow or broken mailbox is reported on its own instead of failing the call.
 - **Works with the mail you have.** Any IMAP/SMTP account with password or app-password login (presets for Strato,
   iCloud and Gmail). Gmail works with just an app password, labels included; the Gmail API through your own Google
   Cloud project stays available. Send-as aliases and per-mailbox signatures.
@@ -100,7 +113,7 @@ On a Tailscale node, `dove tailscale setup` sets `public_url` and publishes exac
 at rest.
 
 ```sh
-dove accounts connect-imap --alias work --email me@example.com
+dove accounts connect-imap work --email me@example.com
 ```
 
 For Gmail, turn on 2-Step Verification, create an app password at <https://myaccount.google.com/apppasswords> and use
@@ -210,6 +223,7 @@ running against a real mailbox since the first release. Before you rely on it:
 | Claude Code and Codex, through `dove mcp install` and direct HTTP | checked |
 | SMTP send behind both gates | checked against real Strato SMTP and the Gmail API |
 | Gmail API | checked against a real account: connect, read, search, digest, organize, drafts, send, watches |
+| Gmail over IMAP (app password) | checked against a real account: connect, labels, search, digest, organize, Trash and back, drafts |
 | ChatGPT and Claude web connectors, iCloud, very large mailboxes, benchmarks | open |
 
 What was checked on real systems is listed in the

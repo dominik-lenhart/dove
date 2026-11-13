@@ -395,9 +395,9 @@ anything; the password is read without echo (or with `--password-stdin` from one
 under the mailbox's key.
 
 ```sh
-dove accounts connect-imap --alias work --email me@example.com            # Strato, iCloud: preset from the domain
-dove accounts connect-imap --alias shop --email info@shop.example --preset strato          # custom domain at Strato
-dove accounts connect-imap --alias own --email me@mail.example \
+dove accounts connect-imap work --email me@example.com            # Strato, iCloud: preset from the domain
+dove accounts connect-imap shop --email info@shop.example --preset strato          # custom domain at Strato
+dove accounts connect-imap own --email me@mail.example \
   --imap-host imap.mail.example --smtp-host smtp.mail.example --smtp-port 587 --smtp-tls starttls
 ```
 
@@ -420,16 +420,22 @@ Gmail and Google Workspace mailboxes connect over IMAP with an app password: no 
 no "unverified app" screen.
 
 1. Turn on 2-Step Verification for the Google account (an app password needs it). Workspace admins must allow it.
-2. Create an app password at <https://myaccount.google.com/apppasswords> (any name, for example `Dove`). Google shows
-   16 letters once; spaces do not matter.
+2. Open <https://myaccount.google.com/apppasswords> directly (the security menu often hides it) and create an app
+   password (any name, for example `Dove`). Google shows 16 letters once; spaces do not matter. "The setting you are
+   looking for is not available for your account" means 2-Step Verification is off, uses only security keys or
+   passkeys (add a phone or authenticator app as a second step), the account is in Advanced Protection, or a
+   Workspace admin blocked app passwords.
 3. In Gmail's settings, under *Forwarding and POP/IMAP*, IMAP is on for most accounts; under *Labels*, keep
    *Show in IMAP* on for **All Mail**, Spam and Trash (Dove refuses to connect without All Mail).
 4. Connect it:
 
 ```sh
-dove accounts connect-imap --alias me --email you@gmail.com                       # gmail.com and googlemail.com
-dove accounts connect-imap --alias work --email you@company.example --preset gmail  # Google Workspace domain
+dove accounts connect-imap me --email you@gmail.com                       # gmail.com and googlemail.com
+dove accounts connect-imap work --email you@company.example --preset gmail  # Google Workspace domain
 ```
+
+If the SMTP check reports that `smtp.gmail.com:465` cannot be reached, your host blocks outgoing port 465 (some
+hosting providers do); add `--smtp-host smtp.gmail.com --smtp-port 587 --smtp-tls starttls`.
 
 Dove recognises Gmail by its IMAP extension (`X-GM-EXT-1`) and puts the mailbox in Gmail mode; `connect-imap` prints
 `"gmail": true`. What differs from other IMAP mailboxes and from the Gmail API path:
@@ -445,6 +451,8 @@ Dove recognises Gmail by its IMAP extension (`X-GM-EXT-1`) and puts the mailbox 
 - Gmail files sent mail in Sent itself, so Dove stores no Sent copy (`save_sent_copy` is off in Gmail mode).
 - Gmail limits IMAP to 15 connections per account and about 2,500 MB of downloads per day; the first index of a large
   mailbox can take a few days on that budget. Thread ids are Dove's own (References and subject), not Gmail's.
+- A label created in Gmail can take a short while to show up in `list_labels`: Gmail refreshes the folder list of an
+  open IMAP connection lazily.
 - `accounts reconnect <alias>` takes a new app password. Revoking the app password at Google stops Dove at once.
 
 ### Send-as aliases and signatures
@@ -768,3 +776,4 @@ Checked in this repository's work, with the tool named; "not verified" means nob
 | Gmail API against a real account (2026-11-13) | A Google Cloud project with an unverified app **In production** and the redirect URI on a `tailscale serve` `.ts.net` name with port; `accounts connect` with the "unverified app" warning; all five scopes granted including `gmail.modify`; `accounts check`; index backfill; `list_labels`, `search_messages`, `digest`, `get_message` (stays unread), `update_messages` (star/unstar), `move_messages` (archive, back to inbox; Trash refused without `delete`), `create_draft`, `update_draft`, `list_drafts`, `delete_draft`, `create_watch` | Refresh-token lifetime over weeks; Workspace accounts |
 | Releases and `send_draft` (2026-11-13) | Tag runs of v0.1.0 and v0.2.0 on GitHub (four targets, minisign signature, attestations, GHCR multi-arch image); a v0.1.0 binary showed the update notice, `dove upgrade --check` exited 10 and `dove upgrade` installed v0.2.0; `send_draft` with `allow_send = true` and a `send` grant, once over Strato SMTP (copy filed in Sent, draft removed) and once over the Gmail API (draft removed, mail in Sent), both delivered to the other mailbox's inbox | Sending to third parties; `send_unknown` handling against a real server |
 | MCP hosts (2026-11-13) | Claude Code 2.1 through `dove mcp install --scope project` (stdio bridge) and through a direct HTTP entry with a bearer token; Codex CLI 0.166 through `dove mcp install` (user scope, and project scope once the project is trusted in Codex); `list_accounts` and `digest` called by the model | ChatGPT and Claude web connectors through the OAuth approval page |
+| Gmail over IMAP with an app password (2026-11-13) | A `@gmail.com` account with 2-Step Verification and an app password, SMTP on 587 STARTTLS (465 is blocked on the test host): `connect-imap` detected Gmail mode and the `\All` folder; the index held each message once with Gmail labels; `list_labels`, `search_messages` (label filter with a modified UTF-7 label `Dove Tést`), `digest` (archived mail left out); `update_messages` (star, read, unread, add and remove a label); `move_messages` archive, inbox, to a label, to Trash and back to the inbox, and from Trash to archive; `create_draft`, `update_draft` (the old revision is gone from All Mail too), `delete_draft` (nothing left in All Mail, Drafts or Trash); no errors in the service log | `send_draft` over Gmail SMTP; IDLE push latency; a large mailbox; a Workspace account; `[Google Mail]` folder prefix |

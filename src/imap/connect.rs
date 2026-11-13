@@ -55,6 +55,10 @@ fn step_error(server: &str, ep: &ServerEndpoint, e: &ImapError) -> anyhow::Error
         ImapError::Tls => {
             anyhow!("{server} TLS failed at {at}: the certificate could not be verified or STARTTLS failed")
         }
+        ImapError::Network | ImapError::NotDispatched if server == "SMTP" && ep.port == 465 => anyhow!(
+            "SMTP connection failed: cannot reach {at}. Some hosting providers block outgoing port 465; try \
+             --smtp-port 587 --smtp-tls starttls"
+        ),
         ImapError::Network | ImapError::NotDispatched => anyhow!("{server} connection failed: cannot reach {at}"),
         ImapError::Capability(c) => anyhow!("{server} server {at} lacks the required capability {c}"),
         ImapError::Missing | ImapError::Protocol(_) | ImapError::OutcomeUnknown => {
@@ -338,4 +342,21 @@ pub async fn check(app: &Arc<App>, account_id: &str, alias: &str) -> Value {
         |r: &Result<(), ImapError>| r.as_ref().err().map(|e| crate::error::ToolError::from(e.clone()).code.as_str());
     json!({ "account": alias, "provider": "imap", "status": status, "imap_ok": imap.is_ok(), "smtp_ok": smtp.is_ok(),
             "imap_error": err(&imap), "smtp_error": err(&smtp) })
+}
+
+#[cfg(test)]
+mod step_error_tests {
+    use super::*;
+    use crate::imap::TlsMode;
+
+    #[test]
+    fn blocked_smtps_port_suggests_submission() {
+        let ep = |port| ServerEndpoint { host: "smtp.example.org".into(), port, tls: TlsMode::Implicit };
+        let hint = step_error("SMTP", &ep(465), &ImapError::Network).to_string();
+        assert!(hint.contains("--smtp-port 587 --smtp-tls starttls"), "{hint}");
+        for (server, port) in [("SMTP", 587), ("IMAP", 465)] {
+            let plain = step_error(server, &ep(port), &ImapError::Network).to_string();
+            assert!(!plain.contains("--smtp-port"), "{plain}");
+        }
+    }
 }

@@ -14,6 +14,11 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
   only (never `\Deleted` or EXPUNGE outside its own drafts) and stores no Sent copy. State store migration 6 widens
   the folder table for the All Mail folder.
 
+### Changed
+
+- `connect-imap` suggests `--smtp-port 587 --smtp-tls starttls` when outgoing port 465 is blocked.
+- README leads with the main point: one MCP server for all your mailboxes (new "Why Dove" section).
+
 ## [0.2.0] - 2026-11-13
 
 ### Added
