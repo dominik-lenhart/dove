@@ -3,8 +3,8 @@
 //! Every byte Dove sends to a mail server is built here from a typed operation. Reads use `BODY.PEEK` only, so
 //! `\Seen` is never set by reading; `UID STORE` sets `\Deleted` and `UID EXPUNGE` runs only for an [`OwnDraftUid`]
 //! or a [`CopiedUid`] (the source of a confirmed copy); other flag changes take typed [`StoreFlag`]s, which cannot
-//! name `\Deleted`; `APPEND` takes a mailbox the session resolved from its Drafts or Sent target. Nothing else can be
-//! produced.
+//! name `\Deleted`; Gmail label changes take typed [`GmLabel`]s (the inbox or an existing user label, PLAN A52);
+//! `APPEND` takes a mailbox the session resolved from its Drafts or Sent target. Nothing else can be produced.
 
 use std::borrow::Cow;
 
@@ -95,6 +95,33 @@ impl Keyword {
     }
 }
 
+/// A Gmail label for `UID STORE +/-X-GM-LABELS` (Gmail mode, PLAN A52): the inbox, or a user label named by the wire
+/// name of a folder the server listed (Dove creates no labels). Other system labels (`\Trash`, `\Spam`, `\Draft`,
+/// ...) cannot be expressed: Trash and Spam are reached only through `UID MOVE`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GmLabel {
+    Inbox,
+    User(UserLabel),
+}
+
+/// The wire name of a user label: not empty, no control characters, and not starting with `\` (Gmail reads a
+/// backslash label as a system label, quoted or not).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserLabel(String);
+
+impl UserLabel {
+    pub fn new(wire: &str) -> Option<Self> {
+        let ok = (1..=1000).contains(&wire.len())
+            && !wire.starts_with('\\')
+            && !wire.chars().any(char::is_control)
+            && !wire.eq_ignore_ascii_case("INBOX");
+        ok.then(|| Self(wire.to_string()))
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 impl StoreFlag {
     fn wire(&self) -> &str {
         match self {
@@ -133,12 +160,15 @@ pub(crate) enum ImapOp<'a> {
     UidFetchMeta {
         uids: &'a [u32],
         modseq: bool,
+        /// Also fetch `X-GM-LABELS` (Gmail mode).
+        gm_labels: bool,
     },
     UidFetchSize(u32),
     UidFetchRaw(u32),
     UidFetchChangedSince {
         modseq: u64,
         vanished: bool,
+        gm_labels: bool,
     },
     Append {
         mailbox: &'a str,
@@ -152,6 +182,12 @@ pub(crate) enum ImapOp<'a> {
         uids: &'a [u32],
         add: bool,
         flags: &'a [StoreFlag],
+    },
+    /// `UID STORE <uids> +X-GM-LABELS (...)` / `-X-GM-LABELS (...)` (Gmail mode).
+    UidStoreGmLabels {
+        uids: &'a [u32],
+        add: bool,
+        labels: &'a [GmLabel],
     },
     /// `UID MOVE <uids> <mailbox>` (RFC 6851).
     UidMove {
@@ -256,20 +292,22 @@ impl<'a> ImapOp<'a> {
             }
             ImapOp::UidSearchAll => ("UID SEARCH", vec![text("UID SEARCH ALL")]),
             ImapOp::UidSearchFrom(uid) => ("UID SEARCH", vec![text(format!("UID SEARCH UID {}:*", uid.max(1)))]),
-            ImapOp::UidFetchMeta { uids, modseq } => (
+            ImapOp::UidFetchMeta { uids, modseq, gm_labels } => (
                 "UID FETCH",
                 vec![text(format!(
-                    "UID FETCH {} (UID FLAGS INTERNALDATE RFC822.SIZE{})",
+                    "UID FETCH {} (UID FLAGS INTERNALDATE RFC822.SIZE{}{})",
                     uid_set(uids),
-                    if modseq { " MODSEQ" } else { "" }
+                    if modseq { " MODSEQ" } else { "" },
+                    if gm_labels { " X-GM-LABELS" } else { "" }
                 ))],
             ),
             ImapOp::UidFetchSize(uid) => ("UID FETCH", vec![text(format!("UID FETCH {uid} (UID RFC822.SIZE)"))]),
             ImapOp::UidFetchRaw(uid) => ("UID FETCH", vec![text(format!("UID FETCH {uid} (UID BODY.PEEK[])"))]),
-            ImapOp::UidFetchChangedSince { modseq, vanished } => (
+            ImapOp::UidFetchChangedSince { modseq, vanished, gm_labels } => (
                 "UID FETCH",
                 vec![text(format!(
-                    "UID FETCH 1:* (UID FLAGS INTERNALDATE RFC822.SIZE MODSEQ) (CHANGEDSINCE {modseq}{})",
+                    "UID FETCH 1:* (UID FLAGS INTERNALDATE RFC822.SIZE MODSEQ{}) (CHANGEDSINCE {modseq}{})",
+                    if gm_labels { " X-GM-LABELS" } else { "" },
                     if vanished { " VANISHED" } else { "" }
                 ))],
             ),
@@ -306,6 +344,21 @@ impl<'a> ImapOp<'a> {
                         f.join(" ")
                     ))],
                 )
+            }
+            ImapOp::UidStoreGmLabels { uids, add, labels } => {
+                let mut p =
+                    vec![text(format!("UID STORE {} {}X-GM-LABELS (", uid_set(uids), if add { '+' } else { '-' }))];
+                for (i, l) in labels.iter().enumerate() {
+                    if i > 0 {
+                        p.push(text(" "));
+                    }
+                    p.push(match l {
+                        GmLabel::Inbox => text("\\Inbox"),
+                        GmLabel::User(u) => mailbox(u.as_str()),
+                    });
+                }
+                p.push(text(")"));
+                ("UID STORE", p)
             }
             ImapOp::UidMove { uids, mailbox: m } => {
                 ("UID MOVE", vec![text(format!("UID MOVE {} ", uid_set(uids))), mailbox(m)])
@@ -436,9 +489,10 @@ mod tests {
             ImapOp::UidCopy { .. } => 23,
             ImapOp::UidStoreDeletedCopied(_) => 24,
             ImapOp::UidExpungeCopied(_) => 25,
+            ImapOp::UidStoreGmLabels { .. } => 26,
         }
     }
-    const VARIANTS: usize = 26;
+    const VARIANTS: usize = 27;
 
     fn wire(c: &Command<'_>) -> String {
         c.parts
@@ -458,6 +512,11 @@ mod tests {
         let uids = [3, 1, 2, 9];
         let kw = Keyword::new("$Follow-up").unwrap();
         let flags = [StoreFlag::Seen, StoreFlag::Flagged, StoreFlag::Keyword(kw)];
+        let gm = [
+            GmLabel::Inbox,
+            GmLabel::User(UserLabel::new("Work").unwrap()),
+            GmLabel::User(UserLabel::new("K\u{e4}se \"x\"").unwrap()),
+        ];
         let samples = vec![
             ImapOp::Capability,
             ImapOp::Login { username: "u", password: "p\"a\\\u{df} w" },
@@ -470,15 +529,19 @@ mod tests {
             ImapOp::Select { mailbox: "INBOX", readonly: false, condstore: false },
             ImapOp::UidSearchAll,
             ImapOp::UidSearchFrom(5),
-            ImapOp::UidFetchMeta { uids: &uids, modseq: true },
+            ImapOp::UidFetchMeta { uids: &uids, modseq: true, gm_labels: false },
+            ImapOp::UidFetchMeta { uids: &uids, modseq: false, gm_labels: true },
             ImapOp::UidFetchSize(4),
             ImapOp::UidFetchRaw(4),
-            ImapOp::UidFetchChangedSince { modseq: 9, vanished: true },
+            ImapOp::UidFetchChangedSince { modseq: 9, vanished: true, gm_labels: false },
+            ImapOp::UidFetchChangedSince { modseq: 9, vanished: false, gm_labels: true },
             ImapOp::Append { mailbox: "Drafts", flags: &[AppendFlag::Draft, AppendFlag::Seen], message: b"x" },
             ImapOp::UidStoreDeleted(&own),
             ImapOp::UidExpunge(&own),
             ImapOp::UidStoreFlags { uids: &uids, add: true, flags: &flags },
             ImapOp::UidStoreFlags { uids: &uids, add: false, flags: &flags[..1] },
+            ImapOp::UidStoreGmLabels { uids: &uids, add: true, labels: &gm },
+            ImapOp::UidStoreGmLabels { uids: &uids, add: false, labels: &gm[..1] },
             ImapOp::UidMove { uids: &uids, mailbox: "Trash" },
             ImapOp::UidCopy { uids: &uids, mailbox: "Gel&APY-scht" },
             ImapOp::UidStoreDeletedCopied(&copied),
@@ -511,6 +574,12 @@ mod tests {
                             || line == "UID STORE 5:6,8 +FLAGS.SILENT (\\Deleted)",
                         "{line}"
                     );
+                } else if line.contains("X-GM-LABELS") {
+                    // Label changes carry typed labels only: never a flag, never a system label but the inbox.
+                    assert!(line.contains(" +X-GM-LABELS (") || line.contains(" -X-GM-LABELS ("), "{line}");
+                    assert!(!line.contains("FLAGS"), "{line}");
+                    let rest = line.split_once("X-GM-LABELS (").unwrap().1;
+                    assert!(!rest.replace("\\Inbox", "").contains('\\'), "{line}");
                 } else {
                     assert!(line.contains("FLAGS.SILENT ("), "{line}");
                 }
@@ -532,6 +601,32 @@ mod tests {
             "UID STORE 1:3,9 +FLAGS.SILENT (\\Seen \\Flagged $Follow-up)"
         );
         assert_eq!(wire(&ImapOp::UidMove { uids: &[4], mailbox: "Trash" }.render()), "UID MOVE 4 \"Trash\"");
+        assert_eq!(
+            wire(&ImapOp::UidStoreGmLabels { uids: &[4, 5], add: true, labels: &gm }.render()),
+            "UID STORE 4:5 +X-GM-LABELS (\\Inbox \"Work\" {9})"
+        );
+        assert_eq!(
+            wire(&ImapOp::UidStoreGmLabels { uids: &[4], add: false, labels: &gm[..1] }.render()),
+            "UID STORE 4 -X-GM-LABELS (\\Inbox)"
+        );
+        assert_eq!(
+            wire(&ImapOp::UidFetchMeta { uids: &[4], modseq: true, gm_labels: true }.render()),
+            "UID FETCH 4 (UID FLAGS INTERNALDATE RFC822.SIZE MODSEQ X-GM-LABELS)"
+        );
+    }
+
+    #[test]
+    fn user_labels_cannot_name_system_labels() {
+        for bad in ["\\Trash", "\\Inbox", "INBOX", "inbox", "", "a\nb", "a\rb", &"x".repeat(1001)] {
+            assert!(UserLabel::new(bad).is_none(), "{bad:?}");
+        }
+        for good in ["Work", "Projekte/Kunden", "K&AOQ-se", "[Gmail]x", "a \"b\""] {
+            assert!(UserLabel::new(good).is_some(), "{good}");
+        }
+        // Quotes and backslashes inside a label are escaped, never closing the list.
+        let l = [GmLabel::User(UserLabel::new("a\") b").unwrap())];
+        let c = ImapOp::UidStoreGmLabels { uids: &[1], add: true, labels: &l }.render();
+        assert_eq!(wire(&c), "UID STORE 1 +X-GM-LABELS (\"a\\\") b\")");
     }
 
     #[test]

@@ -23,12 +23,19 @@ pub struct ImapSettings {
     #[serde(default)]
     pub smtp_username: Option<String>,
     pub save_sent_copy: bool,
+    /// Gmail mode (PLAN A52): the server advertised `X-GM-EXT-1` at connect. Fixed at connect; `reconnect` keeps it.
+    /// The index then reads only All Mail, Spam and Trash and takes labels from `X-GM-LABELS`.
+    #[serde(default)]
+    pub gmail: bool,
     /// Wire name of the Drafts folder (from `imap_folders`).
     #[serde(skip)]
     pub drafts_folder: Option<String>,
     /// Wire name of the Sent folder, if any.
     #[serde(skip)]
     pub sent_folder: Option<String>,
+    /// Wire name of the `\All` folder (Gmail's All Mail), if any.
+    #[serde(skip)]
+    pub all_folder: Option<String>,
     /// Credential generation the password belongs to (fences reauth marking).
     #[serde(skip)]
     pub generation: i64,
@@ -179,6 +186,7 @@ pub async fn load(app: &App, account_id: &str) -> Result<(ImapSettings, Credenti
     let password = app.vault.open_password(account_id, sealed).map_err(internal_from)?;
     settings.drafts_folder = folders.iter().find(|f| f.special == Some(Special::Drafts)).map(|f| f.name.clone());
     settings.sent_folder = folders.iter().find(|f| f.special == Some(Special::Sent)).map(|f| f.name.clone());
+    settings.all_folder = folders.iter().find(|f| f.special == Some(Special::All)).map(|f| f.name.clone());
     settings.generation = row.generation;
     settings.alias = row.alias;
     settings.email = row.email;
@@ -238,11 +246,12 @@ where
     F: for<'s> FnOnce(&'s mut ImapSession) -> SessionFuture<'s, T>,
 {
     let (settings, creds) = load(app, account_id).await?;
-    let (drafts, sent) = (settings.drafts_folder.clone(), settings.sent_folder.clone());
+    let (drafts, sent, gmail) = (settings.drafts_folder.clone(), settings.sent_folder.clone(), settings.gmail);
     let r = app
         .imap
         .with_session_prio(account_id, &settings.imap, &creds, prio, move |s| {
             s.set_append_targets(drafts, sent);
+            s.set_gmail(gmail);
             f(s)
         })
         .await;

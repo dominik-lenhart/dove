@@ -11,8 +11,12 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use zeroize::Zeroizing;
 
-use super::ops::{AppendFlag, IMAP_VERBS, ImapOp, Part, StoreFlag};
+use super::ops::{AppendFlag, GmLabel, IMAP_VERBS, ImapOp, Part, StoreFlag};
 use super::{Credentials, ImapConnector, ImapError, Io, ServerEndpoint, TlsMode, utf7};
+
+/// Capability of Gmail's IMAP extensions (`X-GM-LABELS`, ...); its presence at connect puts an account in Gmail mode
+/// (PLAN A52).
+pub const GMAIL_CAP: &str = "X-GM-EXT-1";
 
 const MAX_LINE: usize = 64 * 1024;
 /// Most UIDs kept from the `SEARCH` responses of one command.
@@ -43,6 +47,8 @@ pub enum Special {
     Sent,
     Junk,
     Trash,
+    /// Gmail's All Mail (`\All`, RFC 6154): every message except Spam and Trash.
+    All,
 }
 
 impl Special {
@@ -52,6 +58,7 @@ impl Special {
             Special::Sent => "sent",
             Special::Junk => "junk",
             Special::Trash => "trash",
+            Special::All => "all",
         }
     }
     pub fn parse(s: &str) -> Option<Self> {
@@ -60,6 +67,7 @@ impl Special {
             "sent" => Some(Special::Sent),
             "junk" => Some(Special::Junk),
             "trash" => Some(Special::Trash),
+            "all" => Some(Special::All),
             _ => None,
         }
     }
@@ -98,6 +106,8 @@ pub struct FetchedMeta {
     pub internal_date_s: i64,
     pub size: u64,
     pub modseq: Option<u64>,
+    /// Gmail labels (`X-GM-LABELS`) as the server spells them (`\\Inbox`, modified UTF-7 user labels), when fetched.
+    pub gm_labels: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -651,6 +661,8 @@ pub struct ImapSession {
     sent: Option<String>,
     selected: Option<(String, bool, FolderStatus)>,
     qresync: bool,
+    /// Gmail mode (from the account settings): FETCHes add `X-GM-LABELS`, moves never fall back to COPY + EXPUNGE.
+    gmail: bool,
     /// Set while an `IDLE` command is in progress (between [`ImapSession::idle_start`] and its completion).
     idle: Option<IdleState>,
 }
@@ -799,6 +811,7 @@ impl ImapSession {
             sent: None,
             selected: None,
             qresync: false,
+            gmail: false,
             idle: None,
         };
         if connector.is_plaintext() || ep.tls == TlsMode::Implicit {
@@ -881,6 +894,20 @@ impl ImapSession {
 
     pub fn has_cap(&self, cap: &str) -> bool {
         self.caps.iter().any(|c| c.eq_ignore_ascii_case(cap))
+    }
+
+    /// Puts the session in Gmail mode (the account's `ImapSettings.gmail`).
+    pub fn set_gmail(&mut self, on: bool) {
+        self.gmail = on;
+    }
+
+    pub fn is_gmail(&self) -> bool {
+        self.gmail
+    }
+
+    /// Whether FETCHes ask for `X-GM-LABELS`: Gmail mode on a server that still offers the extension.
+    fn gm_labels(&self) -> bool {
+        self.gmail && self.has_cap(GMAIL_CAP)
     }
 
     fn condstore(&self) -> bool {
@@ -1088,7 +1115,12 @@ impl ImapSession {
                 col.mem = before;
                 col.charge(
                     std::mem::size_of::<(FetchedMeta, bool)>()
-                        + meta.flags.iter().map(|f| TOK_COST + f.len()).sum::<usize>(),
+                        + meta
+                            .flags
+                            .iter()
+                            .chain(meta.gm_labels.iter().flatten())
+                            .map(|f| TOK_COST + f.len())
+                            .sum::<usize>(),
                 )?;
                 col.metas.get_or_insert_default().push((meta, has_size));
                 return Ok(Resp::Untagged);
@@ -1153,6 +1185,7 @@ impl ImapSession {
                 "\\sent" => Some(Special::Sent),
                 "\\junk" => Some(Special::Junk),
                 "\\trash" => Some(Special::Trash),
+                "\\all" => Some(Special::All),
                 _ => None,
             });
             let delimiter = if delim.is_nil() { None } else { delim.text().and_then(|d| d.chars().next()) };
@@ -1258,6 +1291,10 @@ impl ImapSession {
                 }
                 ("RFC822.SIZE", v) => m.size = v.num().unwrap_or(0),
                 ("MODSEQ", Tok::List(l)) => m.modseq = l.first().and_then(Tok::num),
+                // Atoms (`\\Inbox`) or strings (`"\\\\Inbox"`, `"My label"`, literals): the text either way.
+                ("X-GM-LABELS", Tok::List(l)) => {
+                    m.gm_labels = Some(l.iter().filter_map(Tok::text).map(Cow::into_owned).collect())
+                }
                 _ => {}
             }
         }
@@ -1270,8 +1307,8 @@ impl ImapSession {
         if uids.is_empty() {
             return Ok(Vec::new());
         }
-        let modseq = self.condstore();
-        let d = self.simple(ImapOp::UidFetchMeta { uids, modseq }, SMALL_LITERAL).await?;
+        let (modseq, gm_labels) = (self.condstore(), self.gm_labels());
+        let d = self.simple(ImapOp::UidFetchMeta { uids, modseq, gm_labels }, SMALL_LITERAL).await?;
         let mut out: Vec<FetchedMeta> = d
             .metas
             .into_iter()
@@ -1320,8 +1357,8 @@ impl ImapSession {
         if !self.condstore() {
             return Err(ImapError::Capability("CONDSTORE"));
         }
-        let vanished = self.qresync;
-        let d = self.simple(ImapOp::UidFetchChangedSince { modseq, vanished }, SMALL_LITERAL).await?;
+        let (vanished, gm_labels) = (self.qresync, self.gm_labels());
+        let d = self.simple(ImapOp::UidFetchChangedSince { modseq, vanished, gm_labels }, SMALL_LITERAL).await?;
         Ok(Changes {
             changed: d.metas.into_iter().map(|(m, _)| m).collect(),
             vanished: if vanished { d.vanished } else { None },
@@ -1412,10 +1449,40 @@ impl ImapSession {
         self.fetch_meta(&present).await
     }
 
+    /// Adds and removes Gmail labels (`X-GM-LABELS`) on `uids` of `folder` (Gmail mode) and returns the current
+    /// metadata of the UIDs that exist. The message ids do not change.
+    pub async fn store_gm_labels(
+        &mut self,
+        folder: &str,
+        uidvalidity: u32,
+        uids: &[u32],
+        add: &[GmLabel],
+        remove: &[GmLabel],
+    ) -> Result<Vec<FetchedMeta>, ImapError> {
+        if !self.gm_labels() {
+            return Err(ImapError::Capability("X-GM-EXT-1"));
+        }
+        self.select_checked(folder, uidvalidity).await?;
+        let present: Vec<u32> = self.fetch_meta(uids).await?.into_iter().map(|m| m.uid).collect();
+        if present.is_empty() {
+            return Ok(Vec::new());
+        }
+        if !add.is_empty() {
+            self.simple(ImapOp::UidStoreGmLabels { uids: &present, add: true, labels: add }, SMALL_LITERAL).await?;
+        }
+        if !remove.is_empty() {
+            self.simple(ImapOp::UidStoreGmLabels { uids: &present, add: false, labels: remove }, SMALL_LITERAL).await?;
+        }
+        self.fetch_meta(&present).await
+    }
+
     /// Moves `uids` of `src` to `dest`: `UID MOVE` (RFC 6851) when offered, else `UID COPY`, then `\Deleted` and
     /// `UID EXPUNGE` of exactly the sources the server's `COPYUID` confirmed as copied (a [`CopiedUid`] each).
     /// Without a confirmation nothing is flagged or expunged. A lost connection after the command was sent is
     /// [`ImapError::OutcomeUnknown`].
+    ///
+    /// In Gmail mode only `UID MOVE` is used: there `\Deleted` + `EXPUNGE` can delete a message for good (depending
+    /// on the account's settings), so a server without `MOVE` is a [`ImapError::Capability`] error before any command.
     pub async fn move_uids(
         &mut self,
         src: &str,
@@ -1423,6 +1490,9 @@ impl ImapSession {
         uids: &[u32],
         dest: &str,
     ) -> Result<MoveOutcome, ImapError> {
+        if self.gmail && !self.has_cap("MOVE") {
+            return Err(ImapError::Capability("MOVE"));
+        }
         self.select_checked(src, uidvalidity).await?;
         let present: Vec<u32> = self.fetch_meta(uids).await?.into_iter().map(|m| m.uid).collect();
         if present.is_empty() {
@@ -1489,6 +1559,9 @@ impl ImapSession {
     /// Flags the confirmed copy sources `\Deleted` and expunges exactly them, in their own folder only.
     async fn expunge_copied(&mut self, copied: &[CopiedUid]) -> Result<(), ImapError> {
         let Some(first) = copied.first() else { return Ok(()) };
+        if self.gmail {
+            return Err(ImapError::Protocol("no expunge outside Drafts in Gmail mode"));
+        }
         let (name, readonly, st) = self.selected()?.clone();
         if readonly
             || copied.iter().any(|c| c.folder != name || c.uidvalidity != st.uidvalidity || c.folder != first.folder)
@@ -1690,6 +1763,7 @@ mod tests {
             sent: None,
             selected: None,
             qresync: false,
+            gmail: false,
             idle: None,
         }
     }
@@ -1894,6 +1968,47 @@ mod tests {
         assert_eq!(ch.changed.len(), n as usize);
         assert_eq!(ch.changed[n as usize - 1].flags, vec!["\\Seen".to_string()]);
         assert_eq!(ch.changed[0].modseq, Some(5));
+    }
+
+    /// Gmail labels arrive as atoms (`\Inbox`), quoted strings with escapes and literals; all become their text. Without
+    /// Gmail mode the item is not requested.
+    #[tokio::test]
+    async fn gmail_labels_are_parsed_in_every_form() {
+        let resp = b"* 1 FETCH (UID 7 FLAGS (\\Seen) RFC822.SIZE 10 MODSEQ (3) X-GM-LABELS (\\Inbox \"\\\\Important\" \"My label\" {9}\r\nK&AOQ-se/ Work))\r\nd1 OK done\r\n";
+        let mut s = answering(resp.to_vec());
+        s.caps.push(GMAIL_CAP.into());
+        s.set_gmail(true);
+        assert!(s.gm_labels());
+        let m = s.fetch_meta(&[7]).await.unwrap();
+        assert_eq!(m.len(), 1);
+        assert_eq!(
+            m[0].gm_labels.as_deref(),
+            Some(
+                &["\\Inbox".to_string(), "\\Important".into(), "My label".into(), "K&AOQ-se/".into(), "Work".into()][..]
+            )
+        );
+        // Gmail mode on a server without the extension (or the reverse) asks for no labels.
+        let mut s = answering(Vec::new());
+        s.set_gmail(true);
+        assert!(!s.gm_labels());
+        s.caps.push(GMAIL_CAP.into());
+        s.set_gmail(false);
+        assert!(!s.gm_labels());
+    }
+
+    /// In Gmail mode a server without MOVE is refused before any command: never the COPY + `\Deleted` + EXPUNGE
+    /// fallback, and the confirmed-copy expunge refuses to run at all.
+    #[tokio::test]
+    async fn gmail_mode_never_falls_back_to_copy_and_expunge() {
+        let mut s = answering(Vec::new());
+        s.caps.push(GMAIL_CAP.into());
+        s.set_gmail(true);
+        assert_eq!(s.move_uids("[Gmail]/All Mail", 1, &[3], "[Gmail]/Trash").await, Err(ImapError::Capability("MOVE")));
+        // Even with the copy's folder selected read-write.
+        s.selected = Some(("INBOX".into(), false, FolderStatus { uidvalidity: 1, ..Default::default() }));
+        let copied = CopiedUid::for_ops_tests(&[3]);
+        assert!(matches!(s.expunge_copied(&copied).await, Err(ImapError::Protocol(_))));
+        assert_eq!(s.tag, 0, "nothing was sent");
     }
 
     /// A stream that fails any write of exactly `fail_on` (reads come from the duplex peer).
