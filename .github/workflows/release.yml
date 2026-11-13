@@ -58,7 +58,7 @@ jobs:
           set -eu
           # The section "## [VERSION]"; a prerelease may fall back to "## [Unreleased]".
           section() {
-            awk -v h="## [$1]" 'index($0, h) == 1 {p=1; next} /^## \[/{p=0} p' CHANGELOG.md
+            awk -v h="## [$1]" 'index($0, h) == 1 {p=1; next} /^## \[/{p=0} /^\[[^]]*\]: /{next} p' CHANGELOG.md
           }
           notes=$(section "$VERSION")
           if [ -z "$(printf '%s' "$notes" | tr -d '[:space:]')" ]; then
