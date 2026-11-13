@@ -530,8 +530,8 @@ async fn doctor(app: &Arc<App>) -> Value {
         verify.as_ref().is_ok_and(|v| v.ok),
         verify.map(|v| format!("{} records", v.records)).unwrap_or_default(),
     );
-    // Public URL TLS check: a HEAD to /healthz through the proxy.
-    let health = format!("{}/healthz", app.cfg.public_base());
+    // Public URL TLS check: a public path through the proxy. Not /healthz, which the proxy allowlists never forward.
+    let health = format!("{}{}", app.cfg.public_base(), PUBLIC_PROBE_PATH);
     let tls =
         reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).build().map(|c| c.get(&health).send());
     let tls_ok = match tls {
@@ -545,9 +545,17 @@ async fn doctor(app: &Arc<App>) -> Value {
     json!(checks)
 }
 
+/// The path `dove doctor` fetches through the public URL: public in every proxy allowlist and always 200.
+const PUBLIC_PROBE_PATH: &str = "/.well-known/oauth-protected-resource";
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn doctor_probe_path_is_public() {
+        assert!(crate::tailscale::PUBLIC_PATHS.contains(&PUBLIC_PROBE_PATH), "{PUBLIC_PROBE_PATH}");
+    }
 
     /// A request arriving in small pieces is read into the one buffer allocated up front (no reallocation copies), up
     /// to its newline; an over-long one is reported as longer than the limit.
