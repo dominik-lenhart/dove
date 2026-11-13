@@ -12,3 +12,5 @@
 *.age
 /state-backup*.db
 .claude/worktrees/
+AGENTS.local.md
+CLAUDE.local.md

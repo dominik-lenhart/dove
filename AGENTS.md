@@ -2,6 +2,8 @@
 
 Guide for coding agents working on Dove. Keep it current: when you learn something durable about this repo
 (a pitfall, a command that works, a decision), add it under "Learnings" in the same commit as the change.
+Notes about one particular machine or deployment (build wrappers, hostnames, ports, local users) go in
+`AGENTS.local.md` instead: it is gitignored, so read it when it exists and never commit it.
 
 ## What this is
 
@@ -11,13 +13,10 @@ Spec: `docs/spec.md`. Plan, status and assumptions: `docs/PLAN.md`. Rust, one pa
 
 ## Commands
 
-The host is shared. Use `heavy` for full builds and the full test suite; keep jobs low.
-
 ```sh
-export PATH=$HOME/.cargo/bin:$PATH
-CARGO_BUILD_JOBS=3 heavy cargo build              # full build
-CARGO_BUILD_JOBS=3 heavy cargo test -- --test-threads=2   # full suite
-cargo test --lib vault::                          # one module, no heavy needed
+cargo build                                       # full build
+cargo test -- --test-threads=2                    # full suite
+cargo test --lib vault::                          # one module
 cargo test --test <file>                          # one integration test file
 cargo clippy --all-targets -- -D warnings
 cargo fmt
@@ -75,9 +74,8 @@ cargo fmt
   definitive (safe to retry), 5xx / lost response / unreadable body is `outcome_unknown`. Never classify by
   matching error message text.
 - 2026-11-12: AC19 runs the real CLI as `nobody` (`cargo test --test agent_shell -- --ignored`, needs passwordless
-  `sudo -n -u nobody`). On this dev host agent sessions run as uid 1000 with passwordless sudo, so a deployment
-  here would give agents admin rights (operator uid or root). Production needs an agent uid that is neither the
-  operator uid nor able to sudo.
+  `sudo -n -u nobody`). Production needs an agent uid that is neither the operator uid nor able to sudo: an agent
+  running as the operator or with sudo has admin rights.
 - 2026-11-12: Do not set `PrivateUsers=` in the systemd unit: inside a user namespace `SO_PEERCRED` reports the
   operator uid as unmapped, and the admin socket's peer check rejects the operator. `systemd-analyze verify` only
   checks syntax; to test sandbox directives run the binary as `systemd-run --user` (the user manager cannot apply
@@ -137,7 +135,7 @@ cargo fmt
 - 2026-11-12: serde never borrows through `Option<Cow<'a, str>>` (it copies even with `#[serde(borrow)]`); use a
   plain `Cow<'a, str>` with `#[serde(default)]` or `&'a str`. Memory claims are checked with the counting global
   allocator in `tests/ingest_memory.rs` (one test per binary, the counter is process-wide); its measurement test is
-  `--ignored`. Do not build `--release` ad hoc: it is a full build and belongs under `heavy`.
+  `--ignored`. Do not build `--release` ad hoc: it is a full build.
 - 2026-11-12: First real systemd install (systemd 259): `LoadCredential=` copies are 0440 root:root with an ACL for the
   service user, so a strict "no group bits" secret check rejects them; `secrets::secret_mode_ok` allows that one case
   (A44). Test unit directives with `sudo systemd-run --wait --pipe -p User=dove -p LoadCredential=...` before
@@ -256,8 +254,8 @@ cargo fmt
   must be a string literal or `AUTHORIZE_PATH`). Tests fake `tailscale` with a shell script that keeps serve state in
   files (`tests/tailscale_e2e.rs`); write it once per process (writing an executable per test races with other tests'
   forks, ETXTBSY) and keep `/usr/bin:/bin` in the child's PATH (the script needs `cat`, `awk`). Never run the real
-  `tailscale serve`/`funnel` here: the host's Tailscale serves other things (read-only `status --json` and
-  `serve status --json` are fine). Real node JSON: `Self.DNSName` has a trailing dot, `CertDomains` empty means HTTPS
+  `tailscale serve`/`funnel` from tests or while developing: it changes the machine's Tailscale config (read-only
+  `status --json` and `serve status --json` are fine). Real node JSON: `Self.DNSName` has a trailing dot, `CertDomains` empty means HTTPS
   is off, `Self.CapMap` has a `funnel` key when Funnel is allowed, serve state keys are `host:port`.
 
 - 2026-11-13: Watches (`src/watch/`, `src/tools/watches.rs`): events come from one hook,
@@ -320,10 +318,6 @@ cargo fmt
 - 2026-11-13: CI's gitleaks scans the whole git history, and a fixed UUID literal such as `"request_key": "4b0c..."` trips
   its `generic-api-key` rule. Use `uuid::Uuid::new_v4()` in tests; a finding already in history needs a fingerprint line
   in `.gitleaksignore` (`<commit>:<file>:<rule>:<line>`). Check locally with the docker command above before pushing.
-- 2026-11-13: The production host blocks outgoing port 465; SMTP to Gmail and Strato runs on 587 STARTTLS here. Dove on
-  this host is public at `https://dove.verge-one.com` through Angie (`deploy/nginx/dove-restricted.conf`, files under
-  `/etc/angie/`, allowlist timer `dove-allowlist.timer`); `/mcp` and the OAuth machine endpoints answer only Claude's and
-  ChatGPT's ranges plus the host's own IPs. The tailscale serve on 43395 is gone; 43361 and 43380 belong to other services.
 - 2026-11-13: Packaging lives in `deploy/` (`deb/`, `homebrew/`, `release/`) and `.github/workflows/release*.yml`. The Homebrew
   formula is generated (`deploy/homebrew/render.sh`, tested in `tests/packaging.rs`, which runs the real script) and pushed to
   `dominik-lenhart/homebrew-tap` by the `homebrew` release job with a write deploy key (secret `HOMEBREW_TAP_DEPLOY_KEY`); never
