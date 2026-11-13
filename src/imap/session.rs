@@ -11,7 +11,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use zeroize::Zeroizing;
 
-use super::ops::{AppendFlag, IMAP_VERBS, ImapOp, Part};
+use super::ops::{AppendFlag, IMAP_VERBS, ImapOp, Part, StoreFlag};
 use super::{Credentials, ImapConnector, ImapError, Io, ServerEndpoint, TlsMode, utf7};
 
 const MAX_LINE: usize = 64 * 1024;
@@ -169,6 +169,81 @@ impl OwnDraftUid {
     pub fn uidvalidity(&self) -> u32 {
         self.uidvalidity
     }
+}
+
+/// The source UID of a message whose copy the server confirmed with `COPYUID` during a move on a server without
+/// `MOVE`: besides [`OwnDraftUid`], the only message Dove may flag `\Deleted` and expunge. It names the folder and
+/// UIDVALIDITY it was copied from; the session refuses it anywhere else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopiedUid {
+    folder: String,
+    uidvalidity: u32,
+    uid: u32,
+}
+
+impl CopiedUid {
+    /// Only [`ImapSession::move_uids`] may call this, with a UID the server's `COPYUID` response listed as copied and
+    /// that Dove asked to copy (`tests/imap_organize_e2e.rs` enforces the single caller).
+    fn confirmed_by_copyuid(folder: &str, uidvalidity: u32, uid: u32) -> Self {
+        Self { folder: folder.to_string(), uidvalidity, uid }
+    }
+    pub fn uid(&self) -> u32 {
+        self.uid
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_ops_tests(uids: &[u32]) -> Vec<Self> {
+        uids.iter().map(|u| Self { folder: "INBOX".into(), uidvalidity: 1, uid: *u }).collect()
+    }
+}
+
+/// What a move did in one source folder. UIDs Dove asked for that appear in neither list were not moved (they did
+/// not exist, or the server did not copy them).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MoveOutcome {
+    /// UIDVALIDITY of the destination from `COPYUID`, when reported.
+    pub dest_uidvalidity: Option<u32>,
+    /// (source UID, destination UID when reported).
+    pub moved: Vec<(u32, Option<u32>)>,
+    /// Copied (server without MOVE), but the original was not removed: the copy was not confirmed by `COPYUID`, or
+    /// flagging or expunging the original failed.
+    pub copied_kept: Vec<(u32, Option<u32>)>,
+}
+
+/// Parses a `COPYUID <uidvalidity> <source set> <destination set>` response code into (uidvalidity, pairs). Sets are
+/// expanded in the order given, at most `max` UIDs each; any malformed or oversized code is `None`.
+fn parse_copyuid(code: &[Tok], max: usize) -> Option<(u32, Vec<(u32, u32)>)> {
+    if !code.first().and_then(Tok::atom).is_some_and(|a| a.eq_ignore_ascii_case("COPYUID")) {
+        return None;
+    }
+    let v: u32 = code.get(1)?.num()?;
+    let expand = |t: &Tok| -> Option<Vec<u32>> {
+        let mut out = Vec::new();
+        for part in t.atom()?.split(',') {
+            let (a, b) = match part.split_once(':') {
+                Some((a, b)) => (a.parse::<u32>().ok()?, b.parse::<u32>().ok()?),
+                None => {
+                    let n = part.parse::<u32>().ok()?;
+                    (n, n)
+                }
+            };
+            // Width is checked before expanding: a hostile `1:4294967295` must not allocate.
+            if a == 0 || b == 0 || out.len() + a.abs_diff(b) as usize + 1 > max {
+                return None;
+            }
+            if a <= b {
+                out.extend(a..=b);
+            } else {
+                out.extend((b..=a).rev());
+            }
+        }
+        Some(out)
+    };
+    let (src, dst) = (expand(code.get(2)?)?, expand(code.get(3)?)?);
+    if src.len() != dst.len() || v == 0 {
+        return None;
+    }
+    Some((v, src.into_iter().zip(dst).collect()))
 }
 
 // ------------------------------------------------------------------ response model
@@ -1302,6 +1377,129 @@ impl ImapSession {
         Ok(())
     }
 
+    // ------------------------------------------------------------------ organize
+
+    /// Selects `folder` read-write and checks its UIDVALIDITY (a change is [`ImapError::Missing`]).
+    async fn select_checked(&mut self, folder: &str, uidvalidity: u32) -> Result<(), ImapError> {
+        let st = self.select(folder, false).await?;
+        if st.uidvalidity != uidvalidity {
+            return Err(ImapError::Missing);
+        }
+        Ok(())
+    }
+
+    /// Adds and removes organize flags on `uids` of `folder` and returns the current metadata of the UIDs that exist
+    /// (the others are skipped by the server and absent from the result).
+    pub async fn store_flags(
+        &mut self,
+        folder: &str,
+        uidvalidity: u32,
+        uids: &[u32],
+        add: &[StoreFlag],
+        remove: &[StoreFlag],
+    ) -> Result<Vec<FetchedMeta>, ImapError> {
+        self.select_checked(folder, uidvalidity).await?;
+        let present: Vec<u32> = self.fetch_meta(uids).await?.into_iter().map(|m| m.uid).collect();
+        if present.is_empty() {
+            return Ok(Vec::new());
+        }
+        if !add.is_empty() {
+            self.simple(ImapOp::UidStoreFlags { uids: &present, add: true, flags: add }, SMALL_LITERAL).await?;
+        }
+        if !remove.is_empty() {
+            self.simple(ImapOp::UidStoreFlags { uids: &present, add: false, flags: remove }, SMALL_LITERAL).await?;
+        }
+        self.fetch_meta(&present).await
+    }
+
+    /// Moves `uids` of `src` to `dest`: `UID MOVE` (RFC 6851) when offered, else `UID COPY`, then `\Deleted` and
+    /// `UID EXPUNGE` of exactly the sources the server's `COPYUID` confirmed as copied (a [`CopiedUid`] each).
+    /// Without a confirmation nothing is flagged or expunged. A lost connection after the command was sent is
+    /// [`ImapError::OutcomeUnknown`].
+    pub async fn move_uids(
+        &mut self,
+        src: &str,
+        uidvalidity: u32,
+        uids: &[u32],
+        dest: &str,
+    ) -> Result<MoveOutcome, ImapError> {
+        self.select_checked(src, uidvalidity).await?;
+        let present: Vec<u32> = self.fetch_meta(uids).await?.into_iter().map(|m| m.uid).collect();
+        if present.is_empty() {
+            return Ok(MoveOutcome::default());
+        }
+        let use_move = self.has_cap("MOVE");
+        let op = if use_move {
+            ImapOp::UidMove { uids: &present, mailbox: dest }
+        } else {
+            ImapOp::UidCopy { uids: &present, mailbox: dest }
+        };
+        let d = match self.exec(op, SMALL_LITERAL).await {
+            Ok(d) => d,
+            Err(ExecError { sent_all: true, .. }) => return Err(ImapError::OutcomeUnknown),
+            Err(ExecError { err, sent_all: false }) => {
+                return Err(if err == ImapError::Network { ImapError::NotDispatched } else { err });
+            }
+        };
+        match d.status {
+            Status::Ok => {}
+            Status::No if d.code_name().as_deref() == Some("TRYCREATE") => return Err(ImapError::Missing),
+            Status::No => return Err(ImapError::Protocol("move refused by the server")),
+            Status::Bad => return Err(ImapError::Protocol("move rejected as malformed")),
+        }
+        // RFC 4315 puts COPYUID in the tagged OK; RFC 6851 sends it untagged before the expunges.
+        let copyuid = parse_copyuid(&d.code, present.len()).or_else(|| {
+            d.untagged.iter().find_map(|Untagged(t)| match (t.first(), t.get(1)) {
+                (Some(Tok::Atom(ok)), Some(Tok::Code(c))) if ok.eq_ignore_ascii_case("OK") => {
+                    parse_copyuid(c, present.len())
+                }
+                _ => None,
+            })
+        });
+        // Only UIDs Dove asked for count, whatever else a server lists.
+        let pairs: Vec<(u32, u32)> = copyuid
+            .as_ref()
+            .map(|(_, p)| p.iter().copied().filter(|(s, _)| present.contains(s)).collect())
+            .unwrap_or_default();
+        let mut out = MoveOutcome { dest_uidvalidity: copyuid.as_ref().map(|(v, _)| *v), ..Default::default() };
+        if use_move {
+            out.moved = match copyuid {
+                Some(_) => pairs.into_iter().map(|(s, d)| (s, Some(d))).collect(),
+                // Moved, but the server did not say where to.
+                None => present.iter().map(|u| (*u, None)).collect(),
+            };
+            return Ok(out);
+        }
+        if copyuid.is_none() {
+            out.copied_kept = present.iter().map(|u| (*u, None)).collect();
+            return Ok(out);
+        }
+        let confirmed: Vec<CopiedUid> =
+            pairs.iter().map(|(s, _)| CopiedUid::confirmed_by_copyuid(src, uidvalidity, *s)).collect();
+        let removed = self.expunge_copied(&confirmed).await;
+        let done: Vec<(u32, Option<u32>)> = pairs.into_iter().map(|(s, d)| (s, Some(d))).collect();
+        if removed.is_ok() {
+            out.moved = done;
+        } else {
+            out.copied_kept = done;
+        }
+        Ok(out)
+    }
+
+    /// Flags the confirmed copy sources `\Deleted` and expunges exactly them, in their own folder only.
+    async fn expunge_copied(&mut self, copied: &[CopiedUid]) -> Result<(), ImapError> {
+        let Some(first) = copied.first() else { return Ok(()) };
+        let (name, readonly, st) = self.selected()?.clone();
+        if readonly
+            || copied.iter().any(|c| c.folder != name || c.uidvalidity != st.uidvalidity || c.folder != first.folder)
+        {
+            return Err(ImapError::Protocol("copied UIDs do not belong to the selected folder"));
+        }
+        self.simple(ImapOp::UidStoreDeletedCopied(copied), SMALL_LITERAL).await?;
+        self.simple(ImapOp::UidExpungeCopied(copied), SMALL_LITERAL).await?;
+        Ok(())
+    }
+
     // ------------------------------------------------------------------ IDLE (RFC 2177)
 
     /// Starts `IDLE` on the selected folder. Returns whether change notifications arrived before the server accepted
@@ -1765,5 +1963,31 @@ mod tests {
         assert_eq!(v, vec![(1, 3), (7, 7), (8, 9)]);
         assert_eq!(literal_len(b"* 1 FETCH (BODY[] {123}"), Some(123));
         assert_eq!(literal_len(b"* OK {weird}"), None);
+    }
+
+    #[test]
+    fn copyuid_is_parsed_strictly_and_bounded() {
+        let code = |s: &str| -> Vec<Tok> {
+            let t = toks(&format!("d1 OK [{s}] done"));
+            match &t[2] {
+                Tok::Code(c) => c.clone(),
+                other => panic!("{other:?}"),
+            }
+        };
+        assert_eq!(
+            parse_copyuid(&code("COPYUID 9 4:6,9 20:23"), 10),
+            Some((9, vec![(4, 20), (5, 21), (6, 22), (9, 23)]))
+        );
+        assert_eq!(parse_copyuid(&code("COPYUID 9 7 31"), 1), Some((9, vec![(7, 31)])));
+        // Descending ranges keep their order.
+        assert_eq!(parse_copyuid(&code("COPYUID 9 3:2 11:12"), 5), Some((9, vec![(3, 11), (2, 12)])));
+        for bad in
+            ["COPYUID 9 4:6 20:21", "COPYUID 0 4 5", "COPYUID 9 0 5", "COPYUID 9 x 5", "APPENDUID 9 5", "COPYUID 9 4"]
+        {
+            assert_eq!(parse_copyuid(&code(bad), 10), None, "{bad}");
+        }
+        // Wider than what Dove asked for: refused before expanding.
+        assert_eq!(parse_copyuid(&code("COPYUID 9 1:4294967295 1:4294967295"), 100), None);
+        assert_eq!(parse_copyuid(&code("COPYUID 9 1:3 1:3"), 2), None);
     }
 }

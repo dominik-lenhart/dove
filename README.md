@@ -33,11 +33,14 @@ An agent that helps with mail needs to read it, and an agent that has your mail 
 Dove sits in between:
 
 - **Scoped tokens.** A token belongs to one project and sees only the mailboxes and actions you granted
-  (`read`, `draft`, `send`). Anything else, including whether another mailbox exists, returns the same `not_found`.
+  (`read`, `draft`, `organize`, `delete`, `send`). Anything else, including whether another mailbox exists, returns the
+  same `not_found`.
 - **Drafts by default.** Agents create and revise drafts that show up in your normal Drafts folder. Sending is off
   unless you enable it on the server *and* grant it to one token for one mailbox.
-- **Nothing is deleted.** Dove never deletes or moves your mail. The only thing it removes is a draft it wrote
-  itself: the old revision after an update, and the draft after it was sent.
+- **Nothing is deleted for good.** Dove has no permanent delete. With `organize` an agent can mark, label, archive
+  and move mail; only with `delete` can it move mail to Trash, where you can restore it. The only messages Dove ever
+  removes from a folder are its own drafts and the originals of a move it just completed on a server without IMAP
+  `MOVE`.
 - **An audit trail.** Every tool call produces one hash-chained audit record, without mail content.
 - **Your server, your keys.** Passwords and Google tokens are encrypted at rest with a key that lives outside the
   data directory. The search index is SQLCipher-encrypted. The server sends nothing anywhere except to your mail
@@ -53,9 +56,29 @@ Dove sits in between:
 | `get_attachment` | Fetch an attachment as an MCP resource (up to 10 MiB) |
 | `list_drafts`, `get_draft` | Drafts in the mailbox's Drafts folder |
 | `create_draft`, `update_draft` | New mail, replies (threaded and quoted) and forwards (with attachments), sent from the mailbox address or an alias you configured, with your signature. Attach files by reference or inline. Revision-checked: a draft you edited yourself is never overwritten |
+| `delete_draft` | Delete a draft Dove created and nobody changed (Gmail: to Trash) |
+| `update_messages` | Mark read or unread, star, add or remove labels (Gmail labels, IMAP keywords); needs `organize` |
+| `move_messages` | Move to a folder or label, archive, back to the inbox; to Trash or Spam only with `delete` |
 | `send_draft` | Only when both send gates are open, only drafts Dove created and nobody changed |
 | `create_watch`, `list_watches`, `delete_watch` | Get told about new mail instead of polling: a reply in a thread, mail from an address or domain, mail matching a search, or no reply by a deadline. Per token, at most 50, expire after 30 days by default |
 | `list_watch_events` | Pull watch events (ids and times only, no content; kept 14 days). Optionally pushed to a signed webhook the operator registered (`dove sinks add`) |
+
+### Permissions
+
+Each token gets actions per mailbox. Presets cover the usual cases; you can also list actions or mix both
+(`--grant work=assistant,send`):
+
+| Preset | Actions | For |
+| --- | --- | --- |
+| `reader` | `read` | search, read, attachments |
+| `drafter` | `read,draft` | plus create, edit and delete its own drafts |
+| `assistant` | `read,draft,organize` | plus mark read/unread, star, label, archive, move between folders |
+| `full` | `read,draft,organize,delete` | plus move to Trash or Spam (recoverable) |
+
+`send` is in no preset; it needs an explicit grant and `allow_send = true` on the server. `organize` is reversible and
+destroys nothing, so the approval page pre-selects it. `delete` is opt-in because a steered agent could hide mail from
+you in Trash, and Spam counts as delete because providers purge it. Presets are expanded when you create the token:
+changing a preset in a later version never widens an existing token.
 
 New INBOX mail is indexed within seconds through IMAP IDLE. Mail content always reaches the model inside a clearly
 marked envelope; hidden HTML and invisible Unicode are stripped and Dove never loads remote content.
@@ -109,7 +132,7 @@ dove accounts connect-imap --alias work --email me@example.com
 ```sh
 dove projects create assistant
 dove projects add-account assistant work
-dove clients create claude --project assistant --grant work=read,draft --expires 90d   # prints the token once
+dove clients create claude --project assistant --grant work=assistant --expires 90d   # prints the token once
 ```
 
 **4. Connect the agent.** Put Dove behind HTTPS (Caddy and nginx allowlists are in [`deploy/`](deploy/)), then:

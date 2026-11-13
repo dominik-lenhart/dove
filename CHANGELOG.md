@@ -28,6 +28,21 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
   `dove sinks list`, `dove sinks remove <name>`. Deliveries are signed (`Dove-Signature`, HMAC-SHA256 over timestamp
   and body), retried a bounded number of times, and sent only to the registered URLs; agents name sinks but never
   supply URLs. See docs/deployment.md, "Watches and sinks".
+- New grant actions `organize` (mark read/unread, star, labels, archive, move between folders, move out of Trash/Spam)
+  and `delete` (move to Trash or Spam; never a permanent delete), and presets `reader`, `drafter`, `assistant` and
+  `full` for `--grant`, `--capabilities` and the OAuth approval page (`work=assistant,send` mixes both). Presets are
+  stored expanded, so existing tokens keep exactly their grants.
+- Tools `update_messages` and `move_messages` (up to 100 ids, per-id results; IMAP ids change on a move and come back
+  as `new_id`) and `delete_draft` for drafts Dove created and nobody changed.
+- IMAP moves use `MOVE` where offered and otherwise `COPY` plus `\Deleted`/`UID EXPUNGE` of exactly the messages the
+  server confirmed as copied.
+
+### Changed
+
+- Gmail connects also request `gmail.modify`. Mailboxes connected earlier keep reading, drafting and sending; run
+  `dove accounts reconnect <alias>` to use the organize and delete tools and `delete_draft` there.
+- The OAuth approval page shows a preset selector per mailbox; `organize` is pre-selected, `delete` and `send` are not,
+  and `send` only appears while `allow_send = true`.
 
 ## [0.1.0] - 2026-11-13
 

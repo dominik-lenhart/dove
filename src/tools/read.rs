@@ -365,9 +365,9 @@ async fn list_accounts(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError
         .iter()
         .map(|m| {
             let mut actions = vec![];
-            for (cap, name) in [(Capability::Read, "read"), (Capability::Draft, "draft"), (Capability::Send, "send")] {
+            for cap in Capability::ALL {
                 if m.actions.has(cap) && (cap != Capability::Send || cx.client.allow_send) {
-                    actions.push(name);
+                    actions.push(cap.as_str());
                 }
             }
             let mut v = json!({ "account": m.alias, "email": m.email, "status": m.status, "actions": actions, "indexed": m.index_enabled });

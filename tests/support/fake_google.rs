@@ -445,6 +445,44 @@ impl Mailbox {
         true
     }
 
+    /// Label ids that exist in this mailbox (system labels and `Label_<n>`); unknown ids are a 400 at Gmail.
+    fn label_id_exists(&self, id: &str) -> bool {
+        SYSTEM_LABELS.contains(&id)
+            || id
+                .strip_prefix("Label_")
+                .and_then(|n| n.parse::<usize>().ok())
+                .is_some_and(|n| (1..=self.user_labels.len()).contains(&n))
+    }
+
+    /// `messages.modify` semantics on label ids. Returns None for an unknown message.
+    fn modify(&mut self, id: &str, add: &[String], remove: &[String]) -> Option<Value> {
+        self.find(id)?;
+        let mut rec = self.new_rec();
+        let hid = rec.id;
+        let m = self.messages.iter_mut().find(|m| m.id == id)?;
+        let added: Vec<String> = add.iter().filter(|l| !m.labels.contains(l)).cloned().collect();
+        m.labels.extend(added.iter().cloned());
+        let removed: Vec<String> = remove.iter().filter(|l| m.labels.contains(l)).cloned().collect();
+        m.labels.retain(|l| !removed.contains(l));
+        m.history_id = hid;
+        let mv = msg_with_labels(m);
+        if !added.is_empty() {
+            rec.labels_added.push(json!({"message": mv, "labelIds": added}));
+        }
+        if !removed.is_empty() {
+            rec.labels_removed.push(json!({"message": mv, "labelIds": removed}));
+        }
+        self.history.push(rec);
+        Some(mv)
+    }
+
+    /// `messages.trash`: adds TRASH (a trashed draft leaves the drafts list, as in Gmail).
+    fn trash(&mut self, id: &str) -> Option<Value> {
+        let v = self.modify(id, &["TRASH".to_string()], &[])?;
+        self.drafts.retain(|(_, mid)| mid != id);
+        Some(v)
+    }
+
     fn send_draft(&mut self, did: &str) -> Option<Msg> {
         let idx = self.drafts.iter().position(|(d, _)| d == did)?;
         let (_, mid) = self.drafts.remove(idx);
@@ -623,7 +661,7 @@ impl Inner {
                 let access = self.mint_access(&email);
                 (
                     200,
-                    json!({"access_token": access, "expires_in": 3599, "token_type": "Bearer", "scope": "openid email https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.compose"}),
+                    json!({"access_token": access, "expires_in": 3599, "token_type": "Bearer", "scope": "openid email https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.compose https://www.googleapis.com/auth/gmail.modify"}),
                 )
             }
             _ => oauth_err(400, "unsupported_grant_type"),
@@ -655,6 +693,9 @@ impl Inner {
                         | ("POST", ["drafts"])
                         | ("PUT", ["drafts", _])
                         | ("POST", ["drafts", "send"])
+                        | ("POST", ["messages", _, "modify" | "trash" | "untrash"])
+                        | ("POST", ["messages", "batchModify"])
+                        | ("POST", ["threads", _, "modify"])
                 ) && segs.iter().all(|s| !s.is_empty())
             }
             _ => false,
@@ -862,6 +903,40 @@ fn gmail(mb: &mut Mailbox, c: &mut u64, method: &str, segs: &[&str], q: &Query, 
                 None => not_found(),
             }
         }
+        ("POST", ["messages", id, "modify"]) => {
+            let v: Value = serde_json::from_slice(body).unwrap_or_default();
+            let list = |k: &str| -> Option<Vec<String>> {
+                match &v[k] {
+                    Value::Null => Some(vec![]),
+                    Value::Array(a) => a.iter().map(|x| x.as_str().map(String::from)).collect(),
+                    _ => None,
+                }
+            };
+            let (Some(add), Some(remove)) = (list("addLabelIds"), list("removeLabelIds")) else {
+                return bad_request();
+            };
+            // Gmail refuses unknown label ids and TRASH through modify (messages.trash exists for that).
+            if add.iter().chain(&remove).any(|l| !mb.label_id_exists(l) || l == "TRASH" || l == "DRAFT" || l == "SENT")
+            {
+                return bad_request();
+            }
+            match mb.modify(id, &add, &remove) {
+                Some(m) => (200, m),
+                None => not_found(),
+            }
+        }
+        ("POST", ["messages", id, "trash"]) => match mb.trash(id) {
+            Some(m) => (200, m),
+            None => not_found(),
+        },
+        ("POST", ["messages", id, "untrash"]) => match mb.modify(id, &[], &["TRASH".to_string()]) {
+            Some(m) => (200, m),
+            None => not_found(),
+        },
+        ("POST", ["messages", "batchModify"]) | ("POST", ["threads", _, "modify"]) => {
+            // Allowlisted for completeness; Dove's tools use per-message calls.
+            (200, json!({}))
+        }
         ("GET", ["settings", "sendAs"]) => {
             let mut v =
                 vec![json!({"sendAsEmail": mb.email, "displayName": mb.email, "isPrimary": true, "isDefault": true})];
@@ -1026,6 +1101,16 @@ impl FakeGoogle {
 
     pub fn sent_messages(&self, email: &str) -> Vec<String> {
         self.with_mailbox(email, |mb, _| mb.sent.clone())
+    }
+
+    /// Label ids of a message (`Label_<n>` for user labels), None when it does not exist.
+    pub fn labels_of(&self, email: &str, id: &str) -> Option<Vec<String>> {
+        self.with_mailbox(email, |mb, _| mb.find(id).map(|m| m.labels.clone()))
+    }
+
+    /// Id of a user label by name (created on first use, as `add_message` labels are).
+    pub fn label_id(&self, email: &str, name: &str) -> String {
+        self.with_mailbox(email, |mb, _| mb.resolve_label(name))
     }
 
     pub fn message_raw(&self, email: &str, id: &str) -> Option<Vec<u8>> {

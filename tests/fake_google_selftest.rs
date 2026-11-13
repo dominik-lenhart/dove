@@ -388,15 +388,17 @@ async fn allowlist_violations_are_403_and_recorded() {
     let r = c.post(g(&fg, "messages/send")).bearer_auth(&tok).json(&json!({"raw": "x"})).send().await.unwrap();
     assert_eq!(r.status(), 403);
     for (m, p) in [
-        (reqwest::Method::POST, "messages/abc/modify"),
+        // Organize is allowlisted since 0.2; permanent deletion never is.
+        (reqwest::Method::POST, "messages/batchDelete"),
         (reqwest::Method::DELETE, "messages/abc"),
+        (reqwest::Method::DELETE, "drafts/abc"),
         (reqwest::Method::GET, "settings/filters"),
         (reqwest::Method::POST, "watch"),
         (reqwest::Method::POST, "messages/import"),
     ] {
         assert_eq!(c.request(m, g(&fg, p)).bearer_auth(&tok).send().await.unwrap().status(), 403, "{p}");
     }
-    assert_eq!(fg.violations().len(), 6);
+    assert_eq!(fg.violations().len(), 7);
     assert!(fg.violations()[0].contains("POST") && fg.violations()[0].contains("messages/send"));
     assert_eq!(fg.count("POST", "messages/send"), 1);
     fg.clear_requests();

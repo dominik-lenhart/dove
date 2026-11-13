@@ -937,3 +937,115 @@ async fn every_oauth_state_change_is_audited() {
         ["clients.invite:ok", "oauth.register:ok", "oauth.approve:ok", "oauth.token:ok", "oauth.refresh:ok"]
     );
 }
+
+/// The `<input>` tag of the first field named `<kind>.<...>` on the approval page, for the mailbox with `id`.
+fn input_tag(html: &str, kind: &str, id: &str) -> Option<String> {
+    let pat = format!("name=\"{kind}.{id}\"");
+    let at = html.find(&pat)?;
+    let start = html[..at].rfind('<')?;
+    Some(html[start..at + html[at..].find('>')?].to_string())
+}
+
+/// Actions per alias as list_accounts reports them.
+async fn actions_of(h: &Harness, token: &str) -> Vec<(String, String)> {
+    let v = h.ok(token, "list_accounts", json!({})).await;
+    v["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| {
+            let acts: Vec<&str> = a["actions"].as_array().unwrap().iter().map(|x| x.as_str().unwrap()).collect();
+            (a["account"].as_str().unwrap().to_string(), acts.join(","))
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn approval_page_presets_and_defaults() {
+    let mut o = Oauth::with(|c| c.allow_send = true).await;
+    let inv = o.invite("org-host", &["all"], "full,send").await;
+    let client_id = o.register(REDIRECT).await;
+    let v = verifier();
+    let (cookie, rid, csrf, html) = o.enter_invitation(&client_id, &challenge(&v), &inv).await;
+    let ids: Vec<String> =
+        html.split("name=\"read.").skip(1).filter_map(|s| s.split('"').next()).map(String::from).collect();
+    let (billing, info) = (&ids[0], &ids[1]);
+    // Defaults: organize on (with read and draft), delete and send off.
+    for (kind, checked) in [("read", true), ("draft", true), ("organize", true), ("delete", false), ("send", false)] {
+        let tag = input_tag(&html, kind, info).unwrap_or_else(|| panic!("no {kind} box: {html}"));
+        assert_eq!(tag.contains(" checked"), checked, "{kind}: {tag}");
+    }
+    for p in ["reader", "drafter", "assistant", "full"] {
+        assert!(html.contains(&format!("<option value=\"{p}\">{p}</option>")), "{p}");
+    }
+    // billing by preset (its checkboxes are ignored, send stays separate); info by checkboxes.
+    let (pb, sb, db, ri, oi, di) = (
+        format!("preset.{billing}"),
+        format!("send.{billing}"),
+        format!("delete.{billing}"),
+        format!("read.{info}"),
+        format!("organize.{info}"),
+        format!("delete.{info}"),
+    );
+    let form: Vec<(&str, &str)> = vec![
+        ("rid", &rid),
+        ("csrf", &csrf),
+        ("step", "approve"),
+        ("action", "approve"),
+        (&pb, "assistant"),
+        (&sb, "on"),
+        (&db, "on"),
+        (&ri, "on"),
+        (&oi, "on"),
+        (&di, "on"),
+    ];
+    let r = o.post_form(&cookie, &form).await;
+    assert_eq!(r.status(), 303);
+    let code = query_of(r.headers()["location"].to_str().unwrap())["code"].clone();
+    let (status, tok) = o.exchange(&client_id, &code, &v).await;
+    assert_eq!(status, 200, "{tok}");
+    let at = tok["access_token"].as_str().unwrap();
+    assert_eq!(
+        actions_of(&o.h, at).await,
+        vec![("billing".into(), "read,draft,organize,send".into()), ("info".into(), "read,organize,delete".into())]
+    );
+
+    // With sending switched off later, the page hides send and a forged send box grants nothing.
+    let inv = o.invite("org-host-2", &["info"], "assistant,send").await;
+    o.h.restart_with(|c| c.allow_send = false).await;
+    let client_id = o.register(REDIRECT).await;
+    let v = verifier();
+    let (cookie, rid, csrf, html) = o.enter_invitation(&client_id, &challenge(&v), &inv).await;
+    let id = html.split("name=\"read.").nth(1).and_then(|s| s.split('"').next()).unwrap().to_string();
+    assert!(input_tag(&html, "send", &id).is_none(), "{html}");
+    assert!(input_tag(&html, "delete", &id).is_none(), "delete was not invited: {html}");
+    // Presets beyond the invitation are not offered.
+    assert!(!html.contains("<option value=\"full\">"), "{html}");
+    let (pi, si) = (format!("preset.{id}"), format!("send.{id}"));
+    let form: Vec<(&str, &str)> =
+        vec![("rid", &rid), ("csrf", &csrf), ("step", "approve"), ("action", "approve"), (&pi, "full"), (&si, "on")];
+    let r = o.post_form(&cookie, &form).await;
+    assert_eq!(r.status(), 303);
+    let code = query_of(r.headers()["location"].to_str().unwrap())["code"].clone();
+    let (_, tok) = o.exchange(&client_id, &code, &v).await;
+    // A forged preset beyond the invitation is narrowed to it.
+    assert_eq!(
+        actions_of(&o.h, tok["access_token"].as_str().unwrap()).await,
+        vec![("info".into(), "read,draft,organize".into())]
+    );
+    // The forged send box is not stored either (list_accounts hides send anyway while sending is off).
+    let stored: String =
+        o.h.app()
+            .store
+            .call(|c| {
+                Ok(c.query_row(
+                    "SELECT cm.actions FROM client_mailboxes cm JOIN clients c ON c.id = cm.client_id \
+                 WHERE c.name = 'org-host-2'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+    assert_eq!(stored, "read,draft,organize");
+}

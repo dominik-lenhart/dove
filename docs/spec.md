@@ -91,7 +91,7 @@ so no operator's grants ever pass through anyone else's infrastructure.
 
 - FR-P1. `dove projects create <name>`, `projects add-account <project> <alias>`,
   `projects remove-account <project> <alias>`, `projects list`, `projects show <name>`.
-- FR-P2. `dove clients create support --project acme --grant info=read,draft --grant billing=read [--expires 90d] [--allow-ip <cidr>...]` prints a new token once. Resolve aliases to immutable account IDs at issuance. Require explicit mailbox grants. Adding a project mailbox grants existing tokens zero new access. Each grant containing `draft` requires `read`; `send` requires both.
+- FR-P2. `dove clients create support --project acme --grant info=read,draft --grant billing=read [--expires 90d] [--allow-ip <cidr>...]` prints a new token once. Resolve aliases to immutable account IDs at issuance. Require explicit mailbox grants. Adding a project mailbox grants existing tokens zero new access. Each grant containing `draft` or `organize` requires `read`, `delete` requires `organize`, and `send` requires `read` and `draft`. Since 0.2 the grant also accepts presets (`reader`, `drafter`, `assistant`, `full`, never including `send`), expanded at issuance and stored expanded; unknown words are an error.
 - FR-P3. `clients set-grants <name> --grant ...` atomically replaces the entire grant set. Show effective account/action pairs in `clients show`. Rotation preserves grants and invalidates the old secret. Revocation blocks the next request. Removing a mailbox from a project deletes its client grants transactionally; re-adding it does not resurrect access.
 - Project membership sets the ceiling. One authorized mailbox is one read boundary, including aliases, labels and other projects' messages in that mailbox. Ownership restricts draft mutations only.
 - FR-P4. A change to a project or client takes effect on the next request, with no restart.
@@ -120,6 +120,9 @@ is always delivered in the untrusted-content envelope from section 6.5.
 | `get_draft` | read | Draft content and current revision in the specified mailbox. |
 | `create_draft` | draft | Create a new message, a threaded reply (quoting the original) or a forward, with attachments. |
 | `update_draft` | draft | Edit an owned draft, conditional on the expected revision (§5.3); attachments kept unless replaced. |
+| `delete_draft` | draft | Delete one owned, unchanged draft (optionally conditional on `expected_revision`). Gmail: `messages.trash` of the draft's message; IMAP: `\Deleted` + `UID EXPUNGE` of exactly the own draft's UID. |
+| `update_messages` | organize | Up to 100 ids: add/remove flags (`UNREAD`, `STARRED`) and labels (Gmail user labels, never created; IMAP keywords). Per-id results. |
+| `move_messages` | organize (+ delete) | Up to 100 ids to a folder/label, `archive`, `inbox`, `trash` or `spam`. Trash, Spam/Junk and folders below them need `delete`; moving out of them is organize. Per-id results with `new_id` (IMAP ids change). Never a permanent delete. |
 | `send_draft` | send | Optional. Submit one existing, owned draft under §6.3. |
 | `create_watch` | read | Watch an indexed mailbox: `thread_reply`, `from` (address or domain), `query` (a `where` filter, checked against newly indexed mail only) or `no_reply_by` (fires once at a deadline). Belongs to the creating token; at most 50 active, expiry 30 days by default, 180 at most; optional operator sink by name. |
 | `list_watches` | read | This token's watches (active and recently ended, with the reason) and the operator's sink names. |
@@ -493,6 +496,15 @@ Outbound allowlist (method, path pattern under `https://gmail.googleapis.com/gma
 | PUT | `drafts/{id}` | `update_draft` |
 | POST | `drafts/send` | Only through the separately gated `send_draft` operation (§6.3). |
 | GET | `settings/sendAs` | Validate `from_address`; `gmail.readonly` is accepted. |
+| POST | `messages/{id}/modify` | `update_messages`, `move_messages` (labels, archive, inbox, spam); needs `gmail.modify` |
+| POST | `messages/batchModify` | Allowlisted for bulk label changes (the tools currently send per-message `modify`) |
+| POST | `messages/{id}/trash` | `move_messages` to `trash` (needs `delete`), `delete_draft` |
+| POST | `messages/{id}/untrash` | `move_messages` out of Trash |
+| POST | `threads/{id}/modify` | Allowlisted for thread-level label changes (not used by the tools yet) |
+
+There is no `DELETE` and no `batchDelete`: Dove cannot delete permanently. Since 0.2, connects request `gmail.modify`
+as well (optional at the consent screen; without it organize/delete answer `account_unavailable` with
+`reason: reauth_required` until `dove accounts reconnect`).
 
 Plus `POST https://oauth2.googleapis.com/token` (code exchange, refresh) and
 `POST https://oauth2.googleapis.com/revoke`, and Google's public keys for ID token validation.
