@@ -292,6 +292,7 @@ mod tests {
         assert!(normalize_server("ftp://x").is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn atomic_write_keeps_symlink_and_mode() {
         use std::os::unix::fs::PermissionsExt;

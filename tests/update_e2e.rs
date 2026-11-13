@@ -10,6 +10,10 @@
 //!   v0.4.0: signed, but `dove` is a symlink to /bin/sh
 //!   v0.5.0: signed Windows zip that also holds `dove-v0.5.0-<target>/../../evil.exe`
 
+// Unix only: the tests check file modes and run as a non-root user. The Windows replacement of a running binary is
+// tested in `dove::update::windows`.
+#![cfg(unix)]
+
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};

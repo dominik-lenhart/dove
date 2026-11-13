@@ -434,7 +434,6 @@ async fn save_attachment(
     out: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
     let (_, _, r) = remote_for(p.profile.as_deref())?;
     let res = r.call_tool("get_attachment", json!({ "ref": reference, "attachment_id": attachment_id })).await?;
     if res.is_error {
@@ -453,10 +452,11 @@ async fn save_attachment(
     // The server sanitises the name already; do it again so a hostile name can never leave the target directory.
     let name = crate::tools::attachments::sanitize_filename(res.structured["filename"].as_str());
     let path = out.unwrap_or_else(|| PathBuf::from(".")).join(&name);
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    let mut f = opts
         .open(&path)
         .with_context(|| format!("cannot create {} (an existing file is never overwritten)", path.display()))?;
     f.write_all(&bytes)?;

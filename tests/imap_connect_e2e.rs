@@ -390,6 +390,8 @@ async fn google_section_optional() {
     assert!(google[0]["detail"].as_str().unwrap().contains("[google]"));
 }
 
+// Unix only: writes secret files with Unix modes.
+#[cfg(unix)]
 #[tokio::test]
 async fn keys_rotate_rewraps_imap_passwords() {
     use std::os::unix::fs::PermissionsExt;

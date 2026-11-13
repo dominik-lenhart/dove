@@ -370,3 +370,33 @@ hosts or reference hardware.
   `att_complete`, which queries report as a coverage exception instead of treating as "no".
   (f) Cost: extraction runs in ingest on bytes already fetched, so it adds CPU and a transient copy per attachment,
   and no upstream traffic. Messages over `max_message_bytes` are metadata-only and get no attachment text.
+- A58. Local mode and the Windows port (design `docs/superpowers/specs/2026-11-13-local-mode-and-packaging-design.md`
+  section A, approved 2026-11-13). (a) `mode = "local"` (default `"server"`) allows a plain-HTTP `public_url` only for
+  the hosts `127.0.0.1` and `localhost` and only with the port of `listen`, which stays loopback-only; the Host check
+  then accepts exactly that origin. Server mode is unchanged and still refuses any non-HTTPS URL. In local mode the
+  HTTP guard never reads `X-Forwarded-For` (there is no proxy, only local processes could send it), so no
+  `proxy_secret_file` is needed and doctor does not ask for one. (b) Per-user paths (`platform::paths`): config
+  `dove.toml` (not `config.toml`: the remote client's profiles share the directory on Linux and Windows) under
+  `$XDG_CONFIG_HOME/dove`, `~/Library/Application Support/Dove` or `%APPDATA%\Dove`; data under `$XDG_DATA_HOME/dove`,
+  `~/Library/Application Support/Dove/data` or `%LOCALAPPDATA%\Dove`; keys in `<data>/secrets`; the Unix admin socket
+  in the data directory. `DOVE_LOCAL_HOME=<dir>` replaces all of them (tests, portable setups). (c) `dove local init`
+  writes all three keys before the config and refuses to run when any of them or the config exists (a lost kek loses
+  every stored credential). On Windows a key file is `dove-dpapi-v1` plus a base64 DPAPI (CurrentUser) blob, which
+  `secrets::read_secret_file` decrypts; other platforms refuse such a file. On Unix the keys are 0600 files. (d)
+  Windows "private" (`platform::windows::check_private`): owner is the current user (or the token's default owner),
+  and every allow ACE names the current user, SYSTEM, BUILTIN\Administrators or CREATOR OWNER; a NULL DACL or any
+  other allow ACE (Everyone, Users, Authenticated Users, another user) fails; deny ACEs are ignored. Dove creates its
+  directories and files with an owner + protected DACL for the user only. (e) Windows admin channel: the pipe
+  `\\.\pipe\dove-admin-<SID>` with DACL `D:P(A;;GA;;;<SID>)`, `first_pipe_instance` (a pipe someone else created
+  first makes startup fail) and remote clients rejected. The server reads each client's user SID from its process
+  token (`GetNamedPipeClientProcessId`) and admits only its own SID; the CLI checks the server's SID the same way
+  before sending (a squatting pipe could collect a mailbox password). `admin.operator_uid` is ignored on Windows. (f)
+  The CLI's admin endpoint: `--socket`/`DOVE_ADMIN_SOCKET`, else `/run/dove/admin.sock` when it exists, else the
+  socket of this user's local config, else the server default (Windows: this user's pipe). (g) Login items: a
+  `systemd --user` unit (`dove.service`, journal), a launchd agent `io.github.dominik-lenhart.dove` and a Task
+  Scheduler logon task "Dove (<user>)" running `conhost --headless` (no console window), both writing
+  `<data>/dove.log` (rotated once at start past 10 MB). None needs administrator rights. (h) Windows `dove upgrade`
+  renames the running `dove.exe` to `.dove.exe.old-<id>`, moves the new file in (renaming back on failure), and every
+  later start deletes leftovers that are no longer in use. (i) Not available on Windows: disabling crash dumps per
+  process (Windows Error Reporting), Tailscale setup, the systemd hardening and service-user checks; the doctor's
+  mode checks become a `data_dir_private` ACL check.

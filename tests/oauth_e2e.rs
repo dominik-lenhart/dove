@@ -860,6 +860,8 @@ async fn authorize_requests_are_bounded_per_ip() {
     assert_eq!(statuses, [200, 200, 200, 429], "authorize is rate-limited per IP");
 }
 
+// Unix only: writes secret files with Unix modes.
+#[cfg(unix)]
 #[tokio::test]
 async fn preregistered_confidential_client() {
     let dir = tempfile::tempdir().unwrap();

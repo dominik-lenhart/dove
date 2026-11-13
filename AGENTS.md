@@ -323,3 +323,15 @@ cargo fmt
   `dominik-lenhart/homebrew-tap` by the `homebrew` release job with a write deploy key (secret `HOMEBREW_TAP_DEPLOY_KEY`); never
   edit the tap by hand. Workflow YAML check: `docker run --rm -v $PWD:/repo -w /repo rhysd/actionlint:latest`. The Windows release
   (`WINDOWS_RELEASE` in `release.yml`) and the Windows CI job (`continue-on-error`) stay gated until the Windows port is merged.
+- 2026-11-13: Platform code (PLAN A58) lives in `src/platform/` (`mod.rs` private dirs/files and the strict check per OS,
+  `paths.rs` local-mode paths, `windows.rs` SIDs, DACLs, DPAPI, pipe peer SIDs). Never call
+  `std::os::unix` APIs outside `cfg(unix)`; use `platform::{restrict_file, restrict_dir, ensure_private_dir,
+  write_private_new}`. Integration test files that need Unix sockets, modes or `sudo` start with `#![cfg(unix)]`.
+  Type-check the Windows code here with the `dove-t-mingw:local` image (Ubuntu 24.04 + mingw-w64; rebuild it from
+  `ubuntu:24.04` with `apt-get install gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 make perl` if it is gone), mounting
+  `~/.rustup` and `~/.cargo`, `RUSTC_WRAPPER=` (sccache is not in the image) and a separate target dir:
+  `heavy docker run --rm -u 1000:1000 -v ~/.rustup:/rustup -v ~/.cargo:/cargo -v $PWD:/src -w /src
+  -e RUSTUP_HOME=/rustup -e CARGO_HOME=/cargo -e PATH=/cargo/bin:/usr/bin:/bin -e HOME=/tmp -e RUSTC_WRAPPER=
+  -e CARGO_TARGET_DIR=/src/target/win-gnu -e CARGO_BUILD_JOBS=3 dove-t-mingw:local cargo clippy
+  --target x86_64-pc-windows-gnu --all-targets -- -D warnings` (about 4 min cold). This compiles, it does not run:
+  the `cfg(windows)` tests (DACLs, DPAPI, the admin pipe, replacing a running exe) only run on a Windows machine.

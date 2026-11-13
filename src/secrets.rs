@@ -5,9 +5,12 @@
 //! service user through an ACL; PLAN A44). Key files use one line per
 //! key version: `<version> <base64 32-byte key>`. Lines starting with `#` are ignored. A single bare base64 line is
 //! accepted as version 1.
+//!
+//! On Windows the mode check is an ACL check (owner = the current user, no other account in the DACL; PLAN A58), and a
+//! secret file may hold a DPAPI blob of the current user instead of the plaintext (`dove local init` writes those):
+//! the file then starts with [`DPAPI_MAGIC`] followed by the base64 blob.
 
 use std::collections::BTreeMap;
-use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use anyhow::{Context, bail};
@@ -24,28 +27,79 @@ pub fn secret_mode_ok(mode: u32, uid: u32, gid: u32) -> bool {
     mode & 0o077 == 0 || (uid == 0 && gid == 0 && mode & 0o037 == 0)
 }
 
-/// Fails unless `path` is a regular file whose mode passes [`secret_mode_ok`].
+/// First line of a secret file that holds a DPAPI (CurrentUser) blob instead of the secret itself (Windows only).
+pub const DPAPI_MAGIC: &str = "dove-dpapi-v1";
+
+/// Fails unless `path` is a regular file whose mode passes [`secret_mode_ok`] (Unix) or that is private to the
+/// current user (Windows: [`crate::platform::windows::check_private`]).
 pub fn check_secret_file_mode(path: &Path) -> anyhow::Result<()> {
     let meta = std::fs::metadata(path).with_context(|| format!("secret file {} is missing", path.display()))?;
     if !meta.is_file() {
         bail!("secret file {} is not a regular file", path.display());
     }
-    let mode = meta.mode() & 0o777;
-    if !secret_mode_ok(mode, meta.uid(), meta.gid()) {
-        bail!(
-            "secret file {} has mode {:o}; it must not be readable or writable by group or others (use 0400 or 0600)",
-            path.display(),
-            mode
-        );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let mode = meta.mode() & 0o777;
+        if !secret_mode_ok(mode, meta.uid(), meta.gid()) {
+            bail!(
+                "secret file {} has mode {:o}; it must not be readable or writable by group or others (use 0400 or \
+                 0600)",
+                path.display(),
+                mode
+            );
+        }
+    }
+    #[cfg(windows)]
+    if let Err(why) = crate::platform::windows::check_private(path) {
+        bail!("secret file {} is not private to the current user: {why}", path.display());
     }
     Ok(())
 }
 
-/// Reads a secret file after checking its mode.
+/// Reads a secret file after checking its mode. A DPAPI-protected file is decrypted (Windows only).
 pub fn read_secret_file(path: &Path) -> anyhow::Result<Zeroizing<Vec<u8>>> {
     check_secret_file_mode(path)?;
-    let data = std::fs::read(path).with_context(|| format!("cannot read secret file {}", path.display()))?;
-    Ok(Zeroizing::new(data))
+    let data =
+        Zeroizing::new(std::fs::read(path).with_context(|| format!("cannot read secret file {}", path.display()))?);
+    match dpapi_payload(&data) {
+        None => Ok(data),
+        Some(b64) => unprotect(b64).with_context(|| format!("cannot decrypt secret file {}", path.display())),
+    }
+}
+
+/// The base64 blob of a DPAPI secret file, or `None` for a plain one.
+fn dpapi_payload(data: &[u8]) -> Option<&[u8]> {
+    let rest = data.strip_prefix(DPAPI_MAGIC.as_bytes())?;
+    let rest = rest.strip_prefix(b"\r").unwrap_or(rest);
+    rest.strip_prefix(b"\n")
+}
+
+#[cfg(windows)]
+fn unprotect(b64: &[u8]) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+    let text = std::str::from_utf8(b64).context("not UTF-8")?;
+    let blob = util::b64_decode_any(text.trim()).context("the DPAPI blob is not base64")?;
+    crate::platform::windows::dpapi_unprotect(&blob)
+        .context("DPAPI refused it (it was protected by another Windows user or on another computer)")
+}
+
+#[cfg(not(windows))]
+fn unprotect(_: &[u8]) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+    bail!("it is protected with Windows DPAPI, which works only on the Windows account that wrote it")
+}
+
+/// The content of a secret file for `secret`: DPAPI-protected on Windows, the secret itself elsewhere.
+pub fn encode_secret_file(secret: &[u8]) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+    #[cfg(windows)]
+    {
+        let blob = crate::platform::windows::dpapi_protect(secret).context("DPAPI protect failed")?;
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, blob);
+        Ok(Zeroizing::new(format!("{DPAPI_MAGIC}\n{b64}\n").into_bytes()))
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(Zeroizing::new(secret.to_vec()))
+    }
 }
 
 /// Reads a secret string (for example the Google client secret), trimming surrounding whitespace.
@@ -139,8 +193,42 @@ pub fn generate_key_line(version: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
+    #[test]
+    fn dpapi_files_are_recognised_by_their_first_line() {
+        assert_eq!(dpapi_payload(b"dove-dpapi-v1\nQUJD\n"), Some(&b"QUJD\n"[..]));
+        assert_eq!(dpapi_payload(b"dove-dpapi-v1\r\nQUJD"), Some(&b"QUJD"[..]));
+        assert_eq!(dpapi_payload(b"1 dove-dpapi-v1\n"), None);
+        assert_eq!(dpapi_payload(b"dove-dpapi-v1x\n"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dpapi_files_are_refused_off_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("kek");
+        std::fs::write(&p, "dove-dpapi-v1\nQUJD\n").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let err = KeyRing::load(&p).err().unwrap();
+        assert!(format!("{err:#}").contains("DPAPI"), "{err:#}");
+    }
+
+    /// The local-mode secret files round-trip through the reader (DPAPI on Windows, plain elsewhere).
+    #[test]
+    fn encoded_secret_files_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("kek");
+        let line = generate_key_line(1);
+        crate::platform::write_private_new(&p, &encode_secret_file(line.as_bytes()).unwrap()).unwrap();
+        let raw = std::fs::read(&p).unwrap();
+        assert_eq!(raw.starts_with(DPAPI_MAGIC.as_bytes()), cfg!(windows));
+        assert_eq!(&**read_secret_file(&p).unwrap(), line.as_bytes());
+        KeyRing::load(&p).unwrap();
+    }
+
+    #[cfg(unix)]
     #[test]
     fn rejects_group_or_world_readable() {
         let dir = tempfile::tempdir().unwrap();
@@ -167,6 +255,7 @@ mod tests {
         assert!(!secret_mode_ok(0o404, 981, 981));
     }
 
+    #[cfg(unix)]
     #[test]
     fn proxy_secret_must_be_long_and_header_safe() {
         let dir = tempfile::tempdir().unwrap();

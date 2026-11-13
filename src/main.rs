@@ -4,6 +4,9 @@ use clap::Parser;
 
 fn main() -> std::process::ExitCode {
     let cli = dove::cli::Cli::parse();
+    // Binaries renamed aside by an earlier `dove upgrade` while they were running (PLAN A58).
+    #[cfg(windows)]
+    dove::update::windows::cleanup_after_upgrade();
     if !matches!(cli.command, dove::cli::Command::Serve { .. }) {
         dove::logging::init_cli_logging();
     }

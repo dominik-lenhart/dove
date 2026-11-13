@@ -623,6 +623,8 @@ async fn events_and_ended_watches_are_pruned_after_14_days() {
     assert_eq!(next["events"].as_array().unwrap().len(), 1);
 }
 
+// Unix only: writes secret files with Unix modes.
+#[cfg(unix)]
 #[tokio::test]
 async fn keys_rotate_rewraps_sink_secrets_and_watch_filters() {
     use std::os::unix::fs::PermissionsExt;

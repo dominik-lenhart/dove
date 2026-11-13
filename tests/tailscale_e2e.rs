@@ -2,6 +2,9 @@
 //! host's Tailscale serves other things). The fake keeps its state in files, records every call, and answers
 //! `status --json` and `serve status --json` like the real CLI, so setup can be run twice and repaired.
 
+// Unix only: fakes the tailscale CLI with a shell script.
+#![cfg(unix)]
+
 mod support;
 
 use std::path::{Path, PathBuf};

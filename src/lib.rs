@@ -22,6 +22,7 @@ pub mod mcp;
 pub mod mime;
 pub mod notifier;
 pub mod oauth;
+pub mod platform;
 pub mod policy;
 pub mod secrets;
 pub mod serve;

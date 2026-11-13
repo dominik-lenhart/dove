@@ -335,7 +335,6 @@ pub fn set_public_url(text: &str, url: &str) -> anyhow::Result<Option<String>> {
 
 /// Writes `text` over `path` atomically (temp file in the same directory, same mode and owner, then rename).
 fn write_config(path: &Path, text: &str) -> anyhow::Result<()> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     let meta = std::fs::metadata(path).with_context(|| format!("cannot read {}", path.display()))?;
     let tmp = temp_path(path);
     let denied = |e: std::io::Error| {
@@ -348,19 +347,27 @@ fn write_config(path: &Path, text: &str) -> anyhow::Result<()> {
             anyhow!("cannot write {}: {e}", path.display())
         }
     };
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
     // Never wider than the original while the file is half written.
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(meta.permissions().mode() & 0o770)
-        .open(&tmp)
-        .map_err(denied)?;
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(
+        &mut opts,
+        std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o770,
+    );
+    let mut f = opts.open(&tmp).map_err(denied)?;
     let res = (|| -> std::io::Result<()> {
         f.write_all(text.as_bytes())?;
         f.sync_all()?;
-        // Keep the owner when root edits a file owned by someone else (a no-op error for other users).
-        let _ = std::os::unix::fs::chown(&tmp, Some(meta.uid()), Some(meta.gid()));
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(meta.permissions().mode() & 0o7777))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            // Keep the owner when root edits a file owned by someone else (a no-op error for other users).
+            let _ = std::os::unix::fs::chown(&tmp, Some(meta.uid()), Some(meta.gid()));
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(meta.permissions().mode() & 0o7777))?;
+        }
+        #[cfg(windows)]
+        let _ = &meta;
         std::fs::rename(&tmp, path)
     })();
     if let Err(e) = res {

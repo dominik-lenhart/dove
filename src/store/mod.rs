@@ -5,7 +5,6 @@
 
 pub mod schema;
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -28,7 +27,7 @@ impl Store {
         for suffix in ["", "-wal", "-shm"] {
             let p = PathBuf::from(format!("{}{suffix}", path.display()));
             if p.exists() {
-                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))?;
+                crate::platform::restrict_file(&p)?;
             }
         }
         Self::init(conn, Some(path.to_path_buf()))
@@ -78,15 +77,7 @@ impl Store {
 
 /// Creates `dir` with mode 0700 or fails if it exists with group/other access.
 pub fn ensure_private_dir(dir: &Path) -> anyhow::Result<()> {
-    if !dir.exists() {
-        std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-    }
-    let mode = std::fs::metadata(dir)?.permissions().mode() & 0o777;
-    if mode & 0o077 != 0 {
-        bail!("data directory {} has mode {:o}; it must be 0700", dir.display(), mode);
-    }
-    Ok(())
+    crate::platform::ensure_private_dir(dir)
 }
 
 /// Applies migrations in order, each inside its own transaction. A failure rolls back and stops startup (spec 10).
@@ -139,8 +130,13 @@ mod tests {
         assert_eq!(v.as_deref(), Some(schema::MIGRATIONS.len().to_string().as_str()));
         drop(s);
         Store::open(&path).unwrap();
-        let mode = std::fs::metadata(dir.path().join("data")).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o700);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.path().join("data")).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700);
+        }
+        crate::platform::dir_is_private(&dir.path().join("data")).unwrap();
     }
 
     /// The Gmail-over-IMAP migration keeps every folder row and id and only widens the `special` check.
@@ -188,7 +184,7 @@ mod tests {
     fn refuses_newer_schema() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        crate::platform::restrict_dir(dir.path()).unwrap();
         let s = Store::open(&path).unwrap();
         s.call_blocking(|c| set_meta(c, "schema_version", "999")).unwrap();
         drop(s);
