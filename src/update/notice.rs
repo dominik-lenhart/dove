@@ -31,10 +31,30 @@ pub struct CacheEntry {
     pub latest: Option<String>,
 }
 
-/// Whether the notice may run at all: only for a terminal on stderr, not in CI, and not when opted out with
-/// `DOVE_NO_UPDATE_CHECK` (any value except empty or `0`).
-pub fn enabled(var: impl Fn(&str) -> Option<OsString>, stderr_is_terminal: bool) -> bool {
-    stderr_is_terminal && var("CI").is_none() && !var("DOVE_NO_UPDATE_CHECK").is_some_and(|v| !v.is_empty() && v != "0")
+/// Real and effective user id of a process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ids {
+    pub uid: u32,
+    pub euid: u32,
+}
+
+impl Ids {
+    pub fn current() -> Self {
+        Self { uid: nix::unistd::getuid().as_raw(), euid: nix::unistd::geteuid().as_raw() }
+    }
+}
+
+/// Whether the notice may run at all: only for a terminal on stderr, not in CI, not when opted out with
+/// `DOVE_NO_UPDATE_CHECK` (any value except empty or `0`), and never with privileges (root, setuid, or under sudo):
+/// a privileged process must not read or write a cache in a directory another user controls (`sudo -E` or macOS
+/// sudo keep `HOME`).
+pub fn enabled(var: impl Fn(&str) -> Option<OsString>, stderr_is_terminal: bool, ids: Ids) -> bool {
+    stderr_is_terminal
+        && ids.euid != 0
+        && ids.euid == ids.uid
+        && var("SUDO_UID").is_none()
+        && var("CI").is_none()
+        && !var("DOVE_NO_UPDATE_CHECK").is_some_and(|v| !v.is_empty() && v != "0")
 }
 
 /// The cache directory: `~/Library/Caches/dove` on macOS, else `$XDG_CACHE_HOME/dove` or `~/.cache/dove`.
@@ -54,22 +74,47 @@ pub fn cache_file(var: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
     cache_dir(var).map(|d| d.join(CACHE_FILE))
 }
 
-/// Reads the cache; anything unreadable counts as no cache.
+/// Reads the cache; anything unreadable counts as no cache. A symlink at `path` is not followed.
 pub fn read_cache(path: &Path) -> Option<CacheEntry> {
+    use std::os::unix::fs::OpenOptionsExt;
     let mut text = String::new();
-    std::fs::File::open(path).ok()?.take(MAX_CACHE_BYTES).read_to_string(&mut text).ok()?;
+    let f = std::fs::OpenOptions::new().read(true).custom_flags(nix::libc::O_NOFOLLOW).open(path).ok()?;
+    f.take(MAX_CACHE_BYTES).read_to_string(&mut text).ok()?;
     serde_json::from_str(&text).ok()
 }
 
 /// Writes the cache (directory 0700, file 0600). Errors are ignored: the notice must never fail a command.
+///
+/// Symlinks are never followed: the cache directory must be a real directory owned by the effective user, the data
+/// goes to a new file with a random name (`O_EXCL | O_NOFOLLOW`), and the rename replaces whatever sits at `path`
+/// (a symlink included) instead of writing through it.
 pub fn write_cache(path: &Path, entry: &CacheEntry) {
-    use std::os::unix::fs::DirBuilderExt;
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
     let Some(dir) = path.parent() else { return };
     if std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).is_err() {
         return;
     }
-    if let Ok(data) = serde_json::to_vec(entry) {
-        let _ = crate::client::profile::atomic_write(path, &data, 0o600);
+    let euid = nix::unistd::geteuid().as_raw();
+    match std::fs::symlink_metadata(dir) {
+        Ok(m) if m.file_type().is_dir() && m.uid() == euid => {}
+        _ => return,
+    }
+    let Ok(data) = serde_json::to_vec(entry) else { return };
+    let tmp = dir.join(format!(".update-check.{}.tmp", crate::util::new_id()));
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(&tmp)
+    else {
+        return;
+    };
+    let written = f.write_all(&data).and_then(|()| f.sync_all());
+    drop(f);
+    if written.and_then(|()| std::fs::rename(&tmp, path)).is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
@@ -125,14 +170,53 @@ mod tests {
 
     #[test]
     fn suppressed_without_terminal_in_ci_and_on_opt_out() {
-        assert!(enabled(env(&[]), true));
-        assert!(!enabled(env(&[]), false), "stderr is not a terminal");
-        assert!(!enabled(env(&[("CI", "true")]), true));
-        assert!(!enabled(env(&[("CI", "")]), true), "CI set, even empty");
-        assert!(!enabled(env(&[("DOVE_NO_UPDATE_CHECK", "1")]), true));
-        assert!(!enabled(env(&[("DOVE_NO_UPDATE_CHECK", "yes")]), true));
-        assert!(enabled(env(&[("DOVE_NO_UPDATE_CHECK", "0")]), true));
-        assert!(enabled(env(&[("DOVE_NO_UPDATE_CHECK", "")]), true));
+        let user = Ids { uid: 1000, euid: 1000 };
+        assert!(enabled(env(&[]), true, user));
+        assert!(!enabled(env(&[]), false, user), "stderr is not a terminal");
+        assert!(!enabled(env(&[("CI", "true")]), true, user));
+        assert!(!enabled(env(&[("CI", "")]), true, user), "CI set, even empty");
+        assert!(!enabled(env(&[("DOVE_NO_UPDATE_CHECK", "1")]), true, user));
+        assert!(!enabled(env(&[("DOVE_NO_UPDATE_CHECK", "yes")]), true, user));
+        assert!(enabled(env(&[("DOVE_NO_UPDATE_CHECK", "0")]), true, user));
+        assert!(enabled(env(&[("DOVE_NO_UPDATE_CHECK", "")]), true, user));
+    }
+
+    #[test]
+    fn never_with_privileges() {
+        assert!(!enabled(env(&[]), true, Ids { uid: 0, euid: 0 }), "root");
+        assert!(!enabled(env(&[]), true, Ids { uid: 1000, euid: 0 }), "setuid root");
+        assert!(!enabled(env(&[]), true, Ids { uid: 0, euid: 1000 }), "euid differs from uid");
+        assert!(!enabled(env(&[("SUDO_UID", "1000")]), true, Ids { uid: 1001, euid: 1001 }), "sudo -u someone");
+    }
+
+    #[test]
+    fn cache_writes_do_not_follow_symlinks() {
+        use std::os::unix::fs::symlink;
+        let d = tempfile::tempdir().unwrap();
+        // The cache directory is a symlink to somewhere else: nothing is written there.
+        let elsewhere = d.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::create_dir(d.path().join("cache")).unwrap();
+        symlink(&elsewhere, d.path().join("cache").join("dove")).unwrap();
+        let entry = CacheEntry { checked_at: 7, latest: Some("v1.0.0".into()) };
+        write_cache(&d.path().join("cache").join("dove").join(CACHE_FILE), &entry);
+        assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0, "wrote through a symlinked directory");
+
+        // The cache file is a symlink to a victim file: the victim keeps its content, the link is replaced.
+        let dir = d.path().join("real");
+        std::fs::create_dir(&dir).unwrap();
+        let victim = d.path().join("victim");
+        // A valid cache entry, so reading through the link would be visible.
+        let precious = br#"{"checked_at":1,"latest":"v9.9.9"}"#;
+        std::fs::write(&victim, precious).unwrap();
+        let path = dir.join(CACHE_FILE);
+        symlink(&victim, &path).unwrap();
+        assert_eq!(read_cache(&path), None, "a symlinked cache file is not read");
+        write_cache(&path, &entry);
+        assert_eq!(std::fs::read(&victim).unwrap(), precious);
+        assert!(!std::fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
+        assert_eq!(read_cache(&path), Some(entry));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "no temporary file left");
     }
 
     #[cfg(not(target_os = "macos"))]

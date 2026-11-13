@@ -10,7 +10,11 @@ fn main() -> std::process::ExitCode {
     // The daily new-version notice (stderr only, never for `serve`): looked up alongside the command, bounded by
     // NOTICE_BUDGET from the start, and printed after the command's own output.
     let notice = dove::cli::update_notice_applies(&cli.command)
-        && dove::update::notice::enabled(|k| std::env::var_os(k), std::io::stderr().is_terminal());
+        && dove::update::notice::enabled(
+            |k| std::env::var_os(k),
+            std::io::stderr().is_terminal(),
+            dove::update::notice::Ids::current(),
+        );
     let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
         Ok(rt) => rt,
         Err(e) => {

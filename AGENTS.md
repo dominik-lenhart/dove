@@ -242,3 +242,5 @@ cargo fmt
   archives are made with Python's `tarfile`. A source scan in `tests/update_e2e.rs` keeps `serve` away from the
   updater. Dropping a tokio runtime waits for blocking tasks (a hanging DNS lookup), so `main` uses
   `shutdown_background()` when the notice check ran; try the notice in a pty with `script -qec "<cmd>" /dev/null`.
+  The notice never runs privileged (euid 0, euid != uid, `SUDO_UID` set: `sudo -E` keeps the user's HOME), and its
+  cache writes never follow symlinks (owned real dir, `O_EXCL|O_NOFOLLOW` temp file, rename onto the literal path).
