@@ -26,6 +26,8 @@ const CONNECT_RETRIES: u32 = 3;
 
 struct Bridge {
     http: reqwest::Client,
+    /// The server origin (checked before every request, P1) and its MCP endpoint.
+    server: String,
     url: String,
     token: zeroize::Zeroizing<String>,
     /// Negotiated protocol version, sent as `MCP-Protocol-Version` after initialize.
@@ -56,6 +58,7 @@ pub async fn run(server: &str, token: zeroize::Zeroizing<String>) -> anyhow::Res
     });
     let bridge = Arc::new(Bridge {
         http: remote::http_client()?,
+        server: server.to_string(),
         url: format!("{server}/mcp"),
         token,
         version: Mutex::new(None),
@@ -166,6 +169,21 @@ async fn read_line_bounded<R: tokio::io::AsyncBufRead + Unpin>(
 
 async fn forward(b: &Bridge, msg: Value, id: Option<Value>) {
     let is_initialize = msg.get("method").and_then(Value::as_str) == Some("initialize");
+    // Every request carries the bearer token: a plain-http loopback port must belong to this user (P1).
+    if let Err(e) = super::loopback::check_server(&b.server) {
+        eprintln!("dove: {e:#}");
+        if let Some(id) = id {
+            let _ = b
+                .out
+                .send(rpc_error(
+                    id,
+                    -32603,
+                    "Dove refused to send the credential: the local server port is not held by this user",
+                ))
+                .await;
+        }
+        return;
+    }
     let body = msg.to_string();
     let mut attempt = 0;
     let resp = loop {

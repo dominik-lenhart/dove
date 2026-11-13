@@ -340,3 +340,8 @@ cargo fmt
   directory such as `/tmp/dl-<id>` for manual runs, set `DOVE_LOCAL_HOME` for every command, and remove it afterwards.
   `dove local install` on this host writes the real `~/.config/systemd/user/dove.service`; always `dove local uninstall`
   after trying it.
+- 2026-11-13: The client's loopback owner check (`client::loopback`, P1) runs before every credential it sends to a
+  plain-http loopback server; tests that serve such a server must run it in the test process (same uid). A test helper
+  started as `sudo -n -u nobody <cmd>` survives `kill_on_drop` (only `sudo` dies) and keeps inherited pipes open, which
+  hangs `cargo test | grep`: give it its own timeout and `stderr(Stdio::null())`. To undo a mutation, never
+  `git checkout <file>` on a file with uncommitted work; reverse the edit and `touch` it.

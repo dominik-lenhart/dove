@@ -6,6 +6,7 @@
 //! command can never exceed the rights of its connection.
 
 pub mod install;
+pub mod loopback;
 pub mod profile;
 pub mod remote;
 pub mod stdio;

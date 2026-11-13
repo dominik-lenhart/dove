@@ -279,3 +279,50 @@ async fn mcp_client_against_local_mode() {
         .await;
     assert_ne!(o.code, 0);
 }
+
+/// P1: when another user holds the local port (here `nobody`, which needs passwordless `sudo -n -u nobody` like AC19),
+/// `dove login` refuses before it connects, so the invitation never reaches that listener. Linux only (the owner
+/// check reads /proc/net/tcp; macOS does not check, see docs/deployment.md).
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "needs passwordless sudo -n -u nobody"]
+async fn login_never_sends_to_a_loopback_port_of_another_user() {
+    let e = Env::new();
+    let port = free_port();
+    // Records everything the first connection sends, then prints it.
+    let script = format!(
+        "import socket,sys\ns=socket.socket()\ns.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)\n\
+         s.bind(('127.0.0.1',{port}))\ns.listen(4)\ns.settimeout(20)\nprint('ready',flush=True)\nc,_=s.accept()\nc.settimeout(3)\n\
+         data=b''\ntry:\n  while True:\n    d=c.recv(65536)\n    if not d: break\n    data+=d\nexcept Exception: pass\n\
+         sys.stdout.write('received:'+data.decode('latin1'))\n"
+    );
+    let mut squatter = tokio::process::Command::new("sudo")
+        .args(["-n", "-u", "nobody", "python3", "-c", &script])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut out = BufReader::new(squatter.stdout.take().unwrap());
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(10), out.read_line(&mut line)).await.unwrap().unwrap();
+    assert_eq!(line.trim(), "ready");
+
+    let server = format!("http://127.0.0.1:{port}");
+    let file = e.path("p.secret");
+    let args = ["login", "--server", &server, "--profile", "p", "--secret-file", file.to_str().unwrap()];
+    let o = e.run(&args, "dovei_secretinvitation\n").await;
+    assert_ne!(o.code, 0, "{}", o.stdout);
+    assert!(o.stderr.contains("belongs to another user"), "{}", o.stderr);
+
+    // Our own empty connection ends the squatter; the first connection it saw must be this one, not the CLI's.
+    drop(std::net::TcpStream::connect(("127.0.0.1", port)).unwrap());
+    let mut rest = String::new();
+    tokio::time::timeout(Duration::from_secs(10), tokio::io::AsyncReadExt::read_to_string(&mut out, &mut rest))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(rest.starts_with("received:"), "{rest}");
+    assert!(!rest.contains("dovei_"), "the invitation reached another user's listener: {rest}");
+    let _ = squatter.wait().await;
+}

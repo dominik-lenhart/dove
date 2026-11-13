@@ -425,6 +425,16 @@ another machine or as another OS user (server mode). Dove never weakens server m
 
 Remote web connectors (ChatGPT, claude.ai on the web) cannot reach a local Dove; use server mode for them.
 
+Plain HTTP on `127.0.0.1` authenticates nobody. On a computer shared with other OS users, another user could bind
+Dove's port while your Dove is not running and collect the invitation or token your client sends. Before the `dove`
+client sends a credential to a plain-http loopback server (login, the MCP bridge, every tool call), it therefore
+checks that every socket listening on that port belongs to your OS user, and refuses otherwise ("belongs to another
+user", "nothing listens there"). Linux reads the owners from `/proc/net/tcp` and `/proc/net/tcp6`, Windows maps the
+listener's process to its user. macOS has no cheap way to attribute a listener to a user, so the client does not
+check there: on a Mac shared with other users, keep Dove running (`dove local install`) so its port is never free.
+A short window between the check and the connection remains on every platform. Other MCP clients that connect to
+`http://127.0.0.1:<port>/mcp` directly (not through `dove`) do not make this check.
+
 ### Set up
 
 Install the binary (`install.sh`, Homebrew, or `install.ps1` on Windows; see [Install](#install)), then:
