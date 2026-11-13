@@ -46,7 +46,8 @@ dove.example.com {
 	header {
 		Strict-Transport-Security "max-age=31536000"
 		X-Content-Type-Options "nosniff"
-		Referrer-Policy "no-referrer"
+		# Dove sets its own (same-origin on the approval page); fill in only where it is missing.
+		?Referrer-Policy "no-referrer"
 		-Server
 	}
 
