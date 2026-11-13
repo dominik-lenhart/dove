@@ -1,0 +1,17 @@
+#!/bin/sh
+# Removing or purging the package keeps /etc/dove (config and secrets), /var/lib/dove (mail index, state, audit
+# log) and the dove user: they are the operator's data, and deleting them cannot be undone.
+set -e
+
+case "$1" in
+remove | purge)
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload || true
+    fi
+    if [ "$1" = purge ]; then
+        echo "Dove: /etc/dove, /var/lib/dove and the 'dove' user were kept; remove them by hand if you are done with Dove."
+    fi
+    ;;
+esac
+
+exit 0

@@ -89,6 +89,33 @@ testing = ["dep:tempfile"]
 tempfile = "3"
 dove-mcp = { path = ".", features = ["testing"] }
 
+# Debian/Ubuntu package (`cargo deb --no-build --no-strip --target <triple>`, see docs/releasing.md). The binary is
+# built (and stripped) by the release workflow. The package creates the `dove` user and /etc/dove, installs the unit,
+# and generates no secrets; it does not enable or start the service.
+[package.metadata.deb]
+name = "dove"
+maintainer = "Dominik Lenhart <noreply@github.com>"
+copyright = "Dominik Lenhart"
+extended-description = """\
+Dove gives AI agents token-scoped read and draft access to Gmail and IMAP mailboxes over MCP. \
+This package installs the dove binary, a hardened systemd unit and the service account. \
+Configuration and secrets are the operator's job: see docs/deployment.md."""
+section = "mail"
+priority = "optional"
+# libc6 2.35: the Linux builds run on Ubuntu 22.04 (glibc 2.35). libgcc-s1 provides libgcc_s.so.1.
+depends = "libc6 (>= 2.35), libgcc-s1"
+recommends = "systemd"
+maintainer-scripts = "deploy/deb/"
+assets = [
+    ["target/release/dove", "usr/bin/", "755"],
+    ["deploy/deb/dove.service", "usr/lib/systemd/system/dove.service", "644"],
+    ["deploy/systemd/dove.sysusers.conf", "usr/lib/sysusers.d/dove.conf", "644"],
+    ["deploy/systemd/dove.tmpfiles.conf", "usr/lib/tmpfiles.d/dove.conf", "644"],
+    ["README.md", "usr/share/doc/dove/README.md", "644"],
+    ["docs/deployment.md", "usr/share/doc/dove/deployment.md", "644"],
+    ["LICENSE", "usr/share/doc/dove/copyright", "644"],
+]
+
 [profile.release]
 lto = "thin"
 codegen-units = 4

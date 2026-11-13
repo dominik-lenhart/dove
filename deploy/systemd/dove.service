@@ -10,7 +10,7 @@
 
 [Unit]
 Description=Dove MCP server (token-scoped Gmail access for AI agents)
-Documentation=https://github.com/dove-mcp/dove-mcp
+Documentation=https://github.com/dominik-lenhart/dove
 After=network-online.target
 Wants=network-online.target
 # Do not start without a config and the three key files. Missing secrets fail loudly here instead of in the service.
