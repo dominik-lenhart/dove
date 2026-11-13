@@ -223,7 +223,7 @@ async fn service_reports_its_version() {
     let sock = start(&env).await;
     let before = audit_count(&env).await;
     let v = client::send(&sock, &AdminRequest::Version).await.unwrap();
-    assert_eq!(v, serde_json::json!({ "version": env!("CARGO_PKG_VERSION") }));
+    assert_eq!(v, serde_json::json!({ "version": env!("CARGO_PKG_VERSION"), "mode": "server" }));
     assert_eq!(audit_count(&env).await, before + 1);
     let doctor = client::send(&sock, &AdminRequest::Doctor).await.unwrap();
     let row = doctor.as_array().unwrap().iter().find(|c| c["check"] == "service_version").cloned().unwrap();
