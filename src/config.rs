@@ -141,8 +141,8 @@ pub struct Limits {
     pub client_burst: u32,
     pub client_sends_per_hour: u32,
     /// Failed bearer authentications on `/mcp` per source address (IPv6 by /64) and minute, also the burst. Once
-    /// used up, further bearer requests from that address get 429 before any token lookup; successful requests are
-    /// not counted, so hosts sharing egress addresses keep working.
+    /// used up, further failures from that address get 429 instead of 401; valid tokens are always accepted, since
+    /// MCP hosts share egress addresses.
     pub auth_failures_per_minute: u32,
     /// Messages a client may change per hour with update_messages and move_messages (each id counts once).
     pub client_organize_per_hour: u32,

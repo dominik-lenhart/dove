@@ -536,7 +536,10 @@ async fn failed_bearer_authentication_is_limited_per_address() {
         assert_eq!(from("192.0.2.7", bad()).await.0, 401);
     }
     assert_eq!(from("192.0.2.7", bad()).await, (429, true), "the address used up its failures");
-    assert_eq!(from("192.0.2.7", Some(token.clone())).await.0, 429, "refused before the token is looked up");
+    // Valid tokens from the same address still work: MCP hosts share egress addresses, and a stranger sending bad
+    // tokens from them must not lock the owner's connectors out.
+    assert_eq!(from("192.0.2.7", Some(token.clone())).await.0, 200, "a valid token is never refused");
+    assert_eq!(from("192.0.2.7", bad()).await.0, 429, "failures stay limited");
     // Another address keeps its own budget.
     assert_eq!(from("198.51.100.9", bad()).await.0, 401);
     assert_eq!(from("198.51.100.9", Some(token.clone())).await.0, 200);

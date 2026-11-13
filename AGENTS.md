@@ -369,9 +369,10 @@ cargo fmt
   dynamic client's redirect is not `oauth::known_redirect` (HTTPS on `KNOWN_REDIRECT_HOSTS`, exact host, or loopback).
   `tests/oauth_e2e.rs`'s `REDIRECT` is a known host on purpose; tests of unknown destinations use `with_redirect`.
   `/connect/redeem` checks the invitation's `--allow-ip`; the approval page does not (A34: the browser is not the host).
-- 2026-11-13: Failed bearer auth on `/mcp` draws from a per-address bucket (`limits.auth_failures_per_minute`) checked with
-  `RateLimiter::exhausted` (no token taken) before the lookup; loopback and unknown addresses are exempt because behind
-  Tailscale Serve or in local mode they stand for every caller. Tests simulate addresses with `X-Forwarded-For` plus
+- 2026-11-13: Failed bearer auth on `/mcp` draws from a per-address bucket (`limits.auth_failures_per_minute`), charged
+  only after a failed lookup; a valid token is never refused by it, because Claude's and ChatGPT's egress addresses
+  are shared with anyone holding an API key (a pre-lookup check let strangers lock the owner out). Loopback and unknown
+  addresses are exempt because behind Tailscale Serve or in local mode they stand for every caller. Tests simulate addresses with `X-Forwarded-For` plus
   `X-Dove-Proxy-Auth`.
 - 2026-11-13: Security review fixes. Organize writes spend `limits.client_organize_per_hour` (messages, per client):
   `organize::Budget::take` reserves before the first write, `settle` refunds failed ids, or everything when the call

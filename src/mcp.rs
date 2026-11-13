@@ -99,16 +99,6 @@ impl RateLimiter {
         self.check_rate(key, f64::from(per_minute.max(1)) / 60.0, burst, 1)
     }
 
-    /// Like [`RateLimiter::check`], but only reports whether the bucket is used up, without taking a token.
-    pub fn exhausted(&self, key: &str, per_minute: u32, burst: u32) -> Option<u64> {
-        let rate = f64::from(per_minute.max(1)) / 60.0;
-        let cap = f64::from(burst.max(1));
-        let b = self.inner.lock().expect("lock");
-        let tokens = b.map.get(key)?;
-        let left = (tokens.tokens + Instant::now().duration_since(tokens.last).as_secs_f64() * rate).min(cap);
-        (left < 1.0).then(|| ((1.0 - left) / rate).ceil() as u64)
-    }
-
     /// Token bucket refilling `per_hour` tokens per hour, holding at most `burst`.
     pub fn check_hourly(&self, key: &str, per_hour: u32, burst: u32) -> Option<u64> {
         self.check_rate(key, f64::from(per_hour.max(1)) / 3600.0, burst, 1)
@@ -200,17 +190,16 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
     if bearer.is_empty() {
         return unauthorized(&app);
     }
-    // Each attempt costs a keyed hash and a store lookup: an address that keeps failing is refused before both.
+    // Failed tokens are limited per address, but only failures are ever refused: a valid token is always looked
+    // up and accepted. Many callers share one address (the MCP hosts' egress ranges, which anyone with an API key
+    // can send from), so refusing before the lookup would let a stranger lock the owner's connectors out.
     // Unknown and loopback addresses are not limited: they stand for every caller at once (local mode, Tailscale
-    // Serve, a proxy without the shared secret), so one bucket would let any caller lock out all the others.
+    // Serve, a proxy without the shared secret).
     let fail_key = ip
         .map(|i| i.to_canonical())
         .filter(|i| !i.is_loopback())
         .map(|i| format!("mcp-auth-fail:{}", crate::oauth::ip_bucket(Some(i))));
     let fail_limit = app.cfg.limits.auth_failures_per_minute;
-    if let Some(wait) = fail_key.as_deref().and_then(|k| app.rate_limiter.exhausted(k, fail_limit, fail_limit)) {
-        return too_many(wait);
-    }
     let resource = resource_url(&app);
     let allow_send = app.cfg.allow_send;
     let pepper = app.pepper.clone();
@@ -218,8 +207,8 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
     let authed = match auth {
         Ok(Ok(a)) => a,
         Ok(Err(AuthFailure::Unauthorized)) => {
-            if let Some(k) = &fail_key {
-                app.rate_limiter.check(k, fail_limit, fail_limit);
+            if let Some(wait) = fail_key.as_deref().and_then(|k| app.rate_limiter.check(k, fail_limit, fail_limit)) {
+                return too_many(wait);
             }
             return unauthorized(&app);
         }
