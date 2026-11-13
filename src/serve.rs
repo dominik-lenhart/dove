@@ -65,7 +65,13 @@ async fn run_until_shutdown(app: Arc<App>) -> anyhow::Result<()> {
         tracing::warn!(count = recovered, "sends interrupted by a restart are marked outcome-unknown");
     }
     let listener = tokio::net::TcpListener::bind(app.cfg.listen).await.context("cannot bind listen address")?;
-    let signal = shutdown_signal();
+    let requested = app.clone();
+    let signal = async move {
+        tokio::select! {
+            () = shutdown_signal() => {}
+            () = requested.shutdown.notified() => tracing::info!("shutdown requested over the admin channel"),
+        }
+    };
     // Graceful shutdown finishes in-flight requests for up to 10 seconds (spec 8.2).
     serve_until(app.clone(), listener, signal, std::time::Duration::from_secs(10)).await
 }

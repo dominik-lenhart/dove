@@ -166,6 +166,9 @@ pub enum AdminRequest {
     Doctor,
     /// The running service's version (`dove upgrade` compares it with the new binary).
     Version,
+    /// Local mode only: stop the service gracefully (`dove local stop`, uninstall). A Windows logon task cannot stop
+    /// it reliably: `schtasks /End` ends `conhost`, not necessarily the `dove.exe` it started.
+    Shutdown,
     Export,
 
     IndexEnable {
@@ -248,6 +251,7 @@ impl AdminRequest {
             KeysRotate => ("keys.rotate", None, None, vec![]),
             Doctor => ("doctor", None, None, vec![]),
             Version => ("version", None, None, vec![]),
+            Shutdown => ("service.shutdown", None, None, vec![]),
             Export => ("export", None, None, vec![]),
             IndexEnable { alias } => ("index.enable", None, Some(alias.clone()), vec![]),
             IndexDisable { alias } => ("index.disable", None, Some(alias.clone()), vec![]),

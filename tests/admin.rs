@@ -229,3 +229,24 @@ async fn service_reports_its_version() {
     let row = doctor.as_array().unwrap().iter().find(|c| c["check"] == "service_version").cloned().unwrap();
     assert_eq!(row["detail"], env!("CARGO_PKG_VERSION"));
 }
+
+/// The admin `Shutdown` verb exists for local mode only; a server-mode service keeps running and audits the refusal.
+#[tokio::test]
+async fn server_mode_refuses_shutdown_over_the_admin_socket() {
+    let env = TestEnv::new();
+    let sock = start(&env).await;
+    let notified = env.app.shutdown.notified();
+    let err = client::send(&sock, &AdminRequest::Shutdown).await.unwrap_err().to_string();
+    assert!(err.contains("only in local mode"), "{err}");
+    assert!(tokio::time::timeout(std::time::Duration::from_millis(500), notified).await.is_err(), "shutdown requested");
+    client::send(&sock, &AdminRequest::Version).await.unwrap();
+    let last = env.app.store.call(|c| dove::audit::tail(c, 2)).await.unwrap();
+    let last = serde_json::to_value(last).unwrap();
+    assert!(
+        last.as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["tool_or_action"] == "service.shutdown" && r["result_code"] == "error"),
+        "{last}"
+    );
+}

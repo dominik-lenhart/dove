@@ -327,6 +327,20 @@ async fn execute(call: &mut AdminCall<'_>, req: AdminRequest) -> anyhow::Result<
         Doctor => Ok(doctor(&app).await),
         Version => Ok(json!({ "version": env!("CARGO_PKG_VERSION"),
                               "mode": if app.cfg.is_local() { "local" } else { "server" } })),
+        Shutdown => {
+            if !app.cfg.is_local() {
+                bail!(
+                    "shutdown over the admin socket exists only in local mode; stop the service with its service manager"
+                );
+            }
+            // Answer first: the request is acknowledged before the HTTP listener starts its graceful stop.
+            let app = app.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                app.shutdown.notify_one();
+            });
+            Ok(json!({ "stopping": true }))
+        }
         IndexEnable { alias } => crate::index::admin::enable(call, alias).await,
         IndexDisable { alias } => crate::index::admin::disable(call, alias).await,
         IndexStatus { alias } => crate::index::admin::status(&app, alias).await,

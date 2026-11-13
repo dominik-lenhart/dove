@@ -193,6 +193,24 @@ async fn local_init_start_admin_and_stop() {
     let o = e.ok(&["local", "status"], "").await;
     assert!(o.stdout.contains("service:    not answering"), "{}", o.stdout);
     assert!(std::fs::metadata(&log).unwrap().len() > 0);
+
+    // `dove local stop` stops it over the admin channel, without a signal (P4: the Windows task cannot be relied on).
+    let mut server = e.command(&["local", "start", "--log-file", log.to_str().unwrap()]).spawn().unwrap();
+    let mut up = false;
+    for _ in 0..80 {
+        if e.run(&["local", "status"], "").await.stdout.contains("service:    running") {
+            up = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(up, "the local service did not come up again");
+    let o = e.ok(&["local", "stop"], "").await;
+    assert!(o.stdout.contains("Dove stopped."), "{}", o.stdout);
+    let status = tokio::time::timeout(Duration::from_secs(20), server.wait()).await.unwrap().unwrap();
+    assert!(status.success(), "{status:?}");
+    let o = e.ok(&["local", "stop"], "").await;
+    assert!(o.stdout.contains("Dove was not running."), "{}", o.stdout);
 }
 
 /// A local-mode server (plain HTTP on 127.0.0.1) with an IMAP mailbox, used by the real client: login with an

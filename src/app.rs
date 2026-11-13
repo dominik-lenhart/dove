@@ -38,6 +38,8 @@ pub struct App {
     pub oauth: crate::oauth::OAuthState,
     /// Watch event worker state (`crate::watch`).
     pub watch: crate::watch::Runtime,
+    /// Graceful stop requested over the admin channel (local mode's `Shutdown`).
+    pub shutdown: tokio::sync::Notify,
 }
 
 impl App {
@@ -90,6 +92,7 @@ impl App {
             draft_locks: Default::default(),
             oauth: crate::oauth::OAuthState::load(&cfg.oauth)?,
             watch: Default::default(),
+            shutdown: Default::default(),
             vault,
             pepper: Pepper::new(pepper),
             index: crate::index::Index::new(cfg.index_db_path(), index_key.clone(), cfg.index.clone()),

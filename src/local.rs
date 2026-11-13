@@ -42,6 +42,8 @@ pub enum LocalCmd {
     },
     /// Start Dove now and at every login (launchd agent, systemd user unit or Task Scheduler logon task).
     Install,
+    /// Stop the running service gracefully. A login item starts it again at the next login.
+    Stop,
     /// Stop Dove and remove the login item. Config, keys and data stay.
     Uninstall,
     /// Show paths, the login item and whether the service answers.
@@ -71,7 +73,15 @@ pub async fn run(cmd: LocalCmd) -> anyhow::Result<()> {
             }
         }
         LocalCmd::Install => install(&paths).await,
-        LocalCmd::Uninstall => uninstall(&paths),
+        LocalCmd::Stop => {
+            if stop_service(&paths).await? {
+                println!("Dove stopped.");
+            } else {
+                println!("Dove was not running.");
+            }
+            Ok(())
+        }
+        LocalCmd::Uninstall => uninstall(&paths).await,
         LocalCmd::Status => status(&paths).await,
     }
 }
@@ -386,6 +396,9 @@ fn conhost_path() -> PathBuf {
 async fn install(paths: &LocalPaths) -> anyhow::Result<()> {
     let _cfg = require_config(paths)?;
     let exe = exe()?;
+    // A running instance (an older login item or a foreground `dove local start`) holds the port and the admin
+    // channel; the new one could not start next to it.
+    stop_service(paths).await?;
     #[cfg(target_os = "linux")]
     {
         let unit = systemd_unit_path()?;
@@ -443,7 +456,7 @@ async fn install(paths: &LocalPaths) -> anyhow::Result<()> {
 
 /// Waits a few seconds for the service to answer on the admin channel and says whether it did.
 async fn wait_until_up(paths: &LocalPaths) {
-    let socket = Config::load(&paths.config_file).map(|c| c.admin.socket_path).unwrap_or_else(|_| paths.admin_socket());
+    let socket = admin_socket(paths);
     for _ in 0..20 {
         if service_version(&socket).await.is_some() {
             println!("Dove answers on its admin channel.");
@@ -452,6 +465,35 @@ async fn wait_until_up(paths: &LocalPaths) {
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
     println!("Dove did not answer within 5 seconds; check `dove local status` and the log.");
+}
+
+fn admin_socket(paths: &LocalPaths) -> PathBuf {
+    Config::load(&paths.config_file).map(|c| c.admin.socket_path).unwrap_or_else(|_| paths.admin_socket())
+}
+
+/// Asks the running service to stop over its admin channel and waits until it no longer answers. Returns whether one
+/// was running. This is the reliable stop on every platform: on Windows `schtasks /End` ends the task's `conhost`
+/// process, which does not always take the `dove.exe` it started along (P4); the task commands remain a fallback.
+pub async fn stop_service(paths: &LocalPaths) -> anyhow::Result<bool> {
+    let socket = admin_socket(paths);
+    if service_version(&socket).await.is_none() {
+        return Ok(false);
+    }
+    let req = crate::admin::AdminRequest::Shutdown;
+    let v = tokio::time::timeout(std::time::Duration::from_secs(5), crate::admin::client::send(&socket, &req))
+        .await
+        .context("the service did not answer the stop request")??;
+    if v["stopping"] != true {
+        bail!("the service did not accept the stop request: {v}");
+    }
+    // In-flight requests get up to 10 seconds (spec 8.2).
+    for _ in 0..60 {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        if service_version(&socket).await.is_none() {
+            return Ok(true);
+        }
+    }
+    bail!("Dove still answers on {} after 15 seconds; stop it by hand", socket.display())
 }
 
 async fn service_version(socket: &Path) -> Option<String> {
@@ -463,8 +505,11 @@ async fn service_version(socket: &Path) -> Option<String> {
     v["version"].as_str().map(str::to_string)
 }
 
-fn uninstall(paths: &LocalPaths) -> anyhow::Result<()> {
-    let _ = paths;
+async fn uninstall(paths: &LocalPaths) -> anyhow::Result<()> {
+    // Stop over the admin channel first; the service manager's stop below is the fallback.
+    if let Err(e) = stop_service(paths).await {
+        eprintln!("warning: {e:#}");
+    }
     #[cfg(target_os = "linux")]
     {
         let unit = systemd_unit_path()?;
