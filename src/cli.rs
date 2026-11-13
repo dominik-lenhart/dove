@@ -56,6 +56,9 @@ pub enum Command {
     /// Unknown-outcome draft operations (admin).
     #[command(subcommand)]
     Operations(OperationsCmd),
+    /// Webhook sinks for watch push delivery (admin).
+    #[command(subcommand)]
+    Sinks(SinksCmd),
     /// Check configuration, permissions and reachability (admin). With --profile: check a remote profile instead.
     Doctor {
         /// Check this remote client profile (config, credential, network, grants). Never uses the admin socket.
@@ -439,6 +442,33 @@ pub enum OperationsCmd {
     },
 }
 
+#[derive(Subcommand)]
+pub enum SinksCmd {
+    /// Register a webhook sink: an HTTPS URL that receives signed, content-free watch events.
+    Add {
+        name: String,
+        /// HTTPS URL (no query or fragment). Only this exact URL is ever contacted.
+        #[arg(long)]
+        url: String,
+        /// File with the HMAC signing secret (at least 32 characters, mode 0600 or stricter), e.g. from
+        /// `openssl rand -hex 32`. The service keeps it sealed; the receiver needs the same secret.
+        #[arg(long)]
+        secret_file: PathBuf,
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+    List {
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+    /// Remove a sink. Watches that named it keep working without push.
+    Remove {
+        name: String,
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+}
+
 fn split_list(s: &str) -> Vec<String> {
     s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()
 }
@@ -534,6 +564,14 @@ fn admin_request(cmd: Command) -> anyhow::Result<(AdminOpts, AdminRequest)> {
             OperationsCmd::Remove { client, account, request_key, admin } => {
                 (admin, R::OperationsRemove { client, account, request_key })
             }
+        },
+        Command::Sinks(c) => match c {
+            SinksCmd::Add { name, url, secret_file, admin } => {
+                let secret = crate::secrets::read_secret_string(&secret_file)?;
+                (admin, R::SinksAdd { name, url, secret: crate::admin::Password(secret) })
+            }
+            SinksCmd::List { admin } => (admin, R::SinksList),
+            SinksCmd::Remove { name, admin } => (admin, R::SinksRemove { name }),
         },
         Command::Doctor { .. } => unreachable!("handled in run_command"),
         Command::Export { admin } => (admin, R::Export),

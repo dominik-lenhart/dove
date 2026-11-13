@@ -40,6 +40,7 @@ pub async fn run(config_path: &Path) -> anyhow::Result<()> {
     tokio::spawn(crate::admin::server::serve(app.clone(), admin));
     crate::index::start(app.clone());
     crate::index::imap_idle::start(app.clone());
+    crate::watch::start(app.clone());
     tracing::info!(listen = %app.cfg.listen, "dove started");
     run_until_shutdown(app).await
 }

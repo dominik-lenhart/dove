@@ -320,6 +320,9 @@ async fn execute(call: &mut AdminCall<'_>, req: AdminRequest) -> anyhow::Result<
         IndexDisable { alias } => crate::index::admin::disable(call, alias).await,
         IndexStatus { alias } => crate::index::admin::status(&app, alias).await,
         IndexRebuild { alias } => crate::index::admin::rebuild(call, alias).await,
+        SinksAdd { name, url, secret } => crate::watch::sinks::add(call, name, url, secret.0).await,
+        SinksList => crate::watch::sinks::list(call).await,
+        SinksRemove { name } => crate::watch::sinks::remove(call, name).await,
         other => Err(anyhow!("'{}' is not available in this build yet", other.audit_fields().0)),
     }
 }
@@ -454,8 +457,15 @@ async fn keys_rotate(call: &mut AdminCall<'_>) -> anyhow::Result<Value> {
                 )?;
                 n += 1;
             }
+            // Sink secrets and watch filters are sealed under the KEK too.
+            n += crate::watch::sinks::rewrap_sealed(tx, &vault)?;
             let mut stmt = tx.prepare("SELECT DISTINCT kek_version FROM grants")?;
-            let remaining: Vec<u32> = stmt.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
+            let mut remaining: Vec<u32> = stmt.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
+            for v in crate::watch::sinks::sealed_versions(tx)? {
+                if !remaining.contains(&v) {
+                    remaining.push(v);
+                }
+            }
             crate::store::set_meta(tx, "kek_version", &current.to_string())?;
             Ok((n, remaining))
         })

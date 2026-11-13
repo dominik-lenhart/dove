@@ -36,6 +36,8 @@ pub struct App {
     pub draft_locks: crate::tools::drafts::DraftLocks,
     pub index: crate::index::Index,
     pub oauth: crate::oauth::OAuthState,
+    /// Watch event worker state (`crate::watch`).
+    pub watch: crate::watch::Runtime,
 }
 
 impl App {
@@ -66,6 +68,8 @@ impl App {
         let notifier = Notifier::new(cfg.notifier.webhook_url.clone(), store.clone());
         let vault = Vault::new(kek);
         let gateway = Arc::new(Gateway::new(upstream, &cfg.limits));
+        // Webhook sinks are the only non-Google destinations; the operator's list is the allowlist.
+        gateway.set_sink_allowlist(store.call_blocking(|c| crate::watch::sinks::registered_urls(c, false))?);
         let tokens = TokenManager::new(
             store.clone(),
             vault.clone(),
@@ -85,6 +89,7 @@ impl App {
             denials: Default::default(),
             draft_locks: Default::default(),
             oauth: crate::oauth::OAuthState::load(&cfg.oauth)?,
+            watch: Default::default(),
             vault,
             pepper: Pepper::new(pepper),
             index: crate::index::Index::new(cfg.index_db_path(), index_key.clone(), cfg.index.clone()),

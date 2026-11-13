@@ -604,12 +604,19 @@ pub(super) async fn commit_results(
 ) -> anyhow::Result<()> {
     let aid = job.account_id.clone();
     let now = util::now_unix();
-    let (indexed, removed, failed) = job
+    let (indexed, removed, failed, arrived) = job
         .tx(move |tx| {
             let (mut indexed, mut removed, mut failed) = (0, 0, 0);
+            // Messages new to the generation that serves the account (incremental sync, not a backfill or rebuild):
+            // the input of watch matching after commit.
+            let live = load_state(tx, &aid)?.and_then(|s| s.active_gen) == Some(gen_id);
+            let mut arrived = Vec::new();
             for (id, r) in &results {
                 match r {
                     Fetched::Doc(d) => {
+                        if live && ingest::row_id(tx, gen_id, id)?.is_none() {
+                            arrived.push(id.clone());
+                        }
                         ingest::upsert(tx, gen_id, &aid, d)?;
                         tx.execute("DELETE FROM pending WHERE gen = ?1 AND gmail_id = ?2", params![gen_id, id])?;
                         indexed += 1;
@@ -648,9 +655,10 @@ pub(super) async fn commit_results(
             if indexed + removed > 0 {
                 tx.execute("UPDATE sync_state SET data_seq = data_seq + 1 WHERE account_id = ?1", [&aid])?;
             }
-            Ok((indexed, removed, failed))
+            Ok((indexed, removed, failed, arrived))
         })
         .await?;
+    crate::watch::messages_indexed(&job.app, &job.account_id, gen_id, arrived).await;
     report.indexed += indexed;
     report.removed += removed;
     report.failed += failed;
