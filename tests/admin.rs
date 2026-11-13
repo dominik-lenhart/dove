@@ -210,3 +210,18 @@ async fn every_admin_action_writes_exactly_one_audit_record() {
     assert!(!dump.contains(&token[5..]));
     let _ = Arc::clone(&env.app);
 }
+
+/// `dove upgrade` and `dove doctor` read the running service's version over the admin socket; the call is audited
+/// like every admin action.
+#[tokio::test]
+async fn service_reports_its_version() {
+    let env = TestEnv::new();
+    let sock = start(&env).await;
+    let before = audit_count(&env).await;
+    let v = client::send(&sock, &AdminRequest::Version).await.unwrap();
+    assert_eq!(v, serde_json::json!({ "version": env!("CARGO_PKG_VERSION") }));
+    assert_eq!(audit_count(&env).await, before + 1);
+    let doctor = client::send(&sock, &AdminRequest::Doctor).await.unwrap();
+    let row = doctor.as_array().unwrap().iter().find(|c| c["check"] == "service_version").cloned().unwrap();
+    assert_eq!(row["detail"], env!("CARGO_PKG_VERSION"));
+}

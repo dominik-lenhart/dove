@@ -315,6 +315,7 @@ async fn execute(call: &mut AdminCall<'_>, req: AdminRequest) -> anyhow::Result<
         AccountsCheck { alias } => accounts_check(&app, alias).await,
         KeysRotate => keys_rotate(call).await,
         Doctor => Ok(doctor(&app).await),
+        Version => Ok(json!({ "version": env!("CARGO_PKG_VERSION") })),
         IndexEnable { alias } => crate::index::admin::enable(call, alias).await,
         IndexDisable { alias } => crate::index::admin::disable(call, alias).await,
         IndexStatus { alias } => crate::index::admin::status(&app, alias).await,
@@ -468,6 +469,7 @@ async fn doctor(app: &Arc<App>) -> Value {
     let mut checks = Vec::new();
     let mut add =
         |name: &str, ok: bool, detail: String| checks.push(json!({ "check": name, "ok": ok, "detail": detail }));
+    add("service_version", true, env!("CARGO_PKG_VERSION").to_string());
     add("config", app.cfg.validate().is_ok(), app.cfg.validate().err().map(|e| e.to_string()).unwrap_or_default());
     let uid = nix::unistd::getuid().as_raw();
     add(

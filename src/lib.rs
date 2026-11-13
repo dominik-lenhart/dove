@@ -25,6 +25,7 @@ pub mod serve;
 pub mod store;
 pub mod tokens;
 pub mod tools;
+pub mod update;
 pub mod util;
 pub mod vault;
 

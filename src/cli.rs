@@ -69,9 +69,39 @@ pub enum Command {
         #[command(flatten)]
         admin: AdminOpts,
     },
+    /// Update this dove binary to the latest signed release (alias: update).
+    #[command(visible_alias = "update")]
+    Upgrade(UpgradeArgs),
     /// Remote client commands (login, search, mcp install, ...). They use only a connection token over HTTPS.
     #[command(flatten)]
     Remote(Box<crate::client::RemoteCmd>),
+}
+
+/// `dove upgrade`: downloads the release, checks its minisign signature and checksum, and replaces this binary.
+#[derive(Args)]
+#[command(after_help = "Exit codes: 0 done or up to date; 10 with --check: a newer release exists; 1 error.\n\
+    Set DOVE_NO_UPDATE_CHECK=1 to turn off the daily new-version notice of other commands.")]
+pub struct UpgradeArgs {
+    /// Only report whether a newer release exists (exit code 10 if so, 0 if up to date).
+    #[arg(long, conflicts_with = "version")]
+    pub check: bool,
+    /// Install this release (X.Y.Z) instead of the latest; also allows going back to an older one.
+    #[arg(long, value_name = "X.Y.Z")]
+    pub version: Option<String>,
+    /// Admin socket of a local service, asked for its version after the upgrade (failures are ignored).
+    #[arg(long, env = "DOVE_ADMIN_SOCKET", default_value = DEFAULT_ADMIN_SOCKET, hide = true)]
+    pub socket: PathBuf,
+}
+
+/// Whether the daily new-version notice may follow this command: not for the service, the MCP stdio bridge (its
+/// stderr belongs to the MCP host) or the upgrade itself.
+pub fn update_notice_applies(cmd: &Command) -> bool {
+    use crate::client::{McpCmd, RemoteCmd};
+    match cmd {
+        Command::Serve { .. } | Command::Upgrade(_) => false,
+        Command::Remote(r) => !matches!(**r, RemoteCmd::Mcp(McpCmd::Stdio { .. })),
+        _ => true,
+    }
 }
 
 #[derive(Subcommand)]
@@ -505,11 +535,12 @@ fn admin_request(cmd: Command) -> anyhow::Result<(AdminOpts, AdminRequest)> {
                 (admin, R::OperationsRemove { client, account, request_key })
             }
         },
-        Command::Doctor { admin, .. } => (admin, R::Doctor),
+        Command::Doctor { .. } => unreachable!("handled in run_command"),
         Command::Export { admin } => (admin, R::Export),
         Command::Serve { .. }
         | Command::ConfigExample
         | Command::Remote(_)
+        | Command::Upgrade(_)
         | Command::Keys(KeysCmd::Generate { .. }) => {
             unreachable!("not an admin command")
         }
@@ -569,8 +600,38 @@ fn print(value: &Value, json: bool) {
     print!("{out}");
 }
 
-pub async fn run(cli: Cli) -> anyhow::Result<()> {
+/// Runs a command and returns the process exit code (errors are exit code 1, printed by the caller).
+pub async fn run(cli: Cli) -> anyhow::Result<u8> {
     match cli.command {
+        Command::Upgrade(a) => {
+            let opts = crate::update::UpgradeOpts { check: a.check, version: a.version, socket: a.socket };
+            crate::update::run_upgrade(opts).await
+        }
+        other => run_command(other).await.map(|()| 0),
+    }
+}
+
+/// Adds this binary's version to the service's doctor checks. A difference means the service still runs another
+/// release (typically: upgraded binary, service not restarted).
+fn add_binary_version(checks: &mut Value) {
+    let Some(list) = checks.as_array_mut() else { return };
+    let binary = env!("CARGO_PKG_VERSION");
+    let service = list.iter().find(|c| c["check"] == "service_version").and_then(|c| c["detail"].as_str());
+    let (ok, detail) = match service {
+        Some(s) if s == binary => (true, binary.to_string()),
+        Some(s) => (false, format!("{binary}, but the service runs {s}: restart it (sudo systemctl restart dove)")),
+        None => (
+            false,
+            format!(
+                "{binary}, but the service does not report its version (older release): restart it (sudo systemctl restart dove)"
+            ),
+        ),
+    };
+    list.push(serde_json::json!({ "check": "binary_version", "ok": ok, "detail": detail }));
+}
+
+async fn run_command(command: Command) -> anyhow::Result<()> {
+    match command {
         Command::Serve { config } => crate::serve::run(&config).await,
         Command::ConfigExample => {
             print!("{}", config::EXAMPLE);
@@ -583,6 +644,12 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         // Remote commands never reach the admin socket (spec 5.6).
         Command::Remote(cmd) => crate::client::run(*cmd).await,
         Command::Doctor { profile: Some(p), admin } => crate::client::doctor(Some(&p), admin.json).await,
+        Command::Doctor { profile: None, admin } => {
+            let mut v = admin_client::send(&admin.socket, &AdminRequest::Doctor).await?;
+            add_binary_version(&mut v);
+            print(&v, admin.json);
+            Ok(())
+        }
         Command::Accounts(AccountsCmd::Reconnect { alias, password_stdin, admin }) => {
             let v = reconnect(alias, password_stdin, &admin).await?;
             print(&v, admin.json);
@@ -610,5 +677,51 @@ mod tests {
         assert_eq!((ep.host.as_str(), ep.port, ep.tls), ("smtp.strato.de", 587, TlsMode::StartTls));
         assert!(endpoint("smtp", None, None, None, (465, 587), Some("smtp.strato.de")).unwrap().is_none());
         assert!(endpoint("smtp", None, Some(587), None, (465, 587), None).is_err(), "no host and no preset");
+    }
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once("dove").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn upgrade_command_line() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+        let Command::Upgrade(a) = parse(&["upgrade", "--version", "0.2.0"]).unwrap().command else { panic!() };
+        assert_eq!((a.check, a.version.as_deref()), (false, Some("0.2.0")));
+        let Command::Upgrade(a) = parse(&["update", "--check"]).unwrap().command else { panic!("alias") };
+        assert!(a.check && a.version.is_none());
+        assert!(parse(&["upgrade", "--check", "--version", "0.2.0"]).is_err());
+        // The top-level --version still prints the binary version.
+        assert_eq!(parse(&["--version"]).err().map(|e| e.kind()), Some(clap::error::ErrorKind::DisplayVersion));
+    }
+
+    #[test]
+    fn notice_skips_service_stdio_bridge_and_upgrade() {
+        let applies = |args: &[&str]| update_notice_applies(&parse(args).unwrap().command);
+        assert!(!applies(&["serve"]));
+        assert!(!applies(&["mcp", "stdio"]));
+        assert!(!applies(&["upgrade"]));
+        assert!(!applies(&["update", "--check"]));
+        assert!(applies(&["config-example"]));
+        assert!(applies(&["mcp", "install", "--client", "claude-code"]));
+        assert!(applies(&["accounts", "list"]));
+        assert!(applies(&["status"]));
+    }
+
+    #[test]
+    fn doctor_compares_binary_and_service_version() {
+        let binary = env!("CARGO_PKG_VERSION");
+        let row = |v: &Value| v.as_array().unwrap().iter().find(|c| c["check"] == "binary_version").cloned().unwrap();
+        let mut same = serde_json::json!([{ "check": "service_version", "ok": true, "detail": binary }]);
+        add_binary_version(&mut same);
+        assert_eq!(row(&same)["ok"], true);
+        let mut other = serde_json::json!([{ "check": "service_version", "ok": true, "detail": "0.0.1" }]);
+        add_binary_version(&mut other);
+        assert_eq!(row(&other)["ok"], false);
+        assert!(row(&other)["detail"].as_str().unwrap().contains("restart"));
+        let mut old = serde_json::json!([{ "check": "config", "ok": true, "detail": "" }]);
+        add_binary_version(&mut old);
+        assert_eq!(row(&old)["ok"], false);
     }
 }
