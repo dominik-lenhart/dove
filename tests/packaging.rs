@@ -147,3 +147,19 @@ fn homebrew_render_refuses_incomplete_or_odd_input() {
     let short = sums_for("1.2.3", None).replacen(&"a".repeat(64), &"a".repeat(63), 1);
     assert!(!render("1.2.3", &short).status.success());
 }
+
+/// The MCP Registry entry (server.json) is published with `mcp-publisher` after a release; its version and name must
+/// follow the crate, or the registry lists a stale release.
+#[test]
+fn registry_entry_matches_the_crate() {
+    let manifest: toml::Table = std::fs::read_to_string(root().join("Cargo.toml")).unwrap().parse().unwrap();
+    let crate_version = manifest["package"]["version"].as_str().unwrap();
+    let entry: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(root().join("server.json")).unwrap()).unwrap();
+    assert_eq!(entry["version"], crate_version, "set server.json `version` to the Cargo.toml version");
+    assert_eq!(entry["name"], "io.github.dominik-lenhart/dove");
+    assert!(entry["description"].as_str().unwrap().chars().count() <= 100, "the registry caps descriptions at 100");
+    let remote = &entry["remotes"][0];
+    assert_eq!(remote["type"], "streamable-http");
+    assert!(remote["url"].as_str().unwrap().ends_with("/mcp"), "Dove serves MCP at /mcp");
+}
