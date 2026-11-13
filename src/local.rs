@@ -144,18 +144,31 @@ pub fn init(paths: &LocalPaths, port: u16) -> anyhow::Result<()> {
     }
     crate::platform::ensure_private_dir(&paths.data_dir)?;
     crate::platform::ensure_private_dir(&secrets_dir)?;
-    for k in &keys {
-        let line = zeroize::Zeroizing::new(secrets::generate_key_line(1));
-        crate::platform::write_private_new(k, &secrets::encode_secret_file(line.as_bytes())?)?;
+    // Everything this run creates is removed again when a later step fails: nothing is encrypted under these keys
+    // yet, and a leftover key would make every retry refuse with "already exists" (L5).
+    let mut created: Vec<PathBuf> = Vec::new();
+    let result = (|| -> anyhow::Result<()> {
+        for k in &keys {
+            let line = zeroize::Zeroizing::new(secrets::generate_key_line(1));
+            crate::platform::write_private_new(k, &secrets::encode_secret_file(line.as_bytes())?)?;
+            created.push(k.clone());
+        }
+        if let Some(dir) = paths.config_file.parent() {
+            std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+        }
+        let text = config_text(paths, port, current_uid());
+        crate::platform::write_private_new(&paths.config_file, text.as_bytes())?;
+        created.push(paths.config_file.clone());
+        let cfg = Config::load(&paths.config_file)?;
+        cfg.validate().context("the new local config does not validate")?;
+        Ok(())
+    })();
+    if result.is_err() {
+        for p in &created {
+            let _ = std::fs::remove_file(p);
+        }
     }
-    if let Some(dir) = paths.config_file.parent() {
-        std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
-    }
-    let text = config_text(paths, port, current_uid());
-    crate::platform::write_private_new(&paths.config_file, text.as_bytes())?;
-    let cfg = Config::load(&paths.config_file)?;
-    cfg.validate().context("the new local config does not validate")?;
-    Ok(())
+    result
 }
 
 /// Longest Unix socket path that binds everywhere (`sun_path` is 104 bytes on macOS, 108 on Linux, NUL included).
@@ -576,6 +589,39 @@ mod tests {
         assert_eq!(p.admin_socket().as_os_str().len(), MAX_SOCKET_PATH);
         init(&p, 48787).unwrap();
         std::os::unix::net::UnixListener::bind(p.admin_socket()).unwrap();
+    }
+
+    /// A failed init leaves nothing behind that blocks the next try (L5): here the config directory cannot be created
+    /// after all three keys were written.
+    #[test]
+    fn a_failed_init_can_be_retried() {
+        let d = tempfile::tempdir().unwrap();
+        let p = paths(d.path());
+        std::fs::write(d.path().join("cfg"), "a file where the config directory should be").unwrap();
+        init(&p, 48787).unwrap_err();
+        for k in ["kek", "pepper", "index_key"] {
+            assert!(!p.secrets_dir().join(k).exists(), "{k} left behind");
+        }
+        let leftovers: Vec<_> = std::fs::read_dir(p.secrets_dir()).unwrap().collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        std::fs::remove_file(d.path().join("cfg")).unwrap();
+        init(&p, 48787).unwrap();
+    }
+
+    /// `write_private_new` never replaces an existing file and leaves no temporary file behind.
+    #[test]
+    fn private_files_are_created_once_and_atomically() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("kek");
+        crate::platform::write_private_new(&f, b"one").unwrap();
+        assert!(crate::platform::write_private_new(&f, b"two").is_err());
+        assert_eq!(std::fs::read(&f).unwrap(), b"one");
+        secrets::check_secret_file_mode(&f).unwrap();
+        let names: Vec<String> = std::fs::read_dir(d.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["kek"]);
     }
 
     #[test]
