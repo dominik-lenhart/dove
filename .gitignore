@@ -11,3 +11,4 @@
 /deploy/Caddyfile.local
 *.age
 /state-backup*.db
+.claude/worktrees/
