@@ -255,16 +255,23 @@ pub fn systemd_unit_path() -> anyhow::Result<PathBuf> {
 }
 
 /// The user unit. systemd quotes arguments with double quotes; paths are escaped for that.
-pub fn systemd_unit(exe: &Path, config: &Path) -> String {
-    let q =
-        |p: &Path| format!("\"{}\"", p.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"").replace('%', "%%"));
-    format!(
+/// The user unit. Paths are double-quoted with `\\`, `"`, `%` (specifiers) and `$` (variables) escaped; a control
+/// character (a newline would start a new directive) is refused (L7).
+pub fn systemd_unit(exe: &Path, config: &Path) -> anyhow::Result<String> {
+    let q = |p: &Path| -> anyhow::Result<String> {
+        let s = p.to_string_lossy();
+        if s.chars().any(char::is_control) {
+            bail!("{} contains a control character; move it to a plain path", p.display());
+        }
+        Ok(format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"").replace('%', "%%").replace('$', "$$")))
+    };
+    Ok(format!(
         "# Written by `dove local install`. Remove with `dove local uninstall`.\n[Unit]\nDescription=Dove mail MCP server \
          (local mode)\nAfter=network-online.target\n\n[Service]\nExecStart={} local start --config {}\nRestart=on-failure\n\
          RestartSec=5\n\n[Install]\nWantedBy=default.target\n",
-        q(exe),
-        q(config)
-    )
+        q(exe)?,
+        q(config)?
+    ))
 }
 
 // ------------------------------------------------------------------ macOS: launchd agent
@@ -317,7 +324,24 @@ pub fn windows_task_name() -> String {
 
 /// Task Scheduler XML: at this user's logon, as this user, without elevation, no time limit. `conhost --headless`
 /// keeps a console window from opening at every login.
-pub fn windows_task_xml(user_sid: &str, conhost: &Path, exe: &Path, config: &Path, log: &Path) -> String {
+/// Task Scheduler expands `%VAR%` in arguments and has no escape for it, and `"` would end a quoted argument: paths
+/// with either are refused (L7; `"` cannot occur in Windows paths anyway).
+pub fn windows_task_xml(
+    user_sid: &str,
+    conhost: &Path,
+    exe: &Path,
+    config: &Path,
+    log: &Path,
+) -> anyhow::Result<String> {
+    for p in [conhost, exe, config, log] {
+        let s = p.to_string_lossy();
+        if s.contains(['%', '"']) || s.chars().any(char::is_control) {
+            bail!(
+                "{} contains %, \" or a control character, which a logon task cannot pass safely; move it",
+                p.display()
+            );
+        }
+    }
     let e = |s: &str| xml_escape(s);
     let args = format!(
         "--headless \"{}\" local start --config \"{}\" --log-file \"{}\"",
@@ -325,7 +349,7 @@ pub fn windows_task_xml(user_sid: &str, conhost: &Path, exe: &Path, config: &Pat
         config.display(),
         log.display()
     );
-    format!(
+    Ok(format!(
         r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo><Description>Dove mail MCP server (local mode). Remove with: dove local uninstall</Description></RegistrationInfo>
@@ -345,7 +369,7 @@ pub fn windows_task_xml(user_sid: &str, conhost: &Path, exe: &Path, config: &Pat
         sid = e(user_sid),
         conhost = e(&conhost.to_string_lossy()),
         args = e(&args),
-    )
+    ))
 }
 
 #[cfg(windows)]
@@ -365,7 +389,7 @@ async fn install(paths: &LocalPaths) -> anyhow::Result<()> {
         if let Some(dir) = unit.parent() {
             std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
         }
-        crate::client::profile::atomic_write(&unit, systemd_unit(&exe, &paths.config_file).as_bytes(), 0o644)?;
+        crate::client::profile::atomic_write(&unit, systemd_unit(&exe, &paths.config_file)?.as_bytes(), 0o644)?;
         run_tool("systemctl", &["--user", "daemon-reload"])?;
         run_tool("systemctl", &["--user", "enable", SYSTEMD_UNIT])?;
         run_tool("systemctl", &["--user", "restart", SYSTEMD_UNIT])?;
@@ -391,7 +415,7 @@ async fn install(paths: &LocalPaths) -> anyhow::Result<()> {
     #[cfg(windows)]
     {
         let sid = crate::platform::windows::current_user_sid()?.to_string_sid()?;
-        let xml = windows_task_xml(&sid, &conhost_path(), &exe, &paths.config_file, &paths.log_file());
+        let xml = windows_task_xml(&sid, &conhost_path(), &exe, &paths.config_file, &paths.log_file())?;
         // schtasks reads task XML as UTF-16 with a byte order mark.
         let mut bytes = vec![0xFF, 0xFE];
         bytes.extend(xml.encode_utf16().flat_map(u16::to_le_bytes));
@@ -641,21 +665,32 @@ mod tests {
     fn login_items_quote_their_paths() {
         let exe = Path::new("/opt/my apps/dove");
         let cfg = Path::new("/home/a/.config/dove/dove.toml");
-        let unit = systemd_unit(exe, cfg);
+        let unit = systemd_unit(exe, cfg).unwrap();
         assert!(
             unit.contains("ExecStart=\"/opt/my apps/dove\" local start --config \"/home/a/.config/dove/dove.toml\"")
         );
+        // systemd expands `$VAR` and `%x` and ends a directive at a newline (L7).
+        let unit = systemd_unit(Path::new("/home/a/$HOME/100%/dove"), cfg).unwrap();
+        assert!(unit.contains("ExecStart=\"/home/a/$$HOME/100%%/dove\" local"), "{unit}");
+        let err = systemd_unit(Path::new("/tmp/x\nExecStartPre=/bin/evil/dove"), cfg).unwrap_err().to_string();
+        assert!(err.contains("control character"), "{err}");
         let plist = launchd_plist(Path::new("/Users/a&b/dove"), cfg, Path::new("/tmp/dove.log"));
         assert!(plist.contains("<string>/Users/a&amp;b/dove</string>"));
-        let xml = windows_task_xml(
-            "S-1-5-21-1-2-3-1001",
-            Path::new(r"C:\Windows\System32\conhost.exe"),
-            Path::new(r"C:\Users\a\AppData\Local\Programs\Dove\dove.exe"),
-            Path::new(r"C:\Users\a\AppData\Roaming\Dove\dove.toml"),
-            Path::new(r"C:\Users\a\AppData\Local\Dove\dove.log"),
-        );
+        let task = |exe: &str| {
+            windows_task_xml(
+                "S-1-5-21-1-2-3-1001",
+                Path::new(r"C:\Windows\System32\conhost.exe"),
+                Path::new(exe),
+                Path::new(r"C:\Users\a\AppData\Roaming\Dove\dove.toml"),
+                Path::new(r"C:\Users\a\AppData\Local\Dove\dove.log"),
+            )
+        };
+        let xml = task(r"C:\Users\a\AppData\Local\Programs\Dove\dove.exe").unwrap();
         assert!(xml.contains("<UserId>S-1-5-21-1-2-3-1001</UserId>"));
         assert!(xml.contains("<LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel>"));
         assert!(xml.contains(r"--headless &quot;C:\Users\a\AppData\Local\Programs\Dove\dove.exe&quot; local start"));
+        // Task Scheduler expands %VAR% in arguments and has no escape for it (L7).
+        let err = task(r"C:\Users\%USERNAME%\dove.exe").unwrap_err().to_string();
+        assert!(err.contains("contains %"), "{err}");
     }
 }
