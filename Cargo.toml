@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.90"
 description = "Self-hosted mail MCP server for AI agents (Gmail, token-scoped access, encrypted search index)"
 license = "Apache-2.0"
-repository = "https://github.com/dove-mcp/dove-mcp"
+repository = "https://github.com/dominik-lenhart/dove"
 publish = false
 
 [[bin]]
@@ -71,6 +71,11 @@ url = "2"
 keyring = "4.2"
 rpassword = "7.5"
 nix = { version = "0.31", features = ["user", "resource", "fs", "process"] }
+# Self-update (`dove upgrade`): release version compare, minisign check of the signed checksum list, archive extraction.
+semver = "1"
+minisign-verify = "0.3"
+flate2 = "1.1"
+tar = { version = "0.4", default-features = false }
 
 # Test support module (`dove::testing`), enabled for this crate's own tests via the self dev-dependency below.
 tempfile = { version = "3", optional = true }

@@ -36,6 +36,7 @@ cargo fmt
 - `src/mcp/`: JSON-RPC / Streamable HTTP protocol layer; `src/tools/`: tool handlers
 - `src/index/`: SQLCipher FTS5 index, sync engine, query compiler
 - `src/client/`: remote client commands (login, search, mcp install, stdio bridge)
+- `src/update/`: `dove upgrade` (signed GitHub Releases) and the daily new-version notice; CLI only
 - `tests/`: integration tests against the fake Google server in `tests/support/`
 
 ## Security invariants (do not weaken)
@@ -233,3 +234,11 @@ cargo fmt
   budget (`tool_call_timeout_secs = 4`) and raise `upstream_request_timeout_secs` so one `Fault::Delay` /
   `SmtpFault::Delay` outlives the call; Gmail write tests must raise the request timeout too, or the 3 s harness
   request timeout ends the write before any deadline does.
+- 2026-11-13: Self-update (`src/update/`) trusts only `SHA256SUMS` signed by `deploy/release/minisign.pub` with the
+  trusted comment `dove <tag>`. Tests pass a `update::Source` (bases, key, current version, target) pointing at a local
+  fake server; there is no env override for the production URLs. Fixtures in `tests/fixtures/update/` are signed with
+  a throwaway key whose secret was not kept: to change one, rebuild all with `build.py`, a new key (minisign in an
+  `ubuntu:24.04` container) and replace `test.pub`. The tar crate's `Builder` refuses `..` paths, so traversal
+  archives are made with Python's `tarfile`. A source scan in `tests/update_e2e.rs` keeps `serve` away from the
+  updater. Dropping a tokio runtime waits for blocking tasks (a hanging DNS lookup), so `main` uses
+  `shutdown_background()` when the notice check ran; try the notice in a pty with `script -qec "<cmd>" /dev/null`.
