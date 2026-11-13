@@ -117,7 +117,9 @@ try {
     if ($minisign) {
         $out = (& $minisign.Source -V -P $PublicKey -m $sumsPath -x $sigPath 2>&1 | Out-String)
         if ($LASTEXITCODE -ne 0) { Invoke-InstallFailure 'signature verification FAILED for SHA256SUMS; not installing' }
-        if (-not $out.Contains("dove $tag")) {
+        # The trusted comment must be exactly "dove <tag>": a substring match would accept "dove v1.2.3-rc.1".
+        $lines = @($out -split "`r?`n" | ForEach-Object { $_.TrimEnd() })
+        if (-not ($lines -ccontains "Trusted comment: dove $tag")) {
             Invoke-InstallFailure "signature is valid but is not for dove $tag (wrong or replayed release); not installing"
         }
         Write-Output "Signature OK (minisign, dove $tag)"

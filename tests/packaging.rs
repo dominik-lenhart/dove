@@ -147,3 +147,166 @@ fn homebrew_render_refuses_incomplete_or_odd_input() {
     let short = sums_for("1.2.3", None).replacen(&"a".repeat(64), &"a".repeat(63), 1);
     assert!(!render("1.2.3", &short).status.success());
 }
+
+// ------------------------------------------------------------------ install.sh
+
+/// Fake `curl`, `wget` and `minisign`, written once per process (writing executables while other tests fork races
+/// into ETXTBSY). The fetchers log their arguments to `$FAKE_LOG` and serve files from `$FAKE_FILES` by the URL's
+/// last segment; minisign prints `$FAKE_MINISIGN_OUT` and succeeds. Nothing touches the network.
+fn fake_tools() -> &'static Path {
+    static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = tempfile::tempdir().unwrap();
+        let fetcher = r#"#!/bin/sh
+printf '%s\n' "$0 $*" >> "$FAKE_LOG"
+out=""; url=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o | -O) out="$2"; shift 2 ;;
+    *) url="$1"; shift ;;
+  esac
+done
+cp "$FAKE_FILES/${url##*/}" "$out"
+"#;
+        for (name, body) in
+            [("curl", fetcher), ("wget", fetcher), ("minisign", "#!/bin/sh\nprintf '%s\\n' \"$FAKE_MINISIGN_OUT\"\n")]
+        {
+            let p = dir.path().join(name);
+            std::fs::write(&p, body).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        dir
+    })
+    .path()
+}
+
+/// A PATH directory holding the system tools install.sh needs plus the chosen fakes (and nothing else, so the
+/// script cannot fall back to a real curl or minisign).
+fn tool_path(dir: &Path, fakes: &[&str]) -> PathBuf {
+    let bin = dir.join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let system = [
+        "sh",
+        "mktemp",
+        "rm",
+        "awk",
+        "wc",
+        "sha256sum",
+        "shasum",
+        "tar",
+        "gzip",
+        "mkdir",
+        "cp",
+        "chmod",
+        "mv",
+        "cut",
+        "grep",
+        "tr",
+        "sed",
+        "tail",
+        "uname",
+        "id",
+        "cat",
+        "printf",
+    ];
+    for tool in system {
+        if let Some(p) = ["/usr/bin", "/bin"].iter().map(|d| Path::new(d).join(tool)).find(|p| p.exists()) {
+            std::os::unix::fs::symlink(p, bin.join(tool)).unwrap();
+        }
+    }
+    for f in fakes {
+        std::os::unix::fs::symlink(fake_tools().join(f), bin.join(f)).unwrap();
+    }
+    bin
+}
+
+struct InstallRun {
+    ok: bool,
+    stderr: String,
+    log: String,
+    installed: Option<Vec<u8>>,
+}
+
+/// Runs install.sh for `version` against a fake release with the given fetcher and minisign output.
+fn run_install_sh(version: &str, fakes: &[&str], minisign_out: &str) -> InstallRun {
+    let dir = tempfile::tempdir().unwrap();
+    let target = match std::env::consts::OS {
+        "linux" => format!("{}-unknown-linux-gnu", std::env::consts::ARCH),
+        "macos" => format!("{}-apple-darwin", std::env::consts::ARCH),
+        os => panic!("unsupported test platform {os}"),
+    };
+    let name = format!("dove-v{version}-{target}");
+    let files = dir.path().join("files");
+    std::fs::create_dir_all(files.join(&name)).unwrap();
+    std::fs::write(files.join(&name).join("dove"), b"fake dove binary").unwrap();
+    let tar = std::process::Command::new("tar")
+        .args(["-czf", &format!("{name}.tar.gz"), &format!("{name}/dove")])
+        .current_dir(&files)
+        .status()
+        .unwrap();
+    assert!(tar.success());
+    use sha2::Digest;
+    let sum = sha2::Sha256::digest(std::fs::read(files.join(format!("{name}.tar.gz"))).unwrap());
+    let hex: String = sum.iter().map(|b| format!("{b:02x}")).collect();
+    std::fs::write(files.join("SHA256SUMS"), format!("{hex}  {name}.tar.gz\n")).unwrap();
+    std::fs::write(files.join("SHA256SUMS.minisig"), "untrusted comment: fake\n").unwrap();
+    let bin = tool_path(dir.path(), fakes);
+    let (log, dest) = (dir.path().join("log"), dir.path().join("dest"));
+    let out = std::process::Command::new("/bin/sh")
+        .arg(root().join("install.sh"))
+        .env_clear()
+        .env("PATH", &bin)
+        .env("HOME", dir.path())
+        .env("TMPDIR", dir.path())
+        .env("DOVE_VERSION", version)
+        .env("DOVE_LIBC", "gnu")
+        .env("DOVE_INSTALL_DIR", &dest)
+        .env("FAKE_LOG", &log)
+        .env("FAKE_FILES", &files)
+        .env("FAKE_MINISIGN_OUT", minisign_out)
+        .output()
+        .unwrap();
+    InstallRun {
+        ok: out.status.success(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        log: std::fs::read_to_string(&log).unwrap_or_default(),
+        installed: std::fs::read(dest.join("dove")).ok(),
+    }
+}
+
+/// minisign's trusted comment must be exactly `dove <tag>`: a signature of another release whose comment merely
+/// contains the tag (a release candidate of the same version, a longer version) is refused.
+#[test]
+fn install_sh_requires_the_exact_trusted_comment() {
+    let verified = "Signature and comment signature verified";
+    let ok = run_install_sh("1.2.3", &["curl", "minisign"], &format!("{verified}\nTrusted comment: dove v1.2.3"));
+    assert!(ok.ok, "{}", ok.stderr);
+    assert_eq!(ok.installed.as_deref(), Some(&b"fake dove binary"[..]));
+    for replayed in ["dove v1.2.3-rc.1", "dove v1.2.30", "dove v1.2.3 extra", "xdove v1.2.3"] {
+        let r = run_install_sh("1.2.3", &["curl", "minisign"], &format!("{verified}\nTrusted comment: {replayed}"));
+        assert!(!r.ok, "accepted '{replayed}'");
+        assert!(r.stderr.contains("not for dove v1.2.3"), "{replayed}: {}", r.stderr);
+        assert!(r.installed.is_none(), "{replayed}");
+    }
+}
+
+/// Without curl the wget fallback refuses plain HTTP (a redirect to http:// included).
+#[test]
+fn install_sh_wget_fallback_is_https_only() {
+    let r = run_install_sh("1.2.3", &["wget"], "");
+    assert!(r.ok, "{}", r.stderr);
+    let calls: Vec<&str> = r.log.lines().collect();
+    assert_eq!(calls.len(), 3, "{}", r.log);
+    for c in calls {
+        assert!(c.contains("/wget ") && c.contains(" --https-only "), "{c}");
+        assert!(c.contains(" https://github.com/dominik-lenhart/dove/releases/download/v1.2.3/"), "{c}");
+    }
+}
+
+/// install.ps1 cannot run here (no PowerShell); keep its trusted-comment check an exact line comparison.
+#[test]
+fn install_ps1_compares_the_whole_trusted_comment_line() {
+    let ps1 = std::fs::read_to_string(root().join("install.ps1")).unwrap();
+    assert!(ps1.contains(r#"-ccontains "Trusted comment: dove $tag""#), "exact line check missing");
+    assert!(!ps1.contains(r#".Contains("dove $tag")"#), "substring check is back");
+}
