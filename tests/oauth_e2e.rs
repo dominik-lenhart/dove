@@ -472,6 +472,8 @@ async fn approval_page_csrf_and_invitation_rules() {
     let client_id = o.register(REDIRECT).await;
     let chal = challenge(&verifier());
     let r = o.authorize_get(&Oauth::params(&client_id, &chal)).await;
+    // no-referrer would make browsers post the form with `Origin: null`, which the Origin check refuses.
+    assert_eq!(r.headers()["referrer-policy"], "same-origin");
     let cookie = r.headers()["set-cookie"].to_str().unwrap().split(';').next().unwrap().to_string();
     let html = r.text().await.unwrap();
     let (rid, csrf) = (field(&html, "rid"), field(&html, "csrf"));

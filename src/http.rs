@@ -100,7 +100,10 @@ async fn guard(State(app): State<Arc<App>>, mut req: Request, next: Next) -> Res
     let mut resp = next.run(req).await;
     let h = resp.headers_mut();
     h.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
-    h.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+    // Under no-referrer a browser sends `Origin: null` with a form POST, so the approval page could not post to
+    // itself. same-origin keeps the real Origin on our own form and still sends nothing to other sites.
+    let referrer = if browser_route(&path) { "same-origin" } else { "no-referrer" };
+    h.insert("referrer-policy", HeaderValue::from_static(referrer));
     if !h.contains_key(header::CACHE_CONTROL) {
         h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     }
