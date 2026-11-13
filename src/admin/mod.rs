@@ -180,6 +180,17 @@ pub enum AdminRequest {
         alias: String,
     },
 
+    /// Registers a webhook sink for watch push delivery (design 0.2 section 3). The secret is sealed by the service.
+    SinksAdd {
+        name: String,
+        url: String,
+        secret: Password,
+    },
+    SinksList,
+    SinksRemove {
+        name: String,
+    },
+
     OperationsList,
     OperationsRemove {
         client: String,
@@ -241,6 +252,9 @@ impl AdminRequest {
             IndexDisable { alias } => ("index.disable", None, Some(alias.clone()), vec![]),
             IndexStatus { alias } => ("index.status", None, alias.clone(), vec![]),
             IndexRebuild { alias } => ("index.rebuild", None, Some(alias.clone()), vec![]),
+            SinksAdd { name, .. } => ("sinks.add", None, None, vec![name.clone()]),
+            SinksList => ("sinks.list", None, None, vec![]),
+            SinksRemove { name } => ("sinks.remove", None, None, vec![name.clone()]),
             OperationsList => ("operations.list", None, None, vec![]),
             OperationsRemove { client, account, request_key } => {
                 ("operations.remove", None, Some(account.clone()), vec![client.clone(), request_key.clone()])

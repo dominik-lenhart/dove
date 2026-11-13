@@ -260,3 +260,14 @@ cargo fmt
   `serve status --json` are fine). Real node JSON: `Self.DNSName` has a trailing dot, `CertDomains` empty means HTTPS
   is off, `Self.CapMap` has a `funnel` key when Funnel is allowed, serve state keys are `host:port`.
 
+- 2026-11-13: Watches (`src/watch/`, `src/tools/watches.rs`): events come from one hook,
+  `watch::messages_indexed`, called by `sync::commit_results` after its transaction with the ids that were new rows of
+  the serving generation (both engines go through it, so IMAP polling and IDLE need nothing extra). Matching re-checks
+  the serving generation in its own index read, then records events in a state-store transaction that re-checks the
+  watch's liveness (`watch::end_reason`). Tests drive the clock through `watch::tick(app, now)` and
+  `watch::sinks::deliver_due(app, now)`; the harness starts no watch worker. Webhook receivers in tests are plain HTTP
+  on loopback, which only `gateway().allow_plain_http_sinks_for_tests()` (cfg `test`/`testing`) permits; call it
+  before `SinksAdd`, and again plus `watch::sinks::reload_allowlist` after a harness restart. Index `received_at` is
+  milliseconds but IMAP INTERNALDATE has second precision, so "newer than" comparisons against a thread baseline need
+  `>=` for newly indexed mail (a reply can share the second). Fake Google's `MessageSpec.from` takes a bare address;
+  `"Name <addr>"` is not parsed into the address.

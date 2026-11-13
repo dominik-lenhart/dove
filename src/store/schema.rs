@@ -1,6 +1,6 @@
 //! Versioned schema migrations for the durable state store. Never edit a released migration; append a new one.
 
-pub const MIGRATIONS: &[&str] = &[V1, V2, V3, V_SEND_IDENTITIES];
+pub const MIGRATIONS: &[&str] = &[V1, V2, V3, V_SEND_IDENTITIES, V_WATCHES];
 
 const V1: &str = r#"
 CREATE TABLE accounts (
@@ -229,4 +229,73 @@ CREATE TABLE account_signatures (
     updated_at INTEGER NOT NULL,
     PRIMARY KEY (account_id, address)
 );
+"#;
+
+/// Watches, their events and the operator's webhook sinks (design 0.2 section 3, `src/watch/`).
+///
+/// - `sinks.secret` is the HMAC signing secret sealed by the vault (`seal_aux`, kind `sink_secret`, scope = sink id).
+/// - `watches.filter` holds the agent's match arguments (`from` address or domain, `where` query) sealed the same way
+///   (kind `watch_filter`, scope = watch id), so the state store keeps no addresses or query text in the clear.
+/// - `watches.baseline_ms`: thread kinds count only messages newer than the thread's newest one at creation.
+/// - `watch_events.seq` is AUTOINCREMENT: pruned positions are never reused, so an old cursor never skips events.
+/// - Events and deliveries carry ids and timestamps only, never subjects, senders or bodies.
+const V_WATCHES: &str = r#"
+CREATE TABLE sinks (
+    id         TEXT PRIMARY KEY,
+    name       TEXT NOT NULL UNIQUE,
+    url        TEXT NOT NULL,
+    secret     BLOB NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
+CREATE TABLE watches (
+    id            TEXT PRIMARY KEY,
+    client_id     TEXT NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
+    account_id    TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    kind          TEXT NOT NULL CHECK (kind IN ('thread_reply', 'from', 'query', 'no_reply_by')),
+    thread_id     TEXT,
+    -- thread_reply / no_reply_by: newest received_at (ms) in the thread when the watch was created; only later
+    -- messages count.
+    baseline_ms   INTEGER,
+    filter        BLOB,
+    deadline      INTEGER,
+    sink_id       TEXT REFERENCES sinks(id) ON DELETE SET NULL,
+    created_at    INTEGER NOT NULL,
+    expires_at    INTEGER NOT NULL,
+    state         TEXT NOT NULL CHECK (state IN ('active', 'ended')),
+    ended_at      INTEGER,
+    end_reason    TEXT,
+    fired         INTEGER NOT NULL DEFAULT 0,
+    last_fired_at INTEGER
+);
+CREATE INDEX watches_account ON watches(account_id, state);
+CREATE INDEX watches_client ON watches(client_id, state);
+
+CREATE TABLE watch_events (
+    seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+    watch_id    TEXT NOT NULL REFERENCES watches(id) ON DELETE CASCADE,
+    client_id   TEXT NOT NULL,
+    account_id  TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    message_id  TEXT,
+    thread_id   TEXT,
+    received_at INTEGER,
+    created_at  INTEGER NOT NULL,
+    UNIQUE (watch_id, message_id)
+);
+CREATE INDEX watch_events_client ON watch_events(client_id, seq);
+CREATE INDEX watch_events_created ON watch_events(created_at);
+
+CREATE TABLE sink_deliveries (
+    event_seq       INTEGER NOT NULL REFERENCES watch_events(seq) ON DELETE CASCADE,
+    sink_id         TEXT NOT NULL REFERENCES sinks(id) ON DELETE CASCADE,
+    state           TEXT NOT NULL CHECK (state IN ('pending', 'delivered', 'failed')),
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at INTEGER NOT NULL,
+    last_status     INTEGER,
+    updated_at      INTEGER NOT NULL,
+    PRIMARY KEY (event_seq, sink_id)
+) WITHOUT ROWID;
+CREATE INDEX sink_deliveries_due ON sink_deliveries(state, next_attempt_at);
+CREATE INDEX sink_deliveries_sink ON sink_deliveries(sink_id);
 "#;

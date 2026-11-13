@@ -19,6 +19,15 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
   with `tailscale serve` and sets `public_url`, idempotently; `--funnel` (internet exposure) only on request, with a
   warning. `dove doctor` checks the serve configuration (`tailscale_serve`). The path allowlist is one list shared with
   `deploy/Caddyfile` and `deploy/nginx/dove.conf`, and a test fails if any of them drift.
+- Watches: `create_watch`, `list_watches`, `delete_watch` and `list_watch_events` (under `read`) tell an agent about
+  a reply in a thread, mail from an address or domain, mail matching a typed search, or no reply by a deadline,
+  instead of polling. Events are produced by the index sync (IMAP IDLE within seconds), carry ids and times only, and
+  are kept 14 days. Watches belong to the token that created them (at most 50, 30 days by default, 180 at most) and
+  end when the token is revoked or loses access, or the mailbox is disabled or removed.
+- Webhook sinks for push delivery of watch events: `dove sinks add <name> --url https://... --secret-file <path>`,
+  `dove sinks list`, `dove sinks remove <name>`. Deliveries are signed (`Dove-Signature`, HMAC-SHA256 over timestamp
+  and body), retried a bounded number of times, and sent only to the registered URLs; agents name sinks but never
+  supply URLs. See docs/deployment.md, "Watches and sinks".
 
 ## [0.1.0] - 2026-11-13
 

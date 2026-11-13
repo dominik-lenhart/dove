@@ -3,9 +3,14 @@
 //! Requests can only be expressed through [`GmailOp`], whose variants are exactly the allowlisted method/path pairs.
 //! Path segments are validated, redirects are disabled and origins are fixed per [`Upstream`]. `drafts.send` needs a
 //! [`SendPermit`], which only the gated send path can create.
+//!
+//! Webhook sinks (watch push delivery) are the only other destination: [`Gateway::post_sink`] POSTs to a URL only if
+//! it is exactly one of the operator's sink URLs (scheme, host, port and path), which the watch module installs with
+//! [`Gateway::set_sink_allowlist`] from the state store. Agents never supply a URL.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use reqwest::Method;
@@ -136,6 +141,9 @@ pub enum GatewayError {
     /// The response body exceeds the caller's byte limit; reading stopped at the limit.
     #[error("upstream response too large")]
     TooLarge,
+    /// The destination is not on the allowlist (a sink URL the operator did not register).
+    #[error("destination not allowed")]
+    NotAllowed,
 }
 
 impl GatewayError {
@@ -166,6 +174,48 @@ pub struct Gateway {
     pub calls: std::sync::atomic::AtomicU64,
     /// Response body bytes read from Google (tests check that size limits stop reading early).
     pub bytes_read: Arc<std::sync::atomic::AtomicU64>,
+    /// Normalized URLs of the operator's webhook sinks (see [`SinkUrl`]); nothing else can be POSTed to.
+    sinks: RwLock<HashSet<String>>,
+    /// Test builds only: sink URLs may be plain `http://` on a loopback address.
+    plain_http_sinks: AtomicBool,
+}
+
+/// A validated webhook sink URL: `https`, a host, no credentials, query or fragment. The normalized form (as the
+/// `url` crate serializes it: lowercase host, default port dropped) is what the allowlist compares exactly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SinkUrl(String);
+
+impl SinkUrl {
+    pub const MAX_LEN: usize = 2048;
+
+    /// Parses an operator-supplied sink URL. `plain_loopback` (test builds) also accepts `http://` to a loopback IP.
+    pub fn parse(s: &str, plain_loopback: bool) -> Result<Self, String> {
+        if s.len() > Self::MAX_LEN {
+            return Err("the URL is too long".into());
+        }
+        let u = url::Url::parse(s.trim()).map_err(|_| "not a valid URL".to_string())?;
+        let loopback = matches!(u.host(), Some(url::Host::Ipv4(ip)) if ip.is_loopback())
+            || matches!(u.host(), Some(url::Host::Ipv6(ip)) if ip.is_loopback());
+        match u.scheme() {
+            "https" => {}
+            "http" if plain_loopback && loopback => {}
+            _ => return Err("sink URLs must use https".into()),
+        }
+        if u.host().is_none() {
+            return Err("the URL has no host".into());
+        }
+        if !u.username().is_empty() || u.password().is_some() {
+            return Err("the URL must not contain credentials".into());
+        }
+        if u.query().is_some() || u.fragment().is_some() {
+            return Err("the URL must not have a query or fragment".into());
+        }
+        Ok(Self(u.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 enum ReadError {
@@ -221,7 +271,57 @@ impl Gateway {
             request_timeout: Duration::from_secs(limits.upstream_request_timeout_secs),
             calls: Default::default(),
             bytes_read: Default::default(),
+            sinks: Default::default(),
+            plain_http_sinks: AtomicBool::new(false),
         }
+    }
+
+    /// Replaces the sink allowlist (the operator's current sink URLs). Called at startup and after `dove sinks`.
+    pub fn set_sink_allowlist(&self, urls: impl IntoIterator<Item = SinkUrl>) {
+        let set: HashSet<String> = urls.into_iter().map(|u| u.0).collect();
+        *self.sinks.write().expect("sink allowlist lock") = set;
+    }
+
+    /// Whether sink URLs may be plain HTTP on loopback (only ever true in test builds).
+    pub fn plain_http_sinks(&self) -> bool {
+        self.plain_http_sinks.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Test builds only: lets tests register `http://127.0.0.1:<port>` sinks served by a local receiver.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn allow_plain_http_sinks_for_tests(&self) {
+        self.plain_http_sinks.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// POSTs a webhook body to an allowlisted sink URL. Returns the HTTP status; the response body is not read.
+    /// Never retried here and never follows redirects: the delivery worker owns retries.
+    pub async fn post_sink(
+        &self,
+        url: &str,
+        headers: &[(&'static str, String)],
+        body: Vec<u8>,
+        deadline: Instant,
+    ) -> Result<u16, GatewayError> {
+        // Re-validate, then require an exact allowlist hit: the URL must be one the operator registered.
+        let parsed = SinkUrl::parse(url, self.plain_http_sinks()).map_err(|_| GatewayError::NotAllowed)?;
+        if parsed.as_str() != url || !self.sinks.read().expect("sink allowlist lock").contains(parsed.as_str()) {
+            return Err(GatewayError::NotAllowed);
+        }
+        let _p = self.acquire(None, Priority::Background, deadline).await?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(GatewayError::Deadline);
+        }
+        let mut req = self.http.post(parsed.as_str()).timeout(remaining.min(self.request_timeout)).body(body);
+        for (k, v) in headers {
+            req = req.header(*k, v);
+        }
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| if e.is_connect() { GatewayError::NotDispatched } else { GatewayError::Unknown })?;
+        Ok(resp.status().as_u16())
     }
 
     /// The global in-flight limit, shared with the IMAP pool (one budget for all upstream work).
