@@ -93,6 +93,31 @@ pub enum AdminRequest {
     AccountsCheck {
         alias: Option<String>,
     },
+    /// Adds a send-as alias to an IMAP mailbox (`envelope`: the SMTP server accepts it as envelope sender).
+    AccountsAliasAdd {
+        account: String,
+        address: String,
+        name: Option<String>,
+        #[serde(default)]
+        envelope: bool,
+    },
+    AccountsAliasList {
+        account: String,
+    },
+    AccountsAliasRemove {
+        account: String,
+        address: String,
+    },
+    /// Sets (`Some`) or clears (`None`) the plain-text signature of a mailbox, or of one of its aliases.
+    AccountsSignatureSet {
+        account: String,
+        alias: Option<String>,
+        signature: Option<String>,
+    },
+    AccountsSignatureShow {
+        account: String,
+        alias: Option<String>,
+    },
 
     ClientsCreate {
         name: String,
@@ -186,6 +211,17 @@ impl AdminRequest {
             AccountsDisable { alias } => ("accounts.disable", None, Some(alias.clone()), vec![]),
             AccountsEnable { alias } => ("accounts.enable", None, Some(alias.clone()), vec![]),
             AccountsCheck { alias } => ("accounts.check", None, alias.clone(), vec![]),
+            // Alias addresses and signature text are configuration, but stay out of the audit log anyway.
+            AccountsAliasAdd { account, .. } => ("accounts.alias_add", None, Some(account.clone()), vec![]),
+            AccountsAliasList { account } => ("accounts.alias_list", None, Some(account.clone()), vec![]),
+            AccountsAliasRemove { account, .. } => ("accounts.alias_remove", None, Some(account.clone()), vec![]),
+            AccountsSignatureSet { account, signature, .. } => (
+                if signature.is_some() { "accounts.signature_set" } else { "accounts.signature_clear" },
+                None,
+                Some(account.clone()),
+                vec![],
+            ),
+            AccountsSignatureShow { account, .. } => ("accounts.signature_show", None, Some(account.clone()), vec![]),
             ClientsCreate { name, project, .. } => ("clients.create", Some(project.clone()), None, vec![name.clone()]),
             ClientsSetGrants { name, .. } => ("clients.set_grants", None, None, vec![name.clone()]),
             ClientsRotate { name } => ("clients.rotate", None, None, vec![name.clone()]),

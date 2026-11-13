@@ -221,6 +221,20 @@ async fn execute(call: &mut AdminCall<'_>, req: AdminRequest) -> anyhow::Result<
         ProjectsList => call.read(ops::project_list).await,
         ProjectsShow { name } => call.read(move |c| ops::project_show(c, &name)).await,
         AccountsList => call.read(ops::account_list).await,
+        AccountsAliasAdd { account, address, name, envelope } => {
+            call.tx(move |tx| crate::identity::alias_add(tx, &account, &address, name.as_deref(), envelope)).await
+        }
+        AccountsAliasList { account } => call.read(move |c| crate::identity::alias_list(c, &account)).await,
+        AccountsAliasRemove { account, address } => {
+            call.tx(move |tx| crate::identity::alias_remove(tx, &account, &address)).await
+        }
+        AccountsSignatureSet { account, alias, signature } => {
+            call.tx(move |tx| crate::identity::signature_set(tx, &account, alias.as_deref(), signature.as_deref()))
+                .await
+        }
+        AccountsSignatureShow { account, alias } => {
+            call.read(move |c| crate::identity::signature_show(c, &account, alias.as_deref())).await
+        }
         AccountsDisable { alias } => call.tx(move |tx| ops::account_set_enabled(tx, &alias, false)).await,
         AccountsEnable { alias } => call.tx(move |tx| ops::account_set_enabled(tx, &alias, true)).await,
         ClientsCreate { name, project, grants, expires, allow_ip } => {

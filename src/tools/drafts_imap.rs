@@ -296,6 +296,8 @@ pub(super) struct PreparedSend {
     /// What goes over SMTP: the same bytes without `Bcc`.
     submit: Vec<u8>,
     rcpts: Vec<String>,
+    /// SMTP `MAIL FROM`: the login address, or the draft's From when that is an envelope-capable alias.
+    envelope_from: String,
     id: ImapMsgId,
     pub thread_id: String,
 }
@@ -321,7 +323,22 @@ pub(super) async fn prepare_send(
     }
     let submit = mime::without_header(&fetched.raw, "Bcc");
     let conn = Conn::load(cx, mb).await?;
-    Ok(PreparedSend { conn, submit, rcpts, id, thread_id: fetched.meta.thread_id, raw: fetched.raw })
+    // The sender is checked against the addresses allowed now: an alias removed since the draft was made no longer
+    // sends. The envelope sender stays the login address unless the alias is marked envelope-capable.
+    let sender = match p.from.as_slice() {
+        [one] => one.email.clone(),
+        _ => return Err(ToolError::invalid("the draft needs exactly one From address")),
+    };
+    let (aid, email, s2) = (mb.account_id.clone(), mb.email.clone(), sender.clone());
+    let allowed = cx.app.store.call(move |c| crate::identity::imap_sender(c, &aid, &email, &s2)).await?;
+    let envelope_from = match allowed {
+        None => {
+            return Err(ToolError::invalid("the draft's From address is no longer an address of this mailbox"));
+        }
+        Some(a) if a.envelope && !sender.eq_ignore_ascii_case(&conn.settings.email) => a.address,
+        Some(_) => conn.settings.email.clone(),
+    };
+    Ok(PreparedSend { conn, submit, rcpts, envelope_from, id, thread_id: fetched.meta.thread_id, raw: fetched.raw })
 }
 
 /// SMTP submission. `outcome_unknown` only when the server may have accepted the message (connection lost after the
@@ -329,8 +346,16 @@ pub(super) async fn prepare_send(
 pub(super) async fn submit(cx: &ToolCx, mb: &Mailbox, p: &PreparedSend) -> Result<(), ToolError> {
     let s = &p.conn.settings;
     let creds = s.smtp_credentials(&p.conn.creds);
-    let r = smtp::submit(cx.app.imap.connector(), &s.smtp, &creds, &s.email, &p.rcpts, &p.submit, cx.write_deadline())
-        .await;
+    let r = smtp::submit(
+        cx.app.imap.connector(),
+        &s.smtp,
+        &creds,
+        &p.envelope_from,
+        &p.rcpts,
+        &p.submit,
+        cx.write_deadline(),
+    )
+    .await;
     match r {
         Ok(()) => Ok(()),
         Err(e) if e.kind == ImapError::OutcomeUnknown => Err(ToolError::from(ImapError::OutcomeUnknown)),

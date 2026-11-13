@@ -10,6 +10,7 @@ pub mod content;
 pub mod error;
 pub mod gmail;
 pub mod http;
+pub mod identity;
 pub mod imap;
 pub mod index;
 pub mod invite;
