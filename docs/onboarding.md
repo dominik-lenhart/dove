@@ -50,6 +50,12 @@ registers itself dynamically and opens Dove's approval page. Enter the invitatio
 mailboxes and application, untick anything you do not want, and approve. The host then refreshes its tokens on its
 own. Registering an application grants nothing; only the invitation does.
 
+The approval page shows where access goes: the full redirect URI, and for a dynamically registered application when
+and from which network it registered. Anyone can register an application under any name, so if the redirect URI is not
+on `claude.ai`, `claude.com`, `chatgpt.com` or `chat.openai.com` (or a loopback address of a native client), the page
+shows a warning and approval needs an extra confirmation box. Only tick it if you started the sign-in yourself; a
+sign-in link that someone sent you, together with a request for an invitation, is a phishing attempt.
+
 Pre-registered applications (for hosts or policies that do not use dynamic registration) go into the server
 configuration; restart the service afterwards:
 

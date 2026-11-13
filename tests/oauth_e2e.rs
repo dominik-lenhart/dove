@@ -10,7 +10,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use support::harness::{HOST, Harness};
 
-const REDIRECT: &str = "https://host.example/callback";
+/// A known host (`oauth::KNOWN_REDIRECT_HOSTS`): no extra confirmation on the approval page.
+const REDIRECT: &str = "https://claude.ai/api/mcp/auth_callback";
 
 fn b64url(b: &[u8]) -> String {
     use base64::Engine;
@@ -1156,4 +1157,114 @@ async fn approval_page_presets_and_defaults() {
             .await
             .unwrap();
     assert_eq!(stored, "read,draft,organize");
+}
+
+/// `params` with its `redirect_uri` replaced.
+fn with_redirect<'a>(params: &[(&'a str, &'a str)], redirect: &'a str) -> Vec<(&'a str, &'a str)> {
+    params.iter().map(|&(k, v)| if k == "redirect_uri" { (k, redirect) } else { (k, v) }).collect()
+}
+
+/// The approval page shows the full redirect URI, when and from where the client registered, and for a dynamically
+/// registered client with an unknown destination a warning plus a required confirmation (invitation phishing).
+#[tokio::test]
+async fn approval_page_names_the_destination_and_confirms_unknown_ones() {
+    let o = Oauth::with(|c| c.oauth.redeem_per_minute = 1000).await;
+    let secret = o.h.app().proxy_secret.as_deref().unwrap().to_string();
+    let evil = "https://claude.ai.evil.example/cb?next=<script>x</script>";
+    let r = o
+        .web
+        .post(o.url("/oauth/dove/register"))
+        .header("host", HOST)
+        .header("x-forwarded-for", "203.0.113.7")
+        .header("x-dove-proxy-auth", &secret)
+        .json(&json!({ "redirect_uris": [evil], "client_name": "Claude <img src=x>" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+    let client_id = r.json::<Value>().await.unwrap()["client_id"].as_str().unwrap().to_string();
+    let v = verifier();
+    let chal = challenge(&v);
+    let params = with_redirect(&Oauth::params(&client_id, &chal), evil);
+    let r = o.authorize_get(&params).await;
+    assert_eq!(r.status(), 200);
+    let cookie = r.headers()["set-cookie"].to_str().unwrap().split(';').next().unwrap().to_string();
+    let html = r.text().await.unwrap();
+    // Full URI, escaped; registration time and network; warning on the invitation step already.
+    assert!(html.contains("https://claude.ai.evil.example/cb?next=&lt;script&gt;x&lt;/script&gt;"), "{html}");
+    assert!(!html.contains("<script>") && !html.contains("<img"), "{html}");
+    assert!(html.contains("Claude &lt;img src=x&gt;"));
+    assert!(html.contains("from network <code>203.0.113.7</code>"), "{html}");
+    let year = &dove::util::rfc3339(dove::util::now_unix())[..10];
+    assert!(html.contains(year), "registration time: {html}");
+    assert!(html.contains("Unknown destination") && html.contains("<code>claude.ai.evil.example</code>"), "{html}");
+    let (rid, csrf) = (field(&html, "rid"), field(&html, "csrf"));
+    let inv = o.invite("phished", &["info"], "read").await;
+    let html = o
+        .post_form(
+            &cookie,
+            &[("rid", &rid), ("csrf", &csrf), ("step", "invitation"), ("action", "continue"), ("invitation", &inv)],
+        )
+        .await
+        .text()
+        .await
+        .unwrap();
+    assert!(html.contains("Unknown destination") && html.contains("name=\"confirm_redirect\""), "{html}");
+    let read = check_name(&html, "read.0");
+    // Approving without the confirmation is refused and consumes nothing.
+    let base = [("rid", rid.as_str()), ("csrf", csrf.as_str()), ("step", "approve"), ("action", "approve")];
+    let mut form = base.to_vec();
+    form.push((read.as_str(), "on"));
+    let r = o.post_form(&cookie, &form).await;
+    assert_eq!(r.status(), 200);
+    assert!(r.text().await.unwrap().contains("Confirm that you trust the destination"));
+    let open: i64 =
+        o.h.app()
+            .store
+            .call(|c| {
+                Ok(c.query_row(
+                    "SELECT COUNT(*) FROM invitations WHERE connection_name = 'phished' AND used_at IS NULL",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+    assert_eq!(open, 1, "the invitation is still unused");
+    // With the confirmation the approval goes through.
+    form.push(("confirm_redirect", "on"));
+    let r = o.post_form(&cookie, &form).await;
+    assert_eq!(r.status(), 303);
+    assert!(r.headers()["location"].to_str().unwrap().starts_with("https://claude.ai.evil.example/cb?"));
+
+    // Known hosts and loopback redirects get no warning and need no confirmation.
+    let known = [REDIRECT, "https://chatgpt.com/connector_platform_oauth_redirect", "http://127.0.0.1:4567/callback"];
+    for (i, redirect) in known.into_iter().enumerate() {
+        let client_id = o.register(redirect).await;
+        let params = with_redirect(&Oauth::params(&client_id, &chal), redirect);
+        let r = o.authorize_get(&params).await;
+        let cookie = r.headers()["set-cookie"].to_str().unwrap().split(';').next().unwrap().to_string();
+        let html = r.text().await.unwrap();
+        assert!(!html.contains("Unknown destination"), "{redirect}: {html}");
+        let (rid, csrf) = (field(&html, "rid"), field(&html, "csrf"));
+        let inv = o.invite(&format!("known-{i}"), &["info"], "read").await;
+        let html = o
+            .post_form(
+                &cookie,
+                &[("rid", &rid), ("csrf", &csrf), ("step", "invitation"), ("action", "continue"), ("invitation", &inv)],
+            )
+            .await
+            .text()
+            .await
+            .unwrap();
+        assert!(!html.contains("confirm_redirect"), "{redirect}");
+        let read = check_name(&html, "read.0");
+        let r = o
+            .post_form(
+                &cookie,
+                &[("rid", &rid), ("csrf", &csrf), ("step", "approve"), ("action", "approve"), (&read, "on")],
+            )
+            .await;
+        assert_eq!(r.status(), 303, "{redirect}");
+    }
 }
