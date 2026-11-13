@@ -76,8 +76,8 @@ hosts or reference hardware.
      CI workflow with `deny.toml` and secret scan. Verified: syntax and sandbox start of the unit as a user unit,
      local container build and compose run, Caddy and nginx route matrices on stock images, actionlint, gitleaks,
      cargo-deny. Unverified: system-level unit with `User=dove`, a production host with real TLS and Google, Podman,
-     the `age` backup step and a restore drill, the CI run on GitHub. Open for the owner: `SECURITY.md` contact
-     placeholder, licence file (A7))
+     the `age` backup step and a restore drill, the CI run on GitHub. Reporting channel and licence decided 2026-11-13
+     (GitHub private vulnerability reporting, Apache-2.0, A7))
 
 ## Assumptions and decisions
 
@@ -196,7 +196,7 @@ hosts or reference hardware.
 - A34. The token endpoint applies the connection's `--allow-ip` list (from the invitation) to both grants before
   anything is consumed: from another address a code or refresh token gets `invalid_grant` and stays usable, and a
   replayed rotated refresh token does not trigger reuse revocation. The approval page itself is not IP-bound.
-- A7. Licence is a placeholder (Apache-2.0) until the owner decides (spec 13.7).
+- A7. Licence: Apache-2.0, decided by the owner on 2026-11-13 (spec 13.7); `LICENSE` holds the full text.
 - A16. batch_read: budgets are assigned in input order (deterministic). Items that do not fit return
   `budget_exceeded` with a smaller-request hint instead of a continuation token. The wire budget counts the
   structured result plus the text rendering. Legacy text-only clients get the structured result serialized as
@@ -264,3 +264,10 @@ hosts or reference hardware.
   Gmail) get `ToolCx::write_deadline`, a reserve of a quarter of the budget (1 to 5 s) before the call deadline, so a
   late answer is normally still recorded and reported in time. A panic inside a claimed send leaves `sending` until
   the next restart turns it into `send_unknown`; a shutdown that ends the process mid-write does the same.
+- A50. Releases and updates (owner request 2026-11-13): tags `vX.Y.Z` build signed archives for x86_64/aarch64 Linux
+  (glibc baseline of Ubuntu 22.04) and macOS, a multi-arch image on GHCR from the same Linux binaries, and an
+  `install.sh`. The trust root is one minisign key (public half in `deploy/release/minisign.pub`, secret half only in
+  the repository's Actions secrets and the owner's backup). `dove upgrade` refuses anything whose `SHA256SUMS`
+  signature or trusted comment (`dove <tag>`) does not verify, refuses downgrades unless a version is named, and
+  never runs inside `serve`. The update hint lives in the CLI only (spec 13a amended); the service keeps its outbound
+  allowlist and reports its version over the admin socket so the CLI can say when a restart is due.

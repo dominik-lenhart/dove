@@ -6,26 +6,22 @@ Dove holds read and draft access to mailboxes, so security reports are welcome a
 
 **Do not open a public issue, pull request or discussion for a security problem.**
 
-Report privately through this channel:
-
-> **OWNER ACTION REQUIRED, placeholder:** `<security-contact: replace with a monitored address or the repository's private vulnerability reporting link before the repository is made public>`
-
-Until that placeholder is replaced, this repository has no working private reporting channel. Maintainers: set up
-GitHub private vulnerability reporting (Security tab, "Report a vulnerability") or a dedicated mailbox, publish an
-encryption key if you want encrypted reports, and edit this section. Do not publish the repository before then.
+Report privately through GitHub's private vulnerability reporting:
+[Report a vulnerability](https://github.com/dominik-lenhart/dove/security/advisories/new) (Security tab of the
+repository). Only the maintainers see the report.
 
 Please include: the affected version or commit, what you did, what you expected, what happened, and the impact you
 see. Use example data; never send real mail content, tokens or Google credentials. If you accidentally obtained
 a real token or mail, say so and delete it.
 
-What to expect (targets for the maintainers once the channel exists, not a contract): acknowledgement within 3 working
+What to expect (targets, not a contract): acknowledgement within 3 working
 days, an assessment within 10 working days, and coordinated disclosure after a fix is available. Reporters who act in
 good faith and avoid harming other people's data will not face legal action from the maintainers.
 
 ## Supported versions
 
-Dove is pre-release. There are no tagged releases yet; only the `main` branch receives security fixes. When releases
-exist, this section will name the supported versions.
+Dove is pre-1.0. Security fixes go into the latest release and `main`; there are no backports to older releases.
+Update with `dove upgrade` (or pull the new image) after an advisory.
 
 ## Scope
 

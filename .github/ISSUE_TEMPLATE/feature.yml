@@ -1,0 +1,20 @@
+name: Feature request
+description: Suggest a capability or an improvement.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: What do you want to do?
+      description: The task you or your agent are trying to get done, and what is missing today.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: Proposed solution
+  - type: textarea
+    id: security
+    attributes:
+      label: Security impact
+      description: Does this widen what a token can reach or do? How should it be gated?

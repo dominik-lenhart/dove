@@ -1,0 +1,41 @@
+name: Bug report
+description: Something does not work as documented.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not paste real mail content, addresses, tokens or passwords. Use example data.
+        Security problems go to the private reporting link, not here.
+  - type: input
+    id: version
+    attributes:
+      label: Dove version
+      description: Output of `dove --version`.
+    validations:
+      required: true
+  - type: dropdown
+    id: provider
+    attributes:
+      label: Mailbox type
+      options: [IMAP/SMTP, Gmail, Not mailbox related]
+    validations:
+      required: true
+  - type: input
+    id: server
+    attributes:
+      label: Mail provider or server software
+      description: For example Strato, iCloud, Dovecot. Helps with provider quirks.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, what happened instead. Include the error code Dove returned.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant lines from `journalctl -u dove` (Dove keeps mail content out of its logs).
+      render: text

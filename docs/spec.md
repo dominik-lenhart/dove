@@ -685,10 +685,10 @@ Acceptance criteria:
 4. Notification channel.
 5. Default audit retention (proposed 180 days).
 6. Initial ChatGPT/Claude compatibility test accounts and the host settings required to connect.
-7. Licence for the public repository (for example MIT or Apache-2.0 for wide use, AGPL-3.0 if hosted forks must
-   publish their changes).
-8. Names: the project is called Dove. Repository, packages and container image are `dove-mcp` (free on npm and PyPI
-   on 12 Nov 2026; plain `dove` is taken on npm). The binary, the CLI and the MCP server name are `dove`. Client tokens
+7. Licence for the public repository: Apache-2.0 (decided 2026-11-13, `LICENSE`).
+8. Names: the project is called Dove. The repository is `github.com/dominik-lenhart/dove` and the container image
+   `ghcr.io/dominik-lenhart/dove` (decided 2026-11-13); the Rust package stays `dove-mcp`, and `dove-mcp` remains the
+   name for npm or PyPI packages should there ever be any (plain `dove` is taken on npm). The binary, the CLI and the MCP server name are `dove`. Client tokens
    start with `dove_`. The name nods to the messenger dove and to Dovecot; Dove has no relation to the Dovecot project,
    and the README says so.
 
@@ -697,8 +697,15 @@ Acceptance criteria:
 - A `SECURITY.md` with a private reporting channel, and a threat-model section in the README that repeats section 6
   in short form, including what Dove does not protect against (a compromised host, 6.2).
 - Document Google's compose scope, both send gates, the implications of giving a token standing send permission, and Apple Mail's sequential editing contract.
-- No telemetry, no update checks that call home.
-- Signed releases with build provenance. The container image runs as non-root by default.
+- No telemetry. The service (`dove serve`) never checks for updates or calls anything but the mail providers and
+  the configured webhook (7.5). The CLI may check for a new release (amended 2026-11-13, owner decision): at most once
+  per day, only from an interactive terminal, one unauthenticated GET to the GitHub releases API that carries nothing
+  but the CLI version in its User-Agent, off with `DOVE_NO_UPDATE_CHECK=1` and under `CI`. Its result is a one-line
+  hint on stderr; it never changes a command's output or exit code.
+- Signed releases with build provenance: minisign signatures over `SHA256SUMS` (public key in
+  `deploy/release/minisign.pub` and built into the binary) and GitHub artifact attestations. `dove upgrade` installs a
+  release only after verifying that signature, and replaces the binary atomically. The container image runs as
+  non-root by default.
 - Example configuration with no real hostnames, ids or secrets. CI scans for secrets.
 
 ## 14. References
