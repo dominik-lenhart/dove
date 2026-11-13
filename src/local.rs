@@ -202,8 +202,10 @@ fn open_log(path: &Path) -> anyhow::Result<std::fs::File> {
     Ok(f)
 }
 
+/// The binary the login item runs. Symlinks are kept on purpose: a package manager's link (Homebrew's
+/// `bin/dove` into a versioned Cellar directory) stays valid across upgrades, its target does not.
 fn exe() -> anyhow::Result<PathBuf> {
-    crate::update::current_exe()
+    std::env::current_exe().context("cannot find the path of the running dove binary")
 }
 
 fn run_tool(program: &str, args: &[&str]) -> anyhow::Result<String> {
