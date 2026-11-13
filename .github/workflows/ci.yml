@@ -15,9 +15,11 @@ on:
 permissions:
   contents: read
 
+# A newer push to the same branch or pull request cancels the older run; a tag is never cancelled (the schedule gets
+# its own group so a push to main cannot cancel it).
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.event_name == 'schedule' && 'schedule' || github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -73,6 +75,77 @@ jobs:
       # Integration tests run against the fake Google server in tests/support/. CI never talks to real Google.
       # Hosted runners have 4 cores (the dev host runs the suite with 2 threads because it is shared).
       - run: cargo test --locked -- --test-threads=4
+
+  # Decides whether the platform jobs below run: they only matter when Rust code, tests or build inputs changed.
+  changes:
+    name: changed paths
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ steps.diff.outputs.rust }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: diff
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.sha }}
+        run: |
+          set -eu
+          rust=true
+          # A new branch or a force push has no usable base: run everything.
+          if [ -n "$BASE" ] && [ "$BASE" != 0000000000000000000000000000000000000000 ] && git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            if ! git diff --name-only "$BASE" "$HEAD" | grep -Eq '^(src/|tests/|build\.rs|Cargo\.(toml|lock)$|rust-toolchain|\.cargo/|\.github/workflows/ci\.yml$|\.github/actions/)'; then
+              rust=false
+            fi
+          fi
+          echo "rust=$rust" >> "$GITHUB_OUTPUT"
+          echo "platform jobs: $rust"
+
+  macos:
+    name: macOS check
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: "1.100.0"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # Compiles the binary and every test target; keeps the macOS code paths (keychain, local mode) from rotting.
+      # It does not run the suite: the Linux job does that, and macOS minutes are the expensive ones.
+      - run: cargo check --locked --all-targets
+
+  windows:
+    name: Windows build
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    # ALLOWED TO FAIL until the Windows port of the Rust code (local mode) is merged: without it the target does not
+    # compile, and a red job here would block main. The failure stays visible in the run, it just does not fail the
+    # workflow. Remove this line in the commit that lands the port (the same commit that flips WINDOWS_RELEASE in
+    # release.yml), and extend the test step below with the integration test files that need neither Unix sockets nor
+    # sudo.
+    continue-on-error: true
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: "1.100.0"
+      - uses: ./.github/actions/windows-build-tools
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo build --locked --bin dove
+      - run: cargo test --locked --lib -- --test-threads=4
 
   secrets:
     name: secret scan

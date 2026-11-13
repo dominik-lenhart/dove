@@ -1,0 +1,20 @@
+name: Windows build tools
+description: >-
+  OpenSSL's Configure (vendored openssl-src, used by SQLCipher) needs a native Perl, not the one from Git for Windows,
+  and NASM. Shared by the Windows release build and the Windows CI job. Run it on Windows runners only.
+
+runs:
+  using: composite
+  steps:
+    - name: Windows build tools (perl, nasm)
+      shell: pwsh
+      run: |
+        if (-not (Get-Command nasm -ErrorAction SilentlyContinue)) {
+          if (Test-Path 'C:\Program Files\NASM\nasm.exe') {
+            Add-Content -Path $env:GITHUB_PATH -Value 'C:\Program Files\NASM'
+          } else {
+            choco install nasm -y --no-progress
+            Add-Content -Path $env:GITHUB_PATH -Value 'C:\Program Files\NASM'
+          }
+        }
+        Add-Content -Path $env:GITHUB_ENV -Value 'OPENSSL_SRC_PERL=C:/Strawberry/perl/bin/perl.exe'
