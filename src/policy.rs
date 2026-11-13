@@ -204,7 +204,7 @@ pub struct ClientCtx {
     pub mailboxes: Vec<Mailbox>,
     /// Instance send gate at load time (spec 6.3).
     pub allow_send: bool,
-    /// Hide secrets in overview results (`clients set-redaction`, PLAN A59).
+    /// Hide secrets in overview results (`clients set-redaction`, PLAN A60).
     pub redact_secrets: bool,
 }
 

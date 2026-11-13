@@ -135,7 +135,7 @@ pub struct Invitation {
     pub grants: Vec<InviteGrant>,
     pub expires_in_secs: Option<i64>,
     pub allowed_cidrs: String,
-    /// Copied to the connection; the approver cannot change it (PLAN A59).
+    /// Copied to the connection; the approver cannot change it (PLAN A60).
     pub redact_secrets: bool,
 }
 

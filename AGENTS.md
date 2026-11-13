@@ -390,3 +390,7 @@ cargo fmt
   process) in a PATH of symlinked system tools, so no network and no real minisign are needed. There is no PowerShell
   on the host; `docker run --rm mcr.microsoft.com/powershell:latest pwsh -NoProfile -File <script>` checks an
   `install.ps1` expression quickly (the image is cached locally).
+- 2026-11-13: Secret redaction (PLAN A60, `src/redact.rs`) applies only at the output step through
+  `ToolCx::redact_table` / `redact_objects`; a new list or overview tool with subjects or snippets must call one of
+  them, targeted reads must not. Test fixtures that look like keys (`ghp_…`, PEM headers, `API key: …`) trip CI's
+  gitleaks: build them at run time (`format!("gh{}", "p_…")`) and check with the docker command above.

@@ -433,3 +433,24 @@ hosts or reference hardware.
   watches and queued deliveries (no table rebuild: dropping `sinks` would run the ON DELETE actions of `watches` and
   `sink_deliveries`); at startup `watch::sinks::seal_legacy_urls` seals their plaintext URL and empties the old `url`
   column, and their project stays NULL, meaning no client can use them until the operator assigns one.
+- A60. Secret redaction in overview results (spec 6.5a, owner request 2026-11-13, after an agent saw customer logins in
+  broad search snippets). (a) A per-connection switch `clients.redact_secrets` (migration `V_REDACT_SECRETS`), not an
+  instance setting: one deployment serves careful and trusted agents side by side. Off by default, so existing
+  connections behave as before. (b) `clients set-redaction` also accepts the name of an open invitation, and
+  `invitations.redact_secrets` is copied at redemption: without it a redeemed connection would start unredacted until
+  the operator noticed. The approver cannot turn it off (redemption only keeps or narrows). No `auth_epoch` bump: the
+  caller is loaded per request and cursors hold query state, not results, so a resumed page follows the current
+  setting. (c) Redaction runs at the projection step (`ToolCx::redact_table` / `redact_objects`, right before
+  rendering), so the structured and the text content agree and query/thread-grouping changes in the search engine
+  need no change here. Fields: `subject` and `snippet` only; addresses, labels and attachment names stay. (d) Rows are
+  marked `redacted: true|false` on every row while the switch is on (search: an appended `redacted` column), so the
+  shape is stable for that connection; rows of connections without redaction are unchanged. (e) Audit: the count of
+  redacted fields goes into `object_ids` as `~redacted=<n>` (a per-call counter on `ToolCx`, shared by batch items),
+  so the audit format and hash chain stay unchanged. (f) Detector choices: precision over recall. A label needs `:` or
+  `=`; with only `ist`/`is`/`lautet` the value must look like a secret (digit, symbol, or lower-upper case change), so
+  "Ihr Passwort ist abgelaufen" stays. User names are never hidden. One-time codes need a code word within 32 bytes
+  after / 40 before and exclude 4-digit years, dates, decimals, times, phone groups and words such as `postcode`,
+  `fehlercode`, `code review`. Known gaps: unlabeled secrets, values after a label in a separate table cell or after
+  extra words ("Ihr Passwort für das Portal lautet …", "lautet jetzt"), passwords containing spaces (only the first
+  word is hidden), "Benutzername / Passwort: a / b" (hides `a`, not `b`), alphanumeric codes without a colon, 4-digit
+  codes that look like years, and over-redaction of a plain word after `Passwort:` in a subject.

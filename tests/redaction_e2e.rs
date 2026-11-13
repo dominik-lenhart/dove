@@ -1,4 +1,4 @@
-//! Secret redaction in overview results (PLAN A59): the operator's per-connection switch and what it changes in
+//! Secret redaction in overview results (PLAN A60): the operator's per-connection switch and what it changes in
 //! `search_messages` (index and live), `digest`, `list_drafts` and `batch_read`, while `get_message` stays intact.
 
 mod support;

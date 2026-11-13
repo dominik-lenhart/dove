@@ -381,6 +381,29 @@ impossible, but it reduces what an injection can reach (6.3, project scoping) an
 - Truncate to `max_body_chars` and report `body_truncated: true`.
 - Dove never follows links, never downloads remote images and never opens attachments in version 1.
 
+### 6.5a Secret redaction in overview results
+
+Broad searches can surface credentials that customers or services sent by mail (logins with passwords, API keys,
+one-time codes) in snippets and subjects, although the agent never asked for them. The operator can switch on
+redaction per connection (PLAN A60):
+
+- FR-R1. `dove clients set-redaction <name> on|off`, or `--redact-secrets` on `clients create` and `clients invite`. Off
+  by default. Shown in `clients list`, `clients show` and `export`. An invitation hands the setting to the connection it
+  creates; the approval page cannot change it. A change applies from the next request.
+- FR-R2. When on, Dove replaces detected secrets with `[redacted]` in the subject and snippet of every overview row:
+  `search_messages` (index and live, also inside `batch_read`), `digest` and `list_drafts`. Every row of such a
+  result carries `redacted: true|false` (search: an extra `redacted` column). `search_contacts` (names, addresses and
+  counts only) and watch events (ids only) carry no preview text.
+- FR-R3. Targeted reads stay complete: `get_message`, `get_thread`, `get_draft` and `get_attachment`. An agent that
+  needs a hidden value reads the one message.
+- FR-R4. The detector is a documented, conservative heuristic (`src/redact.rs`): labeled values (`Passwort:`,
+  `password is …`, `PIN:`, `API key:`, `Zugangsdaten:` …), known key shapes (OpenAI/Anthropic `sk-`, Stripe, GitHub,
+  GitLab, Slack, AWS access key ids, Google API keys, JWTs, `Bearer` tokens, PEM private keys) and one-time codes
+  near code words. It runs in linear time. It is a safety net against accidental exposure, not a guarantee: secrets
+  without a label or known shape pass through.
+- FR-R5. The tool call's audit record notes how many fields were redacted (`~redacted=<n>` in `object_ids`), never
+  the text.
+
 ### 6.6 Network exposure
 
 - The service listens on `127.0.0.1` only. A reverse proxy terminates TLS (TLS 1.2 or later, HSTS) and forwards only

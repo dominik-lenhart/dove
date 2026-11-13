@@ -127,7 +127,7 @@ pub enum AdminRequest {
         expires: Option<String>,
         #[serde(default)]
         allow_ip: Vec<String>,
-        /// Hide secrets in overview results (PLAN A59).
+        /// Hide secrets in overview results (PLAN A60).
         #[serde(default)]
         redact_secrets: bool,
     },
@@ -145,7 +145,7 @@ pub enum AdminRequest {
         name: String,
     },
     /// Turns secret redaction in overview results on or off for a connection, or for an open invitation of that
-    /// connection name (PLAN A59).
+    /// connection name (PLAN A60).
     ClientsSetRedaction {
         name: String,
         enabled: bool,
@@ -160,7 +160,7 @@ pub enum AdminRequest {
         expires: Option<String>,
         #[serde(default)]
         allow_ip: Vec<String>,
-        /// The redeemed connection hides secrets in overview results (PLAN A59).
+        /// The redeemed connection hides secrets in overview results (PLAN A60).
         #[serde(default)]
         redact_secrets: bool,
     },

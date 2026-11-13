@@ -90,7 +90,7 @@ impl ToolCx {
         self.gate.0.load(Ordering::SeqCst) == COMMITTED
     }
 
-    /// Overview redaction (PLAN A59): when the connection has `redact_secrets`, hides secrets in the subject and
+    /// Overview redaction (PLAN A60): when the connection has `redact_secrets`, hides secrets in the subject and
     /// snippet of each row and gives every row `redacted: true|false`. Call it on list and overview results only,
     /// right before rendering; targeted reads stay unredacted.
     pub fn redact_objects(&self, rows: &mut [Value]) {
@@ -143,7 +143,7 @@ impl ToolCx {
     }
 }
 
-/// Overview fields that secret redaction covers (PLAN A59).
+/// Overview fields that secret redaction covers (PLAN A60).
 pub const REDACTED_FIELDS: &[&str] = &["subject", "snippet"];
 
 /// The error for a call whose write started but whose result the caller will not see.

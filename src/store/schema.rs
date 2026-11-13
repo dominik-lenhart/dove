@@ -336,7 +336,7 @@ ALTER TABLE sinks ADD COLUMN url_sealed BLOB;
 CREATE INDEX sinks_project ON sinks(project_id);
 "#;
 
-/// Secret redaction in overview results (PLAN A59): a per-connection switch, off by default, set by the operator. An
+/// Secret redaction in overview results (PLAN A60): a per-connection switch, off by default, set by the operator. An
 /// invitation carries it to the connection it creates.
 const V_REDACT_SECRETS: &str = r#"
 ALTER TABLE clients ADD COLUMN redact_secrets INTEGER NOT NULL DEFAULT 0;

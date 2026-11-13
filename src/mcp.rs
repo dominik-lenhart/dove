@@ -387,7 +387,7 @@ pub async fn call_tool(app: &Arc<App>, ctx: &ClientCtx, version: &str, name: &st
             rec.result_code = "ok".into();
             rec.account_alias = out.audit.account.clone();
             rec.object_ids = out.audit.object_ids.clone();
-            // Secret redaction (PLAN A59): the number of hidden fields, never the text.
+            // Secret redaction (PLAN A60): the number of hidden fields, never the text.
             if cx.redactions() > 0 {
                 rec.object_ids.push(format!("~redacted={}", cx.redactions()));
             }

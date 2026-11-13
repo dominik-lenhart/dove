@@ -1,4 +1,4 @@
-//! Secret redaction for overview results (PLAN A59, spec 6.5a).
+//! Secret redaction for overview results (PLAN A60, spec 6.5a).
 //!
 //! Connections with `redact_secrets` on get credentials and one-time codes replaced by [`MARK`] in the short preview
 //! text of list and overview results (subjects and snippets of `search_messages`, `digest`, `list_drafts`). Targeted
