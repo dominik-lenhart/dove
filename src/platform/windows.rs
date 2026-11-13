@@ -407,6 +407,17 @@ pub fn handle_allowed_sids(handle: RawHandle) -> io::Result<Option<Vec<String>>>
     Ok(Some(out))
 }
 
+/// The bytes of a system-allocated blob. An empty blob may carry a null pointer, which `from_raw_parts` must never see.
+///
+/// # Safety
+/// A non-null `pbData` must point to `cbData` readable and writable bytes that outlive the returned slice.
+unsafe fn blob_bytes<'a>(b: &CRYPT_INTEGER_BLOB) -> &'a mut [u8] {
+    if b.pbData.is_null() || b.cbData == 0 {
+        return &mut [];
+    }
+    unsafe { std::slice::from_raw_parts_mut(b.pbData, b.cbData as usize) }
+}
+
 /// Encrypts `data` for the current Windows user (DPAPI, CurrentUser scope).
 pub fn dpapi_protect(data: &[u8]) -> io::Result<Vec<u8>> {
     let input = CRYPT_INTEGER_BLOB { cbData: data.len() as u32, pbData: data.as_ptr() as *mut u8 };
@@ -426,7 +437,7 @@ pub fn dpapi_protect(data: &[u8]) -> io::Result<Vec<u8>> {
         return Err(io::Error::last_os_error());
     }
     let _free = Local(out.pbData as *mut c_void);
-    Ok(unsafe { std::slice::from_raw_parts(out.pbData, out.cbData as usize) }.to_vec())
+    Ok(unsafe { blob_bytes(&out) }.to_vec())
 }
 
 /// Decrypts a DPAPI blob of the current user. The system's plaintext copy is wiped before it is freed.
@@ -448,7 +459,7 @@ pub fn dpapi_unprotect(blob: &[u8]) -> io::Result<zeroize::Zeroizing<Vec<u8>>> {
         return Err(io::Error::last_os_error());
     }
     let _free = Local(out.pbData as *mut c_void);
-    let plain = unsafe { std::slice::from_raw_parts_mut(out.pbData, out.cbData as usize) };
+    let plain = unsafe { blob_bytes(&out) };
     let copy = zeroize::Zeroizing::new(plain.to_vec());
     zeroize::Zeroize::zeroize(plain);
     Ok(copy)
@@ -540,5 +551,20 @@ pub(crate) mod tests {
         let last = broken.len() - 1;
         broken[last] ^= 1;
         assert!(dpapi_unprotect(&broken).is_err());
+        // An empty secret decrypts to an empty buffer, which DPAPI may return as a null pointer (L6).
+        let empty = dpapi_protect(b"").unwrap();
+        assert!(dpapi_unprotect(&empty).unwrap().is_empty());
+    }
+
+    /// Null or empty system buffers become an empty slice instead of reaching `from_raw_parts` (L6).
+    #[test]
+    fn empty_blobs_are_never_dereferenced() {
+        let null = CRYPT_INTEGER_BLOB { cbData: 0, pbData: std::ptr::null_mut() };
+        assert!(unsafe { blob_bytes(&null) }.is_empty());
+        let null_with_len = CRYPT_INTEGER_BLOB { cbData: 16, pbData: std::ptr::null_mut() };
+        assert!(unsafe { blob_bytes(&null_with_len) }.is_empty());
+        let mut data = *b"abc";
+        let some = CRYPT_INTEGER_BLOB { cbData: 3, pbData: data.as_mut_ptr() };
+        assert_eq!(unsafe { blob_bytes(&some) }, b"abc");
     }
 }
