@@ -497,7 +497,8 @@ const MAX_PDF_STREAM_BYTES: usize = 8 * 1024 * 1024;
 /// `/ObjStm`). Names are plain text even in encrypted or compressed documents; a count that is too high only makes
 /// the check stricter, so strings and stream data containing a slash do no harm.
 fn count_pdf_names(pdf: &[u8], wanted: &[&[u8]]) -> usize {
-    let is_delim = |b: u8| b.is_ascii_whitespace() || b"()<>[]{}/%".contains(&b);
+    // The PDF whitespace set (including NUL, which `is_ascii_whitespace` lacks) and delimiters, as lopdf's tokenizer.
+    let is_delim = |b: u8| b" \t\n\r\0\x0C()<>[]{}/%".contains(&b);
     let mut count = 0usize;
     let mut i = 0usize;
     let mut name: Vec<u8> = Vec::with_capacity(16);
@@ -800,6 +801,13 @@ mod tests {
         // Ordinary escapes in other names, and a few object streams, are fine to count.
         assert_eq!(count_pdf_names(b"/BaseFont /Arial#20Bold /Type/ObjStm /Type /ObjStm>>/ObjStmX", &[b"ObjStm"]), 2);
         assert_eq!(count_pdf_names(b"/Obj#5", &[b"ObjStm"]), 0, "a truncated escape is not an escape");
+        // NUL ends a name like any other PDF whitespace: `/ObjStm\0` must still count.
+        assert_eq!(count_pdf_names(b"/Type /ObjStm\0/N 1 /Type/XRef\0", &[b"ObjStm", b"XRef"]), 2);
+        let mut pdf = b"%PDF-1.5\n".to_vec();
+        for i in 0..300 {
+            pdf.extend(format!("{i} 0 obj\n<< /Type /ObjStm\0/N 0 /Length 0 >>\nstream\n\nendstream\nendobj\n").bytes());
+        }
+        assert_eq!(extract(&pdf, Kind::Pdf, &lim(1000)).unwrap_err(), ExtractError::TooLarge);
     }
 
     #[test]

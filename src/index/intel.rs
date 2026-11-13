@@ -304,7 +304,7 @@ pub struct ThreadRow {
 }
 
 /// The filter shared by the thread query and the per-thread detail query: window, folders, category.
-fn filter(sql: &mut String, params: &mut Vec<SqlValue>, req: &DigestReq, t: &[Target]) {
+fn filter(sql: &mut String, params: &mut Vec<SqlValue>, req: &DigestReq) {
     sql.push_str(&format!(
         " AND m.spam_trash = 0 AND m.received_at >= ? AND EXISTS \
          (SELECT 1 FROM labels l WHERE l.msg = m.id AND l.gen = m.gen AND l.label IN {})",
@@ -326,7 +326,7 @@ pub fn thread_sql(req: &DigestReq, t: &[Target], after: Option<&DigestKey>) -> (
         marks(t.len())
     );
     let mut params = gens(t);
-    filter(&mut sql, &mut params, req, t);
+    filter(&mut sql, &mut params, req);
     sql.push_str(" GROUP BY m.account_id, m.thread_id");
     if let Some((newest, acc, thread)) = after {
         sql.push_str(
@@ -378,13 +378,12 @@ pub fn digest_page(
     let mut out = Vec::with_capacity(heads.len().min(req.limit));
     for (account_id, thread_id, newest, count, unread) in heads.into_iter().take(req.limit) {
         let Some(gen_id) = t.iter().find(|x| x.account_id == account_id).map(|x| x.gen_id) else { continue };
-        let one = [t.iter().find(|x| x.gen_id == gen_id).expect("present").clone()];
         let mut dsql = String::from(
             "SELECT m.gmail_id, m.subject, m.from_list, m.snippet, m.category FROM messages m \
              WHERE m.gen = ? AND m.thread_id = ?",
         );
         let mut dparams = vec![SqlValue::Integer(gen_id), SqlValue::Text(thread_id.clone())];
-        filter(&mut dsql, &mut dparams, req, &one);
+        filter(&mut dsql, &mut dparams, req);
         dsql.push_str(&format!(" ORDER BY m.received_at DESC, m.gmail_id DESC LIMIT {PARTICIPANT_MESSAGES}"));
         let mut dst = conn.prepare_cached(&dsql)?;
         let mut rows = dst.query(params_from_iter(dparams))?;
