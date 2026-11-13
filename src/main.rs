@@ -7,7 +7,10 @@ fn main() -> std::process::ExitCode {
     // Binaries renamed aside by an earlier `dove upgrade` while they were running (PLAN A58).
     #[cfg(windows)]
     dove::update::windows::cleanup_after_upgrade();
-    if !matches!(cli.command, dove::cli::Command::Serve { .. }) {
+    if !matches!(
+        cli.command,
+        dove::cli::Command::Serve { .. } | dove::cli::Command::Local(dove::local::LocalCmd::Start { .. })
+    ) {
         dove::logging::init_cli_logging();
     }
     // The daily new-version notice (stderr only, never for `serve`): looked up alongside the command, bounded by
