@@ -355,3 +355,7 @@ cargo fmt
   allowlist, the rate limit key and the `X-Forwarded-For` Dove trusts. Both nginx templates override it in the server
   block (`set_real_ip_from 192.0.2.1/32`) and log to their own query-free `access_log`; test such proxy behaviour in a
   throwaway `nginx:stable-alpine` container with an http-level `real_ip_header` and a request carrying the header.
+- 2026-11-13: Third-party crates log through the `log` bridge, and the content parsers quote untrusted input (lopdf
+  printed whole PDF font dictionaries, ~1,100 warnings a day in production). `logging::LOG_TARGETS` is an allowlist
+  (Dove plus the transport stack) applied after `DOVE_LOG`; never add a crate that parses mail or attachments.
+  `tests/log_targets.rs` triggers real lopdf and html5ever warnings and checks none reach the log.
