@@ -168,6 +168,11 @@ fn col(v: &Value, name: &str) -> Vec<Value> {
     v["rows"].as_array().unwrap().iter().map(|r| r[i].clone()).collect()
 }
 
+/// Own addresses for plan tests: `<alias>@acme.test` per target.
+fn self_sets(targets: &[Target]) -> HashMap<String, Vec<String>> {
+    targets.iter().map(|t| (t.account_id.clone(), vec![format!("{}@acme.test", t.alias)])).collect()
+}
+
 fn pred(field: &str, op: &str, value: Value) -> Value {
     json!({"field": field, "op": op, "value": value})
 }
@@ -518,7 +523,8 @@ async fn indexed_search_makes_no_gmail_calls_and_uses_indexes() {
             app.index
                 .read(Instant::now() + Duration::from_secs(5), move |c| {
                     let known = HashMap::new();
-                    query::explain(c, &req, &Scope { targets: &targets, known: &known })
+                    let selves = self_sets(&targets);
+                    query::explain(c, &req, &Scope { targets: &targets, known: &known, selves: &selves })
                 })
                 .await
                 .unwrap()
@@ -556,6 +562,46 @@ async fn indexed_search_makes_no_gmail_calls_and_uses_indexes() {
     let text = plan(json!({"where": pred("text", "terms", json!("fox")), "select": ["subject"]})).await;
     assert!(text.iter().any(|l| l.contains("VIRTUAL TABLE INDEX")), "{text:?}");
 
+    // from_self (PLAN A59): own-address lookups per mailbox and the SENT label, both through indexes.
+    let own = plan(json!({"where": pred("from_self", "eq", json!(true)), "select": ["subject", "from_self"]})).await;
+    assert!(!full_scan(&own), "{own:?}");
+    assert_eq!(own.iter().filter(|l| l.contains("addrs_addr (addr=? AND gen=? AND role=?)")).count(), 2, "{own:?}");
+    assert!(own.iter().any(|l| l.contains("SEARCH labels USING PRIMARY KEY (label=? AND gen=?)")), "{own:?}");
+    assert!(own.iter().any(|l| l.contains("SEARCH a USING INDEX addrs_msg (msg=?)")), "the column: {own:?}");
+    // Thread view: matching messages are grouped, every thread's messages are fetched by `messages_thread`, and the
+    // per-message self check is one lookup by message id (materialized once, not copied into every aggregate).
+    let thread_plan_ok = |lines: &[String]| {
+        assert!(!full_scan(lines) && !lines.iter().any(|l| l == "SCAN t" || l.starts_with("SCAN t ")), "{lines:?}");
+        assert!(lines.iter().any(|l| l == "SEARCH t USING INDEX messages_thread (thread_id=? AND gen=?)"), "{lines:?}");
+        assert_eq!(
+            lines.iter().filter(|l| l.contains("SEARCH a USING INDEX addrs_msg (msg=?)")).count(),
+            1,
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines.iter().filter(|l| l.contains("SEARCH l USING PRIMARY KEY (label=? AND gen=? AND msg=?)")).count(),
+            1,
+            "{lines:?}"
+        );
+    };
+    let threads = plan(json!({"group_by": "thread", "where": pred("from", "eq", json!("anna@example.com"))})).await;
+    thread_plan_ok(&threads);
+    assert!(threads.iter().any(|l| l.contains("addrs_addr")), "the filter drives the candidates: {threads:?}");
+    thread_plan_ok(&plan(json!({"group_by": "thread", "awaiting_reply": true, "count_only": true})).await);
+    let latest = {
+        let targets = targets.clone();
+        fx.h.app()
+            .index
+            .read(Instant::now() + Duration::from_secs(5), move |c| {
+                let req = dove::tools::search::parse_index_req(&json!({"group_by": "thread"})).unwrap();
+                let (known, selves) = (HashMap::new(), self_sets(&targets));
+                query::explain_latest(c, &req, &Scope { targets: &targets, known: &known, selves: &selves })
+            })
+            .await
+            .unwrap()
+    };
+    assert!(latest.iter().any(|l| l.contains("messages_thread (thread_id=? AND gen=?)")), "{latest:?}");
+
     // Text predicates evaluate MATCH only on the eligible generations' own FTS tables (spec 7.9): the other indexed
     // mailboxes (ops, secret) have postings, but their tables appear neither in the SQL nor in the plan.
     let fts_names = |text: &str| -> std::collections::BTreeSet<String> {
@@ -582,7 +628,9 @@ async fn indexed_search_makes_no_gmail_calls_and_uses_indexes() {
             {"not": pred("subject", "phrase", json!("quick brown"))}]}, "select": ["subject"]});
         let req = dove::tools::search::parse_index_req(&args).unwrap();
         let known = HashMap::new();
-        let (sql, _) = query::page_sql(&req, &Scope { targets: &targets[..n], known: &known }, &[]).unwrap();
+        let (sql, _) =
+            query::page_sql(&req, &Scope { targets: &targets[..n], known: &known, selves: &HashMap::new() }, &[])
+                .unwrap();
         assert_eq!(fts_names(&sql), mine(n), "{sql}");
         let lines = plan_n(args, n).await;
         assert_eq!(fts_names(&lines.join("\n")), mine(n), "{lines:?}");
@@ -637,6 +685,24 @@ async fn body_and_mime_coverage_affect_only_queries_using_them() {
     assert!(
         v["exceptions"].as_array().unwrap().iter().any(|e| e["reason"] == "message metadata unknown for some messages")
     );
+    // The thread view reads every message's sender (reply status), and from_self reads senders too (PLAN A59).
+    for args in [
+        json!({"accounts": ["info"], "where": pred("label", "eq", json!("STARRED")), "group_by": "thread",
+            "select": ["thread_id", "message_count"]}),
+        json!({"accounts": ["info"], "where": pred("from_self", "eq", json!(false)), "select": ["message_id"]}),
+        json!({"accounts": ["info"], "where": pred("label", "eq", json!("STARRED")), "select": ["from_self"]}),
+    ] {
+        let v = fx.search(args.clone()).await;
+        assert_eq!(v["coverage"], "partial", "{args}");
+        assert!(
+            v["exceptions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["reason"] == "message metadata unknown for some messages"),
+            "{args}"
+        );
+    }
     // Unknown has_attachment never matches a positive predicate.
     let v = fx.search(json!({"accounts": ["info"], "where": pred("has_attachment", "eq", json!(true)), "select": ["subject"], "limit": 100})).await;
     assert_eq!(v["rows"], json!([["Invoice October"], ["Invoice October"]]));

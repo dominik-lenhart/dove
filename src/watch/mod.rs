@@ -413,7 +413,9 @@ async fn match_new(app: &Arc<App>, account_id: &str, gen_id: i64, ids: Vec<Strin
                 tx.query_row("SELECT att_fts FROM generations WHERE id = ?1", [gen_id], |r| r.get(0))?;
             let targets = [Target { account_id: aid.clone(), alias: alias.clone(), gen_id, att_fts }];
             let known: HashMap<String, String> = [(alias.clone(), aid.clone())].into();
-            let scope = Scope { targets: &targets, known: &known };
+            // No own addresses: watches refuse `from_self` (`tools::watches`), so it never needs them here.
+            let selves = HashMap::new();
+            let scope = Scope { targets: &targets, known: &known, selves: &selves };
             let mut hits: HashMap<usize, HashSet<i64>> = HashMap::new();
             for (i, e) in &queries {
                 // A filter that no longer compiles (for example a qualifier naming another mailbox) matches nothing.

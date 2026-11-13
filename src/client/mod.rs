@@ -130,6 +130,18 @@ pub struct SearchArgs {
     pub unread: bool,
     #[arg(long)]
     pub has_attachment: bool,
+    /// Only mail sent by the mailbox itself (its address, its send-as aliases or the SENT label).
+    #[arg(long, conflicts_with = "not_from_self")]
+    pub from_self: bool,
+    /// Leave out mail sent by the mailbox itself.
+    #[arg(long)]
+    pub not_from_self: bool,
+    /// One row per thread (latest message, message count, reply status) instead of per message.
+    #[arg(long)]
+    pub threads: bool,
+    /// Only threads whose latest non-draft message is not from the mailbox itself (implies --threads).
+    #[arg(long)]
+    pub awaiting_reply: bool,
     /// Comma-separated output columns, e.g. subject,from,received_at.
     #[arg(long)]
     pub select: Option<String>,
@@ -506,6 +518,10 @@ pub fn search_args(a: &SearchArgs) -> anyhow::Result<Value> {
         || a.before.is_some()
         || a.unread
         || a.has_attachment
+        || a.from_self
+        || a.not_from_self
+        || a.threads
+        || a.awaiting_reply
         || a.select.is_some()
         || !a.order_by.is_empty()
         || a.limit.is_some()
@@ -567,6 +583,9 @@ pub fn search_args(a: &SearchArgs) -> anyhow::Result<Value> {
     if a.has_attachment {
         preds.push(eq("has_attachment", json!(true)));
     }
+    if a.from_self || a.not_from_self {
+        preds.push(eq("from_self", json!(a.from_self)));
+    }
     if !preds.is_empty() {
         if a.gmail_query.is_some() {
             bail!("--gmail-query cannot be combined with index filters");
@@ -592,6 +611,12 @@ pub fn search_args(a: &SearchArgs) -> anyhow::Result<Value> {
     }
     if a.require_complete {
         args["coverage_policy"] = json!("require_complete");
+    }
+    if a.threads || a.awaiting_reply {
+        args["group_by"] = json!("thread");
+    }
+    if a.awaiting_reply {
+        args["awaiting_reply"] = json!(true);
     }
     Ok(args)
 }

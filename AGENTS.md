@@ -350,3 +350,9 @@ cargo fmt
   opening a SQLCipher connection outlasted a 100 ms deadline). `Index::read` enforces deadlines with a progress handler
   on the reader's own thread (rusqlite feature `hooks`). Tests of a deadline use a bounded query so a regression fails
   instead of hanging the runner.
+- 2026-11-13: SQLite flattens a subquery or CTE into its user and copies the column expression into every place that
+  uses it; `EXPLAIN QUERY PLAN` then lists one `CORRELATED SCALAR SUBQUERY` per copy. A per-row correlated check used
+  in several aggregates (the thread view's `from_self`) goes in an `AS MATERIALIZED` CTE so it runs once per row;
+  assert the count of the lookup lines in the plan test. `query::Scope` carries `selves` (own addresses per account
+  id); `from_self` and `group_by:"thread"` refuse to compile without an entry for every target, so a new caller that
+  passes an empty map gets `invalid_argument`, not a silently wrong answer.
