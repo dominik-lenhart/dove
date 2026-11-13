@@ -507,6 +507,7 @@ async fn indexed_search_makes_no_gmail_calls_and_uses_indexes() {
             account_id: fx.accounts[alias].clone(),
             alias: alias.into(),
             gen_id: st.serving_gen().unwrap(),
+            att_fts: true,
         });
     }
     let plan_n = |args: Value, n: usize| {

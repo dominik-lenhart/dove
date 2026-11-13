@@ -114,6 +114,8 @@ async fn search(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
         return match cur.payload {
             Payload::Index(p) => index_search(cx, p.req.clone(), Some(p), &args).await,
             Payload::Live(p) => live_search(cx, p, Vec::new(), true, &args).await,
+            // A digest cursor belongs to `digest`.
+            Payload::Digest(_) => Err(cursor::invalid()),
         };
     }
     match opt_str(&args, "source")?.unwrap_or("index") {
@@ -140,7 +142,7 @@ fn opt_limit(args: &Value) -> Result<usize, ToolError> {
     Ok(super::opt_u64(args, "limit", DEFAULT_LIMIT as u64, 1, MAX_LIMIT as u64)? as usize)
 }
 
-fn accounts_arg(args: &Value) -> Result<Option<Vec<String>>, ToolError> {
+pub(crate) fn accounts_arg(args: &Value) -> Result<Option<Vec<String>>, ToolError> {
     match args.get("accounts") {
         None | Some(Value::Null) => Ok(None),
         Some(_) => {
@@ -192,7 +194,7 @@ pub fn parse_index_req(args: &Value) -> Result<SearchReq, ToolError> {
 }
 
 /// Requested mailboxes with read access: active ones to search, others reported as account errors.
-fn resolve_accounts(cx: &ToolCx, names: Option<&[String]>) -> Result<(Vec<Mailbox>, Vec<Value>), ToolError> {
+pub(crate) fn resolve_accounts(cx: &ToolCx, names: Option<&[String]>) -> Result<(Vec<Mailbox>, Vec<Value>), ToolError> {
     let mut picked: Vec<Mailbox> = vec![];
     match names {
         Some(names) => {
@@ -220,13 +222,13 @@ fn resolve_accounts(cx: &ToolCx, names: Option<&[String]>) -> Result<(Vec<Mailbo
     Ok((active, errors))
 }
 
-fn known_aliases(cx: &ToolCx) -> HashMap<String, String> {
+pub(crate) fn known_aliases(cx: &ToolCx) -> HashMap<String, String> {
     cx.client.mailboxes.iter().map(|m| (m.alias.clone(), m.account_id.clone())).collect()
 }
 
 /// Reloads grants after the query ran (spec 5.3 "again before release if changed in flight"). Returns the account
 /// ids that may still be released.
-async fn recheck(cx: &ToolCx, resumed: bool, need_index: bool) -> Result<HashSet<String>, ToolError> {
+pub(crate) async fn recheck(cx: &ToolCx, resumed: bool, need_index: bool) -> Result<HashSet<String>, ToolError> {
     let client_id = cx.client.client_id.clone();
     let (epoch, mbs) = cx
         .app

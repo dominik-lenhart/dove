@@ -375,20 +375,25 @@ fn xml_text(xml: &[u8], flavor: Flavor, lim: &Limits) -> Result<String, ExtractE
     let mut out = String::new();
     let mut i = 0usize;
     let mut in_wt = false;
-    let mut tags = 0u32;
+    let mut steps = 0u32;
     while i < b.len() && out.len() < budget {
+        steps += 1;
+        if steps % 1024 == 0 && Instant::now() >= lim.deadline {
+            return Err(ExtractError::Timeout);
+        }
         if b[i] != b'<' {
             let end = memchr(b'<', b, i).unwrap_or(b.len());
-            // DOCX: text only inside <w:t>. ODT: every text node of content.xml.
+            // DOCX: text only inside <w:t>. ODT: every text node of content.xml. A node is cut to what the output
+            // budget still allows before it is unescaped.
             if flavor == Flavor::Odt || in_wt {
-                push_unescaped(&s[i..end], &mut out);
+                let mut stop = end.min(i + budget.saturating_sub(out.len()));
+                while !s.is_char_boundary(stop) {
+                    stop -= 1;
+                }
+                push_unescaped(&s[i..stop], &mut out);
             }
             i = end;
             continue;
-        }
-        tags += 1;
-        if tags % 1024 == 0 && Instant::now() >= lim.deadline {
-            return Err(ExtractError::Timeout);
         }
         let rest = &s[i..];
         if let Some(r) = rest.strip_prefix("<!--") {
@@ -450,7 +455,8 @@ fn push_unescaped(s: &str, out: &mut String) {
     while let Some(p) = rest.find('&') {
         out.push_str(&rest[..p]);
         rest = &rest[p..];
-        let Some(semi) = rest.find(';').filter(|e| *e <= 12) else {
+        // The terminator must be within the next 12 bytes: a long run of `&` without `;` stays linear.
+        let Some(semi) = rest.as_bytes().iter().take(13).position(|b| *b == b';') else {
             out.push('&');
             rest = &rest[1..];
             continue;
@@ -480,16 +486,24 @@ fn push_unescaped(s: &str, out: &mut String) {
 
 /// Pages read from one PDF, at most.
 const MAX_PDF_PAGES: usize = 300;
+/// Object streams a PDF may declare. Real documents within the attachment size cap have a few dozen; every one is
+/// inflated and parsed eagerly while the document loads, so a crafted file with thousands is refused before that.
+const MAX_PDF_OBJECT_STREAMS: usize = 256;
+/// Most bytes one PDF stream may inflate to (object, cross-reference and page content streams alike).
+const MAX_PDF_STREAM_BYTES: usize = 16 * 1024 * 1024;
 
 fn pdf_text(bytes: &[u8], lim: &Limits) -> Result<String, ExtractError> {
     if !bytes.get(..1024.min(bytes.len())).is_some_and(|h| h.windows(5).any(|w| w == b"%PDF-")) {
         return Err(ExtractError::Invalid);
     }
-    let opts = lopdf::LoadOptions {
-        max_decompressed_size: Some(lim.max_decompressed),
-        strict: false,
-        ..Default::default()
-    };
+    // lopdf loads the whole document eagerly and cannot be interrupted, so the work is bounded by what goes in: the
+    // attachment size cap, the number of object streams, and the inflated size of every stream and page.
+    let objstms = bytes.windows(7).filter(|w| *w == b"/ObjStm").count();
+    if objstms > MAX_PDF_OBJECT_STREAMS {
+        return Err(ExtractError::TooLarge);
+    }
+    let stream_cap = lim.max_decompressed.min(MAX_PDF_STREAM_BYTES);
+    let opts = lopdf::LoadOptions { max_decompressed_size: Some(stream_cap), strict: false, ..Default::default() };
     let doc = lopdf::Document::load_mem_with_options(bytes, opts).map_err(|_| ExtractError::Invalid)?;
     if doc.is_encrypted() {
         return Err(ExtractError::Encrypted);
@@ -508,7 +522,7 @@ fn pdf_text(bytes: &[u8], lim: &Limits) -> Result<String, ExtractError> {
         if out.len() >= budget {
             break;
         }
-        match doc.extract_text_with_limit(&[*n], lim.max_decompressed) {
+        match doc.extract_text_with_limit(&[*n], stream_cap) {
             Ok(t) => {
                 out.push_str(&t);
                 out.push('\n');
@@ -708,6 +722,38 @@ mod tests {
         let z = zip_of(&[("word/document.xml", xml.as_bytes(), true)]);
         let soon = Limits { max_chars: 1_000_000, max_decompressed: 1 << 24, deadline: Instant::now() + Duration::from_millis(0) };
         assert!(matches!(extract(&z, Kind::Docx, &soon), Err(ExtractError::Timeout)));
+    }
+
+    #[test]
+    fn long_runs_of_ampersands_stay_linear() {
+        // 8 MiB of '&' without a terminator used to rescan to the end of the text for every '&'.
+        let xml = format!("<w:document><w:p><w:t>{}</w:t></w:p></w:document>", "&".repeat(8 * 1024 * 1024));
+        let z = zip_of(&[("word/document.xml", xml.as_bytes(), true)]);
+        let started = Instant::now();
+        let t = extract(&z, Kind::Docx, &Limits { max_decompressed: 16 << 20, ..lim(1000) }).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        assert!(t.text.chars().count() <= 1000);
+    }
+
+    #[test]
+    fn unescape_is_linear_without_terminators() {
+        let started = Instant::now();
+        let mut out = String::new();
+        push_unescaped(&"&".repeat(1024 * 1024), &mut out);
+        assert_eq!(out.len(), 1024 * 1024);
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        let mut out = String::new();
+        push_unescaped("a &amp; b &#x41;&#66; &unknown; &lt", &mut out);
+        assert_eq!(out, "a & b AB  &lt");
+    }
+
+    #[test]
+    fn pdf_with_many_object_streams_is_refused() {
+        let mut pdf = b"%PDF-1.5\n".to_vec();
+        for i in 0..300 {
+            pdf.extend(format!("{i} 0 obj\n<< /Type /ObjStm /N 0 /First 0 /Length 0 >>\nstream\n\nendstream\nendobj\n").bytes());
+        }
+        assert_eq!(extract(&pdf, Kind::Pdf, &lim(1000)).unwrap_err(), ExtractError::TooLarge);
     }
 
     #[test]

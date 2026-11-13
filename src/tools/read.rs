@@ -48,6 +48,8 @@ pub const DETAIL_FIELDS: &[&str] = &[
     "body_truncated",
     "attachments",
     "headers",
+    "category",
+    "calendar",
 ];
 
 pub fn defs() -> Vec<ToolDef> {
@@ -266,6 +268,10 @@ pub fn shape(mb: &Mailbox, f: &Fetched, opts: &ShapeOpts) -> (Value, usize) {
     put("body_truncated", json!(truncated));
     put("body_complete", json!(f.parsed.body_complete));
     put("attachments", json!(f.parsed.attachments));
+    put("category", json!(f.parsed.category.as_str()));
+    if let Some(cal) = &f.parsed.calendar {
+        put("calendar", json!(cal));
+    }
     if !opts.include_headers.is_empty() {
         let mut h = Map::new();
         for name in &opts.include_headers {
@@ -301,6 +307,27 @@ pub fn render(msg: &Value) -> String {
         out.push_str(&format!("ref: {r}\n"));
     }
     let mut inner = header;
+    if let Some(c) = msg["category"].as_str() {
+        inner.push_str(&format!("category: {c}\n"));
+    }
+    if let Some(cal) = msg["calendar"].as_object() {
+        let part = |k: &str| cal.get(k).and_then(Value::as_str).unwrap_or("");
+        let when = match (part("start"), part("end")) {
+            (s, "") => s.to_string(),
+            (s, e) => format!("{s} to {e}"),
+        };
+        let tz = if part("timezone").is_empty() { String::new() } else { format!(" ({})", part("timezone")) };
+        inner.push_str(&format!(
+            "calendar: {} {} {}{} at {} organizer {} attendees {}\n",
+            part("method"),
+            part("summary"),
+            when,
+            tz,
+            part("location"),
+            part("organizer"),
+            cal.get("attendees_count").and_then(Value::as_u64).unwrap_or(0)
+        ));
+    }
     if let Some(b) = msg["body_text"].as_str() {
         inner.push('\n');
         inner.push_str(b);
