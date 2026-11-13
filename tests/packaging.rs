@@ -79,3 +79,68 @@ fn deb_postinst_creates_no_secrets() {
         }
     }
 }
+
+const TARGETS: [(&str, char); 4] = [
+    ("aarch64-apple-darwin", 'a'),
+    ("x86_64-apple-darwin", 'b'),
+    ("aarch64-unknown-linux-gnu", 'c'),
+    ("x86_64-unknown-linux-gnu", 'd'),
+];
+
+fn render(version: &str, sums: &str) -> std::process::Output {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("SHA256SUMS");
+    std::fs::write(&path, sums).unwrap();
+    std::process::Command::new("sh")
+        .arg(root().join("deploy/homebrew/render.sh"))
+        .arg(version)
+        .arg(&path)
+        .output()
+        .unwrap()
+}
+
+fn sums_for(version: &str, skip: Option<&str>) -> String {
+    let mut s = String::new();
+    for (t, c) in TARGETS {
+        if Some(t) != skip {
+            s += &format!("{}  dove-v{version}-{t}.tar.gz\n", c.to_string().repeat(64));
+        }
+    }
+    // Other assets in the same list (musl, zip, deb) must not confuse the lookup.
+    s += &format!("{}  dove-v{version}-x86_64-unknown-linux-musl.tar.gz\n", "e".repeat(64));
+    s += &format!("{}  dove-v{version}-x86_64-pc-windows-msvc.zip\n", "f".repeat(64));
+    s += &format!("{}  dove_{version}_amd64.deb\n", "0".repeat(64));
+    s
+}
+
+/// The tap formula pairs every download URL with the checksum of that very archive.
+#[test]
+fn homebrew_formula_pairs_each_url_with_its_checksum() {
+    let out = render("1.2.3", &sums_for("1.2.3", None));
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let formula = String::from_utf8(out.stdout).unwrap();
+    assert!(!formula.contains('@'), "unreplaced placeholder:\n{formula}");
+    let lines: Vec<&str> = formula.lines().map(str::trim).collect();
+    for (target, c) in TARGETS {
+        let url = format!(
+            "url \"https://github.com/dominik-lenhart/dove/releases/download/v1.2.3/dove-v1.2.3-{target}.tar.gz\""
+        );
+        let at = lines.iter().position(|l| *l == url).unwrap_or_else(|| panic!("no url for {target}:\n{formula}"));
+        assert_eq!(lines[at + 1], format!("sha256 \"{}\"", c.to_string().repeat(64)), "{target}");
+    }
+}
+
+#[test]
+fn homebrew_render_refuses_incomplete_or_odd_input() {
+    for (target, _) in TARGETS {
+        let out = render("1.2.3", &sums_for("1.2.3", Some(target)));
+        assert!(!out.status.success(), "rendered without {target}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains(target), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+    let twice = sums_for("1.2.3", None) + &format!("{}  dove-v1.2.3-x86_64-apple-darwin.tar.gz\n", "9".repeat(64));
+    assert!(!render("1.2.3", &twice).status.success());
+    assert!(!render("1.2.3", &sums_for("1.2.4", None)).status.success(), "sums of another release");
+    assert!(!render("1.2.3-rc.1", &sums_for("1.2.3-rc.1", None)).status.success(), "prereleases are not in the tap");
+    let short = sums_for("1.2.3", None).replacen(&"a".repeat(64), &"a".repeat(63), 1);
+    assert!(!render("1.2.3", &short).status.success());
+}
