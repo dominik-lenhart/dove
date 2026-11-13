@@ -5,6 +5,8 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-13
+
 ### Added
 
 - `deploy/nginx/dove-restricted.conf`, `dove-allowlist.py` and a systemd timer: an nginx/Angie site that lets only
@@ -26,9 +28,6 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
   the Intel runner), and a cache warmed on `main` lets tag builds skip the vendored OpenSSL/SQLCipher compile.
 - CI runs the tests with four threads, skips documentation-only changes, cancels superseded runs and checks the code
   on macOS (when Rust code changed) and on Windows (allowed to fail until the port is merged).
-
-### Changed
-
 - The MCP instructions now tell hosts to use Dove for any question about the owner's mail and name the entry points
   (`list_accounts`, `digest`, `search_messages`, `create_draft`), so ChatGPT and Claude pick it without extra prompting.
 - The reference proxy configs (`deploy/Caddyfile`, `deploy/nginx/dove.conf`, `dove-restricted.conf`) add
@@ -144,7 +143,8 @@ First release.
   release only after verifying its minisign signature. The CLI hints at a new release at most once a day
   (`DOVE_NO_UPDATE_CHECK=1` turns it off); the server never checks for updates.
 
-[Unreleased]: https://github.com/dominik-lenhart/dove/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/dominik-lenhart/dove/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/dominik-lenhart/dove/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/dominik-lenhart/dove/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/dominik-lenhart/dove/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/dominik-lenhart/dove/releases/tag/v0.1.0
