@@ -16,6 +16,7 @@ pub mod identity;
 pub mod imap;
 pub mod index;
 pub mod invite;
+pub mod local;
 pub mod logging;
 pub mod mail;
 pub mod mcp;

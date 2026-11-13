@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use crate::admin::{AdminRequest, client as admin_client, ops::parse_grant_args};
 use crate::audit::SearchFilter;
-use crate::config::{self, DEFAULT_ADMIN_SOCKET};
+use crate::config;
 
 #[derive(Parser)]
 #[command(name = "dove", version, about = "Dove: a self-hosted mail MCP server for AI agents")]
@@ -18,12 +18,46 @@ pub struct Cli {
 
 #[derive(Args, Clone)]
 pub struct AdminOpts {
-    /// Admin socket of the local service. Access is decided by the service from your OS user id.
-    #[arg(long, global = true, env = "DOVE_ADMIN_SOCKET", default_value = DEFAULT_ADMIN_SOCKET)]
-    pub socket: PathBuf,
+    /// Admin socket (Windows: pipe) of the local service. Access is decided by the service from your OS user. Default:
+    /// /run/dove/admin.sock when it exists, else the one in the local-mode config (`dove local init`).
+    #[arg(long, global = true, env = "DOVE_ADMIN_SOCKET")]
+    pub socket: Option<PathBuf>,
     /// Print raw JSON.
     #[arg(long, global = true)]
     pub json: bool,
+}
+
+impl AdminOpts {
+    pub fn socket(&self) -> PathBuf {
+        resolve_admin_socket(self.socket.clone())
+    }
+}
+
+/// The admin endpoint to use: an explicit `--socket`/`DOVE_ADMIN_SOCKET`; else the server-mode socket when it exists;
+/// else the one in this user's local-mode config; else the server-mode default (Windows: this user's pipe).
+pub fn resolve_admin_socket(explicit: Option<PathBuf>) -> PathBuf {
+    if let Some(p) = explicit {
+        return p;
+    }
+    #[cfg(unix)]
+    if std::path::Path::new(config::DEFAULT_ADMIN_SOCKET).exists() {
+        return PathBuf::from(config::DEFAULT_ADMIN_SOCKET);
+    }
+    if let Ok(paths) = crate::platform::paths::local_paths()
+        && paths.config_file.exists()
+    {
+        return config::Config::load(&paths.config_file)
+            .map(|c| c.admin.socket_path)
+            .unwrap_or_else(|_| paths.admin_socket());
+    }
+    #[cfg(unix)]
+    {
+        PathBuf::from(config::DEFAULT_ADMIN_SOCKET)
+    }
+    #[cfg(windows)]
+    {
+        PathBuf::from(crate::platform::paths::default_admin_pipe())
+    }
 }
 
 #[derive(Subcommand)]
@@ -70,6 +104,9 @@ pub enum Command {
         #[command(flatten)]
         admin: AdminOpts,
     },
+    /// Dove on your own computer: per-user setup, foreground start and login item (local mode).
+    #[command(subcommand)]
+    Local(crate::local::LocalCmd),
     /// Export projects, clients and accounts without secrets (admin).
     Export {
         #[command(flatten)]
@@ -95,8 +132,8 @@ pub struct UpgradeArgs {
     #[arg(long, value_name = "X.Y.Z")]
     pub version: Option<String>,
     /// Admin socket of a local service, asked for its version after the upgrade (failures are ignored).
-    #[arg(long, env = "DOVE_ADMIN_SOCKET", default_value = DEFAULT_ADMIN_SOCKET, hide = true)]
-    pub socket: PathBuf,
+    #[arg(long, env = "DOVE_ADMIN_SOCKET", hide = true)]
+    pub socket: Option<PathBuf>,
 }
 
 /// Whether the daily new-version notice may follow this command: not for the service, the MCP stdio bridge (its
@@ -105,6 +142,7 @@ pub fn update_notice_applies(cmd: &Command) -> bool {
     use crate::client::{McpCmd, RemoteCmd};
     match cmd {
         Command::Serve { .. } | Command::Upgrade(_) => false,
+        Command::Local(crate::local::LocalCmd::Start { .. }) => false,
         Command::Remote(r) => !matches!(**r, RemoteCmd::Mcp(McpCmd::Stdio { .. })),
         _ => true,
     }
@@ -329,7 +367,7 @@ fn read_password(prompt: &str, from_stdin: bool) -> anyhow::Result<crate::admin:
 
 /// `accounts reconnect`: Gmail accounts get a new authorization link; IMAP accounts are asked for the password.
 async fn reconnect(alias: String, password_stdin: bool, admin: &AdminOpts) -> anyhow::Result<Value> {
-    let list = admin_client::send(&admin.socket, &AdminRequest::AccountsList).await?;
+    let list = admin_client::send(&admin.socket(), &AdminRequest::AccountsList).await?;
     let provider = list
         .as_array()
         .and_then(|a| a.iter().find(|r| r["alias"] == alias.as_str()))
@@ -342,7 +380,7 @@ async fn reconnect(alias: String, password_stdin: bool, admin: &AdminOpts) -> an
     } else {
         AdminRequest::AccountsReconnect { alias }
     };
-    admin_client::send(&admin.socket, &req).await
+    admin_client::send(&admin.socket(), &req).await
 }
 
 #[derive(Subcommand)]
@@ -707,6 +745,7 @@ fn admin_request(cmd: Command) -> anyhow::Result<(AdminOpts, AdminRequest)> {
         Command::Serve { .. }
         | Command::ConfigExample
         | Command::Remote(_)
+        | Command::Local(_)
         | Command::Upgrade(_)
         | Command::Keys(KeysCmd::Generate { .. }) => {
             unreachable!("not an admin command")
@@ -771,7 +810,11 @@ fn print(value: &Value, json: bool) {
 pub async fn run(cli: Cli) -> anyhow::Result<u8> {
     match cli.command {
         Command::Upgrade(a) => {
-            let opts = crate::update::UpgradeOpts { check: a.check, version: a.version, socket: a.socket };
+            let opts = crate::update::UpgradeOpts {
+                check: a.check,
+                version: a.version,
+                socket: resolve_admin_socket(a.socket),
+            };
             crate::update::run_upgrade(opts).await
         }
         other => run_command(other).await.map(|()| 0),
@@ -781,20 +824,24 @@ pub async fn run(cli: Cli) -> anyhow::Result<u8> {
 /// Adds this binary's version to the service's doctor checks. A difference means the service still runs another
 /// release (typically: upgraded binary, service not restarted).
 fn add_binary_version(checks: &mut Value) {
+    let restart = if is_local(checks) { "dove local install" } else { "sudo systemctl restart dove" };
     let Some(list) = checks.as_array_mut() else { return };
     let binary = env!("CARGO_PKG_VERSION");
     let service = list.iter().find(|c| c["check"] == "service_version").and_then(|c| c["detail"].as_str());
     let (ok, detail) = match service {
         Some(s) if s == binary => (true, binary.to_string()),
-        Some(s) => (false, format!("{binary}, but the service runs {s}: restart it (sudo systemctl restart dove)")),
+        Some(s) => (false, format!("{binary}, but the service runs {s}: restart it ({restart})")),
         None => (
             false,
-            format!(
-                "{binary}, but the service does not report its version (older release): restart it (sudo systemctl restart dove)"
-            ),
+            format!("{binary}, but the service does not report its version (older release): restart it ({restart})"),
         ),
     };
     list.push(serde_json::json!({ "check": "binary_version", "ok": ok, "detail": detail }));
+}
+
+/// Whether doctor checks come from a local-mode service.
+fn is_local(checks: &Value) -> bool {
+    checks.as_array().is_some_and(|l| l.iter().any(|c| c["check"] == "mode" && c["detail"] == "local"))
 }
 
 async fn run_command(command: Command) -> anyhow::Result<()> {
@@ -810,15 +857,18 @@ async fn run_command(command: Command) -> anyhow::Result<()> {
         }
         // Remote commands never reach the admin socket (spec 5.6).
         Command::Remote(cmd) => crate::client::run(*cmd).await,
+        Command::Local(cmd) => crate::local::run(cmd).await,
         Command::Doctor { profile: Some(p), admin } => crate::client::doctor(Some(&p), admin.json).await,
         Command::Tailscale(TailscaleCmd::Setup { config, port, funnel, dry_run }) => {
             let opts = crate::tailscale::SetupOpts { config, port, funnel, dry_run };
             crate::tailscale::setup(&opts, &crate::tailscale::Tailscale::from_path(), &mut std::io::stdout()).await
         }
         Command::Doctor { profile: None, admin } => {
-            let mut v = admin_client::send(&admin.socket, &AdminRequest::Doctor).await?;
+            let mut v = admin_client::send(&admin.socket(), &AdminRequest::Doctor).await?;
             add_binary_version(&mut v);
-            crate::tailscale::add_doctor_check(&mut v, &crate::tailscale::Tailscale::from_path()).await;
+            if !is_local(&v) {
+                crate::tailscale::add_doctor_check(&mut v, &crate::tailscale::Tailscale::from_path()).await;
+            }
             print(&v, admin.json);
             Ok(())
         }
@@ -829,7 +879,7 @@ async fn run_command(command: Command) -> anyhow::Result<()> {
         }
         other => {
             let (opts, req) = admin_request(other)?;
-            let v = admin_client::send(&opts.socket, &req).await?;
+            let v = admin_client::send(&opts.socket(), &req).await?;
             print(&v, opts.json);
             Ok(())
         }
