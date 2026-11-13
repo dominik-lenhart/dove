@@ -61,7 +61,9 @@ pub fn defs() -> Vec<ToolDef> {
                 "forward (forward_message_id or forward_ref, includes the original's attachments by default) in a ",
                 "mailbox's server Drafts. Attach files by reference to a message you can read (bytes stay on the ",
                 "server) or inline as base64: at most 10 per draft, 10 MiB in total by default. Recipients are never ",
-                "inferred. Generate a fresh UUID request_key per intent and reuse it only to retry the same request. ",
+                "inferred. If the operator set a signature for the sender it is appended after body_text (before a ",
+                "quote or forward block) unless you pass signature: false; update_draft never adds it again. ",
+                "Generate a fresh UUID request_key per intent and reuse it only to retry the same request. ",
                 "The owner reviews and sends it in Apple Mail unless send rights exist."
             ),
             capability: Capability::Draft,
@@ -81,7 +83,8 @@ pub fn defs() -> Vec<ToolDef> {
                     "forward_ref": { "type": "string", "description": "Forward the message of this ref from search_messages (any mailbox you can read)." },
                     "include_attachments": { "type": "boolean", "description": "Forwards: attach the original's attachments (default true)." },
                     "attachments": attachments_schema(),
-                    "from_address": { "type": "string", "description": "One of the mailbox's send-as addresses." }
+                    "from_address": { "type": "string", "description": "The mailbox address or one of its send-as aliases (list_accounts shows from_addresses for IMAP mailboxes; Gmail uses the account's send-as list)." },
+                    "signature": { "type": "boolean", "description": "Append the sender's signature after body_text (default true; nothing happens when none is set)." }
                 }, "required": ["account", "request_key", "body_text"], "additionalProperties": false })
             },
             output_schema: || {
@@ -259,6 +262,7 @@ async fn create_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError>
             "include_attachments",
             "attachments",
             "from_address",
+            "signature",
         ],
     )?;
     let mb = account_arg(cx, &args, Capability::Draft)?.clone();
@@ -289,6 +293,7 @@ async fn create_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError>
         Some(f) => Some(mime::parse_address(f).map_err(|_| ToolError::invalid("invalid from_address"))?),
         None => None,
     };
+    let signature = opt_bool(&args, "signature", true)?;
     // Every referenced message is authorized here, before any upstream call (identical not_found without read).
     let limit = cx.app.cfg.limits.draft_attachment_bytes;
     let attachments = compose::parse_attachments(cx, args.get("attachments"), limit)?.unwrap_or_default();
@@ -327,7 +332,7 @@ async fn create_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError>
         "to": fmt_addrs(&to), "cc": fmt_addrs(&cc), "bcc": fmt_addrs(&bcc), "subject": subject_arg,
         "body": body, "reply": reply_to, "from": from_arg.as_ref().map(|a| a.email.clone()),
         "attachments": attachments.iter().map(compose::AttachSpec::canonical).collect::<Vec<_>>(),
-        "forward": forward, "include_attachments": include_attachments, "quote": quote,
+        "forward": forward, "include_attachments": include_attachments, "quote": quote, "signature": signature,
     });
     let input_hash = cx.app.pepper.hash("create-op", &canonical.to_string());
     let (cid, aid, key) = (cx.client.client_id.clone(), mb.account_id.clone(), request_key.to_string());
@@ -413,6 +418,7 @@ async fn create_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError>
         include_attachments,
         attachments,
         from_arg,
+        signature,
     };
     let result = dispatch_create(cx, &mb, input).await;
     let (cid, aid, key) = (cx.client.client_id.clone(), mb.account_id.clone(), request_key.to_string());
@@ -507,6 +513,8 @@ struct CreateInput {
     include_attachments: bool,
     attachments: Vec<compose::AttachSpec>,
     from_arg: Option<Addr>,
+    /// Append the sender's signature (when one is set).
+    signature: bool,
 }
 
 /// Count and total size of a new draft's attachments, for the audit record (never names).
@@ -547,13 +555,21 @@ async fn dispatch_create(
         include_attachments,
         attachments,
         from_arg,
+        signature,
     } = input;
     let pre = |e: ToolError| (e, false);
     let limit = cx.app.cfg.limits.draft_attachment_bytes;
     let send_as = match mb.provider {
         Provider::Gmail => send_as_addresses(cx, mb).await.map_err(pre)?,
-        // No send-as aliases on IMAP: the mailbox address is the only sender (design "Send").
-        Provider::Imap => vec![Addr { email: mb.email.to_lowercase(), name: None }],
+        // IMAP: the mailbox address and the aliases the operator configured (design 2026-11-13 section 5).
+        Provider::Imap => {
+            let aid = mb.account_id.clone();
+            let aliases =
+                cx.app.store.call(move |c| crate::identity::load_aliases(c, &aid)).await.map_err(|e| pre(e.into()))?;
+            let mut v = vec![Addr { email: mb.email.to_lowercase(), name: None }];
+            v.extend(aliases.into_iter().map(|a| Addr { email: a.address, name: a.name }));
+            v
+        }
     };
     let from = match from_arg {
         Some(f) => send_as
@@ -567,6 +583,19 @@ async fn dispatch_create(
             .cloned()
             .unwrap_or(Addr { email: mb.email.clone(), name: None }),
     };
+    // The signature follows the agent's text and precedes any quote or forward block added below.
+    if signature {
+        let (aid, sender) = (mb.account_id.clone(), from.email.clone());
+        let sig = cx
+            .app
+            .store
+            .call(move |c| crate::identity::signature_for(c, &aid, &sender))
+            .await
+            .map_err(|e| pre(e.into()))?;
+        if let Some(sig) = sig {
+            body = crate::identity::with_signature(&body, &sig);
+        }
+    }
     let mut subject = subject_arg.clone().unwrap_or_default();
     let mut in_reply_to = None;
     let mut references = Vec::new();

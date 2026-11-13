@@ -55,7 +55,7 @@ pub fn defs() -> Vec<ToolDef> {
         ToolDef {
             name: "list_accounts",
             title: "List mailboxes",
-            description: "Mailboxes this connection may use, with alias, address, status and allowed actions.",
+            description: "Mailboxes this connection may use, with alias, address, status and allowed actions. IMAP mailboxes you can draft in also list from_addresses (the mailbox address and its send-as aliases).",
             capability: Capability::Read,
             read_only: true,
             destructive: false,
@@ -345,6 +345,20 @@ fn shape_opts(args: &Value) -> Result<ShapeOpts, ToolError> {
 
 async fn list_accounts(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
     only_keys(&args, &[])?;
+    // IMAP mailboxes: the addresses `create_draft` accepts as from_address (the mailbox and its aliases), shown only
+    // to connections that may draft there. Gmail's send-as list comes from the Gmail API, not from here.
+    let drafting: Vec<String> = cx
+        .client
+        .mailboxes
+        .iter()
+        .filter(|m| m.provider == crate::policy::Provider::Imap && m.actions.has(Capability::Draft))
+        .map(|m| m.account_id.clone())
+        .collect();
+    let aliases = if drafting.is_empty() {
+        Vec::new()
+    } else {
+        cx.app.store.call(move |c| crate::identity::load_aliases_for(c, &drafting)).await?
+    };
     let accounts: Vec<Value> = cx
         .client
         .mailboxes
@@ -356,7 +370,18 @@ async fn list_accounts(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError
                     actions.push(cap.as_str());
                 }
             }
-            json!({ "account": m.alias, "email": m.email, "status": m.status, "actions": actions, "indexed": m.index_enabled })
+            let mut v = json!({ "account": m.alias, "email": m.email, "status": m.status, "actions": actions, "indexed": m.index_enabled });
+            if m.provider == crate::policy::Provider::Imap && m.actions.has(Capability::Draft) {
+                let mut from = vec![json!({ "address": m.email.to_lowercase(), "name": null })];
+                from.extend(
+                    aliases
+                        .iter()
+                        .filter(|(id, _)| *id == m.account_id)
+                        .map(|(_, a)| json!({ "address": a.address, "name": a.name })),
+                );
+                v["from_addresses"] = Value::Array(from);
+            }
+            v
         })
         .collect();
     let text = accounts

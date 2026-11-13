@@ -934,6 +934,31 @@ pub fn run_count(conn: &Connection, req: &SearchReq, scope: &Scope<'_>) -> anyho
     Ok(conn.query_row(&sql, params_from_iter(params), |r| r.get(0))?)
 }
 
+/// Index row ids among `rows` that match `filter` (spam and trash excluded, like a default search). Used by `query`
+/// watches, which evaluate the agent's typed filter against newly indexed messages only (`crate::watch`).
+pub fn matching_rows(conn: &Connection, filter: &Expr, scope: &Scope<'_>, rows: &[i64]) -> anyhow::Result<Vec<i64>> {
+    if rows.is_empty() {
+        return Ok(vec![]);
+    }
+    let req = SearchReq {
+        accounts: None,
+        filter: Some(filter.clone()),
+        select: vec![],
+        order: vec![],
+        limit: rows.len(),
+        count_only: false,
+        require_complete: false,
+        max_lag_seconds: None,
+        include_spam_trash: false,
+    };
+    let w = where_clause(&req, scope, false)?;
+    let mut q = Sql { text: format!("SELECT m.id FROM messages m WHERE {} AND m.id IN ", w.text), params: w.params };
+    q.list(rows.iter().map(|r| SqlValue::Integer(*r)));
+    let mut st = conn.prepare(&q.text)?;
+    let out = st.query_map(params_from_iter(q.params), |r| r.get(0))?.collect::<Result<_, _>>()?;
+    Ok(out)
+}
+
 /// EXPLAIN QUERY PLAN lines for a page query (tests verify hot paths).
 pub fn explain(conn: &Connection, req: &SearchReq, scope: &Scope<'_>) -> anyhow::Result<Vec<String>> {
     let (sql, params) = if req.count_only { count_sql(req, scope)? } else { page_sql(req, scope, &[])? };

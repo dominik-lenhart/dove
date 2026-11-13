@@ -44,7 +44,7 @@ Dove sits in between:
 - **An audit trail.** Every tool call produces one hash-chained audit record, without mail content.
 - **Your server, your keys.** Passwords and Google tokens are encrypted at rest with a key that lives outside the
   data directory. The search index is SQLCipher-encrypted. The server sends nothing anywhere except to your mail
-  providers.
+  providers and to webhook sinks you register yourself (content-free watch events).
 
 ## What agents can do
 
@@ -55,11 +55,13 @@ Dove sits in between:
 | `get_message`, `get_thread`, `batch_read` | Read mail and threads. HTML becomes clean text, nothing is marked as read |
 | `get_attachment` | Fetch an attachment as an MCP resource (up to 10 MiB) |
 | `list_drafts`, `get_draft` | Drafts in the mailbox's Drafts folder |
-| `create_draft`, `update_draft` | New mail, replies (threaded and quoted) and forwards (with attachments). Attach files by reference or inline. Revision-checked: a draft you edited yourself is never overwritten |
+| `create_draft`, `update_draft` | New mail, replies (threaded and quoted) and forwards (with attachments), sent from the mailbox address or an alias you configured, with your signature. Attach files by reference or inline. Revision-checked: a draft you edited yourself is never overwritten |
 | `delete_draft` | Delete a draft Dove created and nobody changed (Gmail: to Trash) |
 | `update_messages` | Mark read or unread, star, add or remove labels (Gmail labels, IMAP keywords); needs `organize` |
 | `move_messages` | Move to a folder or label, archive, back to the inbox; to Trash or Spam only with `delete` |
 | `send_draft` | Only when both send gates are open, only drafts Dove created and nobody changed |
+| `create_watch`, `list_watches`, `delete_watch` | Get told about new mail instead of polling: a reply in a thread, mail from an address or domain, mail matching a search, or no reply by a deadline. Per token, at most 50, expire after 30 days by default |
+| `list_watch_events` | Pull watch events (ids and times only, no content; kept 14 days). Optionally pushed to a signed webhook the operator registered (`dove sinks add`) |
 
 ### Permissions
 
@@ -192,6 +194,13 @@ token on one mailbox. Even then it only sends a draft Dove created and nobody ch
 of its own, and never resubmits after an unknown outcome. A token with a send grant can send without asking you, so
 give it to a separate token for a mailbox where you accept that, and prefer sending from your mail client. For Gmail,
 note that Google's `gmail.compose` scope itself includes sending; Dove's gates are a policy layer in front of it.
+
+## Tailscale
+
+Dove can sit behind Tailscale instead of a reverse proxy: `dove tailscale setup` publishes exactly Dove's public paths
+on your node's `.ts.net` name (tailnet only; `--funnel` opens it to the internet, on request only). Claude Code, Codex
+and the CLI on your tailnet devices can use it; ChatGPT and claude.ai need Funnel. See the
+[deployment guide](docs/deployment.md#tailscale).
 
 ## Drafts and your mail client
 

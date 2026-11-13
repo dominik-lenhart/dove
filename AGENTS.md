@@ -244,6 +244,33 @@ cargo fmt
   `shutdown_background()` when the notice check ran; try the notice in a pty with `script -qec "<cmd>" /dev/null`.
   The notice never runs privileged (euid 0, euid != uid, `SUDO_UID` set: `sudo -E` keeps the user's HOME), and its
   cache writes never follow symlinks (owned real dir, `O_EXCL|O_NOFOLLOW` temp file, rename onto the literal path).
+- 2026-11-13: Sending identities live in `src/identity.rs` (tables `account_aliases`, `account_signatures`, migration
+  `V_SEND_IDENTITIES`). The IMAP sender is checked twice, at `create_draft` (`dispatch_create`) and again in
+  `drafts_imap::prepare_send`, where the From header decides the SMTP envelope sender (login address unless the alias
+  has `envelope`). `from.email` is already lowercased there, so a mutation that drops the `to_lowercase` in
+  `signature_for` survives (equivalent mutant). `update_draft` never signs; the signature goes in before the
+  quote/forward join in `dispatch_create`. Admin audit rows for alias/signature verbs hold no address and no text.
+- 2026-11-13: `src/tailscale.rs` is CLI-side only (the service never calls `tailscale`). `PUBLIC_PATHS` is the one list of
+  public routes; `allowlists_do_not_drift` compares it with `deploy/Caddyfile`, `deploy/nginx/dove.conf` and the
+  `.route(...)` literals in `src/http.rs`, `src/mcp.rs`, `src/oauth.rs`: a new route needs a line in all of them (and
+  must be a string literal or `AUTHORIZE_PATH`). Tests fake `tailscale` with a shell script that keeps serve state in
+  files (`tests/tailscale_e2e.rs`); write it once per process (writing an executable per test races with other tests'
+  forks, ETXTBSY) and keep `/usr/bin:/bin` in the child's PATH (the script needs `cat`, `awk`). Never run the real
+  `tailscale serve`/`funnel` here: the host's Tailscale serves other things (read-only `status --json` and
+  `serve status --json` are fine). Real node JSON: `Self.DNSName` has a trailing dot, `CertDomains` empty means HTTPS
+  is off, `Self.CapMap` has a `funnel` key when Funnel is allowed, serve state keys are `host:port`.
+
+- 2026-11-13: Watches (`src/watch/`, `src/tools/watches.rs`): events come from one hook,
+  `watch::messages_indexed`, called by `sync::commit_results` after its transaction with the ids that were new rows of
+  the serving generation (both engines go through it, so IMAP polling and IDLE need nothing extra). Matching re-checks
+  the serving generation in its own index read, then records events in a state-store transaction that re-checks the
+  watch's liveness (`watch::end_reason`). Tests drive the clock through `watch::tick(app, now)` and
+  `watch::sinks::deliver_due(app, now)`; the harness starts no watch worker. Webhook receivers in tests are plain HTTP
+  on loopback, which only `gateway().allow_plain_http_sinks_for_tests()` (cfg `test`/`testing`) permits; call it
+  before `SinksAdd`, and again plus `watch::sinks::reload_allowlist` after a harness restart. Index `received_at` is
+  milliseconds but IMAP INTERNALDATE has second precision, so "newer than" comparisons against a thread baseline need
+  `>=` for newly indexed mail (a reply can share the second). Fake Google's `MessageSpec.from` takes a bare address;
+  `"Name <addr>"` is not parsed into the address.
 - 2026-11-13: Grants: `Actions::parse` reads stored lists only (no presets); operator input goes through
   `Actions::parse_grant` (presets + actions) in `admin::ops::resolve_grants`, which also serves invitations. Narrowing
   uses `Actions::intersect`, which keeps the dependency rules. `list_accounts` hides `send` while `allow_send` is off,

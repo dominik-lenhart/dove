@@ -10,6 +10,7 @@ pub mod content;
 pub mod error;
 pub mod gmail;
 pub mod http;
+pub mod identity;
 pub mod imap;
 pub mod index;
 pub mod invite;
@@ -23,11 +24,13 @@ pub mod policy;
 pub mod secrets;
 pub mod serve;
 pub mod store;
+pub mod tailscale;
 pub mod tokens;
 pub mod tools;
 pub mod update;
 pub mod util;
 pub mod vault;
+pub mod watch;
 
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;

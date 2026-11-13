@@ -139,7 +139,7 @@ impl Google {
 
 fn classify_write(e: GatewayError) -> WriteError {
     match e {
-        GatewayError::NotDispatched | GatewayError::Deadline | GatewayError::InvalidId => {
+        GatewayError::NotDispatched | GatewayError::Deadline | GatewayError::InvalidId | GatewayError::NotAllowed => {
             WriteError { error: map_err(e), dispatched: false }
         }
         GatewayError::Status { status, .. } if status < 500 => WriteError { error: map_err(e), dispatched: true },
@@ -162,6 +162,7 @@ pub fn map_err(e: GatewayError) -> ToolError {
         }
         GatewayError::Status { status, .. } => ToolError::upstream(format!("Gmail returned HTTP {status}")),
         GatewayError::NotDispatched => ToolError::upstream("Gmail is unreachable"),
+        GatewayError::NotAllowed => ToolError::internal(),
         GatewayError::Deadline => ToolError::upstream("Gmail did not answer in time"),
         GatewayError::BadResponse => ToolError::upstream("unexpected Gmail response"),
         GatewayError::TooLarge => {

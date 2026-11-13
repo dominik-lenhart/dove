@@ -7,6 +7,27 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 
 ### Added
 
+- IMAP send-as aliases: `dove accounts aliases add|list|remove <mailbox> <address> [--name] [--envelope]`.
+  `create_draft` accepts the mailbox address or an alias as `from_address` (anything else is `invalid_argument`),
+  `list_accounts` shows `from_addresses` to connections that may draft, and the SMTP envelope sender stays the login
+  address unless the alias is marked `--envelope`. A draft whose `From` is no longer an address of the mailbox is not
+  sent.
+- Plain-text signatures per mailbox and per alias, for Gmail and IMAP: `dove accounts signature set|show <mailbox>
+  [--alias <address>] --file <path>|--clear`. `create_draft` appends `-- ` and the signature after the body and before
+  a reply quote or forward block unless `signature: false`; `update_draft` never adds it again.
+- `dove tailscale setup [--port N] [--funnel] [--dry-run]` publishes Dove's public paths on the node's `.ts.net` name
+  with `tailscale serve` and sets `public_url`, idempotently; `--funnel` (internet exposure) only on request, with a
+  warning. `dove doctor` checks the serve configuration (`tailscale_serve`). The path allowlist is one list shared with
+  `deploy/Caddyfile` and `deploy/nginx/dove.conf`, and a test fails if any of them drift.
+- Watches: `create_watch`, `list_watches`, `delete_watch` and `list_watch_events` (under `read`) tell an agent about
+  a reply in a thread, mail from an address or domain, mail matching a typed search, or no reply by a deadline,
+  instead of polling. Events are produced by the index sync (IMAP IDLE within seconds), carry ids and times only, and
+  are kept 14 days. Watches belong to the token that created them (at most 50, 30 days by default, 180 at most) and
+  end when the token is revoked or loses access, or the mailbox is disabled or removed.
+- Webhook sinks for push delivery of watch events: `dove sinks add <name> --url https://... --secret-file <path>`,
+  `dove sinks list`, `dove sinks remove <name>`. Deliveries are signed (`Dove-Signature`, HMAC-SHA256 over timestamp
+  and body), retried a bounded number of times, and sent only to the registered URLs; agents name sinks but never
+  supply URLs. See docs/deployment.md, "Watches and sinks".
 - New grant actions `organize` (mark read/unread, star, labels, archive, move between folders, move out of Trash/Spam)
   and `delete` (move to Trash or Spam; never a permanent delete), and presets `reader`, `drafter`, `assistant` and
   `full` for `--grant`, `--capabilities` and the OAuth approval page (`work=assistant,send` mixes both). Presets are

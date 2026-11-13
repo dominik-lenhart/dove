@@ -221,6 +221,20 @@ async fn execute(call: &mut AdminCall<'_>, req: AdminRequest) -> anyhow::Result<
         ProjectsList => call.read(ops::project_list).await,
         ProjectsShow { name } => call.read(move |c| ops::project_show(c, &name)).await,
         AccountsList => call.read(ops::account_list).await,
+        AccountsAliasAdd { account, address, name, envelope } => {
+            call.tx(move |tx| crate::identity::alias_add(tx, &account, &address, name.as_deref(), envelope)).await
+        }
+        AccountsAliasList { account } => call.read(move |c| crate::identity::alias_list(c, &account)).await,
+        AccountsAliasRemove { account, address } => {
+            call.tx(move |tx| crate::identity::alias_remove(tx, &account, &address)).await
+        }
+        AccountsSignatureSet { account, alias, signature } => {
+            call.tx(move |tx| crate::identity::signature_set(tx, &account, alias.as_deref(), signature.as_deref()))
+                .await
+        }
+        AccountsSignatureShow { account, alias } => {
+            call.read(move |c| crate::identity::signature_show(c, &account, alias.as_deref())).await
+        }
         AccountsDisable { alias } => call.tx(move |tx| ops::account_set_enabled(tx, &alias, false)).await,
         AccountsEnable { alias } => call.tx(move |tx| ops::account_set_enabled(tx, &alias, true)).await,
         ClientsCreate { name, project, grants, expires, allow_ip } => {
@@ -320,6 +334,9 @@ async fn execute(call: &mut AdminCall<'_>, req: AdminRequest) -> anyhow::Result<
         IndexDisable { alias } => crate::index::admin::disable(call, alias).await,
         IndexStatus { alias } => crate::index::admin::status(&app, alias).await,
         IndexRebuild { alias } => crate::index::admin::rebuild(call, alias).await,
+        SinksAdd { name, url, secret } => crate::watch::sinks::add(call, name, url, secret.0).await,
+        SinksList => crate::watch::sinks::list(call).await,
+        SinksRemove { name } => crate::watch::sinks::remove(call, name).await,
         other => Err(anyhow!("'{}' is not available in this build yet", other.audit_fields().0)),
     }
 }
@@ -454,8 +471,15 @@ async fn keys_rotate(call: &mut AdminCall<'_>) -> anyhow::Result<Value> {
                 )?;
                 n += 1;
             }
+            // Sink secrets and watch filters are sealed under the KEK too.
+            n += crate::watch::sinks::rewrap_sealed(tx, &vault)?;
             let mut stmt = tx.prepare("SELECT DISTINCT kek_version FROM grants")?;
-            let remaining: Vec<u32> = stmt.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
+            let mut remaining: Vec<u32> = stmt.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
+            for v in crate::watch::sinks::sealed_versions(tx)? {
+                if !remaining.contains(&v) {
+                    remaining.push(v);
+                }
+            }
             crate::store::set_meta(tx, "kek_version", &current.to_string())?;
             Ok((n, remaining))
         })
@@ -515,6 +539,9 @@ async fn doctor(app: &Arc<App>) -> Value {
         Err(_) => false,
     };
     add("public_url_tls", tls_ok, health);
+    // Public address and loopback listener, for `dove doctor` to compare with the Tailscale serve configuration.
+    checks.push(json!({ "check": "public_url", "ok": true, "detail": app.cfg.public_base(),
+                        "listen": app.cfg.listen.to_string() }));
     json!(checks)
 }
 

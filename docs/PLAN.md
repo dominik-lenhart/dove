@@ -271,7 +271,54 @@ hosts or reference hardware.
   signature or trusted comment (`dove <tag>`) does not verify, refuses downgrades unless a version is named, and
   never runs inside `serve`. The update hint lives in the CLI only (spec 13a amended); the service keeps its outbound
   allowlist and reports its version over the admin socket so the CLI can say when a restart is due.
-- A51. Organize and delete (design 2026-11-13 sections 1-2, points the design left open): `gmail.modify` is requested at
+- A51. Tailscale publishing (design 0.2 section 6, owner request 2026-11-13): `dove tailscale setup` runs as the
+  operator and does not use the admin socket; it reads `listen` and `public_url` from the config file, asks
+  `tailscale status --json` for the node name and `tailscale serve status --json` for the current mounts, and mounts
+  exactly `tailscale::PUBLIC_PATHS` as one `tailscale serve --bg --https=<port> --set-path <p> http://<listen><p>`
+  per path (the same list as the Caddyfile and the nginx map; a test compares all of them and the routes in
+  `src/http.rs`, `src/mcp.rs` and `src/oauth.rs`). It touches only `host:port` of the chosen port, removes mounts that
+  point at Dove's own origin but are no longer public, and refuses (never overwrites) a handler that points elsewhere.
+  `public_url` is edited with `toml_edit` so comments survive, and the file is replaced atomically with its mode and
+  owner. Funnel is only ever turned on by `--funnel`; if it is already on, setup reports it and leaves it. Serve cannot
+  set `X-Dove-Proxy-Auth`, so Dove never trusts a forwarded address in this setup: client IP lists and per-IP limits
+  see `127.0.0.1` (documented in the deployment guide). The doctor check runs in the CLI because the service user
+  normally may not talk to tailscaled; the service reports its `public_url` and `listen` as a `public_url` check row
+  for that purpose. Unverified against a real tailnet (the build host's Tailscale serves other things): the exact
+  `tailscale` flags were taken from `tailscale serve --help` (1.104) and the state JSON shape from `serve status --json`;
+  all tests use a fake executable.
+- A52. No tailnet identity binding (design 0.2 section 6, decided 2026-11-13): `Tailscale-User-Login` and friends are
+  headers set by tailscaled when it proxies, but Serve reaches Dove over loopback TCP, where any local process can send
+  the same headers. LocalAPI `whois` needs the tailnet peer address, and Dove only sees `127.0.0.1` plus an
+  `X-Forwarded-For` value that a local process can forge. Serving to a Unix socket that only the service user (and
+  root, i.e. tailscaled) can open would make the headers trustworthy, but needs a second HTTP listener, depends on
+  `unix:` serve targets and on Tailscale dropping client-sent identity headers, and none of that can be tested without
+  a real tailnet. Bearer token plus tailnet ACLs give the same protection. Revisit when Serve offers an identity Dove
+  can verify (for example a signed header or a peer-credential check Dove can make itself).
+- A53. Sending identities (design 0.2 section 5): IMAP aliases live in `account_aliases` (address lowercased,
+  optional display name, `envelope` flag); a signature is a row of `account_signatures` keyed by address, with `''` as
+  the mailbox's own, so Gmail send-as addresses (which Dove cannot list without a Google call) can carry signatures
+  too. The sender check for IMAP uses the aliases at create time and again at send time (a removed alias stops
+  sending; envelope sender is the alias only when flagged). `from_address` keeps its name; `list_accounts` lists
+  `from_addresses` for IMAP mailboxes only (Gmail's list comes from the API). Signature lookup is exact: the alias's
+  own signature, else the mailbox's. `update_draft` never touches signatures, so a new `body_text` replaces the
+  signature too. Admin audit records for these verbs carry no address and no text.
+- A54. Watches and sinks (design 0.2 section 3), decisions the design leaves open: sink secrets are sealed by the
+  vault (`seal_aux`, kind `sink_secret`) rather than kept as a file reference, because the service user (or the
+  distroless container) cannot read the operator's file; the CLI reads `--secret-file` and sends it over the admin
+  socket as a redacted `Password`. Watch filters (`from` address or domain, `where` query) are sealed the same way
+  (kind `watch_filter`), so the state store holds no addresses or query text in the clear; `keys rotate` re-wraps
+  both. Matching: all kinds ignore mail from the mailbox owner (`watch::owner_addresses`, the single place aliases
+  extend), drafts and spam/trash; thread kinds count only messages not older than the thread's newest message when
+  the watch was created (`baseline_ms`); `from`/`query` only mail received at most 15 minutes before the watch was
+  created, so a re-filed old message never fires. Events come only from incremental syncs of the serving generation:
+  a rebuild or backfill never fires, and mail that arrives while a rebuild runs is not reported. `no_reply_by` fires
+  once the index's `last_success_at` passes the deadline, or one hour after it at the latest; a message from others
+  ends it quietly (`end_reason = replied`). Watches need the index on the mailbox. Ended watches stay listed (state,
+  reason) for 14 days like events. Sink deliveries: 6 attempts (backoff 10 s, 1 min, 5 min, 30 min, 2 h), retried on
+  network errors, 408, 429 and 5xx, any other status final; a removed sink drops its queued deliveries and its
+  watches continue pull-only. The 50-watch limit counts active, unexpired watches; going over it is
+  `invalid_argument`.
+- A55. Organize and delete (design 2026-11-13 sections 1-2, points the design left open): `gmail.modify` is requested at
   connect but optional (readonly and compose stay required); a grant without it gets `account_unavailable` with
   `reason: reauth_required` from the organize tools and Gmail `delete_draft`, decided from the stored granted scopes
   before any request. Gmail `delete_draft` trashes the draft's message (`messages.trash`) because the design forbids
