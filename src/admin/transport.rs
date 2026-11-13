@@ -127,8 +127,9 @@ mod pipe {
         name: String,
         service_sid: String,
         sd: SecurityDescriptor,
-        /// The instance waiting for the next client; `None` after creating it failed (created again on the next
-        /// accept, P3).
+        /// The instance waiting for the next client; `None` after creating it failed (P3). The pipe name may then
+        /// lapse once the connected client is done, so the next accept creates it again as the *first* instance:
+        /// joining a pipe someone else created in the meantime would hand them part of our clients.
         next: Option<NamedPipeServer>,
         #[cfg(test)]
         pub(crate) fail_next_create: bool,
@@ -171,23 +172,25 @@ mod pipe {
     }
 
     impl Listener {
-        fn create_next(&mut self) -> std::io::Result<NamedPipeServer> {
+        fn create_next(&mut self, first: bool) -> std::io::Result<NamedPipeServer> {
             #[cfg(test)]
             if std::mem::take(&mut self.fail_next_create) {
                 return Err(std::io::Error::other("injected failure"));
             }
-            create(&self.name, &self.sd, false)
+            create(&self.name, &self.sd, first)
         }
 
         pub async fn accept(&mut self) -> std::io::Result<(Box<dyn AdminStream>, Peer)> {
             let waiting = match self.next.take() {
                 Some(s) => s,
-                None => self.create_next()?,
+                // Fails while an earlier client is still connected (the serve loop retries) or when another process
+                // took the name: then nothing is served rather than a shared pipe.
+                None => self.create_next(true)?,
             };
             waiting.connect().await?;
             // The connected client is served even when the next instance cannot be created now (P3): it would
             // otherwise hang until it times out. The next accept tries again.
-            self.next = match self.create_next() {
+            self.next = match self.create_next(false) {
                 Ok(s) => Some(s),
                 Err(e) => {
                     tracing::warn!(error = %e, "cannot create the next admin pipe instance; retrying on the next accept");
@@ -351,7 +354,18 @@ mod windows_tests {
             .expect("the connected client must not hang")
             .unwrap();
         assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
-        client::send(&name, &AdminRequest::Version).await.unwrap();
+        // The listener creates the pipe again (as the first instance, once the earlier connection is gone).
+        let mut again = None;
+        for _ in 0..50 {
+            match client::send(&name, &AdminRequest::Version).await {
+                Ok(v) => {
+                    again = Some(v);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+            }
+        }
+        assert_eq!(again.expect("the listener recovers")["version"], env!("CARGO_PKG_VERSION"));
         task.abort();
     }
 }
