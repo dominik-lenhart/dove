@@ -1,6 +1,9 @@
 //! Packaging files that cannot be built in a normal test run stay consistent: the Debian unit and the metadata that
 //! `cargo deb` reads. (The `.deb` itself is built and inspected by the release workflow.)
 
+// Unix only: checks file modes and runs the Homebrew render script.
+#![cfg(unix)]
+
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
