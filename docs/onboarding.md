@@ -14,7 +14,10 @@ dove clients invite web-claude --project acme --accounts info,billing --capabili
 
 `all` expands to the project's current mailboxes once; mailboxes added later are not included. The command prints a
 `dovei_...` invitation once. It is valid for 10 minutes and for one redemption. Hand it over on a trusted channel.
-`--expires` and `--allow-ip` apply to the connection that the invitation creates. Removing a mailbox from the
+`--expires` and `--allow-ip` apply to the connection that the invitation creates. With `--allow-ip`, `dove login` must
+redeem the invitation from an allowed address (from elsewhere it fails like an invalid invitation and stays usable).
+The OAuth approval page is not bound to the list, since the browser is not the host that will use the connection;
+the token endpoint applies it instead. Removing a mailbox from the
 project cancels the project's open invitations. Each redemption creates a normal connection that shows up in
 `dove clients list` and is revoked with `dove clients revoke <name>`.
 

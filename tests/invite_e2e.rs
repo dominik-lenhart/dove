@@ -182,3 +182,48 @@ async fn agent_token_cannot_reach_onboarding_authority() {
         assert_eq!(r.status(), 404, "{path}");
     }
 }
+
+/// An invitation's `--allow-ip` list applies to `dove login`: from another address the redemption fails with the
+/// generic error and the invitation stays usable.
+#[tokio::test]
+async fn redeem_checks_the_invitation_ip_allowlist() {
+    let h = setup(|_| {}).await;
+    let inv = h
+        .admin(AdminRequest::ClientsInvite {
+            name: "office".into(),
+            project: "acme".into(),
+            accounts: vec!["info".into()],
+            capabilities: "read".into(),
+            expires: None,
+            allow_ip: vec!["192.0.2.0/24".into()],
+        })
+        .await
+        .unwrap()["invitation"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let secret = h.app().proxy_secret.as_deref().unwrap().to_string();
+    let redeem_from = |ip: &'static str| {
+        let (h, inv, secret) = (&h, inv.clone(), secret.clone());
+        async move {
+            let r = h
+                .http
+                .post(format!("{}/connect/redeem", h.base))
+                .header("host", HOST)
+                .header("x-forwarded-for", ip)
+                .header("x-dove-proxy-auth", secret)
+                .json(&json!({ "invitation": inv }))
+                .send()
+                .await
+                .unwrap();
+            (r.status().as_u16(), r.json::<Value>().await.unwrap())
+        }
+    };
+    let (s, r) = redeem_from("198.51.100.1").await;
+    assert_eq!((s, r["error"].as_str().unwrap()), (400, "invalid_invitation"), "{r}");
+    assert_eq!(r, redeem(&h, json!({ "invitation": "dovei_unknown" })).await.1, "indistinguishable from unknown");
+    assert_eq!(clients_named(&h, "office").await, 0);
+    let (s, r) = redeem_from("192.0.2.10").await;
+    assert_eq!(s, 200, "the invitation was not used up: {r}");
+    assert_eq!(clients_named(&h, "office").await, 1);
+}
