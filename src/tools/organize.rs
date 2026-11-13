@@ -563,9 +563,18 @@ fn leaf(name: &str) -> &str {
     name.rsplit(['/', '.']).next().unwrap_or(name)
 }
 
-fn is_trash_or_junk(f: &Folder) -> bool {
+/// Whether moving into `f` counts as deleting: it is the Trash or Junk folder (special-use or a well-known name),
+/// or lies anywhere below one (`Trash/alt`, `INBOX.Spam`), since providers purge those with their parent.
+fn is_trash_or_junk(f: &Folder, folders: &[Folder]) -> bool {
+    let purging_name = |seg: &str| TRASH_NAMES.iter().chain(JUNK_NAMES).any(|n| seg.trim().eq_ignore_ascii_case(n));
+    let under = |parent: &str| {
+        f.name_utf8.len() > parent.len()
+            && f.name_utf8[..parent.len()].eq_ignore_ascii_case(parent)
+            && f.name_utf8[parent.len()..].starts_with(['/', '.'])
+    };
     matches!(f.special, Some(Special::Trash | Special::Junk))
-        || TRASH_NAMES.iter().chain(JUNK_NAMES).any(|n| leaf(&f.name_utf8).eq_ignore_ascii_case(n))
+        || f.name_utf8.split(['/', '.']).any(purging_name)
+        || folders.iter().any(|p| matches!(p.special, Some(Special::Trash | Special::Junk)) && under(&p.name_utf8))
 }
 
 const ARCHIVE_NAMES: &[&str] = &["Archive", "Archives", "Archiv"];
@@ -607,7 +616,7 @@ fn imap_target<'a>(folders: &'a [Folder], target: &Target) -> Result<&'a Folder,
 async fn imap_move(cx: &ToolCx, mb: &Mailbox, ids: &[String], target: &Target) -> Result<Vec<Outcome>, ToolError> {
     let ImapGroups { folders, groups, mut outcomes } = imap_groups(cx, mb, ids).await?;
     let dest = imap_target(&folders, target)?.clone();
-    if matches!(target, Target::Trash | Target::Spam) || is_trash_or_junk(&dest) {
+    if matches!(target, Target::Trash | Target::Spam) || is_trash_or_junk(&dest, &folders) {
         require_delete(cx, mb)?;
     }
     let mut committed = false;
@@ -675,6 +684,11 @@ mod tests {
             folder(4, "Archiv", None),
             folder(5, "Projekte/Kunden", None),
             folder(6, "Deleted Items", Some(Special::Trash)),
+            folder(7, "Deleted Items/2025", None),
+            folder(8, "INBOX.Spamverdacht", None),
+            folder(9, "Archiv/Trash", None),
+            folder(10, "Spam-Filter", None),
+            folder(11, "Spam/alt", None),
         ];
         assert_eq!(imap_target(&fs, &Target::Inbox).unwrap().folder_id, 1);
         // The special-use flag wins over a well-known name.
@@ -684,8 +698,9 @@ mod tests {
         assert_eq!(imap_target(&fs, &Target::Named("projekte/kunden".into())).unwrap().folder_id, 5);
         assert!(imap_target(&fs, &Target::Named("Nope".into())).is_err());
         // A trash folder by name only (no special-use flag) still needs delete.
-        assert!(is_trash_or_junk(&fs[1]) && is_trash_or_junk(&fs[2]) && is_trash_or_junk(&fs[5]));
-        assert!(!is_trash_or_junk(&fs[0]) && !is_trash_or_junk(&fs[3]) && !is_trash_or_junk(&fs[4]));
+        let purging: Vec<i64> = fs.iter().filter(|f| is_trash_or_junk(f, &fs)).map(|f| f.folder_id).collect();
+        // Subfolders of Trash/Junk and Strato's `Spamverdacht` count as well.
+        assert_eq!(purging, vec![2, 3, 6, 7, 8, 9, 11]);
         assert_eq!(target_arg(&json!({"to": "Junk"})).unwrap(), Target::Spam);
         assert!(target_arg(&json!({"to": "a\nb"})).is_err());
     }

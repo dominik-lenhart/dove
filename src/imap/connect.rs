@@ -23,9 +23,18 @@ use crate::util;
 const DRAFTS_NAMES: &[&str] = &["Drafts", "Entwürfe", "Draft"];
 const SENT_NAMES: &[&str] =
     &["Sent", "Sent Messages", "Sent Items", "Gesendet", "Gesendete Objekte", "Gesendete Elemente"];
-pub(crate) const JUNK_NAMES: &[&str] = &["Junk", "Spam", "Junk E-Mail", "Junk-E-Mail", "Bulk Mail"];
-pub(crate) const TRASH_NAMES: &[&str] =
-    &["Trash", "Deleted Messages", "Deleted Items", "Papierkorb", "Gelöschte Elemente", "Gelöschte Objekte"];
+/// Junk folder names; `Spamverdacht` is Strato's.
+pub(crate) const JUNK_NAMES: &[&str] = &["Junk", "Spam", "Junk E-Mail", "Junk-E-Mail", "Bulk Mail", "Spamverdacht"];
+pub(crate) const TRASH_NAMES: &[&str] = &[
+    "Trash",
+    "Deleted Messages",
+    "Deleted Items",
+    "Deleted",
+    "Bin",
+    "Papierkorb",
+    "Gelöschte Elemente",
+    "Gelöschte Objekte",
+];
 
 pub struct ConnectImap {
     pub alias: String,

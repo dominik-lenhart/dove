@@ -63,7 +63,7 @@ pub fn create(tx: &Transaction, pepper: &Pepper, allow_send: bool, ni: &NewInvit
     if taken {
         bail!("a connection or open invitation named '{}' already exists", ni.name);
     }
-    Actions::parse(ni.capabilities).map_err(|e| anyhow!("--capabilities: {e}"))?;
+    Actions::parse_grant(ni.capabilities).map_err(|e| anyhow!("--capabilities: {e}"))?;
     let aliases: Vec<String> = if ni.accounts.len() == 1 && ni.accounts[0] == "all" {
         // `all` expands to the project's current accounts, once, now (spec 5.2a).
         let mut stmt = tx.prepare(
