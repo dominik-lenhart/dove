@@ -345,3 +345,8 @@ cargo fmt
   started as `sudo -n -u nobody <cmd>` survives `kill_on_drop` (only `sudo` dies) and keeps inherited pipes open, which
   hangs `cargo test | grep`: give it its own timeout and `stderr(Stdio::null())`. To undo a mutation, never
   `git checkout <file>` on a file with uncommitted work; reverse the edit and `touch` it.
+- 2026-11-13: `sqlite3_interrupt` (`InterruptHandle::interrupt`) is a no-op while no statement runs, so a timer that fires
+  before the first statement starts loses the deadline and the query runs unbounded (seen on the Windows CI runner, where
+  opening a SQLCipher connection outlasted a 100 ms deadline). `Index::read` enforces deadlines with a progress handler
+  on the reader's own thread (rusqlite feature `hooks`). Tests of a deadline use a bounded query so a regression fails
+  instead of hanging the runner.

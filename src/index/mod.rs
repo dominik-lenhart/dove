@@ -163,10 +163,9 @@ impl Index {
             .map_err(|_| ToolError::internal())?;
         let readers = self.readers.clone();
         let opener = self.opener();
-        let rt = tokio::runtime::Handle::current();
         let r = tokio::task::spawn_blocking(move || -> anyhow::Result<T> {
             let conn = readers.lock().map_err(|_| anyhow::anyhow!("reader pool poisoned"))?.pop();
-            let conn = match conn {
+            let mut conn = match conn {
                 Some(c) => c,
                 None => {
                     let c = opener()?;
@@ -174,14 +173,16 @@ impl Index {
                     c
                 }
             };
-            let handle = conn.get_interrupt_handle();
-            let timer = rt.spawn(async move {
-                tokio::time::sleep_until(deadline.into()).await;
-                handle.interrupt();
-            });
+            // SQLite calls the handler on this thread every DEADLINE_CHECK_OPS VM steps and interrupts the statement
+            // once it returns true. Unlike `sqlite3_interrupt` from a timer (a no-op while no statement runs), this
+            // also stops statements that start after the deadline, and it cannot reach the connection once it is back
+            // in the pool.
+            conn.progress_handler(DEADLINE_CHECK_OPS, Some(move || Instant::now() >= deadline))?;
             let out = f(&conn);
-            timer.abort();
-            if let Ok(mut pool) = readers.lock() {
+            let cleared = conn.progress_handler(0, None::<fn() -> bool>);
+            if cleared.is_ok()
+                && let Ok(mut pool) = readers.lock()
+            {
                 pool.push(conn);
             }
             out
@@ -262,6 +263,8 @@ pub(crate) fn new_generation(tx: &Connection, account_id: &str) -> anyhow::Resul
 }
 
 /// Derived rows (and retry records) deleted per transaction when a generation is dropped.
+/// SQLite VM steps between two deadline checks of a reader statement (a few microseconds of work).
+const DEADLINE_CHECK_OPS: std::os::raw::c_int = 1000;
 const DROP_ROWS: i64 = 2000;
 /// FTS segment blocks deleted per transaction when a generation's FTS table is dropped.
 const DROP_FTS_BLOCKS: i64 = 256;
@@ -602,6 +605,27 @@ mod tests {
         assert_eq!(n.expect("the read waited for the writer").unwrap(), 0);
     }
 
+    /// `sqlite3_interrupt` is a no-op while no statement runs. A deadline that passes before the first statement starts
+    /// (slow connection open, slow machine) must still stop it, or the query runs unbounded. Seen on the Windows CI
+    /// runner, where opening the SQLCipher connection outlasted the 100 ms deadline of the test below.
+    #[tokio::test]
+    async fn deadline_that_passes_before_the_statement_starts_still_interrupts() {
+        let env = TestEnv::new();
+        let deadline = Instant::now() + std::time::Duration::from_millis(20);
+        let read = env.app.index.read(deadline, |c| {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            // Bounded (seconds, not forever), so a regression fails the test instead of hanging the runner.
+            let n: i64 = c.query_row(
+                "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 30000000) SELECT count(*) FROM c",
+                [],
+                |r| r.get(0),
+            )?;
+            Ok(n)
+        });
+        let err = read.await.expect_err("the deadline must stop a statement that starts after it");
+        assert_eq!(err.code, ErrorCode::QueryTooBroad);
+    }
+
     #[tokio::test]
     async fn deadline_interrupts_query_as_too_broad() {
         let env = TestEnv::new();
@@ -610,8 +634,9 @@ mod tests {
             .app
             .index
             .read(deadline, |c| {
+                // Bounded (seconds, not forever), so a broken deadline fails the test instead of hanging the runner.
                 let n: i64 = c.query_row(
-                    "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT count(*) FROM c",
+                    "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 30000000) SELECT count(*) FROM c",
                     [],
                     |r| r.get(0),
                 )?;
