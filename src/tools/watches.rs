@@ -279,13 +279,19 @@ async fn create_watch(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError>
         .store
         .call(move |c| {
             let tx = c.transaction()?;
+            // Only sinks of the caller's project; another project's sink is the same not_found as an unknown one.
             let sink_id: Option<String> = match &sink {
                 Some(name) => match tx
-                    .query_row("SELECT id FROM sinks WHERE name = ?1", [name], |r| r.get::<_, String>(0))
+                    .query_row(
+                        "SELECT s.id FROM sinks s JOIN clients c ON c.project_id = s.project_id \
+                         WHERE s.name = ?1 AND c.id = ?2",
+                        params![name, client_id],
+                        |r| r.get::<_, String>(0),
+                    )
                     .optional()?
                 {
                     Some(id) => Some(id),
-                    None => return Ok(Err(ToolError::invalid("unknown sink; list_watches shows the available ones"))),
+                    None => return Ok(Err(ToolError::not_found())),
                 },
                 None => None,
             };
@@ -410,8 +416,11 @@ async fn list_watches(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError>
         .store
         .call(move |c| {
             let rows = load_rows(c, &client_id, None)?;
-            let mut st = c.prepare("SELECT name FROM sinks ORDER BY name")?;
-            let sinks: Vec<String> = st.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
+            let mut st = c.prepare(
+                "SELECT s.name FROM sinks s JOIN clients c ON c.project_id = s.project_id WHERE c.id = ?1 \
+                 ORDER BY s.name",
+            )?;
+            let sinks: Vec<String> = st.query_map([&client_id], |r| r.get(0))?.collect::<Result<_, _>>()?;
             Ok((rows, sinks))
         })
         .await

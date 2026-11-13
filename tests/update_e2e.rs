@@ -156,7 +156,7 @@ async fn valid_upgrade_replaces_the_binary() {
 
     let latest = update::latest_release(&src, &http()).await.unwrap();
     assert_eq!(latest, Version::new(0, 2, 0));
-    let Decision::Install(v) = update::decide(&src.current, Some(&latest), None) else { panic!("no install") };
+    let Decision::Install(v) = update::decide(&src.current, Some(&latest), None, false) else { panic!("no install") };
     update::install(&src, &http(), &v, &exe).await.unwrap();
 
     assert_eq!(std::fs::read(&exe).unwrap(), NEW_BINARY, "the linux build, not the darwin one");
@@ -318,12 +318,18 @@ async fn older_release_only_when_requested_explicitly() {
     let (_dir, exe) = installed();
 
     let latest = update::latest_release(&src, &http()).await.unwrap();
-    assert_eq!(update::decide(&src.current, Some(&latest), None), Decision::UpToDate { latest: latest.clone() });
+    assert_eq!(update::decide(&src.current, Some(&latest), None, false), Decision::UpToDate { latest: latest.clone() });
     assert_eq!(fake.requests().len(), 1, "nothing downloaded");
     assert_eq!(std::fs::read(&exe).unwrap(), OLD_BINARY);
 
     let requested = update::parse_requested("0.2.0").unwrap();
-    let Decision::Install(v) = update::decide(&src.current, None, Some(&requested)) else { panic!("no downgrade") };
+    assert_eq!(
+        update::decide(&src.current, None, Some(&requested), false),
+        Decision::DowngradeRefused(requested.clone())
+    );
+    let Decision::Downgrade(v) = update::decide(&src.current, None, Some(&requested), true) else {
+        panic!("no downgrade")
+    };
     update::install(&src, &http(), &v, &exe).await.unwrap();
     assert_eq!(std::fs::read(&exe).unwrap(), NEW_BINARY);
 }

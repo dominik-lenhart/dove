@@ -124,7 +124,7 @@ is always delivered in the untrusted-content envelope from section 6.5.
 | `update_draft` | draft | Edit an owned draft, conditional on the expected revision (§5.3); attachments kept unless replaced. |
 | `delete_draft` | draft | Delete one owned, unchanged draft (optionally conditional on `expected_revision`). Gmail: `messages.trash` of the draft's message; IMAP: `\Deleted` + `UID EXPUNGE` of exactly the own draft's UID. |
 | `update_messages` | organize | Up to 100 ids: add/remove flags (`UNREAD`, `STARRED`) and labels (Gmail user labels, never created; IMAP keywords). Per-id results. |
-| `move_messages` | organize (+ delete) | Up to 100 ids to a folder/label, `archive`, `inbox`, `trash` or `spam`. Trash, Spam/Junk and folders below them need `delete`; moving out of them is organize. Per-id results with `new_id` (IMAP ids change). Never a permanent delete. |
+| `move_messages` | organize (+ delete) | Up to 100 ids to a folder/label, `archive`, `inbox`, `trash` or `spam`. Trash, Spam/Junk and folders below them need `delete`, and so does moving out of Spam/Junk (it promotes spam); moving out of Trash is organize. IMAP folders without a special-use flag count as Trash/Junk by localized well-known names and trash/junk word stems. Per-id results with `new_id` (IMAP ids change). Never a permanent delete. |
 | `send_draft` | send | Optional. Submit one existing, owned draft under §6.3. |
 | `create_watch` | read | Watch an indexed mailbox: `thread_reply`, `from` (address or domain), `query` (a `where` filter, checked against newly indexed mail only) or `no_reply_by` (fires once at a deadline). Belongs to the creating token; at most 50 active, expiry 30 days by default, 180 at most; optional operator sink by name. |
 | `list_watches` | read | This token's watches (active and recently ended, with the reason) and the operator's sink names. |
@@ -553,7 +553,8 @@ Plus `POST https://oauth2.googleapis.com/token` (code exchange, refresh) and
 
 The only other outbound destination is `POST` to the exact URLs (scheme, host, port, path) of the operator's webhook
 sinks (`dove sinks add`, watch push delivery, design 0.2 section 3). The gateway's sink allowlist is rebuilt from the
-state store whenever a sink is added or removed; agents name sinks but never supply URLs.
+state store whenever a sink is added or removed; agents name sinks of their own project but never supply URLs. Sink
+URLs are stored sealed (vault kind `sink_url`).
 
 Explicitly denied: every other send route, `messages` with POST, `messages/import`,
 `messages/{id}/trash`, `messages/{id}/modify`, `messages/batchModify`, `messages/batchDelete`, DELETE on messages or

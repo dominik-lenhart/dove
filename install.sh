@@ -23,14 +23,17 @@ say() { printf '%s\n' "$*"; }
 die() { printf 'dove install: %s\n' "$*" >&2; exit 1; }
 
 # ---- tools -------------------------------------------------------------------------------------------------
+# HTTPS only, redirects included; plain HTTP only for a test server given with DOVE_DOWNLOAD_BASE.
 proto='=https'
-if [ -n "${DOVE_DOWNLOAD_BASE:-}" ]; then proto='=https,http'; fi
+wget_https='--https-only'
+if [ -n "${DOVE_DOWNLOAD_BASE:-}" ]; then proto='=https,http'; wget_https=''; fi
 if command -v curl >/dev/null 2>&1; then
   fetch() { curl -fsSL --proto "$proto" -o "$2" "$1"; }
   final_url() { curl -fsSL --proto '=https' -o /dev/null -w '%{url_effective}' "$1"; }
 elif command -v wget >/dev/null 2>&1; then
-  fetch() { wget -q -O "$2" "$1"; }
-  final_url() { wget -q --max-redirect=5 --spider -S "$1" 2>&1 | sed -n 's/^ *[Ll]ocation: *//p' | tail -n 1 | tr -d '\r'; }
+  # shellcheck disable=SC2086 # $wget_https is one flag or empty
+  fetch() { wget -q $wget_https -O "$2" "$1"; }
+  final_url() { wget -q --https-only --max-redirect=5 --spider -S "$1" 2>&1 | sed -n 's/^ *[Ll]ocation: *//p' | tail -n 1 | tr -d '\r'; }
 else
   die "curl or wget is required"
 fi
@@ -107,10 +110,9 @@ fetch "$base/SHA256SUMS.minisig" "$tmp/SHA256SUMS.minisig" || die "download fail
 if command -v minisign >/dev/null 2>&1; then
   out=$(minisign -V -P "$PUBKEY" -m "$tmp/SHA256SUMS" -x "$tmp/SHA256SUMS.minisig" 2>&1) \
     || die "signature verification FAILED for SHA256SUMS; not installing"
-  case "$out" in
-    *"dove $tag"*) ;;
-    *) die "signature is valid but is not for dove $tag (wrong or replayed release); not installing" ;;
-  esac
+  # The trusted comment must be exactly "dove <tag>": a substring match would accept "dove v1.2.3-rc.1" for v1.2.3.
+  printf '%s\n' "$out" | tr -d '\r' | grep -qxF "Trusted comment: dove $tag" \
+    || die "signature is valid but is not for dove $tag (wrong or replayed release); not installing"
   say "Signature OK (minisign, dove $tag)"
 else
   say "Note: minisign is not installed, so the signature was NOT checked. Only the SHA-256 from the same release is"

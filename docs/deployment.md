@@ -167,11 +167,14 @@ The file holds no secrets. Unknown keys are rejected. Settings and defaults (fro
 | `index.*` | see below | Search index tuning. |
 
 `limits` defaults: `body_bytes` 1 MiB, `client_requests_per_minute` 120, `client_burst` 40,
-`client_sends_per_hour` 20, `auth_failures_per_minute` 60 (failed bearer tokens on `/mcp` per client address, IPv6 by
+`client_sends_per_hour` 20, `client_organize_per_hour` 500, `auth_failures_per_minute` 60 (failed bearer tokens on `/mcp` per client address, IPv6 by
 /64; then 429 until the bucket refills; successful requests do not count), `upstream_total_inflight` 16, `upstream_per_mailbox` 4, `upstream_search_mailboxes` 8,
 `upstream_request_timeout_secs` 10, `tool_call_timeout_secs` 30, `attachment_bytes` 10 MiB (largest attachment
 `get_attachment` returns), `draft_attachment_bytes` 10 MiB (all attachments of one draft, decoded; at most 16 MiB).
-`body_bytes` caps every request except `/mcp` requests from an authenticated client with `draft` on some mailbox:
+`client_organize_per_hour` is the number of messages one client may change per hour with `update_messages` and
+`move_messages` (each id counts once; ids that did not change are given back). A call that does not fit is refused as
+a whole with `rate_limited` and `retry_after_seconds`, before any change, and audited like other refusals; it bounds
+how much of a mailbox a misled agent can relabel or move. `body_bytes` caps every request except `/mcp` requests from an authenticated client with `draft` on some mailbox:
 those may carry inline attachments and get `draft_attachment_bytes` × 4/3 + 2 MiB (about 15.3 MiB by default). Dove
 reads an `/mcp` body only after the token checked out, so unauthenticated requests never get the larger limit. The
 proxy limit must be at least that large (the shipped Caddy and nginx files use 20 MB). `index` defaults: `poll_interval_secs` 60,
@@ -696,8 +699,8 @@ secret store, not in a project file. Grants are explicit per mailbox. Actions:
 | --- | --- | --- |
 | `read` | search, read, attachments, list folders and drafts | - |
 | `draft` | create, update and delete its own drafts | `read` |
-| `organize` | mark read/unread, star, add/remove labels (IMAP keywords), archive, move between folders, move out of Trash/Spam | `read` |
-| `delete` | move to Trash or Spam/Junk (also any folder below them); never a permanent delete | `organize` |
+| `organize` | mark read/unread, star, add/remove labels (IMAP keywords), archive, move between folders, move out of Trash | `read` |
+| `delete` | move to Trash or Spam/Junk (also any folder below them), and move out of Spam/Junk; never a permanent delete | `organize` |
 | `send` | `send_draft`, only with `allow_send = true` | `draft` |
 
 Presets are shorthands: `reader` = `read`, `drafter` = `read,draft`, `assistant` = `read,draft,organize`, `full` =
@@ -748,17 +751,26 @@ seconds. Mail sent by the mailbox itself, drafts, and spam or trash never fire a
 kind, account alias, message id, thread id and received time, never a subject, sender or body: the agent reads the
 message with its own token. Events are kept 14 days and pulled with `list_watch_events` (opaque cursor).
 
-Push delivery is optional and set up by the operator only. A sink is a name, an HTTPS URL and a signing secret:
+Push delivery is optional and set up by the operator only. A sink is a name, a project, an HTTPS URL and a signing
+secret:
 
 ```sh
 umask 077; openssl rand -hex 32 > ~/dove-hook.secret
-dove sinks add n8n --url https://hooks.example.com/dove --secret-file ~/dove-hook.secret
-dove sinks list        # URL, active watches, pending/delivered/failed deliveries (never the secret)
+dove sinks add n8n --project acme --url https://hooks.example.com/dove --secret-file ~/dove-hook.secret
+dove sinks list        # project, URL origin, active watches, pending/delivered/failed deliveries (never the secret)
+dove sinks set-project n8n --project other   # move it; the old project's watches keep working without push
 dove sinks remove n8n  # watches that used it keep working without push
 ```
 
-The CLI reads the secret file (no group or other access: 0400 or 0600) and the service stores it sealed with the
-KEK (`dove keys rotate` re-wraps it); the file is not needed afterwards. Surrounding whitespace, such as the final
+A sink belongs to one project: only clients of that project see its name and can name it on a watch; for clients
+of other projects it does not exist (`not_found`, like an unknown name). The URL is stored sealed with the KEK like the
+secret, because Slack, Discord or ntfy URLs carry credentials, and `dove sinks list` shows only its origin. The CLI
+reads the secret file (no group or other access: 0400 or 0600) and the service stores it sealed with the KEK
+(`dove keys rotate` re-wraps URL and secret); the file is not needed afterwards.
+
+Upgrading from 0.5 or earlier: existing sinks have their URL sealed at the first start and belong to no project, so
+no client can use them and their watches push nothing (events stay pullable) until you assign one with
+`dove sinks set-project <name> --project <project>`. `dove sinks list` marks them. Surrounding whitespace, such as the final
 newline, is not part of the secret: give the receiver the same trimmed value. Only `https` URLs without credentials, query
 or fragment are accepted, and the service POSTs to exactly the registered URLs and nowhere else. Agents see sink
 names in `list_watches` and may name one in `create_watch`; they can never supply a URL.
@@ -865,9 +877,11 @@ sudo journalctl -u dove -n 50        # look for migration errors
 dove doctor
 ```
 
-`dove upgrade [--check] [--version X.Y.Z]` downloads the release archive, checks its SHA-256 and verifies the
-minisign signature of `SHA256SUMS` with the public key embedded in the binary before replacing itself. Use
-`--version` to install a specific release, including an older one (an older binary will refuse a newer schema).
+`dove upgrade [--check] [--version X.Y.Z [--allow-downgrade]]` downloads the release archive, checks its SHA-256 and
+verifies the minisign signature of `SHA256SUMS` with the public key embedded in the binary before replacing itself.
+Use `--version` to install a specific release. A release older than the running binary is refused unless you add
+`--allow-downgrade`, which prints a warning first: older releases may lack security fixes, and an older binary refuses
+a state store that a newer release has already migrated.
 If you installed from source, rebuild and `install -m 0755 target/release/dove /usr/local/bin/dove` instead.
 
 ### Compose

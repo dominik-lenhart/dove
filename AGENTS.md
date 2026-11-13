@@ -373,3 +373,19 @@ cargo fmt
   `RateLimiter::exhausted` (no token taken) before the lookup; loopback and unknown addresses are exempt because behind
   Tailscale Serve or in local mode they stand for every caller. Tests simulate addresses with `X-Forwarded-For` plus
   `X-Dove-Proxy-Auth`.
+- 2026-11-13: Security review fixes. Organize writes spend `limits.client_organize_per_hour` (messages, per client):
+  `organize::Budget::take` reserves before the first write, `settle` refunds failed ids, or everything when the call
+  failed before `cx.commit()`; `RateLimiter::take_hourly`/`refund` take several tokens at once. Tests shrink it with
+  `Harness::start_with(|c| c.limits.client_organize_per_hour = 5)`. Moving out of Spam/Junk needs `delete` (Gmail
+  `SPAM` label, IMAP `organize::is_junk`, Gmail-over-IMAP `\Junk`). Trash/Junk names live in `imap::connect`
+  (`TRASH_NAMES`, `JUNK_NAMES`, compared with `same_name`, Unicode case) and word stems (`TRASH_STEMS`, `JUNK_STEMS`)
+  count only for the `delete` gate. Named folder lookup (`folder_by_label`, `imap_target`) is still ASCII-case only.
+- 2026-11-13: Sinks belong to a project and their URL is sealed (`sink_url`, store migration 7). A migration that needs
+  the vault cannot be SQL only: add nullable columns in SQL and finish in `App::new` (`watch::sinks::seal_legacy_urls`).
+  Never rebuild a table that others reference with ON DELETE actions (`DROP TABLE` runs them; `V_GMAIL_IMAP` could
+  only because nothing references `imap_folders`). Tests add sinks with `add_sink_to(h, name, project, url)`; a test
+  of an earlier migration pins its index (`n = 6`) instead of `MIGRATIONS.len()`.
+- 2026-11-13: `tests/packaging.rs` runs the real `install.sh` with fake `curl`/`wget`/`minisign` (written once per
+  process) in a PATH of symlinked system tools, so no network and no real minisign are needed. There is no PowerShell
+  on the host; `docker run --rm mcr.microsoft.com/powershell:latest pwsh -NoProfile -File <script>` checks an
+  `install.ps1` expression quickly (the image is cached locally).

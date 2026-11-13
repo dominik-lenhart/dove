@@ -480,6 +480,15 @@ async fn organize_uses_labels_and_move_only() {
     let v = call("move_messages", json!({"account": "me", "ids": [id3], "to": "spam"})).await;
     let spam_id = result(&v)["new_id"].as_str().unwrap().to_string();
     assert_eq!(places(&fx, m3), sorted(&[SPAM]));
+    // Leaving Spam needs delete: an organize-only token is refused before any command.
+    let assistant = fx.h.token("p", "assistant", vec![g("me", "assistant")]).await;
+    let before = fx.h.imap.commands().len();
+    for to in ["archive", "inbox", "Work"] {
+        let e = fx.h.err(&assistant, "move_messages", json!({"account": "me", "ids": [spam_id], "to": to})).await;
+        assert_eq!(e, "forbidden", "{to}");
+    }
+    assert_eq!(fx.h.imap.commands().len(), before, "refused before any IMAP command");
+    assert_eq!(places(&fx, m3), sorted(&[SPAM]));
     let v = call("move_messages", json!({"account": "me", "ids": [spam_id], "to": "archive"})).await;
     assert_eq!(result(&v)["new_id"].as_str().unwrap(), fx.id(ALL, m3).await, "{v}");
     assert_eq!(places(&fx, m3), sorted(&[ALL]));

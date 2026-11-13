@@ -143,7 +143,7 @@ curl -fsSLO "$base/dove-$tag-$target.tar.gz" -O "$base/SHA256SUMS" -O "$base/SHA
 
 # 1. signature over the checksum list (public key from this repository)
 minisign -V -P RWQRx2ysvLhSBINGxR3uV9awNjRzHTcz6NUppfFhP2OBdhxTETjz+zGr -m SHA256SUMS
-#    the trusted comment must read: dove v0.1.0
+#    the trusted comment line must read exactly: Trusted comment: dove v0.1.0
 
 # 2. the archive against the list
 sha256sum --ignore-missing -c SHA256SUMS            # macOS: shasum -a 256 -c SHA256SUMS 2>&1 | grep "$target"

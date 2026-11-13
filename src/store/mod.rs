@@ -144,7 +144,8 @@ mod tests {
     fn gmail_imap_migration_keeps_folders() {
         let mut c = Connection::open_in_memory().unwrap();
         c.execute_batch("PRAGMA foreign_keys = ON").unwrap();
-        let n = schema::MIGRATIONS.len();
+        // V_GMAIL_IMAP is migration 6: apply up to it, not the latest.
+        let n = 6;
         for sql in &schema::MIGRATIONS[..n - 1] {
             c.execute_batch(sql).unwrap();
         }
@@ -178,6 +179,48 @@ mod tests {
         // Removing the account still takes its folders with it.
         c.execute("DELETE FROM accounts WHERE id = 'a'", []).unwrap();
         assert_eq!(c.query_row("SELECT count(*) FROM imap_folders", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    }
+
+    /// The sink migration keeps every sink with its watches and queued deliveries; old sinks get no project (unusable
+    /// by clients until the operator assigns one) and no sealed URL yet (sealed at startup, `seal_legacy_urls`).
+    #[test]
+    fn sink_project_migration_keeps_sinks_watches_and_deliveries() {
+        let mut c = Connection::open_in_memory().unwrap();
+        c.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+        let n = 7;
+        for sql in &schema::MIGRATIONS[..n - 1] {
+            c.execute_batch(sql).unwrap();
+        }
+        c.execute_batch(
+            "INSERT INTO projects VALUES ('p', 'acme', 1);
+             INSERT INTO clients(id, name, project_id, kind, created_at, created_via) VALUES ('c', 'agent', 'p', 'token', 1, 'cli');
+             INSERT INTO accounts(id, alias, email, status, provider) VALUES ('a', 'x', 'x@example.org', 'active', 'gmail');
+             INSERT INTO sinks VALUES ('s', 'hook', 'https://hooks.example.com/T0/secret-path', x'00', 1);
+             INSERT INTO watches(id, client_id, account_id, kind, sink_id, created_at, expires_at, state)
+                 VALUES ('w', 'c', 'a', 'from', 's', 1, 9, 'active');
+             INSERT INTO watch_events(watch_id, client_id, account_id, kind, created_at) VALUES ('w', 'c', 'a', 'from', 1);
+             INSERT INTO sink_deliveries VALUES (1, 's', 'pending', 0, 1, NULL, 1);",
+        )
+        .unwrap();
+        let tx = c.transaction().unwrap();
+        tx.execute_batch(schema::MIGRATIONS[n - 1]).unwrap();
+        tx.commit().unwrap();
+        let row: (String, Option<String>, Option<Vec<u8>>, String) = c
+            .query_row("SELECT name, project_id, url_sealed, url FROM sinks", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .unwrap();
+        assert_eq!(row, ("hook".into(), None, None, "https://hooks.example.com/T0/secret-path".into()));
+        let kept: (Option<String>, i64) = c
+            .query_row("SELECT (SELECT sink_id FROM watches), (SELECT count(*) FROM sink_deliveries)", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(kept, (Some("s".into()), 1));
+        // A removed project leaves its sinks without one.
+        c.execute("UPDATE sinks SET project_id = 'p'", []).unwrap();
+        c.execute("DELETE FROM projects", []).unwrap();
+        assert_eq!(c.query_row("SELECT project_id FROM sinks", [], |r| r.get::<_, Option<String>>(0)).unwrap(), None);
     }
 
     #[test]

@@ -23,18 +23,203 @@ use crate::util;
 const DRAFTS_NAMES: &[&str] = &["Drafts", "Entwürfe", "Draft"];
 const SENT_NAMES: &[&str] =
     &["Sent", "Sent Messages", "Sent Items", "Gesendet", "Gesendete Objekte", "Gesendete Elemente"];
-/// Junk folder names; `Spamverdacht` is Strato's.
-pub(crate) const JUNK_NAMES: &[&str] = &["Junk", "Spam", "Junk E-Mail", "Junk-E-Mail", "Bulk Mail", "Spamverdacht"];
+/// Junk folder names in common languages (compared with [`same_name`]); `Spamverdacht` is Strato's.
+pub(crate) const JUNK_NAMES: &[&str] = &[
+    // en, de
+    "Junk",
+    "Spam",
+    "Junk E-Mail",
+    "Junk-E-Mail",
+    "Junk Email",
+    "Junk Mail",
+    "Bulk Mail",
+    "Spamverdacht",
+    // fr, es, it, nl, pt
+    "Courrier indésirable",
+    "Courriers indésirables",
+    "Indésirables",
+    "Indésirable",
+    "Pourriel",
+    "Pourriels",
+    "Correo no deseado",
+    "No deseado",
+    "Posta indesiderata",
+    "Indesiderata",
+    "Ongewenste e-mail",
+    "Ongewenst",
+    "Lixo eletrônico",
+    "Lixo electrónico",
+    "Correio não solicitado",
+    // pl, sv, da, nb, fi, cs
+    "Wiadomości-śmieci",
+    "Niechciane",
+    "Śmieci",
+    "Skräppost",
+    "Uønsket e-mail",
+    "Uønsket post",
+    "Søppelpost",
+    "Roskaposti",
+    "Nevyžádaná pošta",
+    "Nevyžádané",
+    // ru, tr, ja, zh
+    "Спам",
+    "Нежелательная почта",
+    "Нежелательные",
+    "Gereksiz",
+    "Gereksiz E-posta",
+    "İstenmeyen",
+    "İstenmeyen E-posta",
+    "迷惑メール",
+    "垃圾邮件",
+];
+/// Trash folder names in common languages (compared with [`same_name`]).
 pub(crate) const TRASH_NAMES: &[&str] = &[
+    // en, de
     "Trash",
     "Deleted Messages",
     "Deleted Items",
     "Deleted",
     "Bin",
+    "Recycle Bin",
     "Papierkorb",
     "Gelöschte Elemente",
     "Gelöschte Objekte",
+    "Gelöschte Nachrichten",
+    // fr, es, it, nl, pt
+    "Corbeille",
+    "Éléments supprimés",
+    "Messages supprimés",
+    "Papelera",
+    "Elementos eliminados",
+    "Mensajes eliminados",
+    "Cestino",
+    "Posta eliminata",
+    "Elementi eliminati",
+    "Prullenbak",
+    "Verwijderde items",
+    "Verwijderde berichten",
+    "Lixeira",
+    "Lixo",
+    "Itens excluídos",
+    "Itens eliminados",
+    "Mensagens excluídas",
+    // pl, sv, da, nb, fi, cs
+    "Kosz",
+    "Elementy usunięte",
+    "Usunięte",
+    "Papperskorgen",
+    "Papperskorg",
+    "Borttagna objekt",
+    "Borttaget",
+    "Papirkurv",
+    "Slettede elementer",
+    "Slettet post",
+    "Slettet",
+    "Roskakori",
+    "Poistetut",
+    "Poistetut kohteet",
+    "Koš",
+    "Odstraněná pošta",
+    "Odstraněné položky",
+    // ru, tr, ja, zh
+    "Корзина",
+    "Удаленные",
+    "Удалённые",
+    "Удаленные элементы",
+    "Удалённые элементы",
+    "Çöp Kutusu",
+    "Çöp",
+    "Silinmiş Öğeler",
+    "Silinenler",
+    "ゴミ箱",
+    "ごみ箱",
+    "削除済みアイテム",
+    "已删除邮件",
+    "已删除",
+    "垃圾箱",
 ];
+/// Word stems that mark a folder as trash wherever they appear in its decoded name (any case). Used only to decide
+/// that a move needs `delete` (conservative: a false hit asks for more permission, never less); finding the Trash
+/// folder itself uses the exact [`TRASH_NAMES`].
+pub(crate) const TRASH_STEMS: &[&str] = &[
+    "trash",
+    "deleted",
+    "papierkorb",
+    "gelöscht",
+    "corbeille",
+    "supprim",
+    "papelera",
+    "eliminad",
+    "cestino",
+    "eliminat",
+    "prullenbak",
+    "verwijderd",
+    "lixeira",
+    "lixo",
+    "excluíd",
+    "kosz",
+    "usunięt",
+    "papperskorg",
+    "borttag",
+    "papirkurv",
+    "slettet",
+    "slettede",
+    "roskakori",
+    "poistetu",
+    "koš",
+    "odstraněn",
+    "корзин",
+    "удален",
+    "удалён",
+    "çöp",
+    "silinmiş",
+    "silinen",
+    "ゴミ箱",
+    "ごみ箱",
+    "削除済",
+    "垃圾箱",
+    "已删除",
+];
+/// Word stems that mark a folder as junk, used like [`TRASH_STEMS`] (moving into or out of such a folder needs
+/// `delete`).
+pub(crate) const JUNK_STEMS: &[&str] = &[
+    "junk",
+    "spam",
+    "indésirable",
+    "indesirable",
+    "pourriel",
+    "no deseado",
+    "indesiderat",
+    "ongewenst",
+    "lixo eletr",
+    "lixo electr",
+    "não solicitad",
+    "śmieci",
+    "niechcian",
+    "skräp",
+    "uønsket",
+    "søppel",
+    "roskaposti",
+    "nevyžádan",
+    "спам",
+    "нежелательн",
+    "istenmeyen",
+    "gereksiz",
+    "迷惑",
+    "垃圾邮件",
+];
+
+/// Folder name equality for the well-known names: Unicode case-insensitive, surrounding spaces ignored.
+pub(crate) fn same_name(a: &str, b: &str) -> bool {
+    let (a, b) = (a.trim(), b.trim());
+    a.eq_ignore_ascii_case(b) || a.to_lowercase() == b.to_lowercase()
+}
+
+/// Whether a decoded folder name contains one of `stems` ([`TRASH_STEMS`], [`JUNK_STEMS`]), in any case.
+pub(crate) fn has_stem(name: &str, stems: &[&str]) -> bool {
+    let lower = name.to_lowercase();
+    stems.iter().any(|s| lower.contains(s))
+}
 
 pub struct ConnectImap {
     pub alias: String,
@@ -79,7 +264,7 @@ fn find<'a>(folders: &'a [FolderInfo], role: Special, names: &[&str]) -> Option<
     let usable = || folders.iter().filter(|f| f.selectable);
     usable()
         .find(|f| f.special == Some(role))
-        .or_else(|| names.iter().find_map(|n| usable().find(|f| leaf(f).eq_ignore_ascii_case(n))))
+        .or_else(|| names.iter().find_map(|n| usable().find(|f| same_name(leaf(f), n))))
 }
 
 /// Resolves Drafts, Sent, Junk and Trash, and in Gmail mode the `\All` folder (required, special-use flag only).
@@ -357,6 +542,52 @@ mod step_error_tests {
         for (server, port) in [("SMTP", 587), ("IMAP", 465)] {
             let plain = step_error(server, &ep(port), &ImapError::Network).to_string();
             assert!(!plain.contains("--smtp-port"), "{plain}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::*;
+
+    fn folder(name: &str) -> FolderInfo {
+        FolderInfo {
+            name_utf8: name.into(),
+            raw_name: format!("raw:{name}"),
+            delimiter: Some('/'),
+            special: None,
+            selectable: true,
+        }
+    }
+
+    /// Without SPECIAL-USE, localized Trash and Junk folders are found by name, in any case (non-ASCII included).
+    #[test]
+    fn localized_trash_and_junk_are_recognized() {
+        for (trash, junk) in [
+            ("Corbeille", "Courrier indésirable"),
+            ("Papelera", "Correo no deseado"),
+            ("Cestino", "Posta indesiderata"),
+            ("Prullenbak", "Ongewenste e-mail"),
+            ("Lixeira", "Lixo eletrônico"),
+            ("Kosz", "Wiadomości-śmieci"),
+            ("Papperskorgen", "Skräppost"),
+            ("Papirkurv", "Søppelpost"),
+            ("Roskakori", "Roskaposti"),
+            ("Koš", "Nevyžádaná pošta"),
+            ("КОРЗИНА", "СПАМ"),
+            ("Çöp Kutusu", "Gereksiz"),
+            ("ゴミ箱", "迷惑メール"),
+            ("ÉLÉMENTS SUPPRIMÉS", "INDÉSIRABLES"),
+        ] {
+            let fs = vec![folder("INBOX"), folder("Drafts"), folder(&format!("INBOX/{trash}")), folder(junk)];
+            let got = resolve_specials(&fs, None, false, false).unwrap();
+            assert!(got.contains(&(format!("raw:INBOX/{trash}"), Special::Trash)), "{trash}: {got:?}");
+            assert!(got.contains(&(format!("raw:{junk}"), Special::Junk)), "{junk}: {got:?}");
+        }
+        assert!(has_stem("Alte Spam-Regeln", JUNK_STEMS) && has_stem("Корзина 2025", TRASH_STEMS));
+        assert!(!has_stem("Alte Spam-Regeln", TRASH_STEMS) && !has_stem("Корзина 2025", JUNK_STEMS));
+        for plain in ["Kunden", "Archiv", "Projekte/2025", "Rechnungen"] {
+            assert!(!has_stem(plain, TRASH_STEMS) && !has_stem(plain, JUNK_STEMS), "{plain}");
         }
     }
 }

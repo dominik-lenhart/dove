@@ -257,6 +257,7 @@ pub fn record_events(conn: &Connection, watch_id: &str, hits: &[Hit], now: i64) 
         return Ok((0, false));
     }
     let mut new = 0;
+    let mut queued = 0;
     for h in hits {
         let n = conn.execute(
             "INSERT OR IGNORE INTO watch_events(watch_id, client_id, account_id, kind, message_id, thread_id, \
@@ -268,10 +269,12 @@ pub fn record_events(conn: &Connection, watch_id: &str, hits: &[Hit], now: i64) 
         }
         new += 1;
         if let Some(sink) = &sink_id {
-            conn.execute(
+            // Only into a sink of the watch owner's own project (a sink moved to another project pushes nothing).
+            queued += conn.execute(
                 "INSERT INTO sink_deliveries(event_seq, sink_id, state, attempts, next_attempt_at, updated_at) \
-                 VALUES (?1, ?2, 'pending', 0, ?3, ?3)",
-                params![conn.last_insert_rowid(), sink, now],
+                 SELECT ?1, s.id, 'pending', 0, ?3, ?3 FROM sinks s JOIN clients c ON c.project_id = s.project_id \
+                 WHERE s.id = ?2 AND c.id = ?4",
+                params![conn.last_insert_rowid(), sink, now, client_id],
             )?;
         }
     }
@@ -281,7 +284,7 @@ pub fn record_events(conn: &Connection, watch_id: &str, hits: &[Hit], now: i64) 
             params![new as i64, now, watch_id],
         )?;
     }
-    Ok((new, new > 0 && sink_id.is_some()))
+    Ok((new, queued > 0))
 }
 
 // ------------------------------------------------------------------ matching new messages
