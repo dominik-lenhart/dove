@@ -212,7 +212,7 @@ async fn move_without_move_expunges_only_confirmed_copies() {
     // Another client marked this one \Deleted without expunging: Dove's UID EXPUNGE must leave it alone.
     let other = h.imap.add_message(&u.user, "INBOX", &raw("other"), &["\\Deleted"]);
     let c = h.imap.add_message(&u.user, "INBOX", &raw("c"), &["\\Flagged"]);
-    let ids = vec![imap_id(h, u, "INBOX", a).await, imap_id(h, u, "INBOX", c).await];
+    let ids = [imap_id(h, u, "INBOX", a).await, imap_id(h, u, "INBOX", c).await];
     let missing =
         format!("f{}-{}-77", folder_id(h, &u.account_id, "INBOX").await, h.imap.uidvalidity(&u.user, "INBOX"));
     h.imap.clear_commands();
