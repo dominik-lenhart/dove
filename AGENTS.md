@@ -244,3 +244,17 @@ cargo fmt
   `shutdown_background()` when the notice check ran; try the notice in a pty with `script -qec "<cmd>" /dev/null`.
   The notice never runs privileged (euid 0, euid != uid, `SUDO_UID` set: `sudo -E` keeps the user's HOME), and its
   cache writes never follow symlinks (owned real dir, `O_EXCL|O_NOFOLLOW` temp file, rename onto the literal path).
+- 2026-11-13: Grants: `Actions::parse` reads stored lists only (no presets); operator input goes through
+  `Actions::parse_grant` (presets + actions) in `admin::ops::resolve_grants`, which also serves invitations. Narrowing
+  uses `Actions::intersect`, which keeps the dependency rules. `list_accounts` hides `send` while `allow_send` is off,
+  so tests of the send gate must read `client_mailboxes.actions`.
+- 2026-11-13: Organize tools live in `src/tools/organize.rs`. IMAP `\Deleted` outside Drafts exists only as
+  `ImapOp::UidStoreDeletedCopied(&[CopiedUid])`; `CopiedUid::confirmed_by_copyuid` is private to `session.rs` and called
+  once in `move_uids` (source scan in `tests/imap_organize_e2e.rs`, whose `assert_expunges_only_copied_or_own` walks
+  the command log). The fake IMAP server offers `MOVE` and `COPYUID` by default (`Opts { move_cap, copyuid }`); folders
+  added after connect need a `list_labels` call before Dove knows them. Gmail organize tests drop `gmail.modify` from
+  `accounts.granted_scopes` to simulate a pre-0.2 grant; the fake Google answers `messages.modify` with 400 for
+  unknown label ids and TRASH (use `messages.trash`).
+- 2026-11-13: A `buffered` stream over closures that borrow `ids` fails with "FnOnce is not general enough" even with
+  rebinding when the future is returned from a generic `Fn`; collect `Pin<Box<dyn Future + Send + 'a>>` first, then
+  `stream::iter(futs).buffered(n)` (see `organize::gmail_each`).

@@ -120,6 +120,9 @@ is always delivered in the untrusted-content envelope from section 6.5.
 | `get_draft` | read | Draft content and current revision in the specified mailbox. |
 | `create_draft` | draft | Create a new message, a threaded reply (quoting the original) or a forward, with attachments. |
 | `update_draft` | draft | Edit an owned draft, conditional on the expected revision (§5.3); attachments kept unless replaced. |
+| `delete_draft` | draft | Delete one owned, unchanged draft (optionally conditional on `expected_revision`). Gmail: `messages.trash` of the draft's message; IMAP: `\Deleted` + `UID EXPUNGE` of exactly the own draft's UID. |
+| `update_messages` | organize | Up to 100 ids: add/remove flags (`UNREAD`, `STARRED`) and labels (Gmail user labels, never created; IMAP keywords). Per-id results. |
+| `move_messages` | organize (+ delete) | Up to 100 ids to a folder/label, `archive`, `inbox`, `trash` or `spam`. Trash, Spam/Junk and folders below them need `delete`; moving out of them is organize. Per-id results with `new_id` (IMAP ids change). Never a permanent delete. |
 | `send_draft` | send | Optional. Submit one existing, owned draft under §6.3. |
 
 Read tools set `readOnlyHint: true`. Update and send set `destructiveHint: true`. Annotations describe tools; the server enforces authorization. Draft deletion remains a human mailbox action in v1.
@@ -489,6 +492,15 @@ Outbound allowlist (method, path pattern under `https://gmail.googleapis.com/gma
 | PUT | `drafts/{id}` | `update_draft` |
 | POST | `drafts/send` | Only through the separately gated `send_draft` operation (§6.3). |
 | GET | `settings/sendAs` | Validate `from_address`; `gmail.readonly` is accepted. |
+| POST | `messages/{id}/modify` | `update_messages`, `move_messages` (labels, archive, inbox, spam); needs `gmail.modify` |
+| POST | `messages/batchModify` | Allowlisted for bulk label changes (the tools currently send per-message `modify`) |
+| POST | `messages/{id}/trash` | `move_messages` to `trash` (needs `delete`), `delete_draft` |
+| POST | `messages/{id}/untrash` | `move_messages` out of Trash |
+| POST | `threads/{id}/modify` | Allowlisted for thread-level label changes (not used by the tools yet) |
+
+There is no `DELETE` and no `batchDelete`: Dove cannot delete permanently. Since 0.2, connects request `gmail.modify`
+as well (optional at the consent screen; without it organize/delete answer `account_unavailable` with
+`reason: reauth_required` until `dove accounts reconnect`).
 
 Plus `POST https://oauth2.googleapis.com/token` (code exchange, refresh) and
 `POST https://oauth2.googleapis.com/revoke`, and Google's public keys for ID token validation.

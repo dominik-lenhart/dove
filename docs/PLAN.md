@@ -271,3 +271,17 @@ hosts or reference hardware.
   signature or trusted comment (`dove <tag>`) does not verify, refuses downgrades unless a version is named, and
   never runs inside `serve`. The update hint lives in the CLI only (spec 13a amended); the service keeps its outbound
   allowlist and reports its version over the admin socket so the CLI can say when a restart is due.
+- A51. Organize and delete (design 2026-11-13 sections 1-2, points the design left open): `gmail.modify` is requested at
+  connect but optional (readonly and compose stay required); a grant without it gets `account_unavailable` with
+  `reason: reauth_required` from the organize tools and Gmail `delete_draft`, decided from the stored granted scopes
+  before any request. Gmail `delete_draft` trashes the draft's message (`messages.trash`) because the design forbids
+  `DELETE` (`drafts.delete`); it therefore needs `gmail.modify` too. The tools send one `messages.modify` per id
+  (bounded concurrency) for per-id results; `batchModify` and `threads.modify` are allowlisted but unused. Gmail
+  labels are never created, system labels only through flags and move targets. IMAP labels are keywords (RFC 3501
+  atoms, no system flags); `archive` is a folder named Archive/Archives/Archiv (no special-use role is stored for it).
+  A destination counts as Trash/Junk (needs `delete`) when it has that special-use role, has a well-known Trash/Junk
+  name in any path segment (including Strato's `Spamverdacht`), or lies below a Trash/Junk folder. On IMAP without
+  `MOVE`, an OK `COPY` without `COPYUID` leaves the original in place and reports an error for that id; a failed
+  `\Deleted`/`EXPUNGE` after a confirmed copy does the same. The approval page applies a selected preset instead of
+  the checkboxes (send stays its own checkbox, shown only with `allow_send`); the result is always narrowed to the
+  invitation. `delete_draft` takes an optional `expected_revision` and removes the `own_drafts` row on success.

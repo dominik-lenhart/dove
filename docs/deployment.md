@@ -80,8 +80,9 @@ Do this once, as the owner (spec section 9). Console names change; the intent is
 4. Audience: user type **External** (needed for personal `@gmail.com` accounts and for Workspace domains other than
    the one that owns the project). Set the publishing status to **In production**. While the app is in **Testing**,
    Google expires refresh tokens after 7 days and Dove would stop working every week.
-5. Data access: add the scopes `openid`, `email`, `https://www.googleapis.com/auth/gmail.readonly` and
-   `https://www.googleapis.com/auth/gmail.compose`. Both Gmail scopes are classed as restricted. **Do not submit the
+5. Data access: add the scopes `openid`, `email`, `https://www.googleapis.com/auth/gmail.readonly`,
+   `https://www.googleapis.com/auth/gmail.compose` and `https://www.googleapis.com/auth/gmail.modify` (the last one for
+   the organize and delete tools; Dove never deletes permanently). The Gmail scopes are classed as restricted. **Do not submit the
    app for verification.** A personal-use app stays unverified: when you connect a mailbox Google shows "Google
    hasn't verified this app" and you continue through **Advanced**. An unverified app is limited to 100 users over
    the project's lifetime, which is enough for about 25 mailboxes.
@@ -349,12 +350,25 @@ dove projects add-account acme work-info
 dove projects add-account acme work-billing
 
 dove clients create support-agent --project acme \
-    --grant work-info=read,draft --grant work-billing=read --expires 90d --allow-ip 203.0.113.0/24
+    --grant work-info=assistant --grant work-billing=read --expires 90d --allow-ip 203.0.113.0/24
 ```
 
 `clients create` prints the token (`dove_` followed by 43 base64url characters) **once**. Store it in the agent's
-secret store, not in a project file. Grants are explicit per mailbox, `draft` requires `read`, and `send`
-requires both. Adding a mailbox to a project gives existing tokens no new access. Other commands:
+secret store, not in a project file. Grants are explicit per mailbox. Actions:
+
+| Action | Allows | Needs |
+| --- | --- | --- |
+| `read` | search, read, attachments, list folders and drafts | - |
+| `draft` | create, update and delete its own drafts | `read` |
+| `organize` | mark read/unread, star, add/remove labels (IMAP keywords), archive, move between folders, move out of Trash/Spam | `read` |
+| `delete` | move to Trash or Spam/Junk (also any folder below them); never a permanent delete | `organize` |
+| `send` | `send_draft`, only with `allow_send = true` | `draft` |
+
+Presets are shorthands: `reader` = `read`, `drafter` = `read,draft`, `assistant` = `read,draft,organize`, `full` =
+`read,draft,organize,delete`. Mix them with actions, for example `--grant work-info=assistant,send` or
+`--grant work-info=reader,organize`. Unknown words are an error. Dove stores the expanded action list, so a token keeps
+exactly what it was given; tokens created before 0.2 keep their `read`/`draft`/`send` grants and gain nothing. Adding a
+mailbox to a project gives existing tokens no new access. Other commands:
 `clients set-grants <name> --grant ...` (replaces the whole set atomically), `clients rotate <name>`,
 `clients revoke <name>`, `clients show <name>`, `clients list`, `projects list|show|remove-account`. Changes take
 effect on the next request, without a restart. `--expires` takes `90d`, `12h`, `30m`, `45s` or `2w`.
@@ -367,10 +381,19 @@ claude mcp add --transport http dove https://dove.example.com/mcp --header "Auth
 ```
 
 Instead of handing out a token, the operator can create a one-time invitation with `dove clients invite <name>
---project acme --accounts info --capabilities read,draft`. The user redeems it on their own machine with
+--project acme --accounts info --capabilities assistant` (actions and presets as for `--grant`). The user redeems it on their own machine with
 `dove login --server https://dove.example.com --profile acme` (it prompts for the invitation) and then runs
 `dove mcp install --client claude-code --profile acme`, or enters it on the OAuth approval page of ChatGPT or Claude.
-`dove login --token-stdin` stores an existing `clients create` token instead.
+`dove login --token-stdin` stores an existing `clients create` token instead. On the OAuth approval page the user
+can narrow the invitation per mailbox, never widen it: a preset selector (`custom` means the checkboxes decide) and
+checkboxes, with `read`, `draft` and `organize` pre-selected and `delete` and `send` off. `send` is only shown while
+`allow_send = true`.
+
+**Gmail mailboxes connected before 0.2** lack Google's `gmail.modify` permission, which `organize`, `delete` and
+`delete_draft` need. They keep working for reading, drafts and sending; those tools answer `account_unavailable` with
+`reason: reauth_required` until you run `dove accounts reconnect <alias>` and approve the new permission. IMAP mailboxes
+need nothing: moves use IMAP `MOVE` where the server offers it, otherwise `COPY` and then a `\Deleted` flag and
+`UID EXPUNGE` of exactly the messages the server confirmed as copied.
 
 A `send` grant is refused unless `allow_send = true` is set in `config.toml`; that file is deployment-owner
 configuration, and neither MCP calls nor the CLI can change it. See the README before enabling it.
