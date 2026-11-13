@@ -459,3 +459,32 @@ hosts or reference hardware.
   subject); Gmail over IMAP gets it from All Mail with `SENT`. Both are tested against the fake IMAP server. A reply
   without a stored Sent copy (`save_sent_copy = false`, a client that does not file one) is invisible. (f) Watches
   refuse `from_self` (their filter runs inside the sync hook without the state store's aliases).
+- A62. Coverage exceptions say what happens next (report of a first-backfill `coverage: partial` on two IMAP
+  mailboxes, 2026-11-13: the agent could not tell whether to wait, retry or proceed). Code: `src/tools/coverage.rs`;
+  `search_messages`, `digest` and `search_contacts` share it through `collect_targets` / `field_coverage`. (a) Every
+  exception and every `account_errors` entry has `resolves`: `automatic` (Dove closes it by itself, waiting helps),
+  `operator` (will not resolve on its own: indexing not enabled, `reauth_required`, `disabled`, category and
+  attachment-text gaps that only an index rebuild fills) or `never` (a message-level gap such as a body over the size
+  cap) and a one-sentence `hint`. Existing `reason` strings and the error code `account_unavailable` are unchanged;
+  all new keys are additive. (b) Times come from the scheduler's own rows, never from a guess: `next_sync_at` is
+  `sync_state.next_run_at`; `next_retry_at` of "messages pending retry" is the later of the earliest
+  `pending.next_attempt_at` among rows with `attempts > 0` and `sync_state.next_run_at`, because only a sync pass
+  hydrates due records; `retry_after_seconds` is that time minus now (0 = a pass is due or running now). A mailbox
+  without sync state yet reports `TICK_SECS` (the scheduler tick that creates it). A first backfill has no completion
+  estimate and says so in its hint. `last_error` / `last_sync_error` carry only stable error codes. (c) `pending`
+  rows are split: `attempts = 0` is "queued" (listed, not fetched yet), not a retry. Inside a backfill it only adds
+  `queued` to the stage entry; in a ready mailbox it is its own "messages waiting to be indexed" entry; "pending
+  retry" now counts only rows that failed at least once. (d) A mailbox that is not `active` is an `account_errors`
+  entry with `reason` `reauth_required` / `disabled` (the account status in the state store), `resolves:
+  operator` and the command to run; a grant that changed while the request ran reports `access_changed`. (e) A
+  top-level `hint` appears whenever coverage is partial for these reasons (also in the `index_incomplete` details):
+  "every gap is temporary" when all entries are `automatic`, otherwise it names the mailboxes that will not resolve by
+  waiting. (f) Decision, exceptions only where they can affect the result: not done for pending rows. `pending`
+  stores `(gen, gmail_id, seq, attempts, next_attempt_at, last_error)` and no date: Gmail's list call returns ids
+  only and IMAP's `UID SEARCH ALL` returns UIDs only, so a `received_at` range cannot exclude them without one extra
+  fetch per message, which is the work the pending record exists to defer. The one structural exclusion (IMAP rows in
+  Junk/Trash cannot match a query without `include_spam_trash`) needs `imap_folders.special` from the state store
+  inside the index read transaction, and Gmail-over-IMAP labels are not derivable from the folder; both cost more
+  than they save. So every pending row still makes the result `partial`, now with the time it is expected to be gone.
+  Revisit if `pending` ever gains a date column (it would need a migration plus an `INTERNALDATE` fetch at
+  enumeration).

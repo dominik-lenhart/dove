@@ -396,3 +396,9 @@ cargo fmt
   assert the count of the lookup lines in the plan test. `query::Scope` carries `selves` (own addresses per account
   id); `from_self` and `group_by:"thread"` refuse to compile without an entry for every target, so a new caller that
   passes an empty map gets `invalid_argument`, not a silently wrong answer.
+- 2026-11-13: Coverage exceptions (`src/tools/coverage.rs`, PLAN A62) are built only there; search, digest and contacts
+  must not hand-write exception JSON. `pending` has no date, so a query's `received_at` range cannot exclude pending
+  rows; `attempts = 0` rows are "queued", only `attempts > 0` are retries, and a retry cannot run before the next
+  sync pass (`next_retry_at` = later of `next_attempt_at` and `sync_state.next_run_at`). Tests move those times with
+  `UPDATE pending/sync_state` and compare against the stored values, not wall-clock guesses. The tool-description text
+  about `resolves` is the `coverage_note!` macro in `src/tools/mod.rs`.

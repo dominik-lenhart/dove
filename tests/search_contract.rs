@@ -364,9 +364,35 @@ async fn coverage_counts_and_partial_failures() {
     // AC14: all mailboxes by default; reauth_required ops is one account_errors entry, plain is not indexed.
     let v = fx.search(json!({"select": ["account", "subject"], "limit": 100})).await;
     assert_eq!(v["coverage"], "partial");
-    assert_eq!(v["account_errors"], json!([{"account": "ops", "code": "account_unavailable"}]));
+    // A reauth_required mailbox keeps the stable code and says why and that waiting does not help (PLAN A62).
+    let errs = v["account_errors"].as_array().unwrap();
+    assert_eq!(errs.len(), 1, "{v}");
+    assert_eq!((errs[0]["account"].as_str(), errs[0]["code"].as_str()), (Some("ops"), Some("account_unavailable")));
+    assert_eq!(errs[0]["reason"], "reauth_required");
+    assert_eq!(errs[0]["resolves"], "operator");
+    assert!(errs[0]["hint"].as_str().unwrap().contains("dove accounts reconnect"), "{v}");
     assert_eq!(v["exceptions"][0]["account"], "plain");
     assert_eq!(v["exceptions"][0]["stage"], "not_indexed");
+    assert_eq!(v["exceptions"][0]["resolves"], "operator");
+    // Nothing here resolves by waiting, and the top-level hint names the mailboxes that need the operator.
+    let hint = v["hint"].as_str().unwrap();
+    assert!(hint.starts_with("Waiting will not help: ops, plain need operator action"), "{hint}");
+    // A disabled account gets its own reason.
+    let acct = fx.accounts["ops"].clone();
+    fx.h.app()
+        .store
+        .call(move |c| Ok(c.execute("UPDATE accounts SET status = 'disabled' WHERE id = ?1", [acct])?))
+        .await
+        .unwrap();
+    let d = fx.search(json!({"accounts": ["info", "ops"], "select": ["account"]})).await;
+    assert_eq!(d["account_errors"][0]["reason"], "disabled", "{d}");
+    assert_eq!(d["account_errors"][0]["code"], "account_unavailable");
+    let acct = fx.accounts["ops"].clone();
+    fx.h.app()
+        .store
+        .call(move |c| Ok(c.execute("UPDATE accounts SET status = 'reauth_required' WHERE id = ?1", [acct])?))
+        .await
+        .unwrap();
     let accts: Vec<Value> = col(&v, "account");
     assert!(accts.iter().all(|a| a == "info" || a == "billing"), "{accts:?}");
     assert_eq!(accts.len(), 8);
@@ -416,6 +442,23 @@ async fn coverage_counts_and_partial_failures() {
     assert!(is_err);
     assert_eq!(e["error"]["code"], "index_incomplete");
     assert_eq!(e["error"]["details"]["exceptions"][0]["stage"], "stale");
+    assert_eq!(e["error"]["details"]["exceptions"][0]["resolves"], "automatic");
+    assert!(e["error"]["details"]["hint"].as_str().unwrap().starts_with("Every gap is temporary"), "{e}");
+    // The next scheduled sync is reported from the scheduler's own state.
+    let aid = fx.accounts["info"].clone();
+    let at = dove::util::now_unix() + 120;
+    fx.h.app()
+        .index
+        .write(move |c| {
+            Ok(c.execute("UPDATE sync_state SET next_run_at = ?1 WHERE account_id = ?2", rusqlite::params![at, aid])?)
+        })
+        .await
+        .unwrap();
+    let (_, e) = fx.h.call(&fx.token, "search_messages", json!({"accounts": ["info"], "count_only": true})).await;
+    let ex = &e["error"]["details"]["exceptions"][0];
+    assert_eq!(ex["next_sync_at"], dove::util::rfc3339(at), "{e}");
+    let secs = ex["retry_after_seconds"].as_i64().unwrap();
+    assert!((115..=120).contains(&secs), "{secs}");
     let v = fx.search(json!({"accounts": ["info"], "count_only": true, "max_lag_seconds": 7200})).await;
     assert_eq!(v["count"], 6);
     let v = fx.search(json!({"accounts": ["info"], "max_lag_seconds": 60})).await;
@@ -662,9 +705,15 @@ async fn body_and_mime_coverage_affect_only_queries_using_them() {
     let v = fx.search(body(pred("body_text", "terms", json!("needle")))).await;
     assert_eq!(v["rows"], json!([["Short body"]]));
     assert_eq!(v["coverage"], "partial");
-    assert!(
-        v["exceptions"].as_array().unwrap().iter().any(|e| e["reason"] == "body text incomplete for some messages")
-    );
+    let gap = v["exceptions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["reason"] == "body text incomplete for some messages")
+        .expect("body gap reported");
+    // A message-level gap never fills in by waiting, and the top-level hint says so.
+    assert_eq!(gap["resolves"], "never", "{v}");
+    assert!(v["hint"].as_str().unwrap().starts_with("Waiting will not help"), "{v}");
     let mut rc = body(pred("body_text", "terms", json!("needle")));
     rc["coverage_policy"] = json!("require_complete");
     assert_eq!(fx.err(rc).await, "index_incomplete");
@@ -754,7 +803,10 @@ async fn live_gmail_route() {
         .search(json!({"source": "gmail", "gmail_query": "zulu", "accounts": ["plain", "ops"], "select": ["subject"]}))
         .await;
     assert_eq!(v["rows"], json!([["Plain hello"]]));
-    assert_eq!(v["account_errors"], json!([{"account": "ops", "code": "account_unavailable"}]));
+    assert_eq!(v["account_errors"].as_array().unwrap().len(), 1);
+    assert_eq!(v["account_errors"][0]["account"], "ops");
+    assert_eq!(v["account_errors"][0]["code"], "account_unavailable");
+    assert_eq!(v["account_errors"][0]["reason"], "reauth_required");
     // Upstream failure in one mailbox is reported, the others still answer.
     h.google.fail_next("GET", "/messages", Fault::Status(400, json!({"error": {}})));
     let v = fx

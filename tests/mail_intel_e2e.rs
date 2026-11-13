@@ -550,6 +550,12 @@ async fn contacts_require_an_indexed_mailbox_and_report_coverage() {
     assert_eq!(v["contacts"], json!([]));
     assert_eq!(v["coverage"], "partial");
     assert!(v["exceptions"].as_array().unwrap().iter().any(|e| e["stage"] == "not_indexed"), "{v}");
+    // Digest and contacts share the exceptions: this one needs the operator, and the hint says waiting is useless.
+    assert_eq!(v["exceptions"][0]["resolves"], "operator", "{v}");
+    assert!(v["hint"].as_str().unwrap().starts_with("Waiting will not help"), "{v}");
+    let d = fx.h.ok(&fx.token, "digest", json!({"since": "2026-01-01T00:00:00Z"})).await;
+    assert_eq!(d["exceptions"][0]["resolves"], "operator", "{d}");
+    assert!(d["hint"].as_str().unwrap().starts_with("Waiting will not help"), "{d}");
 }
 
 // ------------------------------------------------------------------ digest
