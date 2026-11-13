@@ -24,6 +24,7 @@ pub mod policy;
 pub mod secrets;
 pub mod serve;
 pub mod store;
+pub mod tailscale;
 pub mod tokens;
 pub mod tools;
 pub mod update;

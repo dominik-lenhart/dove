@@ -529,6 +529,9 @@ async fn doctor(app: &Arc<App>) -> Value {
         Err(_) => false,
     };
     add("public_url_tls", tls_ok, health);
+    // Public address and loopback listener, for `dove doctor` to compare with the Tailscale serve configuration.
+    checks.push(json!({ "check": "public_url", "ok": true, "detail": app.cfg.public_base(),
+                        "listen": app.cfg.listen.to_string() }));
     json!(checks)
 }
 

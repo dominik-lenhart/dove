@@ -53,6 +53,9 @@ pub enum Command {
     /// Manage the per-mailbox search index (admin).
     #[command(subcommand)]
     Index(IndexCmd),
+    /// Publish Dove on your tailnet with Tailscale Serve (run as the operator; does not use the admin socket).
+    #[command(subcommand)]
+    Tailscale(TailscaleCmd),
     /// Unknown-outcome draft operations (admin).
     #[command(subcommand)]
     Operations(OperationsCmd),
@@ -502,6 +505,26 @@ pub enum IndexCmd {
 }
 
 #[derive(Subcommand)]
+pub enum TailscaleCmd {
+    /// Mount Dove's public paths (and only those) on this node's MagicDNS name with `tailscale serve`, and set
+    /// `public_url` in the config file. Safe to run again. Restart Dove afterwards.
+    Setup {
+        /// Config file to read and update.
+        #[arg(long, default_value = "/etc/dove/config.toml")]
+        config: PathBuf,
+        /// HTTPS port on the tailnet name.
+        #[arg(long, default_value_t = 443)]
+        port: u16,
+        /// ALSO make Dove reachable from the internet (Tailscale Funnel). Off unless you ask for it.
+        #[arg(long)]
+        funnel: bool,
+        /// Print the commands and the config change without running anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum OperationsCmd {
     List {
         #[command(flatten)]
@@ -637,7 +660,7 @@ fn admin_request(cmd: Command) -> anyhow::Result<(AdminOpts, AdminRequest)> {
                 (admin, R::OperationsRemove { client, account, request_key })
             }
         },
-        Command::Doctor { .. } => unreachable!("handled in run_command"),
+        Command::Doctor { .. } | Command::Tailscale(_) => unreachable!("handled in run_command"),
         Command::Export { admin } => (admin, R::Export),
         Command::Serve { .. }
         | Command::ConfigExample
@@ -746,9 +769,14 @@ async fn run_command(command: Command) -> anyhow::Result<()> {
         // Remote commands never reach the admin socket (spec 5.6).
         Command::Remote(cmd) => crate::client::run(*cmd).await,
         Command::Doctor { profile: Some(p), admin } => crate::client::doctor(Some(&p), admin.json).await,
+        Command::Tailscale(TailscaleCmd::Setup { config, port, funnel, dry_run }) => {
+            let opts = crate::tailscale::SetupOpts { config, port, funnel, dry_run };
+            crate::tailscale::setup(&opts, &crate::tailscale::Tailscale::from_path(), &mut std::io::stdout()).await
+        }
         Command::Doctor { profile: None, admin } => {
             let mut v = admin_client::send(&admin.socket, &AdminRequest::Doctor).await?;
             add_binary_version(&mut v);
+            crate::tailscale::add_doctor_check(&mut v, &crate::tailscale::Tailscale::from_path()).await;
             print(&v, admin.json);
             Ok(())
         }
