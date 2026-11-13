@@ -540,4 +540,11 @@ async fn failed_bearer_authentication_is_limited_per_address() {
     // Another address keeps its own budget.
     assert_eq!(from("198.51.100.9", bad()).await.0, 401);
     assert_eq!(from("198.51.100.9", Some(token.clone())).await.0, 200);
+    // Loopback stands for every caller behind Tailscale Serve or in local mode: never limited as one address.
+    for _ in 0..5 {
+        let r = h.post_mcp(bad().as_deref(), json!({"jsonrpc":"2.0","id":1,"method":"ping"}), &[]).await;
+        assert_eq!(r.status(), 401);
+    }
+    let r = h.post_mcp(Some(&token), json!({"jsonrpc":"2.0","id":1,"method":"ping"}), &[]).await;
+    assert_eq!(r.status(), 200);
 }

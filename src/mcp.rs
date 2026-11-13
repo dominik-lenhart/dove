@@ -185,9 +185,14 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
         return unauthorized(&app);
     }
     // Each attempt costs a keyed hash and a store lookup: an address that keeps failing is refused before both.
-    let fail_key = format!("mcp-auth-fail:{}", crate::oauth::ip_bucket(ip));
+    // Unknown and loopback addresses are not limited: they stand for every caller at once (local mode, Tailscale
+    // Serve, a proxy without the shared secret), so one bucket would let any caller lock out all the others.
+    let fail_key = ip
+        .map(|i| i.to_canonical())
+        .filter(|i| !i.is_loopback())
+        .map(|i| format!("mcp-auth-fail:{}", crate::oauth::ip_bucket(Some(i))));
     let fail_limit = app.cfg.limits.auth_failures_per_minute;
-    if let Some(wait) = app.rate_limiter.exhausted(&fail_key, fail_limit, fail_limit) {
+    if let Some(wait) = fail_key.as_deref().and_then(|k| app.rate_limiter.exhausted(k, fail_limit, fail_limit)) {
         return too_many(wait);
     }
     let resource = resource_url(&app);
@@ -197,7 +202,9 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
     let authed = match auth {
         Ok(Ok(a)) => a,
         Ok(Err(AuthFailure::Unauthorized)) => {
-            app.rate_limiter.check(&fail_key, fail_limit, fail_limit);
+            if let Some(k) = &fail_key {
+                app.rate_limiter.check(k, fail_limit, fail_limit);
+            }
             return unauthorized(&app);
         }
         Err(e) => {
