@@ -317,3 +317,9 @@ cargo fmt
   `assert_gmail_deletes_only_in_drafts()` walks the command log (it also panics on any `UID COPY`).
 - 2026-11-13: Restoring a mutated file with its old content keeps its old mtime, so cargo reuses the mutated build and
   the "fixed" run still fails (or a later mutant looks killed). `touch` the file after restoring it.
+- 2026-11-13: CI's gitleaks scans the whole git history, and a fixed UUID literal such as `"request_key": "4b0c..."` trips
+  its `generic-api-key` rule. Use `uuid::Uuid::new_v4()` in tests; a finding already in history needs a fingerprint line
+  in `.gitleaksignore` (`<commit>:<file>:<rule>:<line>`). Check locally with the docker command above before pushing.
+- 2026-11-13: The production host blocks outgoing port 465; SMTP to Gmail and Strato runs on 587 STARTTLS here. Dove on
+  this host is published with `tailscale serve` on port 43395 only; ports 43361 and 43380 belong to other services.
+  `dove tailscale setup --port 43395 --dry-run` shows exactly what it would change.

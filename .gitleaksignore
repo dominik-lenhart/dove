@@ -1,0 +1,2 @@
+# False positive: a fixed UUID request_key in a test (replaced by a random one in a later commit).
+84ae4f4e5b33f8f23559cd4bd618f76f5319bab2:tests/imap_gmail_e2e.rs:generic-api-key:564

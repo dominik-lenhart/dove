@@ -561,7 +561,7 @@ async fn drafts_and_send_on_gmail() {
         .ok(
             &fx.token,
             "create_draft",
-            json!({ "account": "me", "request_key": "4b0c2a3e-1f7d-4c55-9a51-0d6e2f1a7b11", "to": ["Ann <ann@example.net>"],
+            json!({ "account": "me", "request_key": uuid::Uuid::new_v4().to_string(), "to": ["Ann <ann@example.net>"],
                     "subject": "Angebot", "body_text": "Hallo Ann" }),
         )
         .await;
