@@ -6,6 +6,7 @@
 # Environment:
 #   DOVE_VERSION       X.Y.Z (or vX.Y.Z); default: the latest release
 #   DOVE_INSTALL_DIR   target directory; default: /usr/local/bin as root, otherwise ~/.local/bin
+#   DOVE_LIBC          Linux only: gnu or musl; default: musl on musl systems (Alpine), gnu everywhere else
 #   DOVE_DOWNLOAD_BASE testing only: replaces https://github.com/dominik-lenhart/dove/releases/download
 #                      (files are fetched from <base>/<tag>/<file>; DOVE_VERSION is then required)
 #
@@ -45,10 +46,22 @@ fi
 command -v tar >/dev/null 2>&1 || die "tar is required"
 
 # ---- platform ----------------------------------------------------------------------------------------------
+# Linux ships two builds: glibc (gnu) and a static musl one. A musl system (Alpine, Void musl) cannot run the gnu build.
+is_musl() {
+  [ -e /etc/alpine-release ] && return 0
+  command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl
+}
 case "$(uname -s)" in
-  Linux) os=unknown-linux-gnu ;;
+  Linux)
+    case "${DOVE_LIBC:-}" in
+      gnu | musl) libc="$DOVE_LIBC" ;;
+      "") if is_musl; then libc=musl; else libc=gnu; fi ;;
+      *) die "DOVE_LIBC must be gnu or musl, not '$DOVE_LIBC'" ;;
+    esac
+    os="unknown-linux-$libc"
+    ;;
   Darwin) os=apple-darwin ;;
-  *) die "unsupported operating system: $(uname -s) (Linux and macOS only)" ;;
+  *) die "unsupported operating system: $(uname -s) (Linux and macOS only; on Windows use install.ps1)" ;;
 esac
 case "$(uname -m)" in
   x86_64 | amd64) arch=x86_64 ;;
