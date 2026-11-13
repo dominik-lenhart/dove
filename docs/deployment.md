@@ -470,8 +470,9 @@ these files). Data directories are 0700 on macOS and Linux; on Windows they are 
 list for your account only, and Dove refuses to start when the data directory grants access to other accounts
 (Everyone, Users, Authenticated Users or another user; SYSTEM and Administrators are accepted).
 
-The config has `mode = "local"`. In local mode `public_url` may be `http://127.0.0.1:<port>` or
-`http://localhost:<port>` with the port of `listen`, and nothing else over plain HTTP; requests must carry exactly that
+The config has `mode = "local"`. In local mode `public_url` must be exactly `http://` plus the `listen` address, for
+example `http://127.0.0.1:8787`: an IP literal, never `localhost` (on Windows and macOS `localhost` resolves to `::1`
+first, an address Dove does not hold and another local user could), and never HTTPS. Requests must carry exactly that
 Host. `X-Forwarded-For` is never trusted, so no proxy secret is needed.
 
 ### Admin channel
