@@ -23,7 +23,7 @@ Contents: [Requirements](#requirements) · [Install](#install) · [Google Cloud]
   memory at steady state is provisional and not measured yet. A 1 GiB profile exists for larger workloads. Disk: the
   state store is small; the search index will grow with mail volume.
 - A Google account that owns a Google Cloud project, and 2-step verification on every mailbox you connect.
-- For building: Rust 1.90 or newer, a C compiler, `perl` and `make` (SQLCipher and OpenSSL are vendored and built
+- For building: Rust 1.100 or newer (pinned in `rust-toolchain.toml`), a C compiler, `perl` and `make` (SQLCipher and OpenSSL are vendored and built
   from source). Running needs none of them.
 - Keep agents off this host, or at least off the service and operator accounts. See
   [Administration access](#administration-access).

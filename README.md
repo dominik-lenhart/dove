@@ -77,7 +77,7 @@ Other ways:
 - **Release archives:** signed `.tar.gz` builds for Linux and macOS on the
   [releases page](https://github.com/dominik-lenhart/dove/releases). [`docs/releasing.md`](docs/releasing.md)
   explains how to verify them.
-- **From source:** Rust 1.90+, a C compiler, `perl` and `make`, then `cargo build --release --locked`.
+- **From source:** Rust 1.100+ (pinned in `rust-toolchain.toml`), a C compiler, `perl` and `make`, then `cargo build --release --locked`.
 
 ## Quickstart
 

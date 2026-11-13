@@ -2,7 +2,7 @@
 name = "dove-mcp"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.90"
+rust-version = "1.100"
 description = "Self-hosted mail MCP server for AI agents (Gmail, token-scoped access, encrypted search index)"
 license = "Apache-2.0"
 repository = "https://github.com/dominik-lenhart/dove"
@@ -23,7 +23,6 @@ tokio-util = "0.7"
 futures = "0.3"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "form", "original-uri"] }
 tower = { version = "0.5", features = ["limit", "timeout", "util"] }
-tower-http = { version = "0.7", features = ["limit"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "form", "query", "http2"] }
 # IMAP/SMTP TLS: the same rustls stack, crypto provider and platform verifier reqwest uses (no second TLS path).
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
