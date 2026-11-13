@@ -33,7 +33,7 @@ services:
   dove:
     # Pin a version tag; never `latest` in production. Upgrade by changing the tag, then
     # `docker compose pull && docker compose up -d` (docs/deployment.md, Upgrading).
-    image: ghcr.io/dominik-lenhart/dove:0.1.0
+    image: ghcr.io/dominik-lenhart/dove:0.3.0
     # To run a source build instead, replace the line above with
     #   image: dove-mcp:local
     # and build it first: docker build -f deploy/Containerfile -t dove-mcp:local .

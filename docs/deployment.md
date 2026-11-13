@@ -61,7 +61,7 @@ Do not enable the service yet; create secrets and the configuration first.
 ### Container
 
 ```sh
-docker pull ghcr.io/dominik-lenhart/dove:0.1.0                   # a release image (linux/amd64, linux/arm64)
+docker pull ghcr.io/dominik-lenhart/dove:0.3.0                   # a release image (linux/amd64, linux/arm64)
 docker build -f deploy/Containerfile -t dove-mcp:local .         # or a local source build
 ```
 

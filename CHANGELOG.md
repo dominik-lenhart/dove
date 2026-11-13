@@ -5,6 +5,8 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-13
+
 ### Added
 
 - Gmail over IMAP with an app password: no Google Cloud project needed. `dove accounts connect-imap --email
@@ -105,6 +107,7 @@ First release.
   release only after verifying its minisign signature. The CLI hints at a new release at most once a day
   (`DOVE_NO_UPDATE_CHECK=1` turns it off); the server never checks for updates.
 
-[Unreleased]: https://github.com/dominik-lenhart/dove/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/dominik-lenhart/dove/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/dominik-lenhart/dove/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/dominik-lenhart/dove/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/dominik-lenhart/dove/releases/tag/v0.1.0
