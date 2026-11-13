@@ -299,3 +299,18 @@ async fn imap_list_drafts_redacts_subjects() {
     assert_eq!(v["drafts"][0]["subject"], "Passwort: [redacted]");
     assert_eq!(v["drafts"][0]["redacted"], true);
 }
+
+/// The thread view (`group_by:"thread"`) renders through the same table step, so its rows are redacted too.
+#[tokio::test]
+async fn thread_view_rows_are_redacted() {
+    let fx = setup().await;
+    let h = &fx.h;
+    let args = json!({ "select": ["thread_id", "subject", "snippet", "message_count"], "group_by": "thread" });
+    let (v, text) = both(h, &fx.on, "search_messages", args.clone()).await;
+    assert!(!leaks(&v.to_string()) && !leaks(&text), "{v}");
+    let r = rows(&v);
+    assert_eq!(r.len(), 2, "{v}");
+    assert_eq!(r.iter().filter(|r| r["redacted"] == true).count(), 1, "{v}");
+    let (v, _) = both(h, &fx.off, "search_messages", args).await;
+    assert!(leaks(&v.to_string()), "the default connection sees the thread rows unchanged");
+}
