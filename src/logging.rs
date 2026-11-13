@@ -7,7 +7,36 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::Layer;
+use tracing_subscriber::filter::filter_fn;
 use tracing_subscriber::fmt::MakeWriter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+
+/// Crates whose log events may reach the log: Dove itself and the transport stack. Everything else is dropped,
+/// whatever `DOVE_LOG` says. The parsers of mail and attachments (lopdf, html5ever, mail-parser, zip ...) see
+/// untrusted content and quote it in their warnings (lopdf prints whole PDF font dictionaries), so a crate that
+/// reads content must never be added here.
+const LOG_TARGETS: &[&str] = &[
+    "dove",
+    "axum",
+    "tower",
+    "tower_http",
+    "hyper",
+    "hyper_util",
+    "h2",
+    "reqwest",
+    "rustls",
+    "tokio_rustls",
+    "rustls_platform_verifier",
+    "tokio",
+    "rusqlite",
+];
+
+/// Whether events of `target` (a module path) may be logged; see [`LOG_TARGETS`].
+pub fn target_allowed(target: &str) -> bool {
+    LOG_TARGETS.iter().any(|c| target.strip_prefix(c).is_some_and(|rest| rest.is_empty() || rest.starts_with("::")))
+}
 
 /// Masks secrets that might slip into a log string.
 pub fn redact(input: &str) -> String {
@@ -102,24 +131,23 @@ pub fn init_service_logging() {
 /// Installs the service log format (JSON, redacted) writing to `writer`. Returns false if a global subscriber
 /// already exists. Tests use it to inspect exactly what the service would log.
 pub fn install_service_logging<W: Write + Send + 'static>(writer: W, filter: EnvFilter) -> bool {
-    tracing_subscriber::fmt()
+    let layer = tracing_subscriber::fmt::layer()
         .json()
         .with_current_span(false)
         .with_span_list(false)
-        .with_env_filter(filter)
         .with_writer(RedactingWriter::new(writer))
-        .try_init()
-        .is_ok()
+        .with_filter(filter_fn(|m| target_allowed(m.target())));
+    tracing_subscriber::registry().with(filter).with(layer).try_init().is_ok()
 }
 
 /// Plain stderr logging for CLI commands (warnings only by default).
 pub fn init_cli_logging() {
     let filter = EnvFilter::try_from_env("DOVE_LOG").unwrap_or_else(|_| EnvFilter::new("warn"));
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
+    let layer = tracing_subscriber::fmt::layer()
         .with_writer(RedactingWriter::new(std::io::stderr()))
         .without_time()
-        .try_init();
+        .with_filter(filter_fn(|m| target_allowed(m.target())));
+    let _ = tracing_subscriber::registry().with(filter).with(layer).try_init();
 }
 
 #[cfg(test)]
@@ -139,5 +167,15 @@ mod tests {
         assert!(!r.contains("0gLongRefreshTokenValue123"));
         assert!(!r.contains("a0AfB_byLongAccess"));
         assert_eq!(redact("plain text ümlaut"), "plain text ümlaut");
+    }
+
+    #[test]
+    fn only_dove_and_transport_targets_are_logged() {
+        for t in ["dove", "dove::index::sync", "hyper::proto", "rustls", "tokio_rustls::client"] {
+            assert!(target_allowed(t), "{t}");
+        }
+        for t in ["lopdf::reader", "html5ever::tree_builder", "mail_parser", "dovecot", "hyperx", "log", ""] {
+            assert!(!target_allowed(t), "{t}");
+        }
     }
 }
