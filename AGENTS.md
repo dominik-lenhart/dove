@@ -350,3 +350,8 @@ cargo fmt
   opening a SQLCipher connection outlasted a 100 ms deadline). `Index::read` enforces deadlines with a progress handler
   on the reader's own thread (rusqlite feature `hooks`). Tests of a deadline use a bounded query so a regression fails
   instead of hanging the runner.
+- 2026-11-13: nginx/Angie `set_real_ip_from` / `real_ip_header` set in the `http {}` context by another site (Cloudflare's
+  `CF-Connecting-IP` on a shared host) also rewrite `$remote_addr` for Dove's server blocks, which feeds the address
+  allowlist, the rate limit key and the `X-Forwarded-For` Dove trusts. Both nginx templates override it in the server
+  block (`set_real_ip_from 192.0.2.1/32`) and log to their own query-free `access_log`; test such proxy behaviour in a
+  throwaway `nginx:stable-alpine` container with an http-level `real_ip_header` and a request carrying the header.

@@ -95,6 +95,23 @@ Repository settings: Actions enabled; no special workflow permissions (each job 
 creates the GHCR package: set it to public under Packages and link it to the repository. Attestations on private
 repositories need GitHub Enterprise, public repositories get them for free.
 
+## Release trust
+
+`dove upgrade` runs as root on servers, so whoever can make the workflow sign a build can run code there. The
+signature proves that the release workflow of this repository built the archive, nothing more. What guards it:
+
+- Only the owner can push to this repository. Keep it that way, use 2FA (a passkey or hardware key) on the GitHub
+  account, and give tokens on machines that run agents the narrowest scope and an expiry.
+- The `verify` job refuses a tag whose commit is not on `main`. A tag carries its own copy of the workflow, so this
+  catches mistakes and a tag pushed by a token that cannot change `main`, not an attacker who controls the account.
+- The signing key lives only in the repository secret `MINISIGN_SECRET_KEY` and offline. Never keep an unencrypted
+  copy on a machine that runs coding agents.
+- `dove upgrade` refuses older versions unless `--allow-downgrade` is given, so a signed but old, vulnerable release
+  cannot be slipped in by asking for its version.
+
+If the account or the key may be compromised, rotate the key (see "Key rotation") and publish a release that only
+the new key signs.
+
 ## Cutting a release
 
 1. On `main` with green CI, set `version` in `Cargo.toml` (and refresh `Cargo.lock`: `cargo update -p dove-mcp`).
