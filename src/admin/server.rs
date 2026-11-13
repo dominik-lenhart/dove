@@ -1,41 +1,29 @@
-//! Admin socket server: peer-uid check, request dispatch, exactly one audit record per admin action.
+//! Admin socket server: peer check (uid on Unix, user SID on Windows), request dispatch, exactly one audit record
+//! per admin action.
 
-use std::os::unix::fs::PermissionsExt;
-
-use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{Context, anyhow, bail};
+use anyhow::{anyhow, bail};
 use rusqlite::Transaction;
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::net::{UnixListener, UnixStream};
 use zeroize::Zeroizing;
 
 use super::ops::{self, Actor};
+use super::transport::AdminStream;
+pub use super::transport::{Listener, Peer, bind};
 use super::{AdminRequest, AdminResponse, MAX_REQUEST_BYTES};
 use crate::app::App;
 use crate::audit::{self, AuditRecord};
 use crate::util;
 
-/// Binds the admin socket with mode 0660. The directory is expected to be owned by the service user and the
-/// operator group (for example systemd `RuntimeDirectory=dove` with `RuntimeDirectoryMode=0750`).
-pub fn bind(path: &Path) -> anyhow::Result<UnixListener> {
-    if path.exists() {
-        std::fs::remove_file(path).with_context(|| format!("cannot remove stale socket {}", path.display()))?;
-    }
-    let listener = UnixListener::bind(path).with_context(|| format!("cannot bind admin socket {}", path.display()))?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))?;
-    Ok(listener)
-}
-
-pub async fn serve(app: Arc<App>, listener: UnixListener) {
+pub async fn serve(app: Arc<App>, mut listener: Listener) {
     loop {
         match listener.accept().await {
-            Ok((stream, _)) => {
+            Ok((stream, peer)) => {
                 let app = app.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_conn(app, stream).await {
+                    if let Err(e) = handle_conn(app, stream, peer).await {
                         tracing::warn!(error = %e, "admin connection error");
                     }
                 });
@@ -76,16 +64,24 @@ pub fn uid_allowed(app: &App, uid: u32) -> bool {
     uid == 0 || uid == app.cfg.admin.operator_uid
 }
 
-async fn handle_conn(app: Arc<App>, stream: UnixStream) -> anyhow::Result<()> {
-    let cred = stream.peer_cred().context("cannot read peer credentials")?;
-    let uid = cred.uid();
-    let (mut rd, mut wr) = stream.into_split();
+/// Whether `peer` may administer this instance: an allowed uid (Unix), or exactly the user the service runs as
+/// (Windows: the peer-uid check's twin; administrators and SYSTEM are not let in through the pipe's DACL either).
+pub fn peer_allowed(app: &App, peer: &Peer) -> bool {
+    match peer {
+        Peer::Uid(uid) => uid_allowed(app, *uid),
+        Peer::Sid { client, service } => !client.is_empty() && client == service,
+        Peer::Unknown => false,
+    }
+}
+
+pub(crate) async fn handle_conn(app: Arc<App>, stream: impl AdminStream, peer: Peer) -> anyhow::Result<()> {
+    let (mut rd, mut wr) = tokio::io::split(stream);
     // The line may carry a mailbox password (connect-imap): wiped when the call is done, never copied on the way.
     let line = read_request(&mut rd).await?;
     let request_id = util::new_id();
-    let actor = Actor { name: format!("uid:{uid}"), request_id: request_id.clone() };
+    let actor = Actor { name: peer.label(), request_id: request_id.clone() };
 
-    let response = if !uid_allowed(&app, uid) {
+    let response = if !peer_allowed(&app, &peer) {
         // Denied before parsing: the request content is untrusted and not interpreted.
         write_audit(&app, &actor, ("admin.denied", None, None, vec![]), "forbidden").await;
         AdminResponse::err("permission denied: this user may not administer Dove")
@@ -329,7 +325,8 @@ async fn execute(call: &mut AdminCall<'_>, req: AdminRequest) -> anyhow::Result<
         AccountsCheck { alias } => accounts_check(&app, alias).await,
         KeysRotate => keys_rotate(call).await,
         Doctor => Ok(doctor(&app).await),
-        Version => Ok(json!({ "version": env!("CARGO_PKG_VERSION") })),
+        Version => Ok(json!({ "version": env!("CARGO_PKG_VERSION"),
+                              "mode": if app.cfg.is_local() { "local" } else { "server" } })),
         IndexEnable { alias } => crate::index::admin::enable(call, alias).await,
         IndexDisable { alias } => crate::index::admin::disable(call, alias).await,
         IndexStatus { alias } => crate::index::admin::status(&app, alias).await,
@@ -490,26 +487,48 @@ async fn keys_rotate(call: &mut AdminCall<'_>) -> anyhow::Result<Value> {
 }
 
 async fn doctor(app: &Arc<App>) -> Value {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     let mut checks = Vec::new();
     let mut add =
         |name: &str, ok: bool, detail: String| checks.push(json!({ "check": name, "ok": ok, "detail": detail }));
     add("service_version", true, env!("CARGO_PKG_VERSION").to_string());
+    add("mode", true, if app.cfg.is_local() { "local" } else { "server" }.to_string());
     add("config", app.cfg.validate().is_ok(), app.cfg.validate().err().map(|e| e.to_string()).unwrap_or_default());
-    let uid = nix::unistd::getuid().as_raw();
-    add(
-        "service_user",
-        uid != app.cfg.admin.operator_uid && uid != 0,
-        format!("service uid {uid}, operator uid {}", app.cfg.admin.operator_uid),
-    );
-    let data_mode = std::fs::metadata(&app.cfg.data_dir).map(|m| m.permissions().mode() & 0o777).unwrap_or(0);
-    add("data_dir_mode", data_mode & 0o077 == 0, format!("{data_mode:o}"));
-    let sock_mode = std::fs::metadata(&app.cfg.admin.socket_path).map(|m| m.permissions().mode() & 0o777).unwrap_or(0);
-    add("admin_socket_mode", sock_mode & 0o007 == 0, format!("{sock_mode:o}"));
+    if app.cfg.is_local() {
+        // Local mode runs as the desktop user on purpose (PLAN A58, threat model in docs/deployment.md).
+        add("service_user", true, format!("local mode: runs as {}", crate::platform::current_user_label()));
+    } else {
+        #[cfg(unix)]
+        {
+            let uid = nix::unistd::getuid().as_raw();
+            add(
+                "service_user",
+                uid != app.cfg.admin.operator_uid && uid != 0,
+                format!("service uid {uid}, operator uid {}", app.cfg.admin.operator_uid),
+            );
+        }
+    }
+    #[cfg(unix)]
+    {
+        let data_mode = std::fs::metadata(&app.cfg.data_dir).map(|m| m.permissions().mode() & 0o777).unwrap_or(0);
+        add("data_dir_mode", data_mode & 0o077 == 0, format!("{data_mode:o}"));
+        let sock_mode =
+            std::fs::metadata(&app.cfg.admin.socket_path).map(|m| m.permissions().mode() & 0o777).unwrap_or(0);
+        add("admin_socket_mode", sock_mode & 0o007 == 0, format!("{sock_mode:o}"));
+    }
+    #[cfg(windows)]
+    {
+        let private = crate::platform::dir_is_private(&app.cfg.data_dir);
+        add("data_dir_private", private.is_ok(), private.err().unwrap_or_default());
+    }
     add("allow_send", true, app.cfg.allow_send.to_string());
     add(
         "proxy_secret",
-        app.proxy_secret.is_some(),
-        if app.proxy_secret.is_some() {
+        app.proxy_secret.is_some() || app.cfg.is_local(),
+        if app.cfg.is_local() {
+            "local mode: X-Forwarded-For is never trusted".into()
+        } else if app.proxy_secret.is_some() {
             "X-Forwarded-For is trusted only with X-Dove-Proxy-Auth".into()
         } else {
             "secrets.proxy_secret_file is not set; local processes can forge X-Forwarded-For".into()
@@ -551,6 +570,51 @@ const PUBLIC_PROBE_PATH: &str = "/.well-known/oauth-protected-resource";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Sends one request through [`handle_conn`] as `peer` and returns the response.
+    async fn as_peer(app: &Arc<App>, peer: Peer, req: &AdminRequest) -> AdminResponse {
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let task = tokio::spawn(handle_conn(app.clone(), server, peer));
+        let mut line = serde_json::to_vec(req).unwrap();
+        line.push(b'\n');
+        client.write_all(&line).await.unwrap();
+        let mut out = Vec::new();
+        client.read_to_end(&mut out).await.unwrap();
+        task.await.unwrap().unwrap();
+        serde_json::from_slice(&out).unwrap()
+    }
+
+    async fn projects(app: &Arc<App>) -> i64 {
+        app.store.call(|c| Ok(c.query_row("SELECT COUNT(*) FROM projects", [], |r| r.get(0))?)).await.unwrap()
+    }
+
+    /// The Windows admin pipe's peer check: only the service's own user SID may administer. Only the SID comparison
+    /// can deny here (the pipe's DACL is not involved), so a mutation that accepts any SID fails this test.
+    #[tokio::test]
+    async fn pipe_peers_must_be_the_service_user() {
+        let env = crate::testing::TestEnv::new();
+        let app = env.app.clone();
+        let service = "S-1-5-21-1111111111-2222222222-3333333333-1001".to_string();
+        let create = |n: &str| AdminRequest::ProjectsCreate { name: n.into() };
+        let other =
+            Peer::Sid { client: "S-1-5-21-1111111111-2222222222-3333333333-1002".into(), service: service.clone() };
+        for peer in [other.clone(), Peer::Sid { client: String::new(), service: String::new() }, Peer::Unknown] {
+            let r = as_peer(&app, peer, &create("evil")).await;
+            assert!(!r.ok && r.error.as_deref().unwrap().contains("permission denied"), "{r:?}");
+        }
+        assert_eq!(projects(&app).await, 0);
+        let tail = app.store.call(|c| crate::audit::tail(c, 3)).await.unwrap();
+        let tail = serde_json::to_value(tail).unwrap();
+        assert!(tail.as_array().unwrap().iter().all(|r| r["tool_or_action"] == "admin.denied"), "{tail}");
+        assert!(
+            tail.as_array().unwrap().iter().any(|r| r["actor"] == "sid:S-1-5-21-1111111111-2222222222-3333333333-1002")
+        );
+
+        let me = Peer::Sid { client: service.clone(), service };
+        let r = as_peer(&app, me, &create("mine")).await;
+        assert!(r.ok, "{r:?}");
+        assert_eq!(projects(&app).await, 1);
+    }
 
     #[test]
     fn doctor_probe_path_is_public() {

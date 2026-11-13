@@ -6,6 +6,7 @@
 pub mod client;
 pub mod ops;
 pub mod server;
+pub mod transport;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;

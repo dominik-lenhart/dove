@@ -5,18 +5,12 @@ use std::path::Path;
 use anyhow::{Context, bail};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 
 use super::{AdminRequest, AdminResponse};
 
 pub async fn send(socket: &Path, req: &AdminRequest) -> anyhow::Result<Value> {
-    let stream = UnixStream::connect(socket).await.with_context(|| {
-        format!(
-            "cannot connect to the admin socket {} (is the service running and are you the operator?)",
-            socket.display()
-        )
-    })?;
-    let (rd, mut wr) = stream.into_split();
+    let stream = super::transport::connect(socket).await?;
+    let (rd, mut wr) = tokio::io::split(stream);
     // The request may carry a mailbox password: wipe the serialized copy after sending.
     // No push onto the buffer: a reallocation would leave an unwiped copy behind.
     let line = zeroize::Zeroizing::new(serde_json::to_vec(req)?);
