@@ -310,6 +310,8 @@ mod tests {
         std::fs::write(&victim, precious).unwrap();
         let path = dir.join(CACHE_FILE);
         if let Err(e) = symlink_file(&victim, &path) {
+            // CI runners can create symlinks (administrator); there a skip would hide a regression.
+            assert!(std::env::var_os("CI").is_none(), "cannot create a symlink on CI: {e}");
             eprintln!("skipped: cannot create a symlink here ({e})");
             return;
         }
@@ -321,12 +323,35 @@ mod tests {
         assert_eq!(read_cache(&path), Some(entry));
     }
 
+    /// A junction (a directory reparse point, which any user may create) as the cache directory is never written
+    /// through, so this half of the check runs on every Windows machine.
+    #[cfg(windows)]
+    #[test]
+    fn cache_writes_do_not_follow_a_junction() {
+        let d = tempfile::tempdir().unwrap();
+        let target = d.path().join("elsewhere");
+        std::fs::create_dir(&target).unwrap();
+        let dir = d.path().join("cache");
+        let ok = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&dir)
+            .arg(&target)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(ok.success(), "mklink /J failed");
+        let entry = CacheEntry { checked_at: 7, latest: Some("v1.0.0".into()) };
+        write_cache(&dir.join(CACHE_FILE), &entry);
+        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0, "written through the junction");
+        assert_eq!(read_cache(&dir.join(CACHE_FILE)), None);
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_cache_location() {
         assert_eq!(
             cache_file(env(&[("LOCALAPPDATA", r"C:\U\a\AppData\Local"), ("HOME", "/h")])),
-            Some(PathBuf::from(r"C:\U\a\AppData\Local\Dove\cache\update-check.json"))
+            Some(PathBuf::from(r"C:\U\a\AppData\Local\DoveCache\update-check.json"))
         );
         assert_eq!(cache_file(env(&[("HOME", r"C:\U\a")])), None);
     }
