@@ -31,20 +31,8 @@ runs:
         sudo apt-get install -y -qq musl-tools
         musl-gcc --version | head -n 1
 
-    # Windows: OpenSSL's Configure needs a native Perl (not the one from Git for Windows) and NASM.
-    - name: Windows build tools (perl, nasm)
+    - uses: ./.github/actions/windows-build-tools
       if: runner.os == 'Windows'
-      shell: pwsh
-      run: |
-        if (-not (Get-Command nasm -ErrorAction SilentlyContinue)) {
-          if (Test-Path 'C:\Program Files\NASM\nasm.exe') {
-            Add-Content -Path $env:GITHUB_PATH -Value 'C:\Program Files\NASM'
-          } else {
-            choco install nasm -y --no-progress
-            Add-Content -Path $env:GITHUB_PATH -Value 'C:\Program Files\NASM'
-          }
-        }
-        Add-Content -Path $env:GITHUB_ENV -Value 'OPENSSL_SRC_PERL=C:/Strawberry/perl/bin/perl.exe'
 
     # One cache per target, named by shared-key so release.yml and release-cache.yml use the same one. The key also
     # covers rustc's version, Cargo.lock and CARGO*/CC* variables, so the callers keep those identical.
