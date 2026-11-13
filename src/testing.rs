@@ -39,33 +39,38 @@ pub fn current_uid() -> u32 {
     }
 }
 
+/// `p` as the content of a TOML basic string (`"..."`): Windows paths carry backslashes, which TOML reads as escapes.
+pub fn toml_path(p: &Path) -> String {
+    p.to_str().unwrap().replace('\\', "\\\\")
+}
+
 /// Builds a config whose secrets live in `dir/secrets` and data in `dir/data`.
 pub fn test_config(dir: &Path, operator_uid: u32) -> Config {
     let sdir = dir.join("secrets");
     std::fs::create_dir_all(&sdir).unwrap();
     let text = EXAMPLE
-        .replace("/var/lib/dove", dir.join("data").to_str().unwrap())
-        .replace("/run/dove/admin.sock", dir.join("admin.sock").to_str().unwrap())
+        .replace("/var/lib/dove", &toml_path(&dir.join("data")))
+        .replace("/run/dove/admin.sock", &toml_path(&dir.join("admin.sock")))
         .replace("operator_uid = 1000", &format!("operator_uid = {operator_uid}"))
         .replace(
             "/run/credentials/dove.service/kek",
-            write_secret(&sdir, "kek", &secrets::generate_key_line(1)).to_str().unwrap(),
+            &toml_path(&write_secret(&sdir, "kek", &secrets::generate_key_line(1))),
         )
         .replace(
             "/run/credentials/dove.service/pepper",
-            write_secret(&sdir, "pepper", &secrets::generate_key_line(1)).to_str().unwrap(),
+            &toml_path(&write_secret(&sdir, "pepper", &secrets::generate_key_line(1))),
         )
         .replace(
             "/run/credentials/dove.service/index_key",
-            write_secret(&sdir, "index_key", &secrets::generate_key_line(1)).to_str().unwrap(),
+            &toml_path(&write_secret(&sdir, "index_key", &secrets::generate_key_line(1))),
         )
         .replace(
             "/run/credentials/dove.service/google_client_secret",
-            write_secret(&sdir, "google_client_secret", "test-client-secret").to_str().unwrap(),
+            &toml_path(&write_secret(&sdir, "google_client_secret", "test-client-secret")),
         )
         .replace(
             "/run/credentials/dove.service/proxy_secret",
-            write_secret(&sdir, "proxy_secret", "test-proxy-secret-0123456789abcdef0123456789").to_str().unwrap(),
+            &toml_path(&write_secret(&sdir, "proxy_secret", "test-proxy-secret-0123456789abcdef0123456789")),
         );
     toml::from_str(&text).unwrap()
 }

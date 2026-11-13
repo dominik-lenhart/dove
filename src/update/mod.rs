@@ -296,6 +296,8 @@ pub fn extract_binary(archive: &[u8], tag: &str, target: &str) -> anyhow::Result
     }
     let top = format!("dove-{tag}-{target}");
     let wanted = Path::new(&top).join("dove");
+    // Archive names use `/` on every platform (`wanted.display()` would show `\` on Windows).
+    let wanted_name = format!("{top}/dove");
     let gz = flate2::read::GzDecoder::new(archive).take(MAX_UNPACKED_BYTES);
     let mut ar = tar::Archive::new(gz);
     let mut binary: Option<Vec<u8>> = None;
@@ -321,7 +323,7 @@ pub fn extract_binary(archive: &[u8], tag: &str, target: &str) -> anyhow::Result
             continue;
         }
         if binary.is_some() {
-            bail!("release archive contains {} twice", wanted.display());
+            bail!("release archive contains {wanted_name} twice");
         }
         if e.header().size().unwrap_or(u64::MAX) > MAX_BINARY_BYTES {
             bail!("the dove binary in the release archive is too large");
@@ -333,7 +335,7 @@ pub fn extract_binary(archive: &[u8], tag: &str, target: &str) -> anyhow::Result
         }
         binary = Some(data);
     }
-    let binary = binary.ok_or_else(|| anyhow!("release archive has no {}", wanted.display()))?;
+    let binary = binary.ok_or_else(|| anyhow!("release archive has no {wanted_name}"))?;
     if binary.is_empty() {
         bail!("the dove binary in the release archive is empty");
     }

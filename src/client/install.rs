@@ -307,8 +307,10 @@ mod tests {
         };
         let d = tempfile::tempdir().unwrap();
         let home = d.path().join("home");
-        let p = claude_desktop_path(&home, env(vec![("XDG_CONFIG_HOME", d.path().join("xdg"))])).unwrap();
+        // Every location comes from the injected variables, never from the test runner's environment.
+        let xdg = || env(vec![("XDG_CONFIG_HOME", d.path().join("xdg"))]);
         if cfg!(target_os = "macos") {
+            let p = claude_desktop_path(&home, xdg()).unwrap();
             assert_eq!(p, home.join("Library/Application Support/Claude/claude_desktop_config.json"));
         } else if cfg!(windows) {
             assert!(claude_desktop_path(&home, env(vec![])).is_err(), "needs %APPDATA%");
@@ -325,6 +327,7 @@ mod tests {
             std::fs::write(pkg.join("claude_desktop_config.json"), "{}").unwrap();
             assert_eq!(claude_desktop_path(&home, vars()).unwrap(), pkg.join("claude_desktop_config.json"));
         } else {
+            let p = claude_desktop_path(&home, xdg()).unwrap();
             assert_eq!(p, d.path().join("xdg").join("Claude").join("claude_desktop_config.json"));
         }
     }
