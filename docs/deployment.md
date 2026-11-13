@@ -292,6 +292,31 @@ Other commands: `accounts list`, `accounts check [alias]` (refreshes a token and
 
 Aliases match `[a-z0-9-]{2,40}`.
 
+### IMAP/SMTP mailboxes
+
+Mailboxes with password login need no Google project. Dove logs in to IMAP and SMTP and checks both before it stores
+anything; the password is read without echo (or with `--password-stdin` from one line on stdin) and stored encrypted
+under the mailbox's key.
+
+```sh
+dove accounts connect-imap --alias work --email me@example.com            # Strato, iCloud: preset from the domain
+dove accounts connect-imap --alias shop --email info@shop.example --preset strato          # custom domain at Strato
+dove accounts connect-imap --alias own --email me@mail.example \
+  --imap-host imap.mail.example --smtp-host smtp.mail.example --smtp-port 587 --smtp-tls starttls
+```
+
+- Presets: `strato` (`imap.strato.de:993`, `smtp.strato.de:465`) and `icloud` (`imap.mail.me.com:993`,
+  `smtp.mail.me.com:587` STARTTLS). A port or TLS flag without a host overrides only that part of the preset.
+- iCloud and many other providers need an app password, not the account password.
+- `--username` / `--smtp-username` when the login name is not the address; `--drafts-folder` when the server marks no
+  Drafts folder and none is called Drafts, Entwürfe or Draft.
+- The server must support `UIDPLUS` (Dove refuses others at connect). `CONDSTORE`/`QRESYNC` make sync cheaper when
+  present; without them Dove re-reads flags in bounded windows.
+- `accounts reconnect <alias>` asks for a new password and verifies it before replacing the stored one.
+- Dove never deletes or moves mail in these mailboxes. It removes only drafts it wrote itself (the previous revision
+  after `update_draft`, the draft after `send_draft`), and only after checking that the draft on the server is still
+  byte-identical to what it wrote.
+
 ### New IMAP mail (IDLE push)
 
 For every active IMAP mailbox with indexing enabled, Dove keeps one extra, long-lived IMAP connection that watches
@@ -493,3 +518,6 @@ Checked in this repository's work, with the tool named; "not verified" means nob
 | `deploy/nginx/dove.conf` | `nginx -t` (1.30) with a throwaway certificate; same route matrix as Caddy, `/MCP` and `//mcp` get 404; 2 MB body got 413 (former 1 MB limit; the 20 MB limit is not re-tested); `nginx -t` (1.30) again with the `dove_proxy_auth.conf` include | Certificate handling; the proxy-secret header end to end against a running Dove behind nginx |
 | `.github/workflows/ci.yml` | `actionlint`; YAML parse; the gitleaks container step run locally, clean on this repository and failing on a planted key; `cargo deny check` (0.20.2) passes | The workflow has not run on GitHub |
 | Backup | `sqlite3 .backup` of a running, freshly initialised store gave an intact copy (`PRAGMA integrity_check` ok) | `age` encryption step, off-host transfer, a full restore drill |
+| systemd system service (2026-11-12) | Running as `User=dove` on a real host (systemd 259) behind `tailscale serve` with `LoadCredential=` secrets (0440 root:root copies with an ACL, see PLAN A44); `/healthz`, admin socket, MCP over HTTPS | A public proxy with automatic certificates |
+| IMAP/SMTP against Strato (2026-11-12) | `accounts connect-imap` with the Strato preset and SMTP on 587 STARTTLS; `list_labels`, `search_messages` (unread, date, full text), `get_message` (message stays unread), `get_thread`, `get_attachment` (three files, byte-exact), `create_draft`, `update_draft` (old revision removed), `list_drafts`, reply drafts with quote and threading, forward drafts with three attachments; drafts appeared in Apple Mail; IMAP IDLE indexed a new mail within a second; reindex after the thread-id change | `send_draft` over real SMTP; iCloud and other providers; a large mailbox; a server with CONDSTORE/QRESYNC |
+| `.github/workflows/release.yml`, `install.sh`, `deploy/Containerfile.release` (2026-11-13) | `actionlint` clean; `install.sh` shellcheck-clean and run against a fake signed release in Ubuntu containers (installs with and without `minisign`, refuses a tampered archive and a tampered `SHA256SUMS`); `Containerfile.release` `buildx --check` and an amd64 build with stand-in binaries | The first tag run on GitHub: runner labels, signing, attestations, GHCR push |
