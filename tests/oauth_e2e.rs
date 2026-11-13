@@ -1033,4 +1033,20 @@ async fn approval_page_presets_and_defaults() {
         actions_of(&o.h, tok["access_token"].as_str().unwrap()).await,
         vec![("info".into(), "read,draft,organize".into())]
     );
+    // The forged send box is not stored either (list_accounts hides send anyway while sending is off).
+    let stored: String = o
+        .h
+        .app()
+        .store
+        .call(|c| {
+            Ok(c.query_row(
+                "SELECT cm.actions FROM client_mailboxes cm JOIN clients c ON c.id = cm.client_id \
+                 WHERE c.name = 'org-host-2'",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(stored, "read,draft,organize");
 }
