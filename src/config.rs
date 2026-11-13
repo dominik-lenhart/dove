@@ -205,6 +205,29 @@ pub struct IndexConfig {
     /// Wall-clock limit of one IMAP sync step (a scan of all folders, or one fetch batch). Work finished before it is
     /// kept; the job then fails and retries at the next poll.
     pub imap_step_timeout_secs: u64,
+    /// Index the text of PDF, DOCX, ODT, plain-text and CSV attachments (found by `text` and `attachment_text`
+    /// searches). The attachments are already in memory when the message is indexed, so this costs CPU and a
+    /// short-lived copy of the attachment, no extra Gmail or IMAP traffic.
+    pub attachment_text: bool,
+    /// Largest decoded attachment that is opened for text extraction; larger ones are skipped and the message
+    /// counts as incomplete for `attachment_text` queries. Bounded by `max_message_bytes` anyway.
+    pub attachment_text_max_bytes: usize,
+    /// Characters of attachment text indexed per message.
+    pub attachment_text_max_chars: usize,
+    /// Wall-clock budget of all attachment extraction for one message.
+    pub attachment_text_timeout_secs: u64,
+}
+
+impl IndexConfig {
+    /// Limits of ingest-time attachment text extraction.
+    pub fn attachment_cfg(&self) -> crate::attachment_text::Cfg {
+        crate::attachment_text::Cfg {
+            enabled: self.attachment_text,
+            max_attachment_bytes: self.attachment_text_max_bytes,
+            max_chars: self.attachment_text_max_chars,
+            budget: std::time::Duration::from_secs(self.attachment_text_timeout_secs.max(1)),
+        }
+    }
 }
 
 impl Default for IndexConfig {
@@ -221,6 +244,10 @@ impl Default for IndexConfig {
             imap_idle: true,
             idle_renew_secs: 1500,
             imap_step_timeout_secs: 300,
+            attachment_text: true,
+            attachment_text_max_bytes: 8 * 1024 * 1024,
+            attachment_text_max_chars: 100_000,
+            attachment_text_timeout_secs: 10,
         }
     }
 }

@@ -2,7 +2,9 @@
 
 pub mod admin;
 pub mod app;
+pub mod attachment_text;
 pub mod audit;
+pub mod calendar;
 pub mod cli;
 pub mod client;
 pub mod config;

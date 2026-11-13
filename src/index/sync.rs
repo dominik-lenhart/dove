@@ -505,7 +505,12 @@ struct RawAnswer<'a> {
 /// Parses a raw answer within the per-job memory budget (spec 8.1a): the response body was read with a byte cap,
 /// and the encoded message is decoded in place inside that buffer, so it is held once (about 4/3 of the message)
 /// plus the MIME parser's working set.
-pub fn doc_from_raw_answer(body: Vec<u8>, max_bytes: usize, max_chars: usize) -> Option<Doc> {
+pub fn doc_from_raw_answer(
+    body: Vec<u8>,
+    max_bytes: usize,
+    max_chars: usize,
+    att: &crate::attachment_text::Cfg,
+) -> Option<Doc> {
     enum Raw {
         Missing,
         At(std::ops::Range<usize>),
@@ -537,7 +542,7 @@ pub fn doc_from_raw_answer(body: Vec<u8>, max_bytes: usize, max_chars: usize) ->
         }
     };
     Some(match raw {
-        Some(raw) => Doc::from_raw(meta, &raw, max_bytes, max_chars),
+        Some(raw) => Doc::from_raw(meta, &raw, max_bytes, max_chars, att),
         None => Doc::metadata_only(meta),
     })
 }
@@ -548,6 +553,7 @@ async fn fetch_full(job: &Job, id: &str) -> Result<Fetched, ToolError> {
     let _permit = job.app.index.body_jobs.clone().acquire_owned().await.map_err(|_| ToolError::internal())?;
     let max_bytes = job.app.cfg.index.max_message_bytes;
     let max_chars = job.app.cfg.index.max_body_chars;
+    let att = job.app.cfg.index.attachment_cfg();
     let owned = id.to_string();
     let fetched = job
         .app
@@ -573,7 +579,7 @@ async fn fetch_full(job: &Job, id: &str) -> Result<Fetched, ToolError> {
         Err(e) if matches!(e.code, ErrorCode::RateLimited | ErrorCode::AccountUnavailable) => return Err(e),
         Err(e) => return Ok(Fetched::Failed(e.code.as_str().into())),
     };
-    let doc = tokio::task::spawn_blocking(move || doc_from_raw_answer(body, max_bytes, max_chars))
+    let doc = tokio::task::spawn_blocking(move || doc_from_raw_answer(body, max_bytes, max_chars, &att))
         .await
         .map_err(|_| ToolError::internal())?;
     Ok(match doc {

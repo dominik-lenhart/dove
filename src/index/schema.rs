@@ -15,8 +15,14 @@ pub enum Migration {
     Code(fn(&Transaction<'_>) -> anyhow::Result<()>),
 }
 
-pub const MIGRATIONS: &[Migration] =
-    &[Migration::Sql(V1), Migration::Sql(V2), Migration::Code(v3), Migration::Sql(V4), Migration::Code(v5)];
+pub const MIGRATIONS: &[Migration] = &[
+    Migration::Sql(V1),
+    Migration::Sql(V2),
+    Migration::Code(v3),
+    Migration::Sql(V4),
+    Migration::Code(v5),
+    Migration::Code(v_mail_intelligence),
+];
 
 /// Name of a generation's FTS table. Derived only from the integer generation id, never from input.
 pub fn fts_table(gen_id: i64) -> String {
@@ -27,8 +33,20 @@ pub fn fts_table(gen_id: i64) -> String {
 /// name cannot exist; it is dropped first anyway so stale postings can never be served under a new generation.
 pub fn create_fts(tx: &Connection, gen_id: i64) -> anyhow::Result<()> {
     let t = fts_table(gen_id);
-    // One text source: subject + sanitized body, written in the same transaction as the metadata row
-    // (rowid = messages.id). Contentless: postings only, never a second copy of the body.
+    // One text source: subject + sanitized body + attachment text, written in the same transaction as the metadata
+    // row (rowid = messages.id). Contentless: postings only, never a second copy of the text. Generations created
+    // before `att` existed (`generations.att_fts = 0`) keep their two-column table until they are rebuilt.
+    tx.execute_batch(&format!(
+        "DROP TABLE IF EXISTS {t}; \
+         CREATE VIRTUAL TABLE {t} USING fts5(subject, body, att, content='', contentless_delete=1, tokenize='unicode61');"
+    ))?;
+    Ok(())
+}
+
+/// The FTS table as V3 created it (subject and body only); migrations are frozen, so V3 does not follow
+/// [`create_fts`].
+fn create_fts_v3(tx: &Connection, gen_id: i64) -> anyhow::Result<()> {
+    let t = fts_table(gen_id);
     tx.execute_batch(&format!(
         "DROP TABLE IF EXISTS {t}; \
          CREATE VIRTUAL TABLE {t} USING fts5(subject, body, content='', contentless_delete=1, tokenize='unicode61');"
@@ -214,7 +232,7 @@ fn v3(tx: &Transaction<'_>) -> anyhow::Result<()> {
         st.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?
     };
     for g in gens {
-        create_fts(tx, g)?;
+        create_fts_v3(tx, g)?;
     }
     let accounts: Vec<String> = {
         let mut st = tx.prepare("SELECT account_id FROM sync_state")?;
@@ -265,9 +283,15 @@ fn v5(tx: &Transaction<'_>) -> anyhow::Result<()> {
         )?;
         st.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?
     };
+    rebuild_accounts(tx, &accounts)
+}
+
+/// Starts a rebuild of every listed account into a fresh generation, exactly like `dove index rebuild`: an active
+/// generation keeps serving meanwhile, a half-built one is left unreferenced for garbage collection.
+fn rebuild_accounts(tx: &Transaction<'_>, accounts: &[String]) -> anyhow::Result<()> {
     for aid in accounts {
         let fence = super::next_fence(tx)?;
-        let g = super::new_generation(tx, &aid)?;
+        let g = super::new_generation(tx, aid)?;
         tx.execute(
             "UPDATE sync_state SET fence = ?1, building_gen = ?2, \
              stage = CASE WHEN active_gen IS NULL THEN 'backfill' ELSE 'rebuilding' END, \
@@ -276,6 +300,38 @@ fn v5(tx: &Transaction<'_>) -> anyhow::Result<()> {
         )?;
     }
     Ok(())
+}
+
+/// Mail intelligence (v0.2): message category, attachment text and contact names.
+///
+/// * `messages.category` (`personal`, `newsletter`, `notification`, `calendar`) and `messages.att_complete` (every
+///   supported attachment was read) are NULL for rows ingested before this version: unknown, reported as a coverage
+///   exception by the queries that use them.
+/// * `addrs.name` / `name_lc` hold the display name of an address in that message (contact search), with the
+///   covering index `addrs_name` for substring scans.
+/// * New generations get a three-column FTS table (`subject, body, att`). Existing generations keep their
+///   two-column table (`generations.att_fts = 0`) and keep serving, so text search does not stop during the upgrade.
+///
+/// Categories and attachment text come from headers and parts the index does not keep, so every indexed mailbox
+/// rebuilds into a fresh generation (Gmail and IMAP alike) and the old generation serves until the new one is ready.
+const V_MAIL_INTELLIGENCE: &str = r#"
+ALTER TABLE messages ADD COLUMN category TEXT;
+ALTER TABLE messages ADD COLUMN att_complete INTEGER;
+ALTER TABLE addrs ADD COLUMN name TEXT;
+ALTER TABLE addrs ADD COLUMN name_lc TEXT;
+ALTER TABLE generations ADD COLUMN att_fts INTEGER NOT NULL DEFAULT 1;
+UPDATE generations SET att_fts = 0;
+CREATE INDEX addrs_name ON addrs(name_lc, gen, role, msg);
+INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES ('addrs', 'addrs_name', '1000000 40 30 20 1');
+"#;
+
+fn v_mail_intelligence(tx: &Transaction<'_>) -> anyhow::Result<()> {
+    tx.execute_batch(V_MAIL_INTELLIGENCE)?;
+    let accounts: Vec<String> = {
+        let mut st = tx.prepare("SELECT account_id FROM sync_state")?;
+        st.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?
+    };
+    rebuild_accounts(tx, &accounts)
 }
 
 /// Applies pending index migrations in one transaction each.
