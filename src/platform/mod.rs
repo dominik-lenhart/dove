@@ -82,9 +82,14 @@ pub fn restrict_dir(path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Writes a new file readable only by the current user; fails if `path` exists.
+/// Writes a new file readable only by the current user; fails if `path` exists. The data goes to a private temporary
+/// file first, which is then hard-linked to `path` (atomic, never replaces anything), so a failed or interrupted write
+/// never leaves a partial file at `path` (L5).
 pub fn write_private_new(path: &Path, data: &[u8]) -> anyhow::Result<()> {
     use std::io::Write;
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let tmp = dir.join(format!(".{name}.tmp-{}", crate::util::new_id()));
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -92,12 +97,17 @@ pub fn write_private_new(path: &Path, data: &[u8]) -> anyhow::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600).custom_flags(nix::libc::O_NOFOLLOW);
     }
-    let mut f = opts.open(path).with_context(|| format!("cannot create {}", path.display()))?;
-    #[cfg(windows)]
-    windows::restrict(path, false).with_context(|| format!("cannot restrict {}", path.display()))?;
-    f.write_all(data)?;
-    f.sync_all()?;
-    Ok(())
+    let mut f = opts.open(&tmp).with_context(|| format!("cannot create {}", tmp.display()))?;
+    let written = (|| -> anyhow::Result<()> {
+        #[cfg(windows)]
+        windows::restrict(&tmp, false).with_context(|| format!("cannot restrict {}", tmp.display()))?;
+        f.write_all(data)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::hard_link(&tmp, path).with_context(|| format!("cannot create {}", path.display()))
+    })();
+    let _ = std::fs::remove_file(&tmp);
+    written
 }
 
 /// The current OS user, as shown in audit actors and doctor output (`uid:1000`, `sid:S-1-5-21-...`).
