@@ -493,24 +493,41 @@ mod tests {
         let line = secrets::generate_key_line(1);
         let text = EXAMPLE
             .replace("https://dove.example.com", public_url)
-            .replace("/run/credentials/dove.service/kek", write_secret(dir, "kek", &line, kek_mode).to_str().unwrap())
+            .replace(
+                "/run/credentials/dove.service/kek",
+                &crate::testing::toml_path(&write_secret(dir, "kek", &line, kek_mode)),
+            )
             .replace(
                 "/run/credentials/dove.service/pepper",
-                write_secret(dir, "pepper", &line, 0o400).to_str().unwrap(),
+                &crate::testing::toml_path(&write_secret(dir, "pepper", &line, 0o400)),
             )
             .replace(
                 "/run/credentials/dove.service/index_key",
-                write_secret(dir, "index_key", &line, 0o400).to_str().unwrap(),
+                &crate::testing::toml_path(&write_secret(dir, "index_key", &line, 0o400)),
             )
             .replace(
                 "/run/credentials/dove.service/google_client_secret",
-                write_secret(dir, "gcs", "secret", 0o400).to_str().unwrap(),
+                &crate::testing::toml_path(&write_secret(dir, "gcs", "secret", 0o400)),
             )
             .replace(
                 "/run/credentials/dove.service/proxy_secret",
-                write_secret(dir, "proxy_secret", &"p".repeat(64), 0o400).to_str().unwrap(),
+                &crate::testing::toml_path(&write_secret(dir, "proxy_secret", &"p".repeat(64), 0o400)),
             );
         toml::from_str(&text).unwrap()
+    }
+
+    /// Test configs put paths into TOML strings; Windows paths (`C:\Users\RUNNER~1\...`) carry backslashes that TOML
+    /// would read as escapes. A Unix directory name with a backslash shows the same on every platform.
+    #[test]
+    fn test_configs_survive_backslashes_in_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let odd = dir.path().join(if cfg!(windows) { "Users" } else { r"C:\Users\RUNNER~1" });
+        std::fs::create_dir_all(&odd).unwrap();
+        let cfg = crate::testing::test_config(&odd, 0);
+        assert_eq!(cfg.data_dir, odd.join("data"));
+        assert_eq!(cfg.secrets.kek_file, odd.join("secrets").join("kek"));
+        let cfg = config(&odd, "https://dove.example.com", 0o400);
+        assert_eq!(cfg.secrets.pepper_file, odd.join("pepper"));
     }
 
     #[test]
