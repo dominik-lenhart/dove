@@ -143,6 +143,9 @@ pub fn init(paths: &LocalPaths, port: u16) -> anyhow::Result<()> {
         }
     }
     crate::platform::ensure_private_dir(&paths.data_dir)?;
+    // A data directory something else created first may pass the check with an inherited access list (Windows);
+    // make it explicitly private before any key goes in (L4).
+    crate::platform::restrict_dir(&paths.data_dir)?;
     crate::platform::ensure_private_dir(&secrets_dir)?;
     // Everything this run creates is removed again when a later step fails: nothing is encrypted under these keys
     // yet, and a leftover key would make every retry refuse with "already exists" (L5).

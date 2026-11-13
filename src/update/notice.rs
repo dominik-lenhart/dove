@@ -66,12 +66,13 @@ pub fn enabled(var: impl Fn(&str) -> Option<OsString>, stderr_is_terminal: bool,
         && !var("DOVE_NO_UPDATE_CHECK").is_some_and(|v| !v.is_empty() && v != "0")
 }
 
-/// The cache directory: `~/Library/Caches/dove` on macOS, `%LOCALAPPDATA%\Dove\cache` on Windows, else
-/// `$XDG_CACHE_HOME/dove` or `~/.cache/dove`.
+/// The cache directory: `~/Library/Caches/dove` on macOS, `%LOCALAPPDATA%\DoveCache` on Windows, else
+/// `$XDG_CACHE_HOME/dove` or `~/.cache/dove`. Never inside local mode's data directory (`%LOCALAPPDATA%\Dove`): the
+/// notice would create that directory first, with an inherited instead of a private access list (L4).
 pub fn cache_dir(var: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
     if cfg!(windows) {
         let local = var("LOCALAPPDATA").map(PathBuf::from).filter(|p| p.is_absolute());
-        return local.map(|d| d.join("Dove").join("cache"));
+        return local.map(|d| d.join("DoveCache"));
     }
     let home = var("HOME").map(PathBuf::from).filter(|p| p.is_absolute());
     if cfg!(target_os = "macos") {
@@ -223,6 +224,20 @@ pub async fn check() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The notice never creates (or writes into) local mode's data directory or config directory (L4).
+    #[test]
+    fn cache_stays_outside_the_local_mode_directories() {
+        let root = std::env::temp_dir().join("dove-l4");
+        let vars: Vec<(&str, PathBuf)> =
+            vec![("HOME", root.join("home")), ("APPDATA", root.join("Roaming")), ("LOCALAPPDATA", root.join("Local"))];
+        let var = |k: &str| vars.iter().find(|(n, _)| *n == k).map(|(_, v)| v.clone().into_os_string());
+        let cache = cache_dir(var).unwrap();
+        let local = crate::platform::paths::local_paths_from(var).unwrap();
+        assert!(!cache.starts_with(&local.data_dir), "{} is inside {}", cache.display(), local.data_dir.display());
+        assert!(!local.data_dir.starts_with(&cache));
+        assert!(!cache.starts_with(local.config_file.parent().unwrap()));
+    }
 
     fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
         let pairs: Vec<(String, String)> = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
