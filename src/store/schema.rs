@@ -1,6 +1,6 @@
 //! Versioned schema migrations for the durable state store. Never edit a released migration; append a new one.
 
-pub const MIGRATIONS: &[&str] = &[V1, V2, V3];
+pub const MIGRATIONS: &[&str] = &[V1, V2, V3, V_SEND_IDENTITIES];
 
 const V1: &str = r#"
 CREATE TABLE accounts (
@@ -206,4 +206,27 @@ CREATE TABLE imap_folders (
 );
 
 ALTER TABLE own_drafts ADD COLUMN content_hash BLOB;
+"#;
+
+/// Sending identities (design 2026-11-13 section 5): send-as aliases of IMAP mailboxes (`envelope` marks an alias the
+/// SMTP server accepts as envelope sender) and plain-text signatures. A signature row with `address = ''` is the
+/// mailbox's default; any other address is a per-alias signature (for Gmail the address is a Gmail send-as address,
+/// which Dove learns from the API, so it is not required to exist in `account_aliases`).
+const V_SEND_IDENTITIES: &str = r#"
+CREATE TABLE account_aliases (
+    account_id   TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    address      TEXT NOT NULL,
+    display_name TEXT,
+    envelope     INTEGER NOT NULL DEFAULT 0,
+    created_at   INTEGER NOT NULL,
+    PRIMARY KEY (account_id, address)
+);
+
+CREATE TABLE account_signatures (
+    account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    address    TEXT NOT NULL,
+    body       TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (account_id, address)
+);
 "#;

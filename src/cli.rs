@@ -53,6 +53,9 @@ pub enum Command {
     /// Manage the per-mailbox search index (admin).
     #[command(subcommand)]
     Index(IndexCmd),
+    /// Publish Dove on your tailnet with Tailscale Serve (run as the operator; does not use the admin socket).
+    #[command(subcommand)]
+    Tailscale(TailscaleCmd),
     /// Unknown-outcome draft operations (admin).
     #[command(subcommand)]
     Operations(OperationsCmd),
@@ -152,6 +155,87 @@ pub enum AccountsCmd {
         #[command(flatten)]
         admin: AdminOpts,
     },
+    /// Send-as aliases of an IMAP mailbox (Gmail keeps its send-as list in Gmail settings).
+    #[command(subcommand)]
+    Aliases(AliasesCmd),
+    /// Plain-text signatures appended to new drafts, per mailbox or per alias.
+    #[command(subcommand)]
+    Signature(SignatureCmd),
+}
+
+#[derive(Subcommand)]
+pub enum AliasesCmd {
+    /// Allow `create_draft` to use ADDRESS as `from_address` for this mailbox. The SMTP envelope sender stays the
+    /// login address unless --envelope is given, which is only right if the SMTP server accepts the alias there.
+    Add {
+        mailbox: String,
+        address: String,
+        /// Display name used when the agent gives only the address.
+        #[arg(long)]
+        name: Option<String>,
+        /// The SMTP server accepts this alias as envelope sender (MAIL FROM).
+        #[arg(long)]
+        envelope: bool,
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+    List {
+        mailbox: String,
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+    Remove {
+        mailbox: String,
+        address: String,
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SignatureCmd {
+    /// Set or clear a signature. It is appended as "-- " plus the text after the body of a new draft (before a
+    /// quote or forward block) unless the agent passes signature: false; update_draft never adds it again.
+    Set {
+        mailbox: String,
+        /// Set the signature of this alias instead of the mailbox's.
+        #[arg(long)]
+        alias: Option<String>,
+        /// Plain-text file with the signature (`-` reads stdin), at most 4096 bytes.
+        #[arg(long, conflicts_with = "clear", required_unless_present = "clear")]
+        file: Option<PathBuf>,
+        /// Remove the signature.
+        #[arg(long)]
+        clear: bool,
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+    Show {
+        mailbox: String,
+        #[arg(long)]
+        alias: Option<String>,
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+}
+
+/// Reads a signature file (`-`: stdin), refusing anything larger than the cap before it is sent.
+fn read_signature(path: &std::path::Path) -> anyhow::Result<String> {
+    use std::io::Read;
+    let cap = (crate::identity::MAX_SIGNATURE_BYTES * 4) as u64;
+    let mut buf = Vec::new();
+    if path == std::path::Path::new("-") {
+        std::io::stdin().lock().take(cap + 1).read_to_end(&mut buf)?;
+    } else {
+        std::fs::File::open(path)
+            .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", path.display()))?
+            .take(cap + 1)
+            .read_to_end(&mut buf)?;
+    }
+    if buf.len() as u64 > cap {
+        anyhow::bail!("the signature file is far larger than the {} byte limit", crate::identity::MAX_SIGNATURE_BYTES);
+    }
+    String::from_utf8(buf).map_err(|_| anyhow::anyhow!("the signature file is not UTF-8 text"))
 }
 
 #[derive(Args)]
@@ -421,6 +505,26 @@ pub enum IndexCmd {
 }
 
 #[derive(Subcommand)]
+pub enum TailscaleCmd {
+    /// Mount Dove's public paths (and only those) on this node's MagicDNS name with `tailscale serve`, and set
+    /// `public_url` in the config file. Safe to run again. Restart Dove afterwards.
+    Setup {
+        /// Config file to read and update.
+        #[arg(long, default_value = "/etc/dove/config.toml")]
+        config: PathBuf,
+        /// HTTPS port on the tailnet name.
+        #[arg(long, default_value_t = 443)]
+        port: u16,
+        /// ALSO make Dove reachable from the internet (Tailscale Funnel). Off unless you ask for it.
+        #[arg(long)]
+        funnel: bool,
+        /// Print the commands and the config change without running anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum OperationsCmd {
     List {
         #[command(flatten)]
@@ -483,6 +587,27 @@ fn admin_request(cmd: Command) -> anyhow::Result<(AdminOpts, AdminRequest)> {
             AccountsCmd::Disable { alias, admin } => (admin, R::AccountsDisable { alias }),
             AccountsCmd::Enable { alias, admin } => (admin, R::AccountsEnable { alias }),
             AccountsCmd::Check { alias, admin } => (admin, R::AccountsCheck { alias }),
+            AccountsCmd::Aliases(a) => match a {
+                AliasesCmd::Add { mailbox, address, name, envelope, admin } => {
+                    (admin, R::AccountsAliasAdd { account: mailbox, address, name, envelope })
+                }
+                AliasesCmd::List { mailbox, admin } => (admin, R::AccountsAliasList { account: mailbox }),
+                AliasesCmd::Remove { mailbox, address, admin } => {
+                    (admin, R::AccountsAliasRemove { account: mailbox, address })
+                }
+            },
+            AccountsCmd::Signature(c) => match c {
+                SignatureCmd::Set { mailbox, alias, file, clear, admin } => {
+                    let signature = match (&file, clear) {
+                        (Some(f), false) => Some(read_signature(f)?),
+                        _ => None,
+                    };
+                    (admin, R::AccountsSignatureSet { account: mailbox, alias, signature })
+                }
+                SignatureCmd::Show { mailbox, alias, admin } => {
+                    (admin, R::AccountsSignatureShow { account: mailbox, alias })
+                }
+            },
         },
         Command::Projects(c) => match c {
             ProjectsCmd::Create { name, admin } => (admin, R::ProjectsCreate { name }),
@@ -535,7 +660,7 @@ fn admin_request(cmd: Command) -> anyhow::Result<(AdminOpts, AdminRequest)> {
                 (admin, R::OperationsRemove { client, account, request_key })
             }
         },
-        Command::Doctor { .. } => unreachable!("handled in run_command"),
+        Command::Doctor { .. } | Command::Tailscale(_) => unreachable!("handled in run_command"),
         Command::Export { admin } => (admin, R::Export),
         Command::Serve { .. }
         | Command::ConfigExample
@@ -644,9 +769,14 @@ async fn run_command(command: Command) -> anyhow::Result<()> {
         // Remote commands never reach the admin socket (spec 5.6).
         Command::Remote(cmd) => crate::client::run(*cmd).await,
         Command::Doctor { profile: Some(p), admin } => crate::client::doctor(Some(&p), admin.json).await,
+        Command::Tailscale(TailscaleCmd::Setup { config, port, funnel, dry_run }) => {
+            let opts = crate::tailscale::SetupOpts { config, port, funnel, dry_run };
+            crate::tailscale::setup(&opts, &crate::tailscale::Tailscale::from_path(), &mut std::io::stdout()).await
+        }
         Command::Doctor { profile: None, admin } => {
             let mut v = admin_client::send(&admin.socket, &AdminRequest::Doctor).await?;
             add_binary_version(&mut v);
+            crate::tailscale::add_doctor_check(&mut v, &crate::tailscale::Tailscale::from_path()).await;
             print(&v, admin.json);
             Ok(())
         }

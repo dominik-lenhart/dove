@@ -5,6 +5,21 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 
 ## [Unreleased]
 
+### Added
+
+- IMAP send-as aliases: `dove accounts aliases add|list|remove <mailbox> <address> [--name] [--envelope]`.
+  `create_draft` accepts the mailbox address or an alias as `from_address` (anything else is `invalid_argument`),
+  `list_accounts` shows `from_addresses` to connections that may draft, and the SMTP envelope sender stays the login
+  address unless the alias is marked `--envelope`. A draft whose `From` is no longer an address of the mailbox is not
+  sent.
+- Plain-text signatures per mailbox and per alias, for Gmail and IMAP: `dove accounts signature set|show <mailbox>
+  [--alias <address>] --file <path>|--clear`. `create_draft` appends `-- ` and the signature after the body and before
+  a reply quote or forward block unless `signature: false`; `update_draft` never adds it again.
+- `dove tailscale setup [--port N] [--funnel] [--dry-run]` publishes Dove's public paths on the node's `.ts.net` name
+  with `tailscale serve` and sets `public_url`, idempotently; `--funnel` (internet exposure) only on request, with a
+  warning. `dove doctor` checks the serve configuration (`tailscale_serve`). The path allowlist is one list shared with
+  `deploy/Caddyfile` and `deploy/nginx/dove.conf`, and a test fails if any of them drift.
+
 ## [0.1.0] - 2026-11-13
 
 First release.

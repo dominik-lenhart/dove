@@ -9,7 +9,7 @@ were checked as described in [What has been verified](#what-has-been-verified). 
 host against real Google yet.
 
 Contents: [Requirements](#requirements) · [Install](#install) · [Google Cloud](#google-cloud-setup) ·
-[Secrets](#secrets) · [Configuration](#configuration) · [Run](#run-the-service) · [Reverse proxy](#reverse-proxy) ·
+[Secrets](#secrets) · [Configuration](#configuration) · [Run](#run-the-service) · [Reverse proxy](#reverse-proxy) · [Tailscale](#tailscale) ·
 [Connect mailboxes](#connect-mailboxes) · [Projects, clients, grants](#projects-clients-and-grants) ·
 [Administration](#administration-access) · [Backup](#backup-and-restore) · [Upgrading](#upgrading) ·
 [KEK rotation](#kek-rotation) · [Deleting data](#deleting-data-logical-versus-physical) ·
@@ -271,6 +271,91 @@ count as `127.0.0.1` (IP-bound tokens fail, per-IP limits are shared), nothing e
 Caddy's `path` matcher ignores case, so `/MCP` is forwarded; Dove matches routes exactly and answers 404. The nginx
 file matches case-sensitively and answers 404 itself.
 
+## Tailscale
+
+Instead of Caddy or nginx you can publish Dove on your tailnet with Tailscale Serve. Tailscale terminates TLS with a
+certificate for the node's MagicDNS name (`dove-host.tailnet-name.ts.net`), and only devices on your tailnet can
+connect. Nothing needs to be open to the internet, and there is no DNS record or certificate to manage.
+
+Requirements: Tailscale connected on the Dove host, MagicDNS and HTTPS certificates enabled for the tailnet (Tailscale
+admin console, DNS page). The node name ends up in public certificate transparency logs, like any certificate.
+
+```sh
+dove tailscale setup --dry-run     # read-only: prints the commands and the config change
+dove tailscale setup               # runs them and sets public_url in /etc/dove/config.toml
+sudo systemctl restart dove
+dove doctor                        # includes a tailscale_serve check
+```
+
+What `setup` does, all of it safe to run again:
+
+1. Reads this node's name from `tailscale status --json`.
+2. Mounts exactly Dove's public paths (the table in [Reverse proxy](#reverse-proxy), nothing else) on that name with
+   `tailscale serve --bg --https=<port> --set-path <path> http://127.0.0.1:8787<path>` and prints each command. There
+   is no mount for `/healthz` or anything admin. It reads the loopback address from `listen` in the config file.
+3. Sets `public_url` in the config file (`https://<node>`, or `https://<node>:<port>` with `--port`), keeping every
+   comment and the layout.
+
+It never changes handlers it did not create: other ports and other apps are untouched, a foreign handler on the chosen
+port stops the setup with a message (pick another `--port`), and it never runs `tailscale serve reset`. Mounts left by
+an older Dove release that are no longer public are removed. The list of paths is the same one `deploy/Caddyfile` and
+`deploy/nginx/dove.conf` use; a test fails if they differ or if Dove registers a route that none of them lists.
+
+Options: `--config <file>` (default `/etc/dove/config.toml`), `--port <n>` (HTTPS port on the tailnet name, default
+443), `--funnel`, `--dry-run`.
+
+If Tailscale only lets root change its configuration, `setup` says so and prints what to run: either
+`sudo dove tailscale setup ...`, or `sudo tailscale set --operator=$USER` once and then run it as yourself. It checks
+that the config file is writable before it touches Tailscale. `dove doctor` runs the `tailscale_serve` check as you
+(not in the service): it compares the serve configuration with the public paths and the service's `listen` address, and
+is silent when `public_url` is not a `.ts.net` name.
+
+### Tailnet only or Funnel
+
+Without `--funnel`, Dove is reachable from your own devices only. **Which MCP hosts that works for:**
+
+| MCP host | Tailnet only | Needs Funnel |
+| --- | --- | --- |
+| Claude Code, Codex and other agents on a device in your tailnet | yes | no |
+| `dove` CLI and `dove mcp stdio` bridge on a tailnet device | yes | no |
+| Any MCP host that starts `dove mcp stdio` (the bridge) on a tailnet device | yes | no |
+| ChatGPT, claude.ai web and mobile connectors | no | yes: their requests come from the vendor's servers |
+
+`--funnel` additionally makes the same paths reachable from the internet (Tailscale Funnel; ports 443, 8443 or 10000;
+the tailnet policy must allow the `funnel` attribute for the node). **This exposes Dove to everyone on the internet.**
+Only the public paths are forwarded and every MCP call still needs a connection token, but the sign-in and OAuth
+endpoints are open to anyone, and Tailscale ACLs no longer limit who can connect. `setup` prints this warning every
+time. It is never turned on by itself. If Funnel is already on for the port and you did not pass `--funnel`, `setup`
+reports it and leaves it alone; turn it off with `tailscale funnel --https=<port> off`.
+
+### Limits of Tailscale Serve compared with a reverse proxy
+
+- **No client address.** Serve cannot add the `X-Dove-Proxy-Auth` header, so Dove never trusts a forwarded address and
+  sees every request as `127.0.0.1`. `--allow-ip` lists on clients cannot match tailnet devices (use Tailscale ACLs),
+  per-IP rate limits are shared by all clients, and audit source IPs read `127.0.0.1`. `dove doctor` still reports
+  `proxy_secret` as not set; with Serve that is expected.
+- **Prefix mounts, no method filter.** A Serve path matches itself and everything below it, and cannot restrict the
+  HTTP method. Dove's own routing answers 404 or 405 for everything that is not an exact route, as it does behind the
+  proxies.
+- **Gmail.** Connecting Gmail redirects your browser to `<public_url>/oauth/google/callback`: add that address to the
+  authorized redirect URIs of your Google OAuth client and use a browser on a tailnet device. If Google refuses a
+  `.ts.net` redirect URI for your client type, connect mailboxes while `public_url` is your normal host.
+- **Two front doors.** Keep either Caddy/nginx or Tailscale in front of one Dove; `public_url` is a single address and
+  Dove rejects requests whose Host header differs from it.
+
+### Why Dove does not bind clients to a tailnet identity
+
+Serve adds `Tailscale-User-Login` and related headers for tailnet users, and it is tempting to require that a token is
+only valid for one person. Dove does not do this. A header is only evidence if nobody but Tailscale can set it, and Dove
+cannot establish that today: Serve connects from tailscaled to Dove's loopback port, so any local process, for
+example an agent's shell on the same host, can connect there with a forged `Tailscale-User-Login`. The alternatives
+do not hold up either: asking tailscaled (LocalAPI `whois`) who a peer is needs the peer's tailnet address, and Dove
+sees only `127.0.0.1` plus a forwarded address that a local process can also forge; Serve to a Unix socket owned by
+the service user (readable by root and the service only) would make the headers trustworthy, but it needs a second
+HTTP listener in Dove, a Tailscale version that supports `unix:` targets, and certainty that Tailscale discards
+identity headers sent by the client. None of that can be tested without a real tailnet. The bearer token plus tailnet
+ACLs (who may reach the node at all) give the same protection without a header Dove cannot check. See PLAN A52.
+
 ## Connect mailboxes
 
 All admin commands talk to the Unix socket (`/run/dove/admin.sock`, override with `--socket` or
@@ -316,6 +401,41 @@ dove accounts connect-imap --alias own --email me@mail.example \
 - Dove never deletes or moves mail in these mailboxes. It removes only drafts it wrote itself (the previous revision
   after `update_draft`, the draft after `send_draft`), and only after checking that the draft on the server is still
   byte-identical to what it wrote.
+
+### Send-as aliases and signatures
+
+**Aliases (IMAP).** A mailbox that receives mail for more addresses (a shop address that lands in the same Strato
+mailbox, say) can send as them. Gmail reads its send-as list from Gmail settings; for IMAP you tell Dove:
+
+```sh
+dove accounts aliases add work sales@example.com --name "Acme Sales"
+dove accounts aliases add work press@example.com --envelope
+dove accounts aliases list work
+dove accounts aliases remove work press@example.com
+```
+
+`create_draft` accepts the mailbox address or one of its aliases as `from_address`; anything else is `invalid_argument`
+and nothing is written. `list_accounts` shows these addresses as `from_addresses` to connections that may draft in the
+mailbox. `--name` is the display name used when the agent gives only the address. The SMTP envelope sender
+(`MAIL FROM`) stays the login address, because most providers reject any other one; use `--envelope` only if your
+provider accepts that alias there. At send time the draft's `From` must still be the mailbox address or an alias, so
+removing an alias also stops existing drafts that use it from being sent. Addresses and names pass the same strict
+parsing as every other header value, so they cannot inject headers.
+
+**Signatures.** A signature is plain text (at most 4096 bytes), set by you, never by an agent, for a mailbox or for one
+of its aliases (IMAP aliases, or Gmail send-as addresses):
+
+```sh
+dove accounts signature set work --file ~/signature.txt              # mailbox signature (--file - reads stdin)
+dove accounts signature set work --alias sales@example.com --file ~/sales.txt
+dove accounts signature set work --clear
+dove accounts signature show work
+```
+
+`create_draft` appends `-- ` and the signature after `body_text`, before the quote of a reply or the block of a
+forward, using the signature of the address the mail is sent from (the alias's own, otherwise the mailbox's). The agent
+can pass `signature: false`. `update_draft` never adds a signature: it keeps what the draft already has, and a new
+`body_text` replaces the body as given.
 
 ### New IMAP mail (IDLE push)
 

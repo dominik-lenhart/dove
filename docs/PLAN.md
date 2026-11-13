@@ -271,3 +271,34 @@ hosts or reference hardware.
   signature or trusted comment (`dove <tag>`) does not verify, refuses downgrades unless a version is named, and
   never runs inside `serve`. The update hint lives in the CLI only (spec 13a amended); the service keeps its outbound
   allowlist and reports its version over the admin socket so the CLI can say when a restart is due.
+- A51. Tailscale publishing (design 0.2 section 6, owner request 2026-11-13): `dove tailscale setup` runs as the
+  operator and does not use the admin socket; it reads `listen` and `public_url` from the config file, asks
+  `tailscale status --json` for the node name and `tailscale serve status --json` for the current mounts, and mounts
+  exactly `tailscale::PUBLIC_PATHS` as one `tailscale serve --bg --https=<port> --set-path <p> http://<listen><p>`
+  per path (the same list as the Caddyfile and the nginx map; a test compares all of them and the routes in
+  `src/http.rs`, `src/mcp.rs` and `src/oauth.rs`). It touches only `host:port` of the chosen port, removes mounts that
+  point at Dove's own origin but are no longer public, and refuses (never overwrites) a handler that points elsewhere.
+  `public_url` is edited with `toml_edit` so comments survive, and the file is replaced atomically with its mode and
+  owner. Funnel is only ever turned on by `--funnel`; if it is already on, setup reports it and leaves it. Serve cannot
+  set `X-Dove-Proxy-Auth`, so Dove never trusts a forwarded address in this setup: client IP lists and per-IP limits
+  see `127.0.0.1` (documented in the deployment guide). The doctor check runs in the CLI because the service user
+  normally may not talk to tailscaled; the service reports its `public_url` and `listen` as a `public_url` check row
+  for that purpose. Unverified against a real tailnet (the build host's Tailscale serves other things): the exact
+  `tailscale` flags were taken from `tailscale serve --help` (1.104) and the state JSON shape from `serve status --json`;
+  all tests use a fake executable.
+- A52. No tailnet identity binding (design 0.2 section 6, decided 2026-11-13): `Tailscale-User-Login` and friends are
+  headers set by tailscaled when it proxies, but Serve reaches Dove over loopback TCP, where any local process can send
+  the same headers. LocalAPI `whois` needs the tailnet peer address, and Dove only sees `127.0.0.1` plus an
+  `X-Forwarded-For` value that a local process can forge. Serving to a Unix socket that only the service user (and
+  root, i.e. tailscaled) can open would make the headers trustworthy, but needs a second HTTP listener, depends on
+  `unix:` serve targets and on Tailscale dropping client-sent identity headers, and none of that can be tested without
+  a real tailnet. Bearer token plus tailnet ACLs give the same protection. Revisit when Serve offers an identity Dove
+  can verify (for example a signed header or a peer-credential check Dove can make itself).
+- A53. Sending identities (design 0.2 section 5): IMAP aliases live in `account_aliases` (address lowercased,
+  optional display name, `envelope` flag); a signature is a row of `account_signatures` keyed by address, with `''` as
+  the mailbox's own, so Gmail send-as addresses (which Dove cannot list without a Google call) can carry signatures
+  too. The sender check for IMAP uses the aliases at create time and again at send time (a removed alias stops
+  sending; envelope sender is the alias only when flagged). `from_address` keeps its name; `list_accounts` lists
+  `from_addresses` for IMAP mailboxes only (Gmail's list comes from the API). Signature lookup is exact: the alias's
+  own signature, else the mailbox's. `update_draft` never touches signatures, so a new `body_text` replaces the
+  signature too. Admin audit records for these verbs carry no address and no text.
