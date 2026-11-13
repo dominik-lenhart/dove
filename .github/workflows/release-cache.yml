@@ -6,8 +6,10 @@ name: Release cache
 #   targets in release mode and SAVE the build caches. Tag runs of release.yml can read caches saved on the default
 #   branch, so a release then only compiles the dove crate itself (the vendored OpenSSL/SQLCipher C build is the
 #   slow part). Same `shared-key` per target as release.yml (see .github/actions/release-build).
-# - pull request touching the same files: build all six release targets (cache restore only) so that a broken
-#   cross-compile (musl, x86_64-apple-darwin on the arm64 runner) shows up here and not on release day.
+# - pull request touching the same files: build all seven release targets (cache restore only) so that a broken
+#   cross-compile (musl, x86_64-apple-darwin on the arm64 runner) or Windows build shows up here and not on release
+#   day. The Windows target is built (and its cache warmed on main) before WINDOWS_RELEASE in release.yml is on, as
+#   docs/releasing.md asks.
 #
 # Not part of the normal test run: ci.yml does that.
 on:
@@ -101,3 +103,21 @@ jobs:
           want=${TARGET%%-*}
           if [ "$want" = aarch64 ]; then want=arm64; fi
           if [ "$archs" != "$want" ]; then echo "::error::expected $want, got $archs"; exit 1; fi
+
+  # x86_64-pc-windows-msvc: built on pull requests and warmed on main like the Linux targets, so the first tag with
+  # WINDOWS_RELEASE on restores a cache instead of compiling OpenSSL/SQLCipher with MSVC from scratch.
+  windows:
+    name: ${{ github.event_name == 'push' && 'warm' || 'build' }} x86_64-pc-windows-msvc
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/release-build
+        with:
+          target: x86_64-pc-windows-msvc
+          save-cache: ${{ github.event_name == 'push' }}
+      - name: Runs
+        shell: bash
+        run: target/x86_64-pc-windows-msvc/release/dove.exe --version

@@ -127,12 +127,9 @@ jobs:
     name: Windows build
     needs: changes
     if: needs.changes.outputs.rust == 'true'
-    # ALLOWED TO FAIL until the Windows port of the Rust code (local mode) is merged: without it the target does not
-    # compile, and a red job here would block main. The failure stays visible in the run, it just does not fail the
-    # workflow. Remove this line in the commit that lands the port (the same commit that flips WINDOWS_RELEASE in
-    # release.yml), and extend the test step below with the integration test files that need neither Unix sockets nor
-    # sudo.
-    continue-on-error: true
+    # Gating since the Windows port (PLAN A58). The lib tests include the Windows-only ones (DACLs, DPAPI, the admin
+    # pipe, replacing a running exe). The integration test files are not run here yet: most of them are Unix-only
+    # (`#![cfg(unix)]`), and the rest have not been tried on Windows.
     runs-on: windows-2022
     timeout-minutes: 45
     steps:

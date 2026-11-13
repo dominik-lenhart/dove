@@ -69,14 +69,12 @@ both, delete the local files and the old deploy key.
 
 ## Windows release switch
 
-The Windows zip is built only when `WINDOWS_RELEASE` in `release.yml` is `"true"`. It is `"false"` until the Windows
-port of the Rust code (local mode) is merged, because without it the target does not compile. Nothing else depends on
-it: the other assets, the checksum count, signing, the `.deb` files, the image and the Homebrew job work with or
-without the zip. Before flipping it, in one commit that also removes `continue-on-error: true` from the `windows` job of
-`ci.yml`:
+The Windows zip is built only when `WINDOWS_RELEASE` in `release.yml` is `"true"`. Nothing else depends on it: the
+other assets, the checksum count, signing, the `.deb` files, the image and the Homebrew job work with or without the
+zip. The Windows port (local mode) made the `windows` job of `ci.yml` gating and added `x86_64-pc-windows-msvc` to
+`Release cache` (built on pull requests, cache warmed on `main`). Before flipping the switch:
 
-1. `Release cache` on a pull request builds `x86_64-pc-windows-msvc` successfully (add it to that workflow's matrix
-   first, so the check runs before a tag does).
+1. `Release cache` on a pull request builds `x86_64-pc-windows-msvc` successfully, and the CI `windows` job is green.
 2. A release candidate tag (`vX.Y.Z-rc.1`) produces the zip, and `install.ps1` with `DOVE_VERSION=X.Y.Z-rc.1` installs
    it on a Windows machine and `dove --version` runs.
 3. `dove upgrade` on that Windows install finds the `.zip` of the next release.
