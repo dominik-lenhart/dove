@@ -223,6 +223,34 @@ mod tests {
         assert_eq!(c.query_row("SELECT project_id FROM sinks", [], |r| r.get::<_, Option<String>>(0)).unwrap(), None);
     }
 
+    /// Connections and open invitations that predate secret redaction keep it off (PLAN A60).
+    #[test]
+    fn redaction_migration_defaults_off() {
+        let mut c = Connection::open_in_memory().unwrap();
+        let n = schema::MIGRATIONS.iter().position(|m| m.contains("redact_secrets")).unwrap();
+        for sql in &schema::MIGRATIONS[..n] {
+            c.execute_batch(sql).unwrap();
+        }
+        c.execute_batch(
+            "INSERT INTO projects(id, name, created_at) VALUES ('p', 'p', 0);
+             INSERT INTO clients(id, name, project_id, kind, created_at, created_via) VALUES ('c', 'c', 'p', 'token', 0, 'cli');
+             INSERT INTO invitations(id, secret_hash, project_id, connection_name, grants, created_at, expires_at)
+                 VALUES ('i', x'00', 'p', 'n', '[]', 0, 1);",
+        )
+        .unwrap();
+        let tx = c.transaction().unwrap();
+        tx.execute_batch(schema::MIGRATIONS[n]).unwrap();
+        tx.commit().unwrap();
+        let flags: (bool, bool) = c
+            .query_row(
+                "SELECT (SELECT redact_secrets FROM clients), (SELECT redact_secrets FROM invitations)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(flags, (false, false));
+    }
+
     #[test]
     fn refuses_newer_schema() {
         let dir = tempfile::tempdir().unwrap();
