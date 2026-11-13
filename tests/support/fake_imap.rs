@@ -5,6 +5,12 @@
 //! UID EXPUNGE, UID COPY / UID MOVE (COPYUID; MOVE optional), ENABLE QRESYNC, NOOP, LOGOUT, IDLE/DONE (pushes EXISTS, EXPUNGE/VANISHED and FETCH for the selected
 //! folder; optional server-side IDLE timeout with BYE; `kick_idle` drops idling connections); SMTP EHLO, AUTH PLAIN/LOGIN, MAIL, RCPT, DATA, RSET, QUIT.
 //! Non-PEEK body fetches set `\Seen` like a real server, so tests can prove Dove never sets it.
+//!
+//! Gmail mode ([`Opts::gmail`], [`FakeImap::gmail_user`]): `X-GM-EXT-1`, labels as folders (one message has a copy with
+//! its own UID in All Mail and in every label folder, flags shared), `X-GM-LABELS` in FETCH and STORE (MODSEQ bumps on
+//! label changes), MOVE into Trash/Spam drops every label, MOVE out of them restores into All Mail (and the target
+//! label), EXPUNGE in a label folder removes that label, in Drafts the draft and in All Mail the message everywhere
+//! (the "delete for good" setting Dove must never trigger). SMTP submissions are filed in Sent like Gmail does.
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
@@ -94,6 +100,8 @@ pub struct Opts {
     pub move_cap: bool,
     /// Report COPYUID for COPY and MOVE (UIDPLUS servers do; off simulates a server that omits it).
     pub copyuid: bool,
+    /// Gmail semantics and `X-GM-EXT-1` (module docs). Users are created with [`FakeImap::gmail_user`].
+    pub gmail: bool,
 }
 
 /// How far past `UIDNEXT` the ranges of [`Opts::wide_vanished`] reach.
@@ -113,6 +121,7 @@ impl Default for Opts {
             wide_vanished: false,
             move_cap: true,
             copyuid: true,
+            gmail: false,
         }
     }
 }
@@ -131,6 +140,8 @@ struct Msg {
     raw: Vec<u8>,
     internal_date: i64,
     modseq: u64,
+    /// Gmail mode: the message all copies share (`X-GM-MSGID`); 0 otherwise.
+    gm_id: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -180,6 +191,7 @@ struct State {
     idling: usize,
     /// Bumped by `kick_idle`: idling connections close without a word.
     kick: u64,
+    next_gm_id: u64,
 }
 
 #[derive(Clone)]
@@ -505,6 +517,7 @@ impl FakeImap {
                 raw: raw.to_vec(),
                 internal_date,
                 modseq,
+                gm_id: 0,
             });
             uid
         })
@@ -570,6 +583,141 @@ impl FakeImap {
 
     pub fn uidvalidity(&self, user: &str, folder: &str) -> u32 {
         self.with(|st| Self::folder_mut(st, user, folder).uidvalidity)
+    }
+
+    /// A Gmail-mode user (start the server with `Opts { gmail: true, .. }`): INBOX, `[Gmail]` (`\Noselect`), All Mail
+    /// (`\All`), Drafts, Sent Mail, Spam (`\Junk`), Trash, Important (`\Important`) and the user labels `Work` and
+    /// `Privat/Kunden`.
+    pub fn gmail_user(&self, user: &str, password: &str) {
+        self.add_user(user, password);
+        for (name, special) in [
+            ("[Gmail]", Some("\\Noselect")),
+            ("[Gmail]/All Mail", Some("\\All")),
+            ("[Gmail]/Drafts", Some("\\Drafts")),
+            ("[Gmail]/Sent Mail", Some("\\Sent")),
+            ("[Gmail]/Spam", Some("\\Junk")),
+            ("[Gmail]/Trash", Some("\\Trash")),
+            ("[Gmail]/Important", Some("\\Important")),
+            ("Work", None),
+            ("Privat/Kunden", None),
+        ] {
+            self.add_folder(user, name, special);
+        }
+    }
+
+    /// A Gmail message with `labels` (folder names: `INBOX`, user labels, `[Gmail]/Important`, `[Gmail]/Sent Mail`;
+    /// or `[Gmail]/Spam` / `[Gmail]/Trash` alone). It gets a copy in All Mail (unless in Spam/Trash) and in every label
+    /// folder. Returns its Gmail id.
+    pub fn gm_add(&self, user: &str, labels: &[&str], raw: &[u8], flags: &[&str], internal_date: i64) -> u64 {
+        self.with(|st| {
+            st.next_gm_id += 1;
+            let gm_id = st.next_gm_id;
+            let u = st.users.get_mut(user).expect("unknown fake user");
+            let mut targets: BTreeSet<usize> = labels
+                .iter()
+                .map(|l| u.folders.iter().position(|f| f.raw_name == encode_utf7(l)).expect("unknown fake folder"))
+                .collect();
+            if !targets.iter().any(|i| matches!(gm_kind(&u.folders[*i]), GmKind::Trash | GmKind::Spam)) {
+                targets.insert(gm_index(u, GmKind::All).expect("All Mail"));
+            }
+            let m = Msg {
+                uid: 0,
+                flags: flags.iter().map(|f| f.to_string()).collect(),
+                raw: raw.to_vec(),
+                internal_date,
+                modseq: 0,
+                gm_id,
+            };
+            for i in targets {
+                push_copy(&mut u.folders[i], &m);
+            }
+            gm_id
+        })
+    }
+
+    /// The UID of Gmail message `gm_id` in `folder`, if it has a copy there.
+    pub fn gm_uid(&self, user: &str, folder: &str, gm_id: u64) -> Option<u32> {
+        self.with(|st| Self::folder_mut(st, user, folder).msgs.iter().find(|m| m.gm_id == gm_id).map(|m| m.uid))
+    }
+
+    /// Wire names of the folders holding a copy of `gm_id`.
+    pub fn gm_folders(&self, user: &str, gm_id: u64) -> Vec<String> {
+        self.with(|st| {
+            let u = &st.users[user];
+            gm_where(u, gm_id).into_iter().map(|i| u.folders[i].raw_name.clone()).collect()
+        })
+    }
+
+    /// Changes labels (folder names) as another client (Gmail on the web) would; MODSEQ bumps like Gmail's.
+    pub fn gm_relabel(&self, user: &str, gm_id: u64, add: &[&str], remove: &[&str]) {
+        self.with(|st| {
+            let u = st.users.get_mut(user).expect("unknown fake user");
+            let idx = |u: &User, n: &str| u.folders.iter().position(|f| f.raw_name == encode_utf7(n)).expect("folder");
+            let mut want = gm_where(u, gm_id);
+            for a in add {
+                want.insert(idx(u, a));
+            }
+            for r in remove {
+                want.remove(&idx(u, r));
+            }
+            gm_place(u, gm_id, &want);
+        })
+    }
+
+    /// Flags of Gmail message `gm_id` (from its first copy).
+    pub fn gm_flags(&self, user: &str, gm_id: u64) -> Vec<String> {
+        self.with(|st| {
+            st.users[user]
+                .folders
+                .iter()
+                .flat_map(|f| f.msgs.iter())
+                .find(|m| m.gm_id == gm_id)
+                .map(|m| m.flags.iter().cloned().collect())
+                .unwrap_or_default()
+        })
+    }
+
+    /// Gmail mode: walks the command log and fails on any `\Deleted` STORE, `EXPUNGE` or `UID EXPUNGE` while a folder
+    /// other than Drafts is selected, and on any `UID COPY` (Dove never copies on Gmail: copying adds a label, and the
+    /// COPY + EXPUNGE move fallback can delete for good). Returns how many deletes it checked (all in Drafts).
+    pub fn assert_gmail_deletes_only_in_drafts(&self) -> usize {
+        let (cmds, drafts) = self.with(|st| {
+            let drafts: Vec<String> = st
+                .users
+                .values()
+                .flat_map(|u| u.folders.iter())
+                .filter(|f| f.special.as_deref() == Some("\\Drafts"))
+                .map(|f| f.raw_name.clone())
+                .collect();
+            (st.commands.clone(), drafts)
+        });
+        let mut selected: Option<String> = None;
+        let mut checked = 0;
+        for c in &cmds {
+            let verb = verb_of(c);
+            let up = c.to_ascii_uppercase();
+            match verb.as_str() {
+                "SELECT" | "EXAMINE" => {
+                    let rest = c.split_once(' ').map(|x| x.1).unwrap_or_default();
+                    let name = match rest.strip_prefix('"') {
+                        Some(r) => r.split('"').next().unwrap_or_default().to_string(),
+                        None => rest.split(' ').next().unwrap_or_default().to_string(),
+                    };
+                    selected = Some(name);
+                }
+                "UID COPY" => panic!("UID COPY in Gmail mode: {c}"),
+                "EXPUNGE" | "UID EXPUNGE" => {
+                    assert!(selected.as_ref().is_some_and(|s| drafts.contains(s)), "{c} outside Drafts ({selected:?})");
+                    checked += 1;
+                }
+                "UID STORE" if up.contains("\\DELETED") => {
+                    assert!(selected.as_ref().is_some_and(|s| drafts.contains(s)), "{c} outside Drafts ({selected:?})");
+                    checked += 1;
+                }
+                _ => {}
+            }
+        }
+        checked
     }
 
     pub fn fail_next(&self, cmd: &str, fault: Fault) {
@@ -667,6 +815,11 @@ impl FakeImap {
                 // \Deleted only alone (own draft or confirmed copy source); other stores carry organize flags only.
                 if up.contains("\\DELETED") {
                     assert!(up.ends_with("+FLAGS.SILENT (\\DELETED)"), "STORE with \\Deleted and more: {c}");
+                } else if up.contains("X-GM-LABELS") {
+                    // Gmail labels: the inbox or a user label only, never a flag or another system label.
+                    assert!(up.contains(" +X-GM-LABELS (") || up.contains(" -X-GM-LABELS ("), "STORE form: {c}");
+                    let rest = up.split_once("X-GM-LABELS (").unwrap().1.replace("\\INBOX", "");
+                    assert!(!rest.contains('\\') && !up.contains("FLAGS"), "STORE of a system label: {c}");
                 } else {
                     assert!(up.contains(" +FLAGS.SILENT (") || up.contains(" -FLAGS.SILENT ("), "STORE form: {c}");
                     assert!(!up.contains("\\DRAFT") && !up.contains("\\RECENT"), "STORE of a system flag: {c}");
@@ -717,6 +870,9 @@ fn caps(o: &Opts) -> String {
     }
     if o.move_cap {
         c.push("MOVE");
+    }
+    if o.gmail {
+        c.push("X-GM-EXT-1");
     }
     c.join(" ")
 }
@@ -1017,8 +1173,10 @@ fn handle(
             let su = s.opts.special_use;
             for f in &s.users[authed.as_ref().unwrap()].folders {
                 let mut attrs = vec!["\\HasNoChildren".to_string()];
-                if su && let Some(sp) = &f.special {
-                    attrs.push(sp.clone());
+                match &f.special {
+                    Some(sp) if sp == "\\Noselect" => attrs.push(sp.clone()),
+                    Some(sp) if su => attrs.push(sp.clone()),
+                    _ => {}
                 }
                 out.line(format!("* {verb} ({}) \"/\" \"{}\"", attrs.join(" "), f.raw_name));
             }
@@ -1078,27 +1236,47 @@ fn handle(
                 bytes = norm;
             }
             let uidplus = s.opts.uidplus;
+            let gm_id = if s.opts.gmail {
+                s.next_gm_id += 1;
+                s.next_gm_id
+            } else {
+                0
+            };
             let user = s.users.get_mut(authed.as_ref().unwrap()).unwrap();
-            let Some(f) = user.folders.iter_mut().find(|f| f.raw_name == name) else {
+            let Some(fi) = user.folders.iter().position(|f| f.raw_name == name) else {
                 out.line(format!("{tag} NO [TRYCREATE] no such mailbox"));
                 return (out.0, false);
             };
-            let uid = f.uidnext;
-            f.uidnext += 1;
-            let modseq = f.bump();
-            f.msgs.push(Msg {
-                uid,
+            let msg = Msg {
+                uid: 0,
                 flags: flags.into_iter().collect(),
                 raw: bytes,
                 internal_date: 1_767_225_600,
-                modseq,
-            });
+                modseq: 0,
+                gm_id,
+            };
+            if gm_id != 0 && gm_kind(&user.folders[fi]) == GmKind::Label {
+                // Gmail: a message appended to a label folder is in All Mail with that label.
+                if let Some(all) = user.folders.iter().position(|f| gm_kind(f) == GmKind::All) {
+                    let all_flags: BTreeSet<String> = msg.flags.clone();
+                    push_copy(&mut user.folders[all], &Msg { flags: all_flags, ..msg.clone() });
+                }
+            }
+            let uid = push_copy(&mut user.folders[fi], &msg);
+            let f = &user.folders[fi];
             if uidplus {
                 out.line(format!("{tag} OK [APPENDUID {} {uid}] appended", f.uidvalidity));
             } else {
                 out.line(ok("appended"));
             }
         }
+        "UID COPY" | "UID MOVE" if s.opts.gmail => return (gm_copy_move(&mut s, conn, tag, verb, args).0, false),
+        "UID STORE"
+            if s.opts.gmail && args.get(1).is_some_and(|a| a.s().to_ascii_uppercase().contains("X-GM-LABELS")) =>
+        {
+            return (gm_store_labels(&mut s, conn, tag, args).0, false);
+        }
+        "UID EXPUNGE" if s.opts.gmail && s.opts.uidplus => return (gm_expunge(&mut s, conn, tag, args).0, false),
         "UID COPY" | "UID MOVE" => {
             let Some((sel, ro)) = conn.selected.clone() else {
                 out.line(format!("{tag} BAD no mailbox selected"));
@@ -1127,7 +1305,7 @@ fn handle(
                 let uid = d.uidnext;
                 d.uidnext += 1;
                 let modseq = d.bump();
-                d.msgs.push(Msg { uid, modseq, ..m.clone() });
+                d.msgs.push(Msg { uid, modseq, gm_id: 0, ..m.clone() });
                 src_uids.push(m.uid.to_string());
                 dst_uids.push(uid.to_string());
             }
@@ -1171,6 +1349,13 @@ fn handle(
             let uidplus = s.opts.uidplus;
             let qresync = conn.qresync;
             let wide_vanished = s.opts.wide_vanished;
+            let gmail = s.opts.gmail;
+            let gm_map: HashMap<u64, Vec<String>> = if gmail {
+                let u = &s.users[authed.as_ref().unwrap()];
+                u.folders.iter().flat_map(|f| f.msgs.iter()).map(|m| (m.gm_id, gm_labels(u, m.gm_id))).collect()
+            } else {
+                HashMap::new()
+            };
             let user = s.users.get_mut(authed.as_ref().unwrap()).unwrap();
             let Some(f) = user.folders.iter_mut().find(|f| f.raw_name == sel) else {
                 out.line(format!("{tag} NO mailbox gone"));
@@ -1253,6 +1438,9 @@ fn handle(
                                 }
                                 "RFC822.SIZE" => parts.push(format!("RFC822.SIZE {}", m.raw.len())),
                                 "MODSEQ" => {}
+                                "X-GM-LABELS" if gmail => {
+                                    parts.push(gm_render(gm_map.get(&m.gm_id).map(Vec::as_slice).unwrap_or_default()))
+                                }
                                 "BODY.PEEK[]" => body = Some(("BODY[]".into(), m.raw.clone())),
                                 "BODY[]" | "RFC822" => {
                                     body = Some((
@@ -1344,9 +1532,370 @@ fn handle(
                 }
                 _ => out.line(format!("{tag} BAD unknown command")),
             }
+            if gmail && let Some(si) = user.folders.iter().position(|f| f.raw_name == sel) {
+                gm_sync_flags(user, si);
+            }
         }
     }
     (out.0, false)
+}
+
+// ------------------------------------------------------------------ Gmail mode
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GmKind {
+    All,
+    Trash,
+    Spam,
+    Label,
+    NoSelect,
+}
+
+fn gm_kind(f: &Folder) -> GmKind {
+    match f.special.as_deref() {
+        Some("\\All") => GmKind::All,
+        Some("\\Trash") => GmKind::Trash,
+        Some("\\Junk") => GmKind::Spam,
+        Some("\\Noselect") => GmKind::NoSelect,
+        _ => GmKind::Label,
+    }
+}
+
+/// Appends a copy of `m` with the next UID and MODSEQ of `f`; returns the UID.
+fn push_copy(f: &mut Folder, m: &Msg) -> u32 {
+    let uid = f.uidnext;
+    f.uidnext += 1;
+    let modseq = f.bump();
+    f.msgs.push(Msg { uid, modseq, ..m.clone() });
+    uid
+}
+
+/// Folders (indices) holding a copy of Gmail message `gm_id`.
+fn gm_where(u: &User, gm_id: u64) -> BTreeSet<usize> {
+    if gm_id == 0 {
+        return BTreeSet::new();
+    }
+    u.folders.iter().enumerate().filter(|(_, f)| f.msgs.iter().any(|m| m.gm_id == gm_id)).map(|(i, _)| i).collect()
+}
+
+fn gm_index(u: &User, kind: GmKind) -> Option<usize> {
+    u.folders.iter().position(|f| gm_kind(f) == kind)
+}
+
+/// `X-GM-LABELS` of a message: one per label folder holding a copy.
+fn gm_labels(u: &User, gm_id: u64) -> Vec<String> {
+    u.folders
+        .iter()
+        .filter(|f| gm_kind(f) == GmKind::Label && gm_id != 0 && f.msgs.iter().any(|m| m.gm_id == gm_id))
+        .map(|f| match (f.raw_name.as_str(), f.special.as_deref()) {
+            ("INBOX", _) => "\\Inbox".to_string(),
+            (_, Some("\\Sent")) => "\\Sent".into(),
+            (_, Some("\\Drafts")) => "\\Draft".into(),
+            (_, Some("\\Important")) => "\\Important".into(),
+            _ => f.raw_name.clone(),
+        })
+        .collect()
+}
+
+/// Renders labels like Gmail does: `\Inbox` as an atom, other system labels quoted with an escaped backslash, user
+/// labels quoted.
+fn gm_render(labels: &[String]) -> String {
+    let items: Vec<String> =
+        labels
+            .iter()
+            .map(|l| {
+                if l == "\\Inbox" { l.clone() } else { format!("\"{}\"", l.replace('\\', "\\\\").replace('"', "\\\"")) }
+            })
+            .collect();
+    format!("X-GM-LABELS ({})", items.join(" "))
+}
+
+/// The label folder a label names (`\Inbox`, `\Important`, `\Sent`, `\Draft` or a user label's folder name). Other
+/// system labels (`\Trash`, `\Spam`, ...) name none.
+fn gm_label_folder(u: &User, label: &str) -> Option<usize> {
+    let by_special = |sp: &str| u.folders.iter().position(|f| f.special.as_deref() == Some(sp));
+    match label.to_ascii_lowercase().as_str() {
+        "\\inbox" => u.folders.iter().position(|f| f.raw_name == "INBOX"),
+        "\\important" => by_special("\\Important"),
+        "\\sent" => by_special("\\Sent"),
+        "\\draft" => by_special("\\Drafts"),
+        l if l.starts_with('\\') => None,
+        _ => u.folders.iter().position(|f| f.raw_name == label && gm_kind(f) == GmKind::Label),
+    }
+}
+
+/// Copies removed and added by [`gm_place`]: (folder index, UID).
+#[derive(Default)]
+struct Placed {
+    removed: Vec<(usize, u32)>,
+    added: Vec<(usize, u32)>,
+}
+
+/// Puts Gmail message `gm_id` into exactly the folders `targets`. Removed copies are recorded as vanished; remaining
+/// copies get a new MODSEQ (their labels changed), as Gmail does.
+fn gm_place(u: &mut User, gm_id: u64, targets: &BTreeSet<usize>) -> Placed {
+    let mut p = Placed::default();
+    let template = u.folders.iter().flat_map(|f| f.msgs.iter()).find(|m| gm_id != 0 && m.gm_id == gm_id).cloned();
+    let Some(mut template) = template else { return p };
+    template.flags.remove("\\Deleted");
+    for (i, f) in u.folders.iter_mut().enumerate() {
+        let has = f.msgs.iter().position(|m| m.gm_id == gm_id);
+        match (has, targets.contains(&i)) {
+            (Some(pos), false) => {
+                let ms = f.bump();
+                let uid = f.msgs.remove(pos).uid;
+                f.vanished.push((uid, ms));
+                p.removed.push((i, uid));
+            }
+            (None, true) => p.added.push((i, push_copy(f, &template))),
+            (Some(pos), true) => {
+                let ms = f.bump();
+                f.msgs[pos].modseq = ms;
+            }
+            (None, false) => {}
+        }
+    }
+    p
+}
+
+/// Gmail flags belong to the message: copies the flags of every Gmail message in folder `from` to its other copies
+/// (all but `\Deleted`, which stays per folder), bumping MODSEQ where they change.
+fn gm_sync_flags(u: &mut User, from: usize) {
+    let src: Vec<(u64, BTreeSet<String>)> = u.folders[from]
+        .msgs
+        .iter()
+        .filter(|m| m.gm_id != 0)
+        .map(|m| (m.gm_id, m.flags.iter().filter(|f| *f != "\\Deleted").cloned().collect()))
+        .collect();
+    for (gm_id, flags) in src {
+        for (i, f) in u.folders.iter_mut().enumerate() {
+            if i == from {
+                continue;
+            }
+            let Some(pos) = f.msgs.iter().position(|m| m.gm_id == gm_id) else { continue };
+            let mut want = flags.clone();
+            if f.msgs[pos].flags.contains("\\Deleted") {
+                want.insert("\\Deleted".into());
+            }
+            if f.msgs[pos].flags != want {
+                let ms = f.bump();
+                f.msgs[pos].flags = want;
+                f.msgs[pos].modseq = ms;
+            }
+        }
+    }
+}
+
+/// Reports UIDs removed from the selected folder (`old` is its UID list before the change, in sequence order).
+fn expunge_lines(out: &mut Out, old: &[u32], removed: &[u32], qresync: bool) {
+    let mut seq_view = old.to_vec();
+    for uid in removed {
+        let Some(pos) = seq_view.iter().position(|u| u == uid) else { continue };
+        out.line(if qresync { format!("* VANISHED {uid}") } else { format!("* {} EXPUNGE", pos + 1) });
+        seq_view.remove(pos);
+    }
+}
+
+/// Gmail-mode COPY/MOVE: into Trash/Spam drops every label; out of Trash/Spam restores into All Mail (plus the
+/// target label); MOVE between labels swaps the label, COPY adds one.
+fn gm_copy_move(s: &mut State, conn: &Conn, tag: &str, verb: &str, args: &[Tok]) -> Out {
+    let mut out = Out::default();
+    let Some((sel, ro)) = conn.selected.clone() else {
+        out.line(format!("{tag} BAD no mailbox selected"));
+        return out;
+    };
+    if verb == "UID MOVE" && (!s.opts.move_cap || ro) {
+        out.line(format!("{tag} {} move not possible", if ro { "NO" } else { "BAD" }));
+        return out;
+    }
+    let (copyuid, qresync) = (s.opts.copyuid, conn.qresync);
+    let dest = args.get(1).map(Tok::s).unwrap_or_default();
+    let user = s.users.get_mut(conn.user.as_ref().unwrap()).unwrap();
+    let (Some(si), Some(di)) = (
+        user.folders.iter().position(|f| f.raw_name == sel),
+        user.folders.iter().position(|f| f.raw_name == dest && gm_kind(f) != GmKind::NoSelect),
+    ) else {
+        out.line(format!("{tag} NO [TRYCREATE] no such mailbox"));
+        return out;
+    };
+    let all = gm_index(user, GmKind::All).expect("All Mail");
+    let old: Vec<u32> = user.folders[si].msgs.iter().map(|m| m.uid).collect();
+    let max = old.iter().copied().max().unwrap_or(0);
+    let set = parse_set(&args.first().map(Tok::s).unwrap_or_default(), max);
+    let picked: Vec<(u32, u64)> =
+        user.folders[si].msgs.iter().filter(|m| in_set(&set, m.uid)).map(|m| (m.uid, m.gm_id)).collect();
+    let (sk, dk) = (gm_kind(&user.folders[si]), gm_kind(&user.folders[di]));
+    let trashy = |k: GmKind| matches!(k, GmKind::Trash | GmKind::Spam);
+    let (mut pairs, mut removed) = (Vec::new(), Vec::new());
+    for (uid, gm) in picked {
+        let mut want = gm_where(user, gm);
+        if trashy(dk) || trashy(sk) {
+            want.clear();
+        }
+        if trashy(sk) && !trashy(dk) {
+            want.insert(all);
+        }
+        want.insert(di);
+        if verb == "UID MOVE" && sk == GmKind::Label {
+            want.remove(&si);
+        }
+        let placed = gm_place(user, gm, &want);
+        let dst = placed
+            .added
+            .iter()
+            .find(|(i, _)| *i == di)
+            .map(|(_, u)| *u)
+            .or_else(|| user.folders[di].msgs.iter().find(|m| m.gm_id == gm).map(|m| m.uid));
+        if let Some(d) = dst {
+            pairs.push((uid, d));
+        }
+        if placed.removed.iter().any(|(i, u)| *i == si && *u == uid) {
+            removed.push(uid);
+        }
+    }
+    let code = (copyuid && !pairs.is_empty()).then(|| {
+        let (a, b): (Vec<String>, Vec<String>) = pairs.iter().map(|(a, b)| (a.to_string(), b.to_string())).unzip();
+        format!("COPYUID {} {} {}", user.folders[di].uidvalidity, a.join(","), b.join(","))
+    });
+    if verb == "UID COPY" {
+        match code {
+            Some(c) => out.line(format!("{tag} OK [{c}] copied")),
+            None => out.line(format!("{tag} OK copied")),
+        }
+        return out;
+    }
+    if let Some(c) = code {
+        out.line(format!("* OK [{c}] moved"));
+    }
+    expunge_lines(&mut out, &old, &removed, qresync);
+    out.line(format!("{tag} OK moved"));
+    out
+}
+
+/// Gmail-mode `UID STORE +/-X-GM-LABELS[.SILENT] (...)` on the selected folder.
+fn gm_store_labels(s: &mut State, conn: &Conn, tag: &str, args: &[Tok]) -> Out {
+    let mut out = Out::default();
+    let Some((sel, ro)) = conn.selected.clone() else {
+        out.line(format!("{tag} BAD no mailbox selected"));
+        return out;
+    };
+    if ro {
+        out.line(format!("{tag} NO read-only"));
+        return out;
+    }
+    let op = args.get(1).map(Tok::s).unwrap_or_default().to_ascii_uppercase();
+    let silent = op.ends_with(".SILENT");
+    let labels: Vec<String> = match args.get(2) {
+        Some(Tok::List(l)) => l.iter().map(Tok::s).collect(),
+        Some(t) => vec![t.s()],
+        None => vec![],
+    };
+    let user = s.users.get_mut(conn.user.as_ref().unwrap()).unwrap();
+    let Some(si) = user.folders.iter().position(|f| f.raw_name == sel) else {
+        out.line(format!("{tag} NO mailbox gone"));
+        return out;
+    };
+    if matches!(gm_kind(&user.folders[si]), GmKind::Trash | GmKind::Spam) {
+        out.line(format!("{tag} NO [CANNOT] no labels in Trash or Spam"));
+        return out;
+    }
+    let mut idx = Vec::new();
+    for l in &labels {
+        match gm_label_folder(user, l) {
+            Some(i) => idx.push(i),
+            // Real Gmail would create the label; the fake refuses so a test notices.
+            None => {
+                out.line(format!("{tag} NO [NONEXISTENT] unknown label"));
+                return out;
+            }
+        }
+    }
+    let all = gm_index(user, GmKind::All).expect("All Mail");
+    let max = user.folders[si].msgs.iter().map(|m| m.uid).max().unwrap_or(0);
+    let set = parse_set(&args.first().map(Tok::s).unwrap_or_default(), max);
+    let picked: Vec<u64> = user.folders[si].msgs.iter().filter(|m| in_set(&set, m.uid)).map(|m| m.gm_id).collect();
+    for gm in picked {
+        let mut want = gm_where(user, gm);
+        if op.starts_with('+') {
+            want.extend(idx.iter().copied());
+        } else if op.starts_with('-') {
+            idx.iter().for_each(|i| {
+                want.remove(i);
+            });
+        } else {
+            want = idx.iter().copied().chain([all]).collect();
+        }
+        gm_place(user, gm, &want);
+    }
+    if !silent {
+        let f = &user.folders[si];
+        let lines: Vec<String> = f
+            .msgs
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| in_set(&set, m.uid))
+            .map(|(seq, m)| {
+                format!(
+                    "* {} FETCH (UID {} {} MODSEQ ({}))",
+                    seq + 1,
+                    m.uid,
+                    gm_render(&gm_labels(user, m.gm_id)),
+                    m.modseq
+                )
+            })
+            .collect();
+        lines.into_iter().for_each(|l| out.line(l));
+    }
+    out.line(format!("{tag} OK stored"));
+    out
+}
+
+/// Gmail-mode `UID EXPUNGE`: in a label folder it removes that label, in Drafts the draft, in All Mail (or Trash and
+/// Spam) the message everywhere: the "delete for good" outcome Dove must never cause.
+fn gm_expunge(s: &mut State, conn: &Conn, tag: &str, args: &[Tok]) -> Out {
+    let mut out = Out::default();
+    let Some((sel, _)) = conn.selected.clone() else {
+        out.line(format!("{tag} BAD no mailbox selected"));
+        return out;
+    };
+    let qresync = conn.qresync;
+    let user = s.users.get_mut(conn.user.as_ref().unwrap()).unwrap();
+    let Some(si) = user.folders.iter().position(|f| f.raw_name == sel) else {
+        out.line(format!("{tag} NO mailbox gone"));
+        return out;
+    };
+    let old: Vec<u32> = user.folders[si].msgs.iter().map(|m| m.uid).collect();
+    let max = old.iter().copied().max().unwrap_or(0);
+    let set = parse_set(&args.first().map(Tok::s).unwrap_or_default(), max);
+    let gone: Vec<(u32, u64)> = user.folders[si]
+        .msgs
+        .iter()
+        .filter(|m| in_set(&set, m.uid) && m.flags.contains("\\Deleted"))
+        .map(|m| (m.uid, m.gm_id))
+        .collect();
+    let drafts = user.folders[si].special.as_deref() == Some("\\Drafts");
+    let kind = gm_kind(&user.folders[si]);
+    let mut removed = Vec::new();
+    for (uid, gm) in gone {
+        if gm == 0 {
+            let f = &mut user.folders[si];
+            let ms = f.bump();
+            f.msgs.retain(|m| m.uid != uid);
+            f.vanished.push((uid, ms));
+        } else {
+            let mut want = gm_where(user, gm);
+            if kind == GmKind::Label && !drafts {
+                want.remove(&si);
+            } else {
+                want.clear();
+            }
+            gm_place(user, gm, &want);
+        }
+        removed.push(uid);
+    }
+    expunge_lines(&mut out, &old, &removed, qresync);
+    out.line(format!("{tag} OK expunged"));
+    out
 }
 
 fn out_push_body(out: &mut Out, seq: usize, parts: &[String], name: &str, body: &[u8]) {
@@ -1477,11 +2026,32 @@ async fn smtp_conn(st: Arc<Mutex<State>>, mut r: BufReader<OwnedReadHalf>, mut w
                     }
                     data.extend_from_slice(&l);
                 }
-                st.lock().unwrap().sent.push(SentMail {
-                    from: from.clone().unwrap_or_default(),
-                    rcpts: rcpts.clone(),
-                    data,
-                });
+                {
+                    let mut g = st.lock().unwrap();
+                    if g.opts.gmail {
+                        // Gmail files every submission in Sent Mail itself.
+                        g.next_gm_id += 1;
+                        let gm_id = g.next_gm_id;
+                        if let Some(u) = g.users.get_mut(from.as_deref().unwrap_or_default())
+                            && let (Some(sent), Some(all)) = (
+                                u.folders.iter().position(|f| f.special.as_deref() == Some("\\Sent")),
+                                gm_index(u, GmKind::All),
+                            )
+                        {
+                            let m = Msg {
+                                uid: 0,
+                                flags: ["\\Seen".to_string()].into(),
+                                raw: data.clone(),
+                                internal_date: 1_767_225_600,
+                                modseq: 0,
+                                gm_id,
+                            };
+                            push_copy(&mut u.folders[sent], &m);
+                            push_copy(&mut u.folders[all], &m);
+                        }
+                    }
+                    g.sent.push(SentMail { from: from.clone().unwrap_or_default(), rcpts: rcpts.clone(), data });
+                }
                 if matches!(fault, Some(SmtpFault::DropAfterTerminator)) {
                     return;
                 }

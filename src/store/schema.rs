@@ -1,6 +1,6 @@
 //! Versioned schema migrations for the durable state store. Never edit a released migration; append a new one.
 
-pub const MIGRATIONS: &[&str] = &[V1, V2, V3, V_SEND_IDENTITIES, V_WATCHES];
+pub const MIGRATIONS: &[&str] = &[V1, V2, V3, V_SEND_IDENTITIES, V_WATCHES, V_GMAIL_IMAP];
 
 const V1: &str = r#"
 CREATE TABLE accounts (
@@ -298,4 +298,21 @@ CREATE TABLE sink_deliveries (
 ) WITHOUT ROWID;
 CREATE INDEX sink_deliveries_due ON sink_deliveries(state, next_attempt_at);
 CREATE INDEX sink_deliveries_sink ON sink_deliveries(sink_id);
+"#;
+
+/// Gmail over IMAP (PLAN A52): `imap_folders.special` also takes `all` (Gmail's All Mail, `\All`). SQLite cannot change
+/// a CHECK constraint, so the table is rebuilt with the same rows and ids (nothing references it).
+const V_GMAIL_IMAP: &str = r#"
+CREATE TABLE imap_folders_v6 (
+    account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    folder_id  INTEGER NOT NULL,
+    name       TEXT NOT NULL,
+    special    TEXT CHECK (special IN ('drafts', 'sent', 'junk', 'trash', 'all')),
+    PRIMARY KEY (account_id, folder_id),
+    UNIQUE (account_id, name)
+);
+INSERT INTO imap_folders_v6(account_id, folder_id, name, special)
+    SELECT account_id, folder_id, name, special FROM imap_folders;
+DROP TABLE imap_folders;
+ALTER TABLE imap_folders_v6 RENAME TO imap_folders;
 "#;

@@ -1,6 +1,7 @@
 //! Provider-neutral message access for tools: one `fetch_message` / `list_labels` API that dispatches on
 //! [`Provider`]. IMAP messages are presented with Gmail-compatible system labels (`UNREAD`, `STARRED`, `DRAFT`,
-//! `SENT`, `TRASH`, `SPAM`) plus their folder path, so shaping, filters and the index stay unchanged.
+//! `SENT`, `TRASH`, `SPAM`) plus their folder path, so shaping, filters and the index stay unchanged. Gmail-mode
+//! messages (PLAN A52) take their labels from `X-GM-LABELS` instead of the folder they were read from.
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -9,7 +10,7 @@ use crate::content;
 use crate::error::{ErrorCode, ToolError};
 use crate::gmail::gateway::{GmailOp, Priority};
 use crate::imap::account::{self, Folder};
-use crate::imap::{ImapError, ImapMsgId, Special};
+use crate::imap::{FetchedMeta, ImapError, ImapMsgId, Special, utf7};
 use crate::mime::{self, ParsedMessage};
 use crate::policy::{Mailbox, Provider};
 use crate::tools::ToolCx;
@@ -75,7 +76,7 @@ async fn fetch_imap(cx: &ToolCx, mb: &Mailbox, id: &str) -> Result<Fetched, Tool
     let f = folder(cx, &mb.account_id, mid.folder_id).await?;
     let name = f.name.clone();
     let max = mime::Limits::default().max_raw_bytes;
-    let (meta, raw) = account::with_session(&cx.app, &mb.account_id, move |s| {
+    let (meta, raw, gmail) = account::with_session(&cx.app, &mb.account_id, move |s| {
         Box::pin(async move {
             let st = s.select(&name, true).await?;
             if st.uidvalidity != mid.uidvalidity {
@@ -83,7 +84,7 @@ async fn fetch_imap(cx: &ToolCx, mb: &Mailbox, id: &str) -> Result<Fetched, Tool
             }
             let meta = s.fetch_meta(&[mid.uid]).await?.into_iter().next().ok_or(ImapError::Missing)?;
             let raw = s.fetch_raw(mid.uid, max).await?;
-            Ok((meta, raw))
+            Ok((meta, raw, s.is_gmail()))
         })
     })
     .await?;
@@ -97,7 +98,7 @@ async fn fetch_imap(cx: &ToolCx, mb: &Mailbox, id: &str) -> Result<Fetched, Tool
     let meta = MessageMeta {
         id: id.to_string(),
         thread_id: imap_thread_id(&parsed, id),
-        labels: imap_labels(&f.name_utf8, &meta.flags, f.special),
+        labels: message_labels(&f, &meta, gmail),
         internal_date_ms: meta.internal_date_s.saturating_mul(1000),
         size_estimate: meta.size as i64,
         snippet,
@@ -117,6 +118,56 @@ pub fn imap_snippet(parsed: &ParsedMessage) -> String {
     let text = read::body_text(parsed);
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
     content::truncate_chars(&flat, SNIPPET_CHARS).0
+}
+
+/// Labels of an IMAP message read from `folder`. In Gmail mode a message outside Trash and Spam is labelled from its
+/// `X-GM-LABELS` ([`gmail_labels`]; always in All Mail, whose path is no label); everything else from its folder
+/// ([`imap_labels`]).
+pub fn message_labels(folder: &Folder, meta: &FetchedMeta, gmail: bool) -> Vec<String> {
+    let in_all = folder.special == Some(Special::All);
+    let trashy = matches!(folder.special, Some(Special::Trash | Special::Junk));
+    match (&meta.gm_labels, gmail && !trashy) {
+        (Some(gm), true) => gmail_labels(&meta.flags, gm),
+        (None, true) if in_all => gmail_labels(&meta.flags, &[]),
+        _ => imap_labels(&folder.name_utf8, &meta.flags, folder.special),
+    }
+}
+
+/// Labels of a Gmail message from its `X-GM-LABELS` and flags: `\Inbox` → `INBOX`, `\Sent` → `SENT`, `\Draft` →
+/// `DRAFT`, `\Important` → `IMPORTANT`, `\Starred` → `STARRED`, other system labels are left out, user labels by
+/// their decoded name; flags as in [`imap_labels`] (`UNREAD`, `STARRED`, `DRAFT`, keywords).
+pub fn gmail_labels(flags: &[String], gm_labels: &[String]) -> Vec<String> {
+    let has = |f: &str| flags.iter().any(|x| x.eq_ignore_ascii_case(f));
+    let mut out: Vec<String> = Vec::new();
+    let mut add = |l: &str| {
+        if !l.is_empty() && !out.iter().any(|x| x == l) {
+            out.push(l.to_string());
+        }
+    };
+    for l in gm_labels {
+        match l.to_ascii_lowercase().as_str() {
+            "\\inbox" => add("INBOX"),
+            "\\sent" => add("SENT"),
+            "\\draft" => add("DRAFT"),
+            "\\important" => add("IMPORTANT"),
+            "\\starred" => add("STARRED"),
+            s if s.starts_with('\\') => {}
+            _ => add(&label_text(&utf7::display_name(l))),
+        }
+    }
+    if !has("\\Seen") {
+        add("UNREAD");
+    }
+    if has("\\Flagged") {
+        add("STARRED");
+    }
+    if has("\\Draft") {
+        add("DRAFT");
+    }
+    for k in flags.iter().filter(|f| !f.starts_with('\\')) {
+        add(&label_text(k));
+    }
+    out
 }
 
 /// Labels of an IMAP message: its folder path, Gmail-style system labels from flags and the folder's special use,
@@ -238,7 +289,10 @@ pub async fn list_labels(cx: &ToolCx, mb: &Mailbox) -> Result<Vec<Value>, ToolEr
                 .unwrap_or_default())
         }
         Provider::Imap => {
-            let listed = account::with_session(&cx.app, &mb.account_id, |s| Box::pin(s.list_folders())).await?;
+            let (listed, gmail) = account::with_session(&cx.app, &mb.account_id, |s| {
+                Box::pin(async move { Ok((s.list_folders().await?, s.is_gmail())) })
+            })
+            .await?;
             let aid = mb.account_id.clone();
             let folders = cx
                 .app
@@ -260,6 +314,10 @@ pub async fn list_labels(cx: &ToolCx, mb: &Mailbox) -> Result<Vec<Value>, ToolEr
                 .collect();
             for l in ["UNREAD", "STARRED", "DRAFT", "SENT", "TRASH", "SPAM"] {
                 out.push(json!({ "id": l, "name": l, "type": "system" }));
+            }
+            if gmail {
+                // Gmail labels map INBOX and user labels to their folder names, `\Important` to IMPORTANT.
+                out.push(json!({ "id": "IMPORTANT", "name": "IMPORTANT", "type": "system" }));
             }
             Ok(out)
         }
@@ -308,6 +366,55 @@ mod tests {
         // Without any Message-ID a message is a thread of its own, the id metadata-only rows get.
         let bare = parsed("Subject: Plan");
         assert_eq!(imap_thread_id(&bare, "f1-1-4"), imap_own_thread_id("f1-1-4"));
+    }
+
+    #[test]
+    fn gmail_labels_map_system_and_user_labels() {
+        let gm: Vec<String> = [
+            "\\Inbox",
+            "\\IMPORTANT",
+            "\\Sent",
+            "\\Draft",
+            "\\Starred",
+            "\\Chats",
+            "Work",
+            "K&AOQ-se/Ablage",
+            "Bad\r\nLabel",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let labels = gmail_labels(&["\\Seen".into(), "$Kw".into()], &gm);
+        assert_eq!(
+            labels,
+            [
+                "INBOX",
+                "IMPORTANT",
+                "SENT",
+                "DRAFT",
+                "STARRED",
+                "Work",
+                "K\u{e4}se/Ablage",
+                "Bad\u{fffd}\u{fffd}Label",
+                "$Kw"
+            ]
+            .map(String::from)
+        );
+        // Unread and flagged come from flags; no labels at all is just that.
+        assert_eq!(gmail_labels(&["\\Flagged".into()], &[]), vec!["UNREAD".to_string(), "STARRED".into()]);
+        // In Gmail mode All Mail is never a label, Trash and Spam keep the folder mapping.
+        let f = |name: &str, special| Folder { folder_id: 1, name: name.into(), name_utf8: name.into(), special };
+        let meta =
+            FetchedMeta { flags: vec!["\\Seen".into()], gm_labels: Some(vec!["\\Inbox".into()]), ..Default::default() };
+        assert_eq!(message_labels(&f("[Gmail]/All Mail", Some(Special::All)), &meta, true), vec!["INBOX".to_string()]);
+        assert_eq!(
+            message_labels(&f("[Gmail]/Trash", Some(Special::Trash)), &meta, true),
+            vec!["[Gmail]/Trash".to_string(), "TRASH".into()]
+        );
+        let bare = FetchedMeta { flags: vec!["\\Seen".into()], ..Default::default() };
+        assert!(message_labels(&f("[Gmail]/All Mail", Some(Special::All)), &bare, true).is_empty());
+        // Outside Gmail mode nothing changes.
+        assert_eq!(message_labels(&f("INBOX", None), &meta, false), vec!["INBOX".to_string()]);
     }
 
     /// Labels built from server data (folder path, keywords) are one line without control or invisible characters,

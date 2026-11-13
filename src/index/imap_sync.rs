@@ -19,6 +19,11 @@
 //!   (`RECENT_FLAGS` + `ROTATE_FLAGS`) / `FLAG_CHUNK` + 1 FETCH commands per folder whatever its size, and a folder
 //!   of n messages is fully refreshed within ceil(n / `ROTATE_FLAGS`) scans.
 //!
+//! Gmail mode (PLAN A52): Gmail shows every label as a folder, so one message has a UID in INBOX, All Mail and each
+//! label folder. Only All Mail (`\All`), Spam and Trash are scanned (together they hold every message once); the other
+//! folders stay in `imap_folders` without checkpoints or rows, and labels come from `X-GM-LABELS`
+//! ([`mail::message_labels`]), which Gmail's MODSEQ covers, so CONDSTORE picks up label changes too.
+//!
 //! Network calls never run inside an index transaction; every write re-checks the job's fence.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -33,7 +38,7 @@ use crate::app::App;
 use crate::error::ToolError;
 use crate::gmail::gateway::Priority;
 use crate::imap::account::{self, Folder};
-use crate::imap::{FetchedMeta, FolderStatus, ImapError, ImapMsgId, ImapSession};
+use crate::imap::{FetchedMeta, FolderStatus, ImapError, ImapMsgId, ImapSession, Special};
 use crate::mail::{self, MessageMeta};
 use crate::util;
 
@@ -127,7 +132,7 @@ pub(super) async fn one_step(job: &Job, js: &mut JobState, report: &mut SyncRepo
 }
 
 /// One bounded INBOX pass for search freshness (`imap_idle::ensure_fresh`): new mail, CONDSTORE flag changes and
-/// expunges of INBOX, then one fetch batch. Runs under the account lock, fence and cancellation like a job, only on
+/// expunges of INBOX (All Mail in Gmail mode, where new inbox mail lands too), then one fetch batch. Runs under the account lock, fence and cancellation like a job, only on
 /// a ready index, and never advances `last_success_at` (it did not look at the other folders), so `as_of` stays
 /// honest. Returns the number of messages indexed. Callers bound it with a timeout; dropping it is safe because no
 /// transaction spans network I/O.
@@ -298,7 +303,13 @@ impl Scanner {
                 account::load_folders(c, &aid)
             })
             .await?;
-        let live: Vec<Folder> = folders.into_iter().filter(|f| live_names.contains(&f.name)).collect();
+        // Gmail mode scans All Mail, Spam and Trash only; label folders hold copies of All Mail's messages.
+        let gmail = s.is_gmail();
+        let live: Vec<Folder> = folders
+            .into_iter()
+            .filter(|f| live_names.contains(&f.name))
+            .filter(|f| !gmail || matches!(f.special, Some(Special::All | Special::Junk | Special::Trash)))
+            .collect();
         let (aid, g) = (self.job.account_id.clone(), self.gen_id);
         let cps = self.job.app.index.write(move |c| load_checkpoints(c, &aid, g)).await?;
         // A folder that is gone (deleted or renamed: a rename is a new folder) takes its rows with it.
@@ -383,12 +394,16 @@ impl Scanner {
         self.write_checkpoint(f.folder_id, cp).await
     }
 
-    /// The quick INBOX pass of [`quick_inbox`]: INBOX only, from the folder list Dove already has (no `LIST`), and
-    /// only when its checkpoint is current. New folders and UIDVALIDITY resets are left to the full scan.
+    /// The quick INBOX pass of [`quick_inbox`]: INBOX only (All Mail in Gmail mode), from the folder list Dove already
+    /// has (no `LIST`), and only when its checkpoint is current. New folders and UIDVALIDITY resets are left to the
+    /// full scan.
     async fn inbox(&self, s: &mut ImapSession) -> Result<(), ScanErr> {
         let aid = self.job.account_id.clone();
         let folders = self.job.app.store.call(move |c| account::load_folders(c, &aid)).await?;
-        let Some(f) = folders.into_iter().find(|f| f.name.eq_ignore_ascii_case("INBOX")) else { return Ok(()) };
+        let gmail = s.is_gmail();
+        let pick =
+            |f: &Folder| if gmail { f.special == Some(Special::All) } else { f.name.eq_ignore_ascii_case("INBOX") };
+        let Some(f) = folders.into_iter().find(pick) else { return Ok(()) };
         let (aid, g) = (self.job.account_id.clone(), self.gen_id);
         let cps = self.job.app.index.write(move |c| load_checkpoints(c, &aid, g)).await?;
         let Some(cp) = cps.get(&f.folder_id).copied().filter(|cp| cp.enumerated) else { return Ok(()) };
@@ -478,7 +493,7 @@ impl Scanner {
                 gone.dedup();
                 self.remove_uids(f.folder_id, uv, &gone).await?;
             }
-            self.apply_flags(f, uv, ch.changed).await?;
+            self.apply_flags(f, uv, ch.changed, s.is_gmail()).await?;
         }
         // 2. New mail: UIDs only grow, so everything new is at or above the checkpoint's UIDNEXT.
         let new: Vec<u32> =
@@ -515,7 +530,7 @@ impl Scanner {
             let (window, next) = refresh_window(&indexed, cp.flag_cursor, RECENT_FLAGS, ROTATE_FLAGS);
             for chunk in window.chunks(FLAG_CHUNK) {
                 let metas = s.fetch_meta(chunk).await?;
-                self.apply_flags(f, uv, metas).await?;
+                self.apply_flags(f, uv, metas, s.is_gmail()).await?;
             }
             flag_cursor = next;
         }
@@ -533,14 +548,20 @@ impl Scanner {
     }
 
     /// Writes changed labels of indexed messages (one transaction); unchanged ones are not rewritten.
-    async fn apply_flags(&self, f: &Folder, uidvalidity: u32, metas: Vec<FetchedMeta>) -> Result<(), ScanErr> {
+    async fn apply_flags(
+        &self,
+        f: &Folder,
+        uidvalidity: u32,
+        metas: Vec<FetchedMeta>,
+        gmail: bool,
+    ) -> Result<(), ScanErr> {
         if metas.is_empty() {
             return Ok(());
         }
         let (g, aid) = (self.gen_id, self.job.account_id.clone());
         let updates: Vec<(String, Vec<String>)> = metas
             .iter()
-            .map(|m| (msg_id(f.folder_id, uidvalidity, m.uid), mail::imap_labels(&f.name_utf8, &m.flags, f.special)))
+            .map(|m| (msg_id(f.folder_id, uidvalidity, m.uid), mail::message_labels(f, m, gmail)))
             .collect();
         let n = self
             .tx(move |tx| {
@@ -807,7 +828,7 @@ async fn fetch_groups_inner(
             let meta = MessageMeta {
                 id: id.clone(),
                 thread_id: String::new(),
-                labels: mail::imap_labels(&folder.name_utf8, &m.flags, folder.special),
+                labels: mail::message_labels(&folder, m, s.is_gmail()),
                 internal_date_ms: m.internal_date_s.saturating_mul(1000),
                 size_estimate: m.size as i64,
                 snippet: None,

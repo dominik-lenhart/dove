@@ -143,6 +143,47 @@ mod tests {
         assert_eq!(mode, 0o700);
     }
 
+    /// The Gmail-over-IMAP migration keeps every folder row and id and only widens the `special` check.
+    #[test]
+    fn gmail_imap_migration_keeps_folders() {
+        let mut c = Connection::open_in_memory().unwrap();
+        c.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+        let n = schema::MIGRATIONS.len();
+        for sql in &schema::MIGRATIONS[..n - 1] {
+            c.execute_batch(sql).unwrap();
+        }
+        c.execute_batch(
+            "INSERT INTO accounts(id, alias, email, status, provider) VALUES ('a', 'x', 'x@example.org', 'active', 'imap');
+             INSERT INTO imap_folders VALUES ('a', 1, 'INBOX', NULL), ('a', 7, 'Entw&APw-rfe', 'drafts');",
+        )
+        .unwrap();
+        assert!(c.execute("INSERT INTO imap_folders VALUES ('a', 8, 'All', 'all')", []).is_err());
+        let tx = c.transaction().unwrap();
+        tx.execute_batch(schema::MIGRATIONS[n - 1]).unwrap();
+        tx.commit().unwrap();
+        c.execute("INSERT INTO imap_folders VALUES ('a', 8, '[Gmail]/All Mail', 'all')", []).unwrap();
+        assert!(c.execute("INSERT INTO imap_folders VALUES ('a', 9, 'X', 'bogus')", []).is_err());
+        assert!(c.execute("INSERT INTO imap_folders VALUES ('a', 10, 'INBOX', NULL)", []).is_err(), "unique name");
+        let rows: Vec<(i64, String, Option<String>)> = c
+            .prepare("SELECT folder_id, name, special FROM imap_folders ORDER BY folder_id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (1, "INBOX".into(), None),
+                (7, "Entw&APw-rfe".into(), Some("drafts".into())),
+                (8, "[Gmail]/All Mail".into(), Some("all".into()))
+            ]
+        );
+        // Removing the account still takes its folders with it.
+        c.execute("DELETE FROM accounts WHERE id = 'a'", []).unwrap();
+        assert_eq!(c.query_row("SELECT count(*) FROM imap_folders", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    }
+
     #[test]
     fn refuses_newer_schema() {
         let dir = tempfile::tempdir().unwrap();
