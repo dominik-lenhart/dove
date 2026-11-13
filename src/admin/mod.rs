@@ -138,6 +138,8 @@ pub enum AdminRequest {
 
     KeysRotate,
     Doctor,
+    /// The running service's version (`dove upgrade` compares it with the new binary).
+    Version,
     Export,
 
     IndexEnable {
@@ -197,6 +199,7 @@ impl AdminRequest {
             AuditPrune => ("audit.prune_request", None, None, vec![]),
             KeysRotate => ("keys.rotate", None, None, vec![]),
             Doctor => ("doctor", None, None, vec![]),
+            Version => ("version", None, None, vec![]),
             Export => ("export", None, None, vec![]),
             IndexEnable { alias } => ("index.enable", None, Some(alias.clone()), vec![]),
             IndexDisable { alias } => ("index.disable", None, Some(alias.clone()), vec![]),
