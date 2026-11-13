@@ -69,15 +69,15 @@ both, delete the local files and the old deploy key.
 
 ## Windows release switch
 
-The Windows zip is built only when `WINDOWS_RELEASE` in `release.yml` is `"true"`. Nothing else depends on it: the
-other assets, the checksum count, signing, the `.deb` files, the image and the Homebrew job work with or without the
-zip. The Windows port (local mode) made the `windows` job of `ci.yml` gating and added `x86_64-pc-windows-msvc` to
-`Release cache` (built on pull requests, cache warmed on `main`). Before flipping the switch:
+The Windows zip is built only when `WINDOWS_RELEASE` in `release.yml` is `"true"`; it is on since 0.5.0-rc.1. Nothing
+else depends on it: the other assets, the checksum count, signing, the `.deb` files, the image and the Homebrew job work
+with or without the zip. The CI `windows` job is gating, and `Release cache` builds `x86_64-pc-windows-msvc`.
 
-1. `Release cache` on a pull request builds `x86_64-pc-windows-msvc` successfully, and the CI `windows` job is green.
-2. A release candidate tag (`vX.Y.Z-rc.1`) produces the zip, and `install.ps1` with `DOVE_VERSION=X.Y.Z-rc.1` installs
-   it on a Windows machine and `dove --version` runs.
-3. `dove upgrade` on that Windows install finds the `.zip` of the next release.
+Every release with the switch on runs the `windows-smoke` job on a Windows runner after publishing: `install.ps1`
+installs the release and `dove --version` must print it; `dove local init`, `dove local start`, the HTTP endpoint on
+127.0.0.1 and `dove local stop` must work; and `dove upgrade --version <new>` must reach the release from the earlier
+Windows release named in `UPGRADE_FROM` (skipped for that release itself). A failing smoke job does not withdraw the
+release: delete the GitHub Release (and tag) by hand if the Windows build is broken, or ship a fix release.
 
 ## One-time setup
 

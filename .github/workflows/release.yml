@@ -17,9 +17,9 @@ env:
   CARGO_INCREMENTAL: "0"
   IMAGE: ghcr.io/dominik-lenhart/dove
   # Windows release (x86_64-pc-windows-msvc zip, listed in SHA256SUMS and the signature like every other asset).
-  # Off until the Windows port of the Rust code (local mode) is merged, because without it the target does not
-  # compile. Flip it to "true" in the commit that lands the port; docs/releasing.md says what to check first.
-  WINDOWS_RELEASE: "false"
+  # On since 0.5.0-rc.1 (the Windows port, PLAN A58). The `windows-smoke` job installs every Windows release on a
+  # Windows runner; docs/releasing.md has the details.
+  WINDOWS_RELEASE: "true"
 
 # Actions are pinned to full commit SHAs (the tag is in the comment), as in ci.yml.
 jobs:
@@ -34,6 +34,7 @@ jobs:
       prerelease: ${{ steps.meta.outputs.prerelease }}
       matrix: ${{ steps.matrix.outputs.matrix }}
       archives: ${{ steps.matrix.outputs.archives }}
+      windows: ${{ steps.matrix.outputs.windows }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -80,8 +81,11 @@ jobs:
           else
             matrix=$(printf '%s' "$matrix" | jq -c '.')
           fi
-          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
-          echo "archives=$(printf '%s' "$matrix" | jq 'length')" >> "$GITHUB_OUTPUT"
+          {
+            echo "matrix=$matrix"
+            echo "archives=$(printf '%s' "$matrix" | jq 'length')"
+            echo "windows=$WINDOWS_RELEASE"
+          } >> "$GITHUB_OUTPUT"
           printf '%s\n' "$matrix" | jq -r '.[].target'
       - name: Release notes from CHANGELOG.md
         env:
@@ -372,6 +376,70 @@ jobs:
           name: checksums
           path: assets/SHA256SUMS
           if-no-files-found: error
+
+  windows-smoke:
+    name: Windows install smoke test
+    needs: [verify, release]
+    if: needs.verify.outputs.windows == 'true'
+    runs-on: windows-2022
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+      REPO: ${{ github.repository }}
+      # An earlier Windows release that `dove upgrade` must be able to leave for this one. Windows releases start
+      # with 0.5.0-rc.1, so that release itself skips the upgrade check.
+      UPGRADE_FROM: "0.5.0-rc.1"
+    steps:
+      - name: install.ps1 installs this release
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:DOVE_VERSION = $env:VERSION
+          $env:DOVE_INSTALL_DIR = Join-Path $env:RUNNER_TEMP 'dove'
+          $env:DOVE_NO_PATH = '1'
+          irm "https://github.com/$env:REPO/releases/download/v$env:VERSION/install.ps1" | iex
+          $out = & (Join-Path $env:DOVE_INSTALL_DIR 'dove.exe') --version
+          Write-Output $out
+          if ($out -ne "dove $env:VERSION") { throw "expected 'dove $env:VERSION', got '$out'" }
+      - name: Local mode starts, answers and stops
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dove = Join-Path $env:RUNNER_TEMP 'dove\dove.exe'
+          & $dove local init --port 18787
+          if ($LASTEXITCODE -ne 0) { throw "dove local init failed" }
+          $log = Join-Path $env:RUNNER_TEMP 'dove-local.log'
+          $p = Start-Process -FilePath $dove -ArgumentList @('local', 'start', '--log-file', $log) -PassThru -NoNewWindow
+          $ok = $false
+          foreach ($i in 1..30) {
+            Start-Sleep -Seconds 1
+            try {
+              $r = Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:18787/.well-known/oauth-protected-resource'
+              if ($r.StatusCode -eq 200) { $ok = $true; break }
+            } catch { }
+          }
+          & $dove local status
+          if (-not $ok) { Get-Content $log -ErrorAction SilentlyContinue; throw "local mode did not answer on 127.0.0.1:18787" }
+          & $dove local stop
+          if ($LASTEXITCODE -ne 0) { Get-Content $log -ErrorAction SilentlyContinue; throw "dove local stop failed" }
+          if (-not $p.WaitForExit(20000)) { Stop-Process -Id $p.Id -Force; throw "dove kept running after dove local stop" }
+      - name: dove upgrade reaches this release from the previous Windows release
+        if: env.VERSION != env.UPGRADE_FROM
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:DOVE_VERSION = $env:UPGRADE_FROM
+          $env:DOVE_INSTALL_DIR = Join-Path $env:RUNNER_TEMP 'dove-old'
+          $env:DOVE_NO_PATH = '1'
+          irm "https://github.com/$env:REPO/releases/download/v$env:UPGRADE_FROM/install.ps1" | iex
+          $dove = Join-Path $env:DOVE_INSTALL_DIR 'dove.exe'
+          & $dove upgrade --version $env:VERSION
+          if ($LASTEXITCODE -ne 0) { throw "dove upgrade failed" }
+          $out = & $dove --version
+          Write-Output $out
+          if ($out -ne "dove $env:VERSION") { throw "expected 'dove $env:VERSION' after the upgrade, got '$out'" }
 
   homebrew:
     name: homebrew tap
