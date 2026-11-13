@@ -114,7 +114,8 @@ the new key signs.
 
 ## Cutting a release
 
-1. On `main` with green CI, set `version` in `Cargo.toml` (and refresh `Cargo.lock`: `cargo update -p dove-mcp`).
+1. On `main` with green CI, set `version` in `Cargo.toml` (and refresh `Cargo.lock`: `cargo update -p dove-mcp`) and in
+   `server.json` (`tests/packaging.rs` fails while they differ).
 2. In `CHANGELOG.md` rename `## [Unreleased]` content into `## [X.Y.Z] - <date>`, add a fresh empty `## [Unreleased]`,
    and update the compare links at the bottom. The release notes are exactly this section.
 3. Commit (`release: vX.Y.Z`), push, wait for CI.
@@ -127,6 +128,8 @@ the new key signs.
    section for it. It builds the archives and `.deb` packages, signs `SHA256SUMS`, verifies the signature against the committed public
    key, attests, creates the release, pushes the image and updates the Homebrew tap.
 6. Verify the published artifacts (next section), then upgrade your own instance with `dove upgrade`.
+7. Update the [MCP Registry](https://registry.modelcontextprotocol.io) entry: `mcp-publisher login github` (as the
+   repository owner), then `mcp-publisher publish` in the repository root. It reads `server.json`.
 
 A failed run before "Create the release" can be re-run from the Actions page. After the release exists, delete it
 and the tag (`gh release delete vX.Y.Z --cleanup-tag`) before pushing the tag again, or cut the next patch version.

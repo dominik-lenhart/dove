@@ -1,0 +1,40 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.dominik-lenhart/dove",
+  "title": "Dove",
+  "description": "Self-hosted mail for agents: scoped search, read and drafts across Gmail and IMAP mailboxes",
+  "version": "0.5.0",
+  "websiteUrl": "https://github.com/dominik-lenhart/dove#quickstart",
+  "repository": {
+    "url": "https://github.com/dominik-lenhart/dove",
+    "source": "github"
+  },
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://{dove_host}/mcp",
+      "variables": {
+        "dove_host": {
+          "description": "Host name of your own Dove server (self-hosted, see the Quickstart), e.g. dove.example.com",
+          "isRequired": true
+        }
+      },
+      "headers": [
+        {
+          "name": "Authorization",
+          "description": "Client token from `dove clients create`. Leave empty to sign in through Dove's OAuth approval page instead.",
+          "value": "Bearer {dove_token}",
+          "isRequired": false,
+          "isSecret": true,
+          "variables": {
+            "dove_token": {
+              "description": "Dove client token (starts with dove_)",
+              "isRequired": true,
+              "isSecret": true
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
