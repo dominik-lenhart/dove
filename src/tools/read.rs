@@ -61,6 +61,7 @@ pub fn defs() -> Vec<ToolDef> {
             capability: Capability::Read,
             read_only: true,
             destructive: false,
+            mail_content: false,
             input_schema: || json!({ "type": "object", "properties": {}, "additionalProperties": false }),
             output_schema: || object_schema(json!({ "accounts": { "type": "array" } })),
             handler: |cx, args| Box::pin(list_accounts(cx, args)),
@@ -72,6 +73,7 @@ pub fn defs() -> Vec<ToolDef> {
             capability: Capability::Read,
             read_only: true,
             destructive: false,
+            mail_content: false,
             input_schema: || json!({ "type": "object", "properties": { "account": account_schema() }, "required": ["account"], "additionalProperties": false }),
             output_schema: || object_schema(json!({ "account": {"type":"string"}, "labels": { "type": "array" } })),
             handler: |cx, args| Box::pin(list_labels(cx, args)),
@@ -87,6 +89,7 @@ pub fn defs() -> Vec<ToolDef> {
             capability: Capability::Read,
             read_only: true,
             destructive: false,
+            mail_content: true,
             input_schema: detail_schema,
             output_schema: || object_schema(json!({ "message": { "type": "object" } })),
             handler: |cx, args| Box::pin(get_message(cx, args)),
@@ -102,6 +105,7 @@ pub fn defs() -> Vec<ToolDef> {
             capability: Capability::Read,
             read_only: true,
             destructive: false,
+            mail_content: true,
             input_schema: || {
                 let mut s = detail_schema();
                 s["properties"].as_object_mut().expect("object").remove("ref");
@@ -125,6 +129,7 @@ pub fn defs() -> Vec<ToolDef> {
             capability: Capability::Read,
             read_only: true,
             destructive: false,
+            mail_content: true,
             input_schema: || {
                 json!({ "type": "object", "properties": {
                     "account": account_schema(),
@@ -148,6 +153,7 @@ pub fn defs() -> Vec<ToolDef> {
             capability: Capability::Read,
             read_only: true,
             destructive: false,
+            mail_content: true,
             input_schema: || {
                 json!({ "type": "object", "properties": {
                     "account": account_schema(), "draft_id": { "type": "string" },

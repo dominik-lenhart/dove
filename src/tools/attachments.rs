@@ -36,6 +36,7 @@ pub fn defs() -> Vec<ToolDef> {
         capability: Capability::Read,
         read_only: true,
         destructive: false,
+        mail_content: true,
         input_schema: || {
             json!({ "type": "object", "properties": {
                 "ref": { "type": "string", "description": "Opaque ref from search_messages; replaces account + message_id." },

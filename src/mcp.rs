@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 
 use crate::app::App;
 use crate::audit::{self, AuditRecord};
+use crate::content;
 use crate::error::{ErrorCode, ToolError};
 use crate::policy::{self, AuthFailure, ClientCtx};
 use crate::tools::{self, ToolCx};
@@ -347,14 +348,30 @@ pub async fn call_tool(app: &Arc<App>, ctx: &ClientCtx, version: &str, name: &st
         ..Default::default()
     };
     let response = match result {
-        Ok(out) => {
+        Ok(mut out) => {
             rec.result_code = "ok".into();
             rec.account_alias = out.audit.account.clone();
             rec.object_ids = out.audit.object_ids.clone();
             rec.result_count = out.audit.result_count;
             rec.query_len = out.audit.query.as_ref().map(|q| q.len() as i64);
             rec.query_hash = out.audit.query.as_ref().map(|q| app.pepper.fingerprint(q));
-            let text = if structured { out.text } else { serde_json::to_string(&out.structured).unwrap_or_default() };
+            // Mail content is marked untrusted in both items: the structured object carries a notice field, and the
+            // text item is the tool's enveloped rendering or, for clients before structured output (also every
+            // client that sends no MCP-Protocol-Version), the JSON inside the envelope.
+            let untrusted = tools::carries_mail_content(name);
+            if untrusted {
+                tools::mark_untrusted(&mut out.structured);
+            }
+            let text = if structured {
+                out.text
+            } else {
+                let json = serde_json::to_string(&out.structured).unwrap_or_default();
+                if untrusted {
+                    format!("{}{}", content::envelope(name, "result", &json), tools::UNTRUSTED_NOTE)
+                } else {
+                    json
+                }
+            };
             let mut content = vec![json!({ "type": "text", "text": text })];
             content.extend(out.extra);
             let mut r = json!({ "content": content, "isError": false });

@@ -241,7 +241,8 @@ async fn get_attachment_imap_and_gmail_bytes_match() {
         assert_eq!(r["isError"], false, "{r}");
         assert_eq!(
             r["structuredContent"],
-            json!({ "filename": "Rechnung März.pdf", "mime_type": PDF, "size_bytes": data.len() })
+            json!({ "filename": "Rechnung März.pdf", "mime_type": PDF, "size_bytes": data.len(),
+                    "untrusted_content_notice": dove::tools::UNTRUSTED_NOTICE })
         );
         let (uri, blob) = resource(&r);
         assert_eq!(uri, format!("dove://attachment/{}/{part}", m["message"]["ref"].as_str().unwrap()));

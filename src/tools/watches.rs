@@ -37,6 +37,7 @@ pub fn defs() -> Vec<ToolDef> {
             capability: Capability::Read,
             read_only: false,
             destructive: false,
+            mail_content: false,
             input_schema: || {
                 json!({
                     "type": "object",
@@ -65,6 +66,7 @@ pub fn defs() -> Vec<ToolDef> {
             capability: Capability::Read,
             read_only: true,
             destructive: false,
+            mail_content: false,
             input_schema: || json!({ "type": "object", "properties": {}, "additionalProperties": false }),
             output_schema: || {
                 object_schema(json!({
@@ -81,6 +83,7 @@ pub fn defs() -> Vec<ToolDef> {
             capability: Capability::Read,
             read_only: false,
             destructive: true,
+            mail_content: false,
             input_schema: || {
                 json!({
                     "type": "object",
@@ -106,6 +109,7 @@ pub fn defs() -> Vec<ToolDef> {
             capability: Capability::Read,
             read_only: true,
             destructive: false,
+            mail_content: false,
             input_schema: || {
                 json!({
                     "type": "object",

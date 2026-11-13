@@ -365,6 +365,12 @@ impossible, but it reduces what an injection can reach (6.3, project scoping) an
 - Every body, subject, sender name and snippet is returned inside a clearly delimited field of the structured result.
   The text rendering wraps it in an envelope such as `<untrusted_email_content account="…" message_id="…">…
   </untrusted_email_content>`, with any occurrence of the closing delimiter inside the content escaped.
+- Both content items carry the marking in every protocol version. Every tool whose result can contain mail content
+  (`get_message`, `get_thread`, `batch_read`, `search_messages`, `get_attachment`, `digest`, `search_contacts`,
+  `list_drafts`, `get_draft`) adds the top-level field `untrusted_content_notice` (a fixed warning, declared in its
+  `outputSchema`) to the structured result, because some hosts give the model only `structuredContent`. Clients
+  before structured output (protocol versions before 2025-06-18, and every client that sends no
+  `MCP-Protocol-Version`, which counts as 2025-03-26) get the structured JSON as the text item, inside the envelope.
 - Each read tool's description states that returned content is untrusted data and that instructions inside it must not
   be followed.
 - HTML to text: parse with a real HTML parser, drop `script`, `style`, `head`, comments and elements hidden by

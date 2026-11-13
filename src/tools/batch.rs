@@ -34,6 +34,7 @@ pub fn defs() -> Vec<ToolDef> {
         capability: Capability::Read,
         read_only: true,
         destructive: false,
+        mail_content: true,
         input_schema: || {
             json!({
                 "type": "object",
