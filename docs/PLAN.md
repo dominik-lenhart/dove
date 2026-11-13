@@ -433,3 +433,29 @@ hosts or reference hardware.
   watches and queued deliveries (no table rebuild: dropping `sinks` would run the ON DELETE actions of `watches` and
   `sink_deliveries`); at startup `watch::sinks::seal_legacy_urls` seals their plaintext URL and empties the old `url`
   column, and their project stays NULL, meaning no client can use them until the operator assigns one.
+- A61. Thread view and `from_self` in `search_messages` (agent feedback 2026-11-13: "whom have I not replied to?" took
+  many calls, and broad searches were dominated by the user's own outreach). (a) `from_self` is computed at query
+  time from the own addresses passed into the query compiler (`query::Scope::selves`: the mailbox address plus its
+  `account_aliases`, normalized like `addrs.addr`, loaded from the state store on every call, also for later cursor
+  pages), so alias changes apply at once and no index migration is needed. Own addresses are per mailbox (the spec
+  says "the mailbox's own address"): mail from another of the caller's mailboxes is inbound. (b) Gmail send-as
+  addresses are only known live (`settings.sendAs`, read at `create_draft`), never stored, and a search must not call
+  Gmail; instead a message with the `SENT` label is also from self. Gmail sets `SENT` for mail sent through the
+  account from any send-as address, and IMAP maps the Sent folder (and Gmail-over-IMAP's `\Sent`) to it. Gap: mail
+  from a Gmail send-as address that arrives without `SENT` (a copy received from elsewhere) is not from self.
+  (c) The thread view groups by (generation, thread id): threads never span mailboxes. A thread is returned when any
+  of its messages matches the filter; its row describes the whole thread under the spam/trash policy (status must not
+  depend on the filter, or `label = INBOX` would hide every reply filed under `SENT`). Message columns come from the
+  latest message including drafts (an agent then sees a pending draft reply), but the reply status ignores drafts.
+  `last_sender_is_self` breaks a tie in favour of self (IMAP dates have second precision and a reply cannot precede
+  what it answers); `awaiting_reply:false` is therefore "latest non-draft is from self", not the complement of
+  `true` (threads of drafts only match neither). Order is the thread's latest message time only, keyset
+  `(last_at, account_id, thread_id)`. (d) Cost: the thread query aggregates every matching message, then reads each
+  candidate thread through `messages_thread` with a per-message self check by message id (`addrs_msg`, labels primary
+  key); the per-message step is a `MATERIALIZED` CTE so the check runs once per message. No new index or stat row;
+  the plans are asserted in `tests/search_contract.rs`. A filter that matches most of a large index is bounded by the
+  tool deadline (`query_too_broad`), not by a separate cap. (e) IMAP: plain IMAP indexes every folder, so the Sent copy
+  of a reply is a row with the inbound message's derived thread id (PLAN A47: same root Message-ID and normalized
+  subject); Gmail over IMAP gets it from All Mail with `SENT`. Both are tested against the fake IMAP server. A reply
+  without a stored Sent copy (`save_sent_copy = false`, a client that does not file one) is invisible. (f) Watches
+  refuse `from_self` (their filter runs inside the sync hook without the state store's aliases).

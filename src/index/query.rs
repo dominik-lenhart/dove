@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use rusqlite::types::Value as SqlValue;
-use rusqlite::{Connection, params_from_iter};
+use rusqlite::{Connection, OptionalExtension, params_from_iter};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
@@ -49,8 +49,23 @@ pub const SELECTABLE: &[&str] = &[
     "is_draft",
     "has_attachment",
     "category",
+    "from_self",
 ];
 pub const DEFAULT_SELECT: &[&str] = &["ref", "received_at", "from", "subject"];
+/// Per-thread columns of `group_by: "thread"` (computed over every message of the thread, see [`thread_page_sql`]).
+pub const THREAD_COLUMNS: &[&str] =
+    &["message_count", "matched_count", "last_sender_is_self", "last_inbound_at", "last_outbound_at", "awaiting_reply"];
+/// Default projection of the thread view: the latest message's handle and headline plus the reply status.
+pub const THREAD_DEFAULT_SELECT: &[&str] =
+    &["ref", "thread_id", "received_at", "from", "subject", "message_count", "awaiting_reply"];
+/// The label Gmail (and Dove's IMAP mapping of the Sent folder) gives to mail sent from the mailbox.
+pub const SENT_LABEL: &str = "SENT";
+
+/// Columns selectable in the thread view: every message column (taken from the thread's latest message) and the
+/// per-thread columns.
+pub fn thread_selectable() -> Vec<&'static str> {
+    SELECTABLE.iter().chain(THREAD_COLUMNS).copied().collect()
+}
 pub const FIELDS: &[&str] = &[
     "from",
     "to",
@@ -75,6 +90,7 @@ pub const FIELDS: &[&str] = &[
     "attachment_mime",
     "attachment_text",
     "category",
+    "from_self",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -103,6 +119,7 @@ pub enum Field {
     AttachmentMime,
     AttachmentText,
     Category,
+    FromSelf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -172,6 +189,21 @@ pub struct SearchReq {
     pub require_complete: bool,
     pub max_lag_seconds: Option<u64>,
     pub include_spam_trash: bool,
+    /// `group_by: "thread"`: one row per (mailbox, thread) instead of per message.
+    pub group_by_thread: bool,
+    /// Thread view only: keep threads whose latest non-draft message is not from self (`true`) or is (`false`).
+    pub awaiting_reply: Option<bool>,
+}
+
+impl Expr {
+    /// True if any predicate in the expression reads `field`.
+    pub fn uses_field(&self, field: Field) -> bool {
+        match self {
+            Expr::All(v) | Expr::Any(v) => v.iter().any(|x| x.uses_field(field)),
+            Expr::Not(x) => x.uses_field(field),
+            Expr::Pred(p) => p.field == field,
+        }
+    }
 }
 
 impl SearchReq {
@@ -199,7 +231,15 @@ impl SearchReq {
         v.iter().any(|p| matches!(p.field, Field::BodyText | Field::Text))
     }
 
-    /// True if filters, projection or order read MIME-derived metadata (addresses, subject, attachments).
+    /// True if the query needs the mailboxes' own addresses (`from_self`, thread reply status).
+    pub fn uses_self(&self) -> bool {
+        self.group_by_thread
+            || self.filter.as_ref().is_some_and(|f| f.uses_field(Field::FromSelf))
+            || self.select.iter().any(|c| c == "from_self")
+    }
+
+    /// True if filters, projection or order read MIME-derived metadata (addresses, subject, attachments). The thread
+    /// view always does: its reply status reads every message's sender.
     pub fn uses_mime_metadata(&self) -> bool {
         let mut v = vec![];
         self.walk(&mut v);
@@ -227,10 +267,11 @@ impl SearchReq {
                     | "attachment_names"
                     | "attachment_mime_types"
                     | "has_attachment"
+                    | "from_self"
             )
         });
         let in_order = self.order.iter().any(|(f, _)| *f == OrderField::Subject);
-        in_filter || in_select || in_order
+        in_filter || in_select || in_order || self.group_by_thread
     }
 
     /// True if the query touches the FTS table.
@@ -291,6 +332,7 @@ fn parse_field(s: &str) -> Result<Field, ToolError> {
         "attachment_mime" => Field::AttachmentMime,
         "attachment_text" => Field::AttachmentText,
         "category" => Field::Category,
+        "from_self" => Field::FromSelf,
         other => return Err(bad(format!("unknown field '{}'", short(other)))),
     })
 }
@@ -317,7 +359,7 @@ fn allowed_ops(f: Field) -> &'static [Op] {
         From | To | Cc | Bcc | Participant | FromDomain | RecipientDomain | Label | ThreadId | MessageId
         | AttachmentMime | Category => &[Op::Eq, Op::In],
         AttachmentName => &[Op::Eq, Op::In, Op::EndsWith],
-        IsUnread | IsStarred | IsDraft | HasAttachment => &[Op::Eq],
+        IsUnread | IsStarred | IsDraft | HasAttachment | FromSelf => &[Op::Eq],
         ReceivedAt | SizeBytes => &[Op::Eq, Op::Lt, Op::Lte, Op::Gt, Op::Gte],
         Subject | BodyText | Text | AttachmentText => &[Op::Terms, Op::Phrase, Op::Prefix],
     }
@@ -337,7 +379,7 @@ fn parse_value(f: Field, op: Op, v: Option<&Value>) -> Result<Val, ToolError> {
     let v = v.ok_or_else(|| bad("predicate 'value' is required"))?;
     use Field::*;
     match (f, op) {
-        (IsUnread | IsStarred | IsDraft | HasAttachment, _) => {
+        (IsUnread | IsStarred | IsDraft | HasAttachment | FromSelf, _) => {
             v.as_bool().map(Val::Bool).ok_or_else(|| bad("boolean fields take true or false"))
         }
         (ReceivedAt, _) => {
@@ -618,6 +660,68 @@ pub struct Scope<'a> {
     pub targets: &'a [Target],
     /// alias -> account id for every mailbox the caller may name (resolution errors are raised by the caller).
     pub known: &'a HashMap<String, String>,
+    /// account id -> the mailbox's own addresses (its address and its sending identities, normalized like
+    /// `addrs.addr`). `from_self` and the thread view need an entry for every target; without one they are refused.
+    pub selves: &'a HashMap<String, Vec<String>>,
+}
+
+impl Scope<'_> {
+    /// (generation, own addresses) per target, or `invalid_argument` if a target has no known own addresses.
+    fn self_sets(&self) -> Result<Vec<(i64, &[String])>, ToolError> {
+        self.targets
+            .iter()
+            .map(|t| {
+                self.selves
+                    .get(&t.account_id)
+                    .map(|v| (t.gen_id, v.as_slice()))
+                    .ok_or_else(|| bad("'from_self' is not available here"))
+            })
+            .collect()
+    }
+}
+
+/// `from_self` as a filter: the message has a From address that is one of its mailbox's own addresses, or it carries
+/// the `SENT` label. One `IN` over a union of index lookups (`addrs_addr` per mailbox, the labels primary key).
+fn compile_from_self(q: &mut Sql, scope: &Scope<'_>) -> Result<(), ToolError> {
+    q.s("m.id IN (");
+    for (gen_id, addrs) in scope.self_sets()? {
+        if addrs.is_empty() {
+            continue;
+        }
+        q.s("SELECT msg FROM addrs WHERE addr IN ")
+            .list(addrs.iter().map(|a| SqlValue::Text(a.clone())))
+            .s(" AND gen = ")
+            .p(SqlValue::Integer(gen_id))
+            .s(" AND role = ")
+            .p(SqlValue::Integer(ROLE_FROM))
+            .s(" UNION ALL ");
+    }
+    q.s("SELECT msg FROM labels WHERE label = ")
+        .p(SqlValue::Text(SENT_LABEL.into()))
+        .s(" AND gen IN ")
+        .list(gens(scope.targets))
+        .s(")");
+    Ok(())
+}
+
+/// `from_self` of the row `x` as a 0/1 expression, for projections and per-thread aggregates: two correlated lookups
+/// by message (`addrs_msg`, the labels primary key), so the cost follows the rows evaluated, not the mailbox size.
+fn self_expr(q: &mut Sql, x: &str, scope: &Scope<'_>) -> Result<(), ToolError> {
+    q.s(&format!("(EXISTS (SELECT 1 FROM addrs a WHERE a.msg = {x}.id AND a.role = "))
+        .p(SqlValue::Integer(ROLE_FROM))
+        .s(" AND CASE a.gen");
+    for (gen_id, addrs) in scope.self_sets()? {
+        q.s(" WHEN ").p(SqlValue::Integer(gen_id)).s(" THEN ");
+        if addrs.is_empty() {
+            q.s("0");
+        } else {
+            q.s("a.addr IN ").list(addrs.iter().map(|a| SqlValue::Text(a.clone())));
+        }
+    }
+    q.s(" ELSE 0 END) OR EXISTS (SELECT 1 FROM labels l WHERE l.label = ")
+        .p(SqlValue::Text(SENT_LABEL.into()))
+        .s(&format!(" AND l.gen = {x}.gen AND l.msg = {x}.id))"));
+    Ok(())
 }
 
 fn split_qualified<'v>(scope: &Scope<'_>, v: &'v str) -> Result<(Option<i64>, &'v str), ToolError> {
@@ -762,6 +866,12 @@ fn compile_pred(q: &mut Sql, p: &Pred, scope: &Scope<'_>) -> Result<(), ToolErro
                 q.s(")");
             }
         }
+        FromSelf => {
+            let Val::Bool(b) = p.value else { unreachable!() };
+            q.s(if b { "(" } else { "(NOT " });
+            compile_from_self(q, scope)?;
+            q.s(")");
+        }
         AttachmentName | AttachmentMime => {
             let vals = str_list(&p.value).into_iter().map(|s| s.to_lowercase());
             if p.op == Op::EndsWith {
@@ -855,32 +965,32 @@ const ROW_COLS: &str = "m.account_id, m.gmail_id, m.received_at, m.size_bytes, m
     m.thread_id, m.from_list, m.to_list, m.cc_list, m.bcc_list, m.subject, m.labels, m.snippet, m.is_unread, \
     m.is_starred, m.is_draft, m.has_attachment, m.attachment_names, m.attachment_mimes, m.category";
 
-/// The page query: filters, keyset seek after `after`, order and `limit + 1` rows.
-pub fn page_sql(req: &SearchReq, scope: &Scope<'_>, after: &[KeyValue]) -> Result<(String, Vec<SqlValue>), ToolError> {
-    let w = where_clause(req, scope, true)?;
-    let terms = sort_terms(&req.order);
-    let mut q = Sql { text: format!("SELECT {ROW_COLS} FROM messages m WHERE "), params: vec![] };
-    q.s(&w.text);
-    q.params.extend(w.params);
-    if !after.is_empty() {
-        if after.len() != terms.len() {
-            return Err(super::cursor::invalid());
-        }
-        // (t1 > v1) OR (t1 = v1 AND ((t2 > v2) OR (t2 = v2 AND ...)))
-        q.s(" AND ");
-        fn seek(q: &mut Sql, terms: &[(&str, Dir)], vals: &[KeyValue]) {
-            let (col, dir) = terms[0];
-            let op = if dir == Dir::Asc { ">" } else { "<" };
-            if terms.len() == 1 {
-                q.s(&format!("{col} {op} ")).p(vals[0].sql());
-                return;
-            }
-            q.s(&format!("({col} {op} ")).p(vals[0].sql()).s(&format!(" OR ({col} = ")).p(vals[0].sql()).s(" AND ");
-            seek(q, &terms[1..], &vals[1..]);
-            q.s("))");
-        }
-        seek(&mut q, &terms, after);
+/// Message columns of a row, followed by `from_self` when the projection asks for it (index [`ROW_COL_COUNT`]).
+fn row_cols(q: &mut Sql, req: &SearchReq, scope: &Scope<'_>) -> Result<(), ToolError> {
+    q.s(ROW_COLS);
+    if req.select.iter().any(|c| c == "from_self") {
+        q.s(", ");
+        self_expr(q, "m", scope)?;
     }
+    Ok(())
+}
+
+const ROW_COL_COUNT: usize = 21;
+
+/// Keyset seek after `vals` in the order `terms`: (t1 > v1) OR (t1 = v1 AND ((t2 > v2) OR (t2 = v2 AND ...))).
+fn seek(q: &mut Sql, terms: &[(&str, Dir)], vals: &[KeyValue]) {
+    let (col, dir) = terms[0];
+    let op = if dir == Dir::Asc { ">" } else { "<" };
+    if terms.len() == 1 {
+        q.s(&format!("{col} {op} ")).p(vals[0].sql());
+        return;
+    }
+    q.s(&format!("({col} {op} ")).p(vals[0].sql()).s(&format!(" OR ({col} = ")).p(vals[0].sql()).s(" AND ");
+    seek(q, &terms[1..], &vals[1..]);
+    q.s("))");
+}
+
+fn order_by(q: &mut Sql, terms: &[(&str, Dir)]) {
     q.s(" ORDER BY ");
     for (i, (col, dir)) in terms.iter().enumerate() {
         if i > 0 {
@@ -888,13 +998,127 @@ pub fn page_sql(req: &SearchReq, scope: &Scope<'_>, after: &[KeyValue]) -> Resul
         }
         let _ = write!(q.text, "{col} {}", if *dir == Dir::Asc { "ASC" } else { "DESC" });
     }
+}
+
+/// The page query: filters, keyset seek after `after`, order and `limit + 1` rows.
+pub fn page_sql(req: &SearchReq, scope: &Scope<'_>, after: &[KeyValue]) -> Result<(String, Vec<SqlValue>), ToolError> {
+    if req.group_by_thread {
+        return thread_page_sql(req, scope, after);
+    }
+    let w = where_clause(req, scope, true)?;
+    let terms = sort_terms(&req.order);
+    let mut q = Sql { text: "SELECT ".into(), params: vec![] };
+    row_cols(&mut q, req, scope)?;
+    q.s(" FROM messages m WHERE ");
+    q.s(&w.text);
+    q.params.extend(w.params);
+    if !after.is_empty() {
+        if after.len() != terms.len() {
+            return Err(super::cursor::invalid());
+        }
+        q.s(" AND ");
+        seek(&mut q, &terms, after);
+    }
+    order_by(&mut q, &terms);
     q.s(" LIMIT ").p(SqlValue::Integer(req.limit as i64 + 1));
     Ok((q.text, q.params))
 }
 
 pub fn count_sql(req: &SearchReq, scope: &Scope<'_>) -> Result<(String, Vec<SqlValue>), ToolError> {
+    if req.group_by_thread {
+        let mut q = threads_cte(req, scope)?;
+        q.s(" SELECT count(*) FROM th");
+        reply_filter(&mut q, req);
+        return Ok((q.text, q.params));
+    }
     let w = where_clause(req, scope, false)?;
     Ok((format!("SELECT count(*) FROM messages m WHERE {}", w.text), w.params))
+}
+
+// ------------------------------------------------------------------ thread view
+
+/// Thread view order: the thread's latest message time, then (account_id, thread_id) ascending as the tiebreaker.
+fn thread_terms(order: &[(OrderField, Dir)]) -> Vec<(&'static str, Dir)> {
+    let dir = order.first().map_or(Dir::Desc, |(_, d)| *d);
+    vec![("last_at", dir), ("account_id", Dir::Asc), ("thread_id", Dir::Asc)]
+}
+
+/// The candidate threads and their reply status, as the CTE `th(gen, account_id, thread_id, matched, n, last_at,
+/// last_out, last_in)`.
+///
+/// * `hit`: threads with at least one message matching the filter (spam/trash policy included), with how many match.
+/// * `tm`: every message of those threads under the same spam/trash policy, joined by `messages_thread`
+///   `(thread_id, gen)` (never across mailboxes), with its time, draft flag and `from_self`.
+/// * `th`: per thread the message count, latest time, latest non-draft time from self (`last_out`) and not from
+///   self (`last_in`). The status therefore does not depend on the filter: a reply filed under `SENT` counts even when
+///   the filter asks for `INBOX`.
+fn threads_cte(req: &SearchReq, scope: &Scope<'_>) -> Result<Sql, ToolError> {
+    let w = where_clause(req, scope, false)?;
+    let mut q = Sql {
+        text: "WITH hit AS (SELECT m.gen AS gen, m.account_id AS account_id, m.thread_id AS thread_id, \
+               count(*) AS matched FROM messages m WHERE "
+            .into(),
+        params: vec![],
+    };
+    q.s(&w.text);
+    q.params.extend(w.params);
+    // `tm` is materialized so the self check runs once per message (inlined, SQLite copies it into every use).
+    q.s(" GROUP BY m.gen, m.thread_id), \
+         tm AS MATERIALIZED (SELECT h.gen AS gen, h.account_id AS account_id, h.thread_id AS thread_id, \
+         h.matched AS matched, t.received_at AS at, t.is_draft AS d, ");
+    self_expr(&mut q, "t", scope)?;
+    q.s(" AS s FROM hit h JOIN messages t ON t.thread_id = h.thread_id AND t.gen = h.gen WHERE ");
+    q.s(if req.include_spam_trash { "t.spam_trash IN (0, 1)" } else { "t.spam_trash = 0" });
+    q.s("), th AS (SELECT gen, account_id, thread_id, matched, count(*) AS n, max(at) AS last_at, \
+         max(CASE WHEN d = 0 AND s THEN at END) AS last_out, max(CASE WHEN d = 0 AND NOT s THEN at END) AS last_in \
+         FROM tm GROUP BY gen, thread_id)");
+    Ok(q)
+}
+
+/// `awaiting_reply`: the latest non-draft message is not from self (`true`) or is from self (`false`). A message
+/// from self at the same instant as the latest inbound one counts as the reply (IMAP dates have second precision).
+/// Threads that hold only drafts match neither.
+fn reply_filter(q: &mut Sql, req: &SearchReq) {
+    match req.awaiting_reply {
+        None => q.s(" WHERE 1"),
+        Some(true) => q.s(" WHERE last_in IS NOT NULL AND (last_out IS NULL OR last_in > last_out)"),
+        Some(false) => q.s(" WHERE last_out IS NOT NULL AND (last_in IS NULL OR last_out >= last_in)"),
+    };
+}
+
+/// The thread page query: candidate threads after `after` in thread order, `limit + 1` of them.
+pub fn thread_page_sql(
+    req: &SearchReq,
+    scope: &Scope<'_>,
+    after: &[KeyValue],
+) -> Result<(String, Vec<SqlValue>), ToolError> {
+    let terms = thread_terms(&req.order);
+    let mut q = threads_cte(req, scope)?;
+    q.s(" SELECT gen, account_id, thread_id, matched, n, last_at, last_out, last_in FROM th");
+    reply_filter(&mut q, req);
+    if !after.is_empty() {
+        if after.len() != terms.len() {
+            return Err(super::cursor::invalid());
+        }
+        q.s(" AND ");
+        seek(&mut q, &terms, after);
+    }
+    order_by(&mut q, &terms);
+    q.s(" LIMIT ").p(SqlValue::Integer(req.limit as i64 + 1));
+    Ok((q.text, q.params))
+}
+
+/// The latest message of one thread under the spam/trash policy (the row the thread view projects).
+fn latest_sql(req: &SearchReq, scope: &Scope<'_>, gen_id: i64, thread_id: &str) -> Result<Sql, ToolError> {
+    let mut q = Sql { text: "SELECT ".into(), params: vec![] };
+    row_cols(&mut q, req, scope)?;
+    q.s(" FROM messages m WHERE m.thread_id = ")
+        .p(SqlValue::Text(thread_id.to_string()))
+        .s(" AND m.gen = ")
+        .p(SqlValue::Integer(gen_id))
+        .s(if req.include_spam_trash { " AND m.spam_trash IN (0, 1)" } else { " AND m.spam_trash = 0" })
+        .s(" ORDER BY m.received_at DESC, m.gmail_id DESC LIMIT 1");
+    Ok(q)
 }
 
 // ------------------------------------------------------------------ execution
@@ -911,6 +1135,43 @@ fn json_list(s: &str) -> Value {
     serde_json::from_str::<Value>(s).unwrap_or_else(|_| json!([]))
 }
 
+/// The selected message columns of a row produced by [`row_cols`] (thread columns are filled in by the caller).
+fn message_values(r: &rusqlite::Row<'_>, select: &[String], alias: &str) -> rusqlite::Result<Map<String, Value>> {
+    let account_id: String = r.get(0)?;
+    let gmail_id: String = r.get(1)?;
+    let received: i64 = r.get(2)?;
+    let size: i64 = r.get(3)?;
+    let mut values = Map::new();
+    for col in select {
+        let v = match col.as_str() {
+            "ref" => json!(crate::tools::make_ref(&account_id, &gmail_id)),
+            "account" => json!(alias),
+            "message_id" => json!(gmail_id),
+            "thread_id" => json!(r.get::<_, String>(6)?),
+            "received_at" => json!(util::rfc3339_ms(received)),
+            "from" => json_list(&r.get::<_, String>(7)?).get(0).cloned().unwrap_or(Value::Null),
+            "to" => json_list(&r.get::<_, String>(8)?),
+            "cc" => json_list(&r.get::<_, String>(9)?),
+            "bcc" => json_list(&r.get::<_, String>(10)?),
+            "subject" => json!(r.get::<_, Option<String>>(11)?),
+            "labels" => json_list(&r.get::<_, String>(12)?),
+            "snippet" => json!(r.get::<_, Option<String>>(13)?),
+            "size_bytes" => json!(size),
+            "is_unread" => json!(r.get::<_, i64>(14)? != 0),
+            "is_starred" => json!(r.get::<_, i64>(15)? != 0),
+            "is_draft" => json!(r.get::<_, i64>(16)? != 0),
+            "has_attachment" => json!(r.get::<_, Option<i64>>(17)?.map(|v| v != 0)),
+            "attachment_names" => json_list(&r.get::<_, String>(18)?),
+            "attachment_mime_types" => json_list(&r.get::<_, String>(19)?),
+            "category" => json!(r.get::<_, Option<String>>(20)?),
+            "from_self" => json!(r.get::<_, i64>(ROW_COL_COUNT)? != 0),
+            _ => continue,
+        };
+        values.insert(col.clone(), v);
+    }
+    Ok(values)
+}
+
 /// Runs one page. Returns rows (at most `limit`) and whether another page exists.
 pub fn run_page(
     conn: &Connection,
@@ -918,6 +1179,9 @@ pub fn run_page(
     scope: &Scope<'_>,
     after: &[KeyValue],
 ) -> anyhow::Result<(Vec<Row>, bool)> {
+    if req.group_by_thread {
+        return run_thread_page(conn, req, scope, after);
+    }
     let (sql, params) = page_sql(req, scope, after)?;
     let alias: HashMap<&str, &str> = scope.targets.iter().map(|t| (t.account_id.as_str(), t.alias.as_str())).collect();
     let mut st = conn.prepare(&sql)?;
@@ -926,54 +1190,74 @@ pub fn run_page(
     while let Some(r) = rows.next()? {
         let account_id: String = r.get(0)?;
         let gmail_id: String = r.get(1)?;
-        let received: i64 = r.get(2)?;
-        let size: i64 = r.get(3)?;
-        let subj_missing: i64 = r.get(4)?;
-        let subj_key: String = r.get(5)?;
         let mut key = vec![];
         for (f, _) in &req.order {
             match f {
-                OrderField::ReceivedAt => key.push(KeyValue::Int(received)),
-                OrderField::SizeBytes => key.push(KeyValue::Int(size)),
+                OrderField::ReceivedAt => key.push(KeyValue::Int(r.get(2)?)),
+                OrderField::SizeBytes => key.push(KeyValue::Int(r.get(3)?)),
                 OrderField::Subject => {
-                    key.push(KeyValue::Int(subj_missing));
-                    key.push(KeyValue::Text(subj_key.clone()));
+                    key.push(KeyValue::Int(r.get(4)?));
+                    key.push(KeyValue::Text(r.get(5)?));
                 }
             }
         }
         key.push(KeyValue::Text(account_id.clone()));
         key.push(KeyValue::Text(gmail_id.clone()));
-        let mut values = Map::new();
-        for col in &req.select {
-            let v = match col.as_str() {
-                "ref" => json!(crate::tools::make_ref(&account_id, &gmail_id)),
-                "account" => json!(alias.get(account_id.as_str()).copied().unwrap_or("")),
-                "message_id" => json!(gmail_id),
-                "thread_id" => json!(r.get::<_, String>(6)?),
-                "received_at" => json!(util::rfc3339_ms(received)),
-                "from" => json_list(&r.get::<_, String>(7)?).get(0).cloned().unwrap_or(Value::Null),
-                "to" => json_list(&r.get::<_, String>(8)?),
-                "cc" => json_list(&r.get::<_, String>(9)?),
-                "bcc" => json_list(&r.get::<_, String>(10)?),
-                "subject" => json!(r.get::<_, Option<String>>(11)?),
-                "labels" => json_list(&r.get::<_, String>(12)?),
-                "snippet" => json!(r.get::<_, Option<String>>(13)?),
-                "size_bytes" => json!(size),
-                "is_unread" => json!(r.get::<_, i64>(14)? != 0),
-                "is_starred" => json!(r.get::<_, i64>(15)? != 0),
-                "is_draft" => json!(r.get::<_, i64>(16)? != 0),
-                "has_attachment" => json!(r.get::<_, Option<i64>>(17)?.map(|v| v != 0)),
-                "attachment_names" => json_list(&r.get::<_, String>(18)?),
-                "attachment_mime_types" => json_list(&r.get::<_, String>(19)?),
-                "category" => json!(r.get::<_, Option<String>>(20)?),
-                _ => Value::Null,
-            };
-            values.insert(col.clone(), v);
-        }
+        let values = message_values(r, &req.select, alias.get(account_id.as_str()).copied().unwrap_or(""))?;
         out.push(Row { account_id, gmail_id, key, values });
     }
     let more = out.len() > req.limit;
     out.truncate(req.limit);
+    Ok((out, more))
+}
+
+/// One page of the thread view: the threads in thread order, each projected from its latest message plus the
+/// per-thread columns. The row key is `(last_at, account_id, thread_id)`.
+fn run_thread_page(
+    conn: &Connection,
+    req: &SearchReq,
+    scope: &Scope<'_>,
+    after: &[KeyValue],
+) -> anyhow::Result<(Vec<Row>, bool)> {
+    type Head = (i64, String, String, i64, i64, i64, Option<i64>, Option<i64>);
+    let (sql, params) = thread_page_sql(req, scope, after)?;
+    let mut st = conn.prepare(&sql)?;
+    let heads: Vec<Head> = st
+        .query_map(params_from_iter(params), |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?))
+        })?
+        .collect::<Result<_, _>>()?;
+    let more = heads.len() > req.limit;
+    let mut out = Vec::with_capacity(heads.len().min(req.limit));
+    for (gen_id, account_id, thread_id, matched, n, last_at, last_out, last_in) in heads.into_iter().take(req.limit) {
+        let alias = scope.targets.iter().find(|t| t.gen_id == gen_id).map_or("", |t| t.alias.as_str());
+        let q = latest_sql(req, scope, gen_id, &thread_id)?;
+        let mut lst = conn.prepare_cached(&q.text)?;
+        let Some((gmail_id, mut values)) = lst
+            .query_row(params_from_iter(q.params), |r| {
+                Ok((r.get::<_, String>(1)?, message_values(r, &req.select, alias)?))
+            })
+            .optional()?
+        else {
+            // Same read transaction as the thread query: cannot happen; skip defensively.
+            continue;
+        };
+        let self_last = last_out.map(|o| last_in.is_none_or(|i| o >= i));
+        for col in &req.select {
+            let v = match col.as_str() {
+                "message_count" => json!(n),
+                "matched_count" => json!(matched),
+                "last_sender_is_self" => json!(self_last.or(last_in.map(|_| false))),
+                "last_inbound_at" => json!(last_in.map(util::rfc3339_ms)),
+                "last_outbound_at" => json!(last_out.map(util::rfc3339_ms)),
+                "awaiting_reply" => json!(last_in.is_some() && self_last != Some(true)),
+                _ => continue,
+            };
+            values.insert(col.clone(), v);
+        }
+        let key = vec![KeyValue::Int(last_at), KeyValue::Text(account_id.clone()), KeyValue::Text(thread_id)];
+        out.push(Row { account_id, gmail_id, key, values });
+    }
     Ok((out, more))
 }
 
@@ -998,6 +1282,8 @@ pub fn matching_rows(conn: &Connection, filter: &Expr, scope: &Scope<'_>, rows: 
         require_complete: false,
         max_lag_seconds: None,
         include_spam_trash: false,
+        group_by_thread: false,
+        awaiting_reply: None,
     };
     let w = where_clause(&req, scope, false)?;
     let mut q = Sql { text: format!("SELECT m.id FROM messages m WHERE {} AND m.id IN ", w.text), params: w.params };
@@ -1005,6 +1291,15 @@ pub fn matching_rows(conn: &Connection, filter: &Expr, scope: &Scope<'_>, rows: 
     let mut st = conn.prepare(&q.text)?;
     let out = st.query_map(params_from_iter(q.params), |r| r.get(0))?.collect::<Result<_, _>>()?;
     Ok(out)
+}
+
+/// EXPLAIN QUERY PLAN lines for the thread view's latest-message lookup in the first target (tests verify it).
+pub fn explain_latest(conn: &Connection, req: &SearchReq, scope: &Scope<'_>) -> anyhow::Result<Vec<String>> {
+    let gen_id = scope.targets.first().map_or(0, |t| t.gen_id);
+    let q = latest_sql(req, scope, gen_id, "t")?;
+    let mut st = conn.prepare(&format!("EXPLAIN QUERY PLAN {}", q.text))?;
+    let rows = st.query_map(params_from_iter(q.params), |r| r.get::<_, String>(3))?;
+    Ok(rows.collect::<Result<_, _>>()?)
 }
 
 /// EXPLAIN QUERY PLAN lines for a page query (tests verify hot paths).

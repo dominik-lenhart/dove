@@ -218,7 +218,10 @@ async fn create_watch(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError>
         Kind::Query => {
             let w =
                 args.get("where").filter(|v| !v.is_null()).ok_or_else(|| ToolError::invalid("'where' is required"))?;
-            query::parse_where(Some(w))?.ok_or_else(|| ToolError::invalid("'where' is required"))?;
+            let e = query::parse_where(Some(w))?.ok_or_else(|| ToolError::invalid("'where' is required"))?;
+            if e.uses_field(query::Field::FromSelf) {
+                return Err(ToolError::invalid("'from_self' is not supported in watches"));
+            }
             audit_query = Some(w.to_string());
             filter.query = Some(w.clone());
         }

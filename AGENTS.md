@@ -390,3 +390,9 @@ cargo fmt
   process) in a PATH of symlinked system tools, so no network and no real minisign are needed. There is no PowerShell
   on the host; `docker run --rm mcr.microsoft.com/powershell:latest pwsh -NoProfile -File <script>` checks an
   `install.ps1` expression quickly (the image is cached locally).
+- 2026-11-13: SQLite flattens a subquery or CTE into its user and copies the column expression into every place that
+  uses it; `EXPLAIN QUERY PLAN` then lists one `CORRELATED SCALAR SUBQUERY` per copy. A per-row correlated check used
+  in several aggregates (the thread view's `from_self`) goes in an `AS MATERIALIZED` CTE so it runs once per row;
+  assert the count of the lookup lines in the plan test. `query::Scope` carries `selves` (own addresses per account
+  id); `from_self` and `group_by:"thread"` refuse to compile without an entry for every target, so a new caller that
+  passes an empty map gets `invalid_argument`, not a silently wrong answer.
