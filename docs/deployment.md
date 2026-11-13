@@ -168,7 +168,8 @@ The file holds no secrets. Unknown keys are rejected. Settings and defaults (fro
 | `index.*` | see below | Search index tuning. |
 
 `limits` defaults: `body_bytes` 1 MiB, `client_requests_per_minute` 120, `client_burst` 40,
-`client_sends_per_hour` 20, `upstream_total_inflight` 16, `upstream_per_mailbox` 4, `upstream_search_mailboxes` 8,
+`client_sends_per_hour` 20, `auth_failures_per_minute` 60 (failed bearer tokens on `/mcp` per client address, IPv6 by
+/64; then 429 until the bucket refills; successful requests do not count), `upstream_total_inflight` 16, `upstream_per_mailbox` 4, `upstream_search_mailboxes` 8,
 `upstream_request_timeout_secs` 10, `tool_call_timeout_secs` 30, `attachment_bytes` 10 MiB (largest attachment
 `get_attachment` returns), `draft_attachment_bytes` 10 MiB (all attachments of one draft, decoded; at most 16 MiB).
 `body_bytes` caps every request except `/mcp` requests from an authenticated client with `draft` on some mailbox:

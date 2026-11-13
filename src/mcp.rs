@@ -99,6 +99,16 @@ impl RateLimiter {
         self.check_rate(key, f64::from(per_minute.max(1)) / 60.0, burst)
     }
 
+    /// Like [`RateLimiter::check`], but only reports whether the bucket is used up, without taking a token.
+    pub fn exhausted(&self, key: &str, per_minute: u32, burst: u32) -> Option<u64> {
+        let rate = f64::from(per_minute.max(1)) / 60.0;
+        let cap = f64::from(burst.max(1));
+        let b = self.inner.lock().expect("lock");
+        let tokens = b.map.get(key)?;
+        let left = (tokens.tokens + Instant::now().duration_since(tokens.last).as_secs_f64() * rate).min(cap);
+        (left < 1.0).then(|| ((1.0 - left) / rate).ceil() as u64)
+    }
+
     /// Token bucket refilling `per_hour` tokens per hour, holding at most `burst`.
     pub fn check_hourly(&self, key: &str, per_hour: u32, burst: u32) -> Option<u64> {
         self.check_rate(key, f64::from(per_hour.max(1)) / 3600.0, burst)
@@ -174,13 +184,22 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
     if bearer.is_empty() {
         return unauthorized(&app);
     }
+    // Each attempt costs a keyed hash and a store lookup: an address that keeps failing is refused before both.
+    let fail_key = format!("mcp-auth-fail:{}", crate::oauth::ip_bucket(ip));
+    let fail_limit = app.cfg.limits.auth_failures_per_minute;
+    if let Some(wait) = app.rate_limiter.exhausted(&fail_key, fail_limit, fail_limit) {
+        return too_many(wait);
+    }
     let resource = resource_url(&app);
     let allow_send = app.cfg.allow_send;
     let pepper = app.pepper.clone();
     let auth = app.store.call(move |c| policy::authenticate(c, &pepper, &bearer, ip, allow_send, &resource)).await;
     let authed = match auth {
         Ok(Ok(a)) => a,
-        Ok(Err(AuthFailure::Unauthorized)) => return unauthorized(&app),
+        Ok(Err(AuthFailure::Unauthorized)) => {
+            app.rate_limiter.check(&fail_key, fail_limit, fail_limit);
+            return unauthorized(&app);
+        }
         Err(e) => {
             tracing::error!(error = %e, "authentication failed internally");
             return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
@@ -213,9 +232,7 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
     }
     let limits = &app.cfg.limits;
     if let Some(wait) = app.rate_limiter.check(&ctx.client_id, limits.client_requests_per_minute, limits.client_burst) {
-        let mut r = (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response();
-        r.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from(wait));
-        return r;
+        return too_many(wait);
     }
     let mut versions = headers.get_all("mcp-protocol-version").iter();
     let header_version = versions.next().map(|v| v.to_str().unwrap_or("").to_string());
@@ -260,6 +277,12 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
             None => StatusCode::ACCEPTED.into_response(),
         },
     }
+}
+
+fn too_many(wait: u64) -> Response {
+    let mut r = (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response();
+    r.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from(wait));
+    r
 }
 
 fn json_response(v: Value) -> Response {
