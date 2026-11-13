@@ -121,6 +121,10 @@ is always delivered in the untrusted-content envelope from section 6.5.
 | `create_draft` | draft | Create a new message, a threaded reply (quoting the original) or a forward, with attachments. |
 | `update_draft` | draft | Edit an owned draft, conditional on the expected revision (§5.3); attachments kept unless replaced. |
 | `send_draft` | send | Optional. Submit one existing, owned draft under §6.3. |
+| `create_watch` | read | Watch an indexed mailbox: `thread_reply`, `from` (address or domain), `query` (a `where` filter, checked against newly indexed mail only) or `no_reply_by` (fires once at a deadline). Belongs to the creating token; at most 50 active, expiry 30 days by default, 180 at most; optional operator sink by name. |
+| `list_watches` | read | This token's watches (active and recently ended, with the reason) and the operator's sink names. |
+| `delete_watch` | read | Delete one of this token's watches and its events. |
+| `list_watch_events` | read | This token's watch events since an opaque cursor, oldest first, kept 14 days: watch id, kind, account, message id, thread id, received_at; never subject, sender or body. |
 
 Read tools set `readOnlyHint: true`. Update and send set `destructiveHint: true`. Annotations describe tools; the server enforces authorization. Draft deletion remains a human mailbox action in v1.
 
@@ -492,6 +496,10 @@ Outbound allowlist (method, path pattern under `https://gmail.googleapis.com/gma
 
 Plus `POST https://oauth2.googleapis.com/token` (code exchange, refresh) and
 `POST https://oauth2.googleapis.com/revoke`, and Google's public keys for ID token validation.
+
+The only other outbound destination is `POST` to the exact URLs (scheme, host, port, path) of the operator's webhook
+sinks (`dove sinks add`, watch push delivery, design 0.2 section 3). The gateway's sink allowlist is rebuilt from the
+state store whenever a sink is added or removed; agents name sinks but never supply URLs.
 
 Explicitly denied: every other send route, `messages` with POST, `messages/import`,
 `messages/{id}/trash`, `messages/{id}/modify`, `messages/batchModify`, `messages/batchDelete`, DELETE on messages or

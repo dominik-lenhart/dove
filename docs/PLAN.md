@@ -271,3 +271,19 @@ hosts or reference hardware.
   signature or trusted comment (`dove <tag>`) does not verify, refuses downgrades unless a version is named, and
   never runs inside `serve`. The update hint lives in the CLI only (spec 13a amended); the service keeps its outbound
   allowlist and reports its version over the admin socket so the CLI can say when a restart is due.
+- A51. Watches and sinks (design 0.2 section 3), decisions the design leaves open: sink secrets are sealed by the
+  vault (`seal_aux`, kind `sink_secret`) rather than kept as a file reference, because the service user (or the
+  distroless container) cannot read the operator's file; the CLI reads `--secret-file` and sends it over the admin
+  socket as a redacted `Password`. Watch filters (`from` address or domain, `where` query) are sealed the same way
+  (kind `watch_filter`), so the state store holds no addresses or query text in the clear; `keys rotate` re-wraps
+  both. Matching: all kinds ignore mail from the mailbox owner (`watch::owner_addresses`, the single place aliases
+  extend), drafts and spam/trash; thread kinds count only messages not older than the thread's newest message when
+  the watch was created (`baseline_ms`); `from`/`query` only mail received at most 15 minutes before the watch was
+  created, so a re-filed old message never fires. Events come only from incremental syncs of the serving generation:
+  a rebuild or backfill never fires, and mail that arrives while a rebuild runs is not reported. `no_reply_by` fires
+  once the index's `last_success_at` passes the deadline, or one hour after it at the latest; a message from others
+  ends it quietly (`end_reason = replied`). Watches need the index on the mailbox. Ended watches stay listed (state,
+  reason) for 14 days like events. Sink deliveries: 6 attempts (backoff 10 s, 1 min, 5 min, 30 min, 2 h), retried on
+  network errors, 408, 429 and 5xx, any other status final; a removed sink drops its queued deliveries and its
+  watches continue pull-only. The 50-watch limit counts active, unexpired watches; going over it is
+  `invalid_argument`.

@@ -41,7 +41,7 @@ Dove sits in between:
 - **An audit trail.** Every tool call produces one hash-chained audit record, without mail content.
 - **Your server, your keys.** Passwords and Google tokens are encrypted at rest with a key that lives outside the
   data directory. The search index is SQLCipher-encrypted. The server sends nothing anywhere except to your mail
-  providers.
+  providers and to webhook sinks you register yourself (content-free watch events).
 
 ## What agents can do
 
@@ -54,6 +54,8 @@ Dove sits in between:
 | `list_drafts`, `get_draft` | Drafts in the mailbox's Drafts folder |
 | `create_draft`, `update_draft` | New mail, replies (threaded and quoted) and forwards (with attachments). Attach files by reference or inline. Revision-checked: a draft you edited yourself is never overwritten |
 | `send_draft` | Only when both send gates are open, only drafts Dove created and nobody changed |
+| `create_watch`, `list_watches`, `delete_watch` | Get told about new mail instead of polling: a reply in a thread, mail from an address or domain, mail matching a search, or no reply by a deadline. Per token, at most 50, expire after 30 days by default |
+| `list_watch_events` | Pull watch events (ids and times only, no content; kept 14 days). Optionally pushed to a signed webhook the operator registered (`dove sinks add`) |
 
 New INBOX mail is indexed within seconds through IMAP IDLE. Mail content always reaches the model inside a clearly
 marked envelope; hidden HTML and invisible Unicode are stripped and Dove never loads remote content.

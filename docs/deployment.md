@@ -375,6 +375,64 @@ Instead of handing out a token, the operator can create a one-time invitation wi
 A `send` grant is refused unless `allow_send = true` is set in `config.toml`; that file is deployment-owner
 configuration, and neither MCP calls nor the CLI can change it. See the README before enabling it.
 
+## Watches and sinks
+
+Agents can watch a mailbox instead of polling search (`create_watch`): a new message in a thread from someone else
+(`thread_reply`), new mail from an address or domain (`from`), new mail matching a typed search (`query`), or no
+reply in a thread before a deadline (`no_reply_by`, fires once). Watches need the search index on the mailbox
+(`dove index enable <alias>`), belong to the token that created them and end on their own when they expire (30 days
+by default, 180 at most), when the token is revoked or loses `read` on the mailbox, and when the mailbox is disabled,
+stops being indexed or is removed. A token may have 50 active watches.
+
+Events are produced when the sync engine commits new mail to the index (Gmail history sync, IMAP polling and IDLE,
+so IDLE mailboxes report new INBOX mail within seconds) and, for `no_reply_by`, by a background tick every 15
+seconds. Mail sent by the mailbox itself, drafts, and spam or trash never fire a watch. An event holds the watch id,
+kind, account alias, message id, thread id and received time, never a subject, sender or body: the agent reads the
+message with its own token. Events are kept 14 days and pulled with `list_watch_events` (opaque cursor).
+
+Push delivery is optional and set up by the operator only. A sink is a name, an HTTPS URL and a signing secret:
+
+```sh
+umask 077; openssl rand -hex 32 > ~/dove-hook.secret
+dove sinks add n8n --url https://hooks.example.com/dove --secret-file ~/dove-hook.secret
+dove sinks list        # URL, active watches, pending/delivered/failed deliveries (never the secret)
+dove sinks remove n8n  # watches that used it keep working without push
+```
+
+The CLI reads the secret file (no group or other access: 0400 or 0600) and the service stores it sealed with the
+KEK (`dove keys rotate` re-wraps it); the file is not needed afterwards. Surrounding whitespace, such as the final
+newline, is not part of the secret: give the receiver the same trimmed value. Only `https` URLs without credentials, query
+or fragment are accepted, and the service POSTs to exactly the registered URLs and nowhere else. Agents see sink
+names in `list_watches` and may name one in `create_watch`; they can never supply a URL.
+
+Each event is one `POST` with `Content-Type: application/json`, a `Dove-Event-Id` header and
+`Dove-Signature: t=<unix seconds>,v1=<hex HMAC-SHA256 of "<t>.<raw body>" with the secret>`. The body:
+
+```json
+{"event_id": "e42", "watch_id": "w_...", "kind": "from", "account": "info", "message_id": "18c2f0a1b2c3d4e5",
+ "thread_id": "18c2f0a1b2c3d4e5", "received_at": "2026-11-13T09:12:44.123Z", "created_at": "2026-11-13T09:12:47Z"}
+```
+
+`message_id` and `received_at` are `null` for `no_reply_by`. Any 2xx answer counts as delivered. Timeouts (10 s),
+network errors, 408, 429 and 5xx are retried after 10 s, 1 min, 5 min, 30 min and 2 h (6 attempts in all); any other
+status fails at once. Undelivered events stay available to the agent through `list_watch_events`. Use `event_id` to
+drop duplicates. Verify the signature on the raw body before parsing it, for example in Python:
+
+```python
+import hashlib, hmac, time
+
+def verify(secret: bytes, header: str, body: bytes, tolerance: int = 300) -> bool:
+    """Checks a Dove-Signature header (t=<unix seconds>,v1=<hex HMAC-SHA256>) over the raw request body."""
+    parts = dict(p.split("=", 1) for p in header.split(",") if "=" in p)
+    t, sig = parts.get("t", ""), parts.get("v1", "")
+    if not t.isdigit() or abs(time.time() - int(t)) > tolerance:
+        return False
+    expected = hmac.new(secret, t.encode() + b"." + body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, sig)
+```
+
+or in a shell: `printf '%s.%s' "$t" "$body" | openssl dgst -sha256 -hmac "$secret"`.
+
 ## Administration access
 
 - The admin protocol is newline-delimited JSON over a Unix socket. The service checks `SO_PEERCRED` and accepts only
@@ -478,7 +536,7 @@ The KEK file is read-only to the service (a credential). Rotation re-wraps each 
    `sudo sh -c 'umask 077; dove keys generate --version 2 >> /etc/dove/credentials/kek'`
    (the new version must be the highest number).
 2. Restart the service so it loads both versions.
-3. `dove keys rotate`. It re-wraps every grant under the newest version and prints
+3. `dove keys rotate`. It re-wraps every grant, sink secret and watch filter under the newest version and prints
    `versions_in_use` and `versions_safe_to_delete_from_kek_file`.
 4. Remove the old version line from the file once it is safe, and restart.
 
