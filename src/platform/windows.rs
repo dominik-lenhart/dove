@@ -202,6 +202,18 @@ pub fn process_user_sid(pid: u32) -> io::Result<Sid> {
     token_user(&process_token(pid)?)
 }
 
+/// Excludes the executable `exe` from Windows Error Reporting for this user (P6): a crash then produces no WER
+/// report or dump that could hold decrypted secrets. Persistent (per-user registry), so calling it at every start is
+/// idempotent. Machine-wide WER settings an administrator made (LocalDumps under HKLM) are outside its reach.
+pub fn exclude_from_error_reporting(exe: &Path) -> io::Result<()> {
+    let w = wide(exe.as_os_str());
+    let hr = unsafe { windows_sys::Win32::System::ErrorReporting::WerAddExcludedApplication(w.as_ptr(), 0) };
+    if hr < 0 {
+        return Err(io::Error::other(format!("WerAddExcludedApplication failed ({hr:#x})")));
+    }
+    Ok(())
+}
+
 /// The user and integrity level of process `pid`.
 pub fn process_identity(pid: u32) -> io::Result<Identity> {
     identity(&process_token(pid)?)
@@ -548,6 +560,17 @@ pub(crate) mod tests {
         assert!(s.starts_with("S-1-5-"), "{s}");
         assert_eq!(current_user_sid().unwrap(), current_user_sid().unwrap());
         assert_eq!(process_user_sid(std::process::id()).unwrap(), current_user_sid().unwrap());
+    }
+
+    /// The exclusion really lands in WER: removing it afterwards succeeds only when it was added.
+    #[test]
+    fn error_reporting_exclusion_is_registered() {
+        use windows_sys::Win32::System::ErrorReporting::WerRemoveExcludedApplication;
+        let exe = std::env::temp_dir().join(format!("dove-wer-test-{}.exe", crate::util::new_id()));
+        let w = wide(exe.as_os_str());
+        assert!(unsafe { WerRemoveExcludedApplication(w.as_ptr(), 0) } < 0, "not excluded yet");
+        exclude_from_error_reporting(&exe).unwrap();
+        assert!(unsafe { WerRemoveExcludedApplication(w.as_ptr(), 0) } >= 0, "the exclusion was not registered");
     }
 
     /// The integrity level is read from the label SID's last sub-authority: a normal or elevated process is medium

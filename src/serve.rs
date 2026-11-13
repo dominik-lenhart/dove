@@ -8,9 +8,18 @@ use anyhow::Context;
 use crate::app::App;
 use crate::config::Config;
 
-/// Disables core dumps so decrypted secrets cannot end up on disk (spec 6.4). Windows has no per-process switch for
-/// Windows Error Reporting dumps; local mode's threat model accepts that (docs/deployment.md).
+/// Disables core dumps so decrypted secrets cannot end up on disk (spec 6.4). On Windows the executable is excluded
+/// from Windows Error Reporting for this user instead, best effort (P6, docs/deployment.md).
 pub fn harden_process() -> anyhow::Result<()> {
+    #[cfg(windows)]
+    match std::env::current_exe() {
+        Ok(exe) => {
+            if let Err(e) = crate::platform::windows::exclude_from_error_reporting(&exe) {
+                tracing::warn!(error = %e, "cannot exclude Dove from Windows Error Reporting; a crash may write a dump");
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "cannot exclude Dove from Windows Error Reporting"),
+    }
     #[cfg(unix)]
     nix::sys::resource::setrlimit(nix::sys::resource::Resource::RLIMIT_CORE, 0, 0)
         .context("cannot disable core dumps")?;
