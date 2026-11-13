@@ -64,7 +64,13 @@ fn peak_for(raw_size: usize, max_message_bytes: usize) -> (usize, usize, usize) 
     let body_len = body.len();
     let base = CUR.load(Relaxed) - body.capacity();
     PEAK.store(CUR.load(Relaxed), Relaxed);
-    let doc = dove::index::sync::doc_from_raw_answer(body, max_message_bytes, 200_000).unwrap();
+    let doc = dove::index::sync::doc_from_raw_answer(
+        body,
+        max_message_bytes,
+        200_000,
+        &dove::config::IndexConfig::default().attachment_cfg(),
+    )
+    .unwrap();
     assert!(doc.meta_complete, "parsed, not metadata-only");
     drop(doc);
     (raw_len, body_len, PEAK.load(Relaxed) - base)

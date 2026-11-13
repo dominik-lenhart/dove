@@ -22,6 +22,62 @@ pub const MAX_DRAFT_ATTACHMENTS: usize = 10;
 /// Longest attachment filename Dove writes, in characters.
 const MAX_FILENAME_CHARS: usize = 200;
 
+/// What kind of mail a message is, derived from its headers and parts at ingest (v0.2 design section 4).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Category {
+    /// Everything that is none of the others: mail written by a person.
+    #[default]
+    Personal,
+    /// `List-Unsubscribe` or `List-Id` present.
+    Newsletter,
+    /// `Auto-Submitted` other than `no`, `Precedence: bulk|list|junk`, or a no-reply style sender.
+    Notification,
+    /// Has a `text/calendar` part.
+    Calendar,
+}
+
+impl Category {
+    pub const ALL: [Category; 4] =
+        [Category::Personal, Category::Newsletter, Category::Notification, Category::Calendar];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Category::Personal => "personal",
+            Category::Newsletter => "newsletter",
+            Category::Notification => "notification",
+            Category::Calendar => "calendar",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Category> {
+        Category::ALL.into_iter().find(|c| c.as_str() == s)
+    }
+}
+
+/// Local-part fragments that mark an address as automated. Compared on the lower-cased local part with `-`, `_` and
+/// `.` removed, so `no-reply`, `No_Reply` and `do.not.reply` all match. Shared by the category rule and by
+/// `search_contacts` (which leaves such addresses out unless asked).
+pub const NOREPLY_MARKERS: [&str; 4] = ["noreply", "donotreply", "mailerdaemon", "postmaster"];
+
+/// Normalized local part (see [`NOREPLY_MARKERS`]).
+fn local_key(email: &str) -> String {
+    email
+        .rsplit_once('@')
+        .map_or(email, |(l, _)| l)
+        .chars()
+        .filter(|c| !matches!(c, '-' | '_' | '.'))
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// True for no-reply style senders (`noreply@`, `no-reply@`, `do-not-reply@`, `mailer-daemon@`, `postmaster@`,
+/// `bounce...@`).
+pub fn is_noreply(email: &str) -> bool {
+    let k = local_key(email);
+    NOREPLY_MARKERS.iter().any(|m| k.contains(m)) || k.starts_with("bounce")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Addr {
     pub name: Option<String>,
@@ -82,6 +138,10 @@ pub struct ParsedMessage {
     /// part is the text/plain body and every other part is a leaf with `Content-Disposition: attachment` (no nested
     /// multiparts, no HTML, no inline parts).
     pub is_draft_shape: bool,
+    /// Derived from headers and parts, see [`Category`].
+    pub category: Category,
+    /// First `VEVENT` of a `text/calendar` part, if it parsed.
+    pub calendar: Option<crate::calendar::CalendarEvent>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -176,6 +236,29 @@ fn body_text(part: &MessagePart<'_>, max: usize) -> (String, bool) {
     }
 }
 
+/// Header value as trimmed, lower-cased text (folding whitespace collapsed); `None` when the header is absent.
+fn header_lc(hdr: &mail_parser::Headers<'_>, name: &str) -> Option<String> {
+    hdr.iter()
+        .find(|h| h.raw_name().trim().eq_ignore_ascii_case(name))
+        .map(|h| String::from_utf8_lossy(h.raw_value()).split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase())
+}
+
+/// Category of a message (first match wins): calendar part, then newsletter, notification, personal.
+fn classify(hdr: &mail_parser::Headers<'_>, from: &[Addr], has_calendar_part: bool) -> Category {
+    if has_calendar_part {
+        return Category::Calendar;
+    }
+    if ["list-unsubscribe", "list-id"].iter().any(|n| header_lc(hdr, n).is_some_and(|v| !v.is_empty())) {
+        return Category::Newsletter;
+    }
+    let auto = header_lc(hdr, "auto-submitted").is_some_and(|v| !v.is_empty() && v != "no" && !v.starts_with("no;"));
+    let bulk = header_lc(hdr, "precedence").is_some_and(|v| matches!(v.as_str(), "bulk" | "list" | "junk"));
+    if auto || bulk || from.first().is_some_and(|a| is_noreply(&a.email)) {
+        return Category::Notification;
+    }
+    Category::Personal
+}
+
 pub fn parse(raw: &[u8], limits: &Limits) -> Result<ParsedMessage, MimeError> {
     if raw.len() > limits.max_raw_bytes {
         return Err(MimeError::TooLarge);
@@ -208,6 +291,7 @@ pub fn parse(raw: &[u8], limits: &Limits) -> Result<ParsedMessage, MimeError> {
     let mut multiparts = 0usize;
     // Every leaf after the first is an explicit attachment (draft shape).
     let mut rest_are_attachments = true;
+    let mut has_calendar_part = false;
     for part in root.parts() {
         part_count += 1;
         if part.flags().contains(PartFlags::LIMIT_REACHED) {
@@ -219,6 +303,15 @@ pub fn parse(raw: &[u8], limits: &Limits) -> Result<ParsedMessage, MimeError> {
         }
         leaves += 1;
         let mime = mime_type_of(&part);
+        if matches!(mime.as_str(), "text/calendar" | "application/ics") {
+            has_calendar_part = true;
+            if out.calendar.is_none() && part.decoded_len() <= crate::calendar::MAX_BYTES * 4 {
+                let bytes = part.decoded();
+                let text = String::from_utf8_lossy(&bytes);
+                let method = part.content_type().and_then(|ct| ct.attribute("method"));
+                out.calendar = crate::calendar::parse(&text, method);
+            }
+        }
         let filename = part.attachment_name().map(str::trim).filter(|n| !n.is_empty()).map(str::to_string);
         if leaves == 1 {
             simple_leaf_is_plain = mime == "text/plain"
@@ -239,6 +332,7 @@ pub fn parse(raw: &[u8], limits: &Limits) -> Result<ParsedMessage, MimeError> {
         }
     }
     out.part_count = part_count;
+    out.category = classify(&hdr, &out.from, has_calendar_part);
     out.has_attachment = !out.attachments.is_empty();
     out.is_simple_text = leaves == 1 && simple_leaf_is_plain && out.attachments.is_empty();
     let root_part = root.root_part();
@@ -305,6 +399,40 @@ pub fn attachment_bytes(
         size_bytes: bytes.len() as u64,
     };
     Ok(Some((meta, bytes)))
+}
+
+/// Callback of [`visit_attachments`]: attachment metadata and a lazy decoder of its bytes.
+pub type AttachmentVisitor<'a> = dyn FnMut(&AttachmentMeta, &dyn Fn() -> Vec<u8>) -> std::ops::ControlFlow<()> + 'a;
+
+/// Calls `f` for every attachment of `raw` (same part numbering and attachment rule as [`parse`]) with its metadata
+/// and a function that decodes its bytes on demand, so attachments the caller does not want are never copied.
+/// `f` returns `Break` to stop. Used by ingest-time attachment text extraction.
+pub fn visit_attachments(raw: &[u8], f: &mut AttachmentVisitor<'_>) -> Result<(), MimeError> {
+    let limits = Limits::default();
+    if raw.len() > limits.max_raw_bytes {
+        return Err(MimeError::TooLarge);
+    }
+    let parser = MessageParser::new().max_parts(limits.max_parts).max_depth(limits.max_depth);
+    let msg = parser.parse(raw).ok_or(MimeError::Unparseable)?;
+    for part in msg.root().parts() {
+        if part.is_multipart() {
+            continue;
+        }
+        let filename = part.attachment_name().map(str::trim).filter(|n| !n.is_empty()).map(str::to_string);
+        if !is_attachment_part(&part, &filename) {
+            continue;
+        }
+        let meta = AttachmentMeta {
+            attachment_id: format!("part-{}", part.id()),
+            filename,
+            mime_type: mime_type_of(&part),
+            size_bytes: part.decoded_len() as u64,
+        };
+        if f(&meta, &|| part.decoded().into_owned()).is_break() {
+            break;
+        }
+    }
+    Ok(())
 }
 
 /// Decoded values of one header (case-insensitive name), unfolded, RFC 2047 decoded.

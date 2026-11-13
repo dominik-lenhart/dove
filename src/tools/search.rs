@@ -114,6 +114,8 @@ async fn search(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
         return match cur.payload {
             Payload::Index(p) => index_search(cx, p.req.clone(), Some(p), &args).await,
             Payload::Live(p) => live_search(cx, p, Vec::new(), true, &args).await,
+            // A digest cursor belongs to `digest`.
+            Payload::Digest(_) => Err(cursor::invalid()),
         };
     }
     match opt_str(&args, "source")?.unwrap_or("index") {
@@ -140,7 +142,7 @@ fn opt_limit(args: &Value) -> Result<usize, ToolError> {
     Ok(super::opt_u64(args, "limit", DEFAULT_LIMIT as u64, 1, MAX_LIMIT as u64)? as usize)
 }
 
-fn accounts_arg(args: &Value) -> Result<Option<Vec<String>>, ToolError> {
+pub(crate) fn accounts_arg(args: &Value) -> Result<Option<Vec<String>>, ToolError> {
     match args.get("accounts") {
         None | Some(Value::Null) => Ok(None),
         Some(_) => {
@@ -192,7 +194,7 @@ pub fn parse_index_req(args: &Value) -> Result<SearchReq, ToolError> {
 }
 
 /// Requested mailboxes with read access: active ones to search, others reported as account errors.
-fn resolve_accounts(cx: &ToolCx, names: Option<&[String]>) -> Result<(Vec<Mailbox>, Vec<Value>), ToolError> {
+pub(crate) fn resolve_accounts(cx: &ToolCx, names: Option<&[String]>) -> Result<(Vec<Mailbox>, Vec<Value>), ToolError> {
     let mut picked: Vec<Mailbox> = vec![];
     match names {
         Some(names) => {
@@ -220,13 +222,13 @@ fn resolve_accounts(cx: &ToolCx, names: Option<&[String]>) -> Result<(Vec<Mailbo
     Ok((active, errors))
 }
 
-fn known_aliases(cx: &ToolCx) -> HashMap<String, String> {
+pub(crate) fn known_aliases(cx: &ToolCx) -> HashMap<String, String> {
     cx.client.mailboxes.iter().map(|m| (m.alias.clone(), m.account_id.clone())).collect()
 }
 
 /// Reloads grants after the query ran (spec 5.3 "again before release if changed in flight"). Returns the account
 /// ids that may still be released.
-async fn recheck(cx: &ToolCx, resumed: bool, need_index: bool) -> Result<HashSet<String>, ToolError> {
+pub(crate) async fn recheck(cx: &ToolCx, resumed: bool, need_index: bool) -> Result<HashSet<String>, ToolError> {
     let client_id = cx.client.client_id.clone();
     let (epoch, mbs) = cx
         .app
@@ -249,6 +251,91 @@ async fn recheck(cx: &ToolCx, resumed: bool, need_index: bool) -> Result<HashSet
 }
 
 // ------------------------------------------------------------------ index route
+
+/// The indexed mailboxes a query may read, their sync states and the coverage exceptions found while looking.
+pub(crate) struct Found {
+    pub targets: Vec<Target>,
+    pub states: HashMap<String, (SyncState, i64)>,
+    pub exceptions: Vec<Value>,
+}
+
+/// Resolves authorized, active mailboxes to the generations they serve, inside one read transaction. Mailboxes
+/// that are not indexed, not ready or stale are reported as exceptions (`max_lag` seconds of staleness allowed).
+pub(crate) fn collect_targets(
+    tx: &rusqlite::Connection,
+    mbs: &[Mailbox],
+    now: i64,
+    max_lag: Option<u64>,
+) -> anyhow::Result<Found> {
+    let mut states = HashMap::new();
+    let mut targets = vec![];
+    let mut exceptions = vec![];
+    for m in mbs {
+        if !m.index_enabled {
+            exceptions.push(exception(&m.alias, "not_indexed", "indexing is not enabled", None));
+            continue;
+        }
+        let Some(s) = load_state(tx, &m.account_id)? else {
+            exceptions.push(exception(&m.alias, "pending", "indexing has not started", None));
+            continue;
+        };
+        let Some(g) = s.serving_gen() else {
+            exceptions.push(exception(&m.alias, &s.stage, "no indexed data yet", s.last_success_at));
+            continue;
+        };
+        let pending: i64 = tx.query_row("SELECT count(*) FROM pending WHERE gen = ?1", [g], |r| r.get(0))?;
+        if s.stage != "ready" {
+            exceptions.push(exception(&m.alias, &s.stage, "index is not complete", s.last_success_at));
+        } else if s.last_success_at.is_none() {
+            exceptions.push(exception(&m.alias, &s.stage, "no successful sync yet", None));
+        } else if let Some(lag) = max_lag
+            && now - s.last_success_at.unwrap_or(0) > lag as i64
+        {
+            exceptions.push(exception(&m.alias, "stale", "last sync is older than max_lag_seconds", s.last_success_at));
+        }
+        if pending > 0 {
+            exceptions.push(json!({ "account": m.alias, "stage": s.stage, "reason": "messages pending retry",
+                "count": pending, "last_success_at": s.last_success_at.map(util::rfc3339) }));
+        }
+        let att_fts: bool = tx.query_row("SELECT att_fts FROM generations WHERE id = ?1", [g], |r| r.get(0))?;
+        targets.push(Target { account_id: m.account_id.clone(), alias: m.alias.clone(), gen_id: g, att_fts });
+        states.insert(m.account_id.clone(), (s, pending));
+    }
+    Ok(Found { targets, states, exceptions })
+}
+
+/// Coverage exceptions for rows whose category or attachment text is unknown or incomplete, for the mailboxes in
+/// `targets`. `category` and `attachments` say which of the two the query depends on.
+pub(crate) fn field_coverage(
+    tx: &rusqlite::Connection,
+    targets: &[Target],
+    category: bool,
+    attachments: bool,
+    exceptions: &mut Vec<Value>,
+) -> anyhow::Result<()> {
+    for t in targets {
+        if category {
+            let n: i64 =
+                tx.query_row("SELECT count(*) FROM messages WHERE gen = ?1 AND category IS NULL", [t.gen_id], |r| {
+                    r.get(0)
+                })?;
+            if n > 0 {
+                exceptions.push(json!({ "account": t.alias, "stage": "ready", "reason": "category unknown for some messages", "count": n }));
+            }
+        }
+        if attachments {
+            let n: i64 = tx.query_row(
+                "SELECT count(*) FROM messages WHERE gen = ?1 AND (att_complete IS NULL OR att_complete = 0)",
+                [t.gen_id],
+                |r| r.get(0),
+            )?;
+            if n > 0 {
+                exceptions.push(json!({ "account": t.alias, "stage": "ready", "reason": "attachment text incomplete for some messages", "count": n }));
+            }
+        }
+    }
+    Ok(())
+}
 
 struct Snapshot {
     targets: Vec<Target>,
@@ -302,40 +389,8 @@ async fn index_search(
         .read(deadline, move |c| {
             // One read transaction: states, coverage counts and rows come from one committed index state.
             let tx = c.unchecked_transaction()?;
-            let mut states = HashMap::new();
-            let mut targets = vec![];
-            let mut exceptions = vec![];
             let max_lag = req2.max_lag_seconds.or(req2.require_complete.then_some(DEFAULT_REQUIRE_LAG_SECS));
-            for m in &mbs {
-                if !m.index_enabled {
-                    exceptions.push(exception(&m.alias, "not_indexed", "indexing is not enabled", None));
-                    continue;
-                }
-                let Some(s) = load_state(&tx, &m.account_id)? else {
-                    exceptions.push(exception(&m.alias, "pending", "indexing has not started", None));
-                    continue;
-                };
-                let Some(g) = s.serving_gen() else {
-                    exceptions.push(exception(&m.alias, &s.stage, "no indexed data yet", s.last_success_at));
-                    continue;
-                };
-                let pending: i64 = tx.query_row("SELECT count(*) FROM pending WHERE gen = ?1", [g], |r| r.get(0))?;
-                if s.stage != "ready" {
-                    exceptions.push(exception(&m.alias, &s.stage, "index is not complete", s.last_success_at));
-                } else if s.last_success_at.is_none() {
-                    exceptions.push(exception(&m.alias, &s.stage, "no successful sync yet", None));
-                } else if let Some(lag) = max_lag
-                    && now - s.last_success_at.unwrap_or(0) > lag as i64
-                {
-                    exceptions.push(exception(&m.alias, "stale", "last sync is older than max_lag_seconds", s.last_success_at));
-                }
-                if pending > 0 {
-                    exceptions.push(json!({ "account": m.alias, "stage": s.stage, "reason": "messages pending retry",
-                        "count": pending, "last_success_at": s.last_success_at.map(util::rfc3339) }));
-                }
-                targets.push(Target { account_id: m.account_id.clone(), alias: m.alias.clone(), gen_id: g });
-                states.insert(m.account_id.clone(), (s, pending));
-            }
+            let Found { targets, states, mut exceptions } = collect_targets(&tx, &mbs, now, max_lag)?;
             if let Some(bound) = &bound {
                 // A rebuild, purge or cutover since the first page invalidates the cursor.
                 for (aid, gen_id, fence, _) in bound {
@@ -369,6 +424,7 @@ async fn index_search(
                     }
                 }
             }
+            field_coverage(&tx, &targets, req2.uses_category(), req2.uses_attachment_text(), &mut exceptions)?;
             let outcome = if req2.require_complete && !exceptions.is_empty() {
                 Outcome::Incomplete
             } else if targets.is_empty() {

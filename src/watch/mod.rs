@@ -409,7 +409,9 @@ async fn match_new(app: &Arc<App>, account_id: &str, gen_id: i64, ids: Vec<Strin
                 }
             }
             let rows: Vec<i64> = msgs.iter().map(|m| m.row).collect();
-            let targets = [Target { account_id: aid.clone(), alias: alias.clone(), gen_id }];
+            let att_fts: bool =
+                tx.query_row("SELECT att_fts FROM generations WHERE id = ?1", [gen_id], |r| r.get(0))?;
+            let targets = [Target { account_id: aid.clone(), alias: alias.clone(), gen_id, att_fts }];
             let known: HashMap<String, String> = [(alias.clone(), aid.clone())].into();
             let scope = Scope { targets: &targets, known: &known };
             let mut hits: HashMap<usize, HashSet<i64>> = HashMap::new();

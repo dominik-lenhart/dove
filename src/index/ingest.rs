@@ -43,6 +43,12 @@ pub struct Doc {
     pub body: String,
     pub body_complete: bool,
     pub meta_complete: bool,
+    /// `personal`, `newsletter`, `notification` or `calendar`; `None` when the MIME could not be parsed (unknown).
+    pub category: Option<&'static str>,
+    /// Text of the supported attachments (PDF, DOCX, ODT, text, CSV), indexed beside the body.
+    pub att_text: String,
+    /// True when every supported attachment was read completely (or there is none); `None` = unknown.
+    pub att_complete: Option<bool>,
 }
 
 /// Normalized address used at ingest and lookup alike: trimmed, lowercased (spec 5.3 "Normalize addresses
@@ -83,7 +89,31 @@ impl Doc {
             body,
             body_complete: p.body_complete && !truncated,
             meta_complete: true,
+            category: Some(p.category.as_str()),
+            att_text: String::new(),
+            // Refined by `with_attachments`; without it a supported attachment counts as not read.
+            att_complete: Some(
+                !p.attachments
+                    .iter()
+                    .any(|a| crate::attachment_text::kind_of(&a.mime_type, a.filename.as_deref()).is_some()),
+            ),
         }
+    }
+
+    /// Adds the text of the message's supported attachments (bounded, see [`crate::attachment_text`]) when
+    /// extraction is enabled. A message without supported attachments is never parsed a second time.
+    pub fn with_attachments(mut self, raw: &[u8], cfg: &crate::attachment_text::Cfg) -> Self {
+        let supported = self
+            .attachments
+            .iter()
+            .any(|(name, mime)| crate::attachment_text::kind_of(mime, name.as_deref()).is_some());
+        if !supported || !cfg.enabled || !self.meta_complete {
+            return self;
+        }
+        let e = crate::attachment_text::extract_message(raw, cfg);
+        self.att_text = e.text;
+        self.att_complete = Some(e.complete);
+        self
     }
 
     /// A message whose MIME could not be parsed (too large, malformed): Gmail metadata only, coverage unknown.
@@ -94,13 +124,19 @@ impl Doc {
     /// A message read over IMAP: `raw` is `None` when it is over the size limit (only its size was fetched). Thread
     /// id and snippet are derived from the MIME as `mail::fetch_message` derives them; an oversize or unparsable
     /// message is indexed from IMAP metadata only, in a thread of its own.
-    pub fn from_imap(mut meta: GmailMeta, raw: Option<&[u8]>, max_message_bytes: usize, max_body_chars: usize) -> Self {
+    pub fn from_imap(
+        mut meta: GmailMeta,
+        raw: Option<&[u8]>,
+        max_message_bytes: usize,
+        max_body_chars: usize,
+        att: &crate::attachment_text::Cfg,
+    ) -> Self {
         let limits = mime::Limits { max_raw_bytes: max_message_bytes, ..Default::default() };
         match raw.map(|r| mime::parse(r, &limits)) {
             Some(Ok(p)) => {
                 meta.thread_id = crate::mail::imap_thread_id(&p, &meta.id);
                 meta.snippet = Some(crate::mail::imap_snippet(&p));
-                Self::from_parsed(meta, &p, max_body_chars)
+                Self::from_parsed(meta, &p, max_body_chars).with_attachments(raw.unwrap_or_default(), att)
             }
             _ => {
                 meta.thread_id = crate::mail::imap_own_thread_id(&meta.id);
@@ -110,10 +146,16 @@ impl Doc {
     }
 
     /// Parses raw bytes within limits; failures degrade to a metadata-only doc.
-    pub fn from_raw(meta: GmailMeta, raw: &[u8], max_message_bytes: usize, max_body_chars: usize) -> Self {
+    pub fn from_raw(
+        meta: GmailMeta,
+        raw: &[u8],
+        max_message_bytes: usize,
+        max_body_chars: usize,
+        att: &crate::attachment_text::Cfg,
+    ) -> Self {
         let limits = mime::Limits { max_raw_bytes: max_message_bytes, ..Default::default() };
         match mime::parse(raw, &limits) {
-            Ok(p) => Self::from_parsed(meta, &p, max_body_chars),
+            Ok(p) => Self::from_parsed(meta, &p, max_body_chars).with_attachments(raw, att),
             Err(_) => Self::metadata_only(meta),
         }
     }
@@ -160,6 +202,18 @@ pub fn remove(tx: &Connection, gen_id: i64, gmail_id: &str) -> anyhow::Result<bo
     }
 }
 
+/// Longest display name kept for `search_contacts`.
+const MAX_NAME_CHARS: usize = 100;
+
+/// The display name of an address as stored for contact search: cleaned, one line, bounded; `None` when absent or
+/// when it only repeats the address.
+fn display_name(a: &Addr) -> Option<String> {
+    let n = content::clean_text(a.name.as_deref()?);
+    let n = n.split_whitespace().collect::<Vec<_>>().join(" ");
+    let (n, _) = content::truncate_chars(&n, MAX_NAME_CHARS);
+    (!n.is_empty() && !n.eq_ignore_ascii_case(&a.email)).then_some(n)
+}
+
 fn display_list(v: &[Addr]) -> String {
     json!(v.iter().map(fmt_addr).collect::<Vec<_>>()).to_string()
 }
@@ -175,9 +229,10 @@ pub fn upsert(tx: &Connection, gen_id: i64, account_id: &str, d: &Doc) -> anyhow
     tx.execute(
         "INSERT INTO messages(gen, account_id, gmail_id, thread_id, received_at, size_bytes, subject, subject_missing, \
          subject_key, from_list, to_list, cc_list, bcc_list, labels, snippet, is_unread, is_starred, is_draft, \
-         spam_trash, has_attachment, attachment_names, attachment_mimes, body_complete, meta_complete) \
+         spam_trash, has_attachment, attachment_names, attachment_mimes, body_complete, meta_complete, category, \
+         att_complete) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, \
-         ?23, ?24)",
+         ?23, ?24, ?25, ?26)",
         params![
             gen_id,
             account_id,
@@ -203,18 +258,29 @@ pub fn upsert(tx: &Connection, gen_id: i64, account_id: &str, d: &Doc) -> anyhow
             json!(mimes).to_string(),
             d.body_complete,
             d.meta_complete,
+            d.category,
+            d.att_complete,
         ],
     )?;
     let id = tx.last_insert_rowid();
     let fts = super::schema::fts_table(gen_id);
-    tx.prepare_cached(&format!("INSERT INTO {fts}(rowid, subject, body) VALUES (?1, ?2, ?3)"))?.execute(params![
-        id,
-        d.subject.as_deref().unwrap_or(""),
-        d.body
-    ])?;
+    // Generations created before attachment text existed keep their two-column FTS table until they are rebuilt.
+    let att_fts: bool = tx
+        .prepare_cached("SELECT att_fts FROM generations WHERE id = ?1")?
+        .query_row([gen_id], |r| r.get(0))
+        .optional()?
+        .unwrap_or(false);
+    if att_fts {
+        tx.prepare_cached(&format!("INSERT INTO {fts}(rowid, subject, body, att) VALUES (?1, ?2, ?3, ?4)"))?
+            .execute(params![id, d.subject.as_deref().unwrap_or(""), d.body, d.att_text])?;
+    } else {
+        tx.prepare_cached(&format!("INSERT INTO {fts}(rowid, subject, body) VALUES (?1, ?2, ?3)"))?
+            .execute(params![id, d.subject.as_deref().unwrap_or(""), d.body])?;
+    }
     {
-        let mut st =
-            tx.prepare_cached("INSERT INTO addrs(msg, gen, role, addr, domain) VALUES (?1, ?2, ?3, ?4, ?5)")?;
+        let mut st = tx.prepare_cached(
+            "INSERT INTO addrs(msg, gen, role, addr, domain, name, name_lc) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )?;
         for (role, list) in [(ROLE_FROM, &d.from), (ROLE_TO, &d.to), (ROLE_CC, &d.cc), (ROLE_BCC, &d.bcc)] {
             let mut seen = std::collections::HashSet::new();
             for a in list.iter() {
@@ -222,7 +288,9 @@ pub fn upsert(tx: &Connection, gen_id: i64, account_id: &str, d: &Doc) -> anyhow
                 if addr.is_empty() || !seen.insert(addr.clone()) {
                     continue;
                 }
-                st.execute(params![id, gen_id, role, addr, domain_of(&addr)])?;
+                let name = display_name(a);
+                let name_lc = name.as_deref().map(str::to_lowercase);
+                st.execute(params![id, gen_id, role, addr, domain_of(&addr), name, name_lc])?;
             }
         }
     }

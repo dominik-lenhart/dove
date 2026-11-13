@@ -332,3 +332,20 @@ hosts or reference hardware.
   `\Deleted`/`EXPUNGE` after a confirmed copy does the same. The approval page applies a selected preset instead of
   the checkboxes (send stays its own checkbox, shown only with `allow_send`); the result is always narrowed to the
   invitation. `delete_draft` takes an optional `expected_revision` and removes the `own_drafts` row on success.
+- A56. Mail intelligence (design 2026-11-13 section 4). (a) PDF text uses `lopdf` with default features off (about
+  15 small crates, licences already allowed); DOCX and ODT use a hand-written ZIP reader (stored and deflate, no ZIP64,
+  no encryption, sizes never trusted) and a tag scanner that expands only the five XML entities and numeric
+  references: no `zip` or XML crate, nothing that can expand entities or follow external references. lopdf's load is
+  not interruptible, so the work is bounded by the attachment size cap, a count of object/cross-reference streams
+  (names resolved through `#XX` escapes), a per-stream inflate cap and a page cap; no subprocess isolation in 0.2.
+  (b) Calendar times carry the TZID name and no offset (no time zone database); only the first VEVENT is read.
+  (c) Category rules, first match wins: calendar part, `List-Unsubscribe` or `List-Id` (newsletter),
+  `Auto-Submitted` other than `no`, `Precedence` bulk/list/junk or a no-reply style sender (notification), else
+  personal. No-reply means the local part, with `-_.` removed, contains noreply, donotreply, mailerdaemon or
+  postmaster, or starts with bounce. (d) Contacts are computed at query time (no counters table that could drift):
+  at most 2 000 candidate addresses, `ln(1 + 2*sent + received)` times a 90 day half-life; only exchanged mail counts.
+  (e) The FTS table gets an `att` column in new generations; older generations keep two columns (`att_fts`) and serve
+  until the mandatory upgrade rebuild replaces them. Rows from before the upgrade have a NULL category and
+  `att_complete`, which queries report as a coverage exception instead of treating as "no".
+  (f) Cost: extraction runs in ingest on bytes already fetched, so it adds CPU and a transient copy per attachment,
+  and no upstream traffic. Messages over `max_message_bytes` are metadata-only and get no attachment text.

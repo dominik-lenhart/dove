@@ -445,6 +445,7 @@ async fn every_tool_call_writes_one_audit_record_without_content() {
     let blob = r["result"]["content"][1]["resource"]["blob"].as_str().unwrap();
     assert_eq!(dove::util::b64std(b"%PDF-1.4 canary"), blob);
     assert_eq!(r["result"]["structuredContent"]["mime_type"], "application/pdf");
+    let day_ago = dove::util::rfc3339_ms(dove::util::now_unix_ms() - 86_400_000);
     let calls: Vec<(&str, Value)> = vec![
         ("list_accounts", json!({})),
         ("get_message", json!({"account":"info","message_id":id})),
@@ -452,6 +453,11 @@ async fn every_tool_call_writes_one_audit_record_without_content() {
         ("list_labels", json!({"account":"billing"})),
         ("get_attachment", json!({"account":"info","message_id":id,"attachment_id":part})),
         ("get_attachment", json!({"account":"info","message_id":id,"attachment_id":"part-77"})),
+        ("get_attachment", json!({"account":"info","message_id":id,"attachment_id":part,"as_text":true})),
+        ("search_contacts", json!({"query":"canary"})),
+        ("search_contacts", json!({"account":"secret"})),
+        ("digest", json!({"since":day_ago})),
+        ("digest", json!({"since":day_ago,"accounts":["secret"]})),
         ("no_such_tool", json!({})),
     ];
     for (tool, args) in calls {

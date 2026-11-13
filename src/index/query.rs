@@ -16,6 +16,7 @@ use serde_json::{Map, Value, json};
 
 use super::ingest::{ROLE_BCC, ROLE_CC, ROLE_FROM, ROLE_TO, norm_addr, norm_domain};
 use crate::error::ToolError;
+use crate::mime::Category;
 use crate::util;
 
 pub const MAX_DEPTH: usize = 4;
@@ -47,6 +48,7 @@ pub const SELECTABLE: &[&str] = &[
     "is_starred",
     "is_draft",
     "has_attachment",
+    "category",
 ];
 pub const DEFAULT_SELECT: &[&str] = &["ref", "received_at", "from", "subject"];
 pub const FIELDS: &[&str] = &[
@@ -71,6 +73,8 @@ pub const FIELDS: &[&str] = &[
     "text",
     "attachment_name",
     "attachment_mime",
+    "attachment_text",
+    "category",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -97,6 +101,8 @@ pub enum Field {
     Text,
     AttachmentName,
     AttachmentMime,
+    AttachmentText,
+    Category,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -231,7 +237,22 @@ impl SearchReq {
     pub fn uses_fts(&self) -> bool {
         let mut v = vec![];
         self.walk(&mut v);
-        v.iter().any(|p| matches!(p.field, Field::Subject | Field::BodyText | Field::Text))
+        v.iter().any(|p| matches!(p.field, Field::Subject | Field::BodyText | Field::Text | Field::AttachmentText))
+    }
+
+    /// True if a filter reads attachment text (attachment coverage matters).
+    pub fn uses_attachment_text(&self) -> bool {
+        let mut v = vec![];
+        self.walk(&mut v);
+        v.iter().any(|p| p.field == Field::AttachmentText)
+    }
+
+    /// True if a filter or the projection reads the message category (rows ingested before categories existed
+    /// have none).
+    pub fn uses_category(&self) -> bool {
+        let mut v = vec![];
+        self.walk(&mut v);
+        v.iter().any(|p| p.field == Field::Category) || self.select.iter().any(|c| c == "category")
     }
 }
 
@@ -268,6 +289,8 @@ fn parse_field(s: &str) -> Result<Field, ToolError> {
         "text" => Field::Text,
         "attachment_name" => Field::AttachmentName,
         "attachment_mime" => Field::AttachmentMime,
+        "attachment_text" => Field::AttachmentText,
+        "category" => Field::Category,
         other => return Err(bad(format!("unknown field '{}'", short(other)))),
     })
 }
@@ -292,11 +315,11 @@ fn allowed_ops(f: Field) -> &'static [Op] {
     use Field::*;
     match f {
         From | To | Cc | Bcc | Participant | FromDomain | RecipientDomain | Label | ThreadId | MessageId
-        | AttachmentMime => &[Op::Eq, Op::In],
+        | AttachmentMime | Category => &[Op::Eq, Op::In],
         AttachmentName => &[Op::Eq, Op::In, Op::EndsWith],
         IsUnread | IsStarred | IsDraft | HasAttachment => &[Op::Eq],
         ReceivedAt | SizeBytes => &[Op::Eq, Op::Lt, Op::Lte, Op::Gt, Op::Gte],
-        Subject | BodyText | Text => &[Op::Terms, Op::Phrase, Op::Prefix],
+        Subject | BodyText | Text | AttachmentText => &[Op::Terms, Op::Phrase, Op::Prefix],
     }
 }
 
@@ -349,6 +372,19 @@ fn parse_value(f: Field, op: Op, v: Option<&Value>) -> Result<Val, ToolError> {
             Ok(Val::Str(s.to_string()))
         }
     }
+    .and_then(|val| check_category(f, val))
+}
+
+/// `category` takes only the four known categories (a typo would silently match nothing).
+fn check_category(f: Field, val: Val) -> Result<Val, ToolError> {
+    if f == Field::Category {
+        for c in str_list(&val) {
+            if Category::parse(&c).is_none() {
+                return Err(bad("'category' is personal, newsletter, notification or calendar"));
+            }
+        }
+    }
+    Ok(val)
 }
 
 struct Budget {
@@ -395,7 +431,7 @@ fn parse_expr(v: &Value, depth: usize, b: &mut Budget) -> Result<Expr, ToolError
         return Err(bad(format!("operator {op:?} is not supported for this field").to_lowercase()));
     }
     let value = parse_value(field, op, obj.get("value"))?;
-    if matches!(field, Field::Subject | Field::BodyText | Field::Text) {
+    if matches!(field, Field::Subject | Field::BodyText | Field::Text | Field::AttachmentText) {
         let Val::Str(s) = &value else { unreachable!("text ops take strings") };
         let toks = tokens(s);
         if toks.is_empty() {
@@ -510,6 +546,7 @@ pub fn fts_expr(field: Field, op: Op, text: &str) -> String {
     match field {
         Field::Subject => format!("subject : ({body})"),
         Field::BodyText => format!("body : ({body})"),
+        Field::AttachmentText => format!("att : ({body})"),
         _ => format!("({body})"),
     }
 }
@@ -522,6 +559,9 @@ pub struct Target {
     pub account_id: String,
     pub alias: String,
     pub gen_id: i64,
+    /// The generation's FTS table has the attachment text column (generations created before attachment text keep
+    /// two columns until they are rebuilt).
+    pub att_fts: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -697,15 +737,22 @@ fn compile_pred(q: &mut Sql, p: &Pred, scope: &Scope<'_>) -> Result<(), ToolErro
             let Val::Int(n) = p.value else { unreachable!() };
             q.s(&format!("{col} {op} ")).p(SqlValue::Integer(n));
         }
-        Subject | BodyText | Text => {
+        Category => {
+            let vals = str_list(&p.value);
+            // Unknown (NULL) never matches the positive predicate.
+            q.s("IFNULL(m.category IN ").list(vals.into_iter().map(SqlValue::Text)).s(", 0)");
+        }
+        Subject | BodyText | Text | AttachmentText => {
             let Val::Str(s) = &p.value else { unreachable!() };
             // MATCH runs only on the FTS tables of the eligible generations (spec 7.9), never on other accounts'.
-            if t.is_empty() {
+            // Generations without the attachment column have no attachment text to match.
+            let usable: Vec<&Target> = t.iter().filter(|x| p.field != AttachmentText || x.att_fts).collect();
+            if usable.is_empty() {
                 q.s("0");
             } else {
                 let expr = fts_expr(p.field, p.op, s);
                 q.s("m.id IN (");
-                for (i, target) in t.iter().enumerate() {
+                for (i, target) in usable.iter().enumerate() {
                     if i > 0 {
                         q.s(" UNION ALL ");
                     }
@@ -806,7 +853,7 @@ fn where_clause(req: &SearchReq, scope: &Scope<'_>, page: bool) -> Result<Sql, T
 
 const ROW_COLS: &str = "m.account_id, m.gmail_id, m.received_at, m.size_bytes, m.subject_missing, m.subject_key, \
     m.thread_id, m.from_list, m.to_list, m.cc_list, m.bcc_list, m.subject, m.labels, m.snippet, m.is_unread, \
-    m.is_starred, m.is_draft, m.has_attachment, m.attachment_names, m.attachment_mimes";
+    m.is_starred, m.is_draft, m.has_attachment, m.attachment_names, m.attachment_mimes, m.category";
 
 /// The page query: filters, keyset seek after `after`, order and `limit + 1` rows.
 pub fn page_sql(req: &SearchReq, scope: &Scope<'_>, after: &[KeyValue]) -> Result<(String, Vec<SqlValue>), ToolError> {
@@ -918,6 +965,7 @@ pub fn run_page(
                 "has_attachment" => json!(r.get::<_, Option<i64>>(17)?.map(|v| v != 0)),
                 "attachment_names" => json_list(&r.get::<_, String>(18)?),
                 "attachment_mime_types" => json_list(&r.get::<_, String>(19)?),
+                "category" => json!(r.get::<_, Option<String>>(20)?),
                 _ => Value::Null,
             };
             values.insert(col.clone(), v);

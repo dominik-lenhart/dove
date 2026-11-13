@@ -30,6 +30,16 @@ pub struct Cursor {
 pub enum Payload {
     Index(IndexPage),
     Live(LivePage),
+    Digest(DigestPage),
+}
+
+/// Digest continuation: the normalized request, the generations it was bound to and the last thread's key.
+#[derive(Debug, Clone)]
+pub struct DigestPage {
+    pub req: super::intel::DigestReq,
+    /// (account_id, generation, fence, data_seq at the first page)
+    pub bound: Vec<(String, i64, i64, i64)>,
+    pub after: super::intel::DigestKey,
 }
 
 /// Index route continuation: the normalized request, the generations it was bound to and the last row's key.
@@ -77,6 +87,13 @@ impl Cursor {
                 p.req.approx_bytes()
                     + p.bound.iter().map(|b| b.0.len() + 32).sum::<usize>()
                     + p.after.iter().map(|k| k.approx_bytes()).sum::<usize>()
+            }
+            Payload::Digest(p) => {
+                p.req.approx_bytes()
+                    + p.bound.iter().map(|b| b.0.len() + 32).sum::<usize>()
+                    + p.after.1.len()
+                    + p.after.2.len()
+                    + 32
             }
             Payload::Live(p) => {
                 p.gmail_query.len()
@@ -224,6 +241,7 @@ impl CursorStore {
         Some(match &e.cursor.payload {
             Payload::Index(p) => p.req.limit,
             Payload::Live(p) => p.limit,
+            Payload::Digest(p) => p.req.limit,
         })
     }
 

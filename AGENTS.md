@@ -285,3 +285,23 @@ cargo fmt
 - 2026-11-13: A `buffered` stream over closures that borrow `ids` fails with "FnOnce is not general enough" even with
   rebinding when the future is returned from a generic `Fn`; collect `Pin<Box<dyn Future + Send + 'a>>` first, then
   `stream::iter(futs).buffered(n)` (see `organize::gmail_each`).
+- 2026-11-13: Mail intelligence (index V6, `src/calendar.rs`, `src/attachment_text.rs`, `src/index/intel.rs`,
+  `src/tools/{contacts,digest}.rs`). FTS5 tables cannot be altered: new generations have `(subject, body, att)`,
+  old ones two columns and `generations.att_fts = 0`; query code must check `Target::att_fts` before naming `att`.
+  Rows from before V6 have `category`/`att_complete` NULL = unknown, never "no": positive predicates skip them and
+  `tools::search::field_coverage` reports the gap, so a test that fakes old rows sets them to NULL. A migration that
+  rebuilds accounts (V5, V6 pattern) makes tests of an earlier step apply only that step (`MIGRATIONS[n]`).
+- 2026-11-13: Attachment text is untrusted-input parsing with a CPU/memory budget: the hand-written ZIP reader never
+  trusts declared sizes (inflate through `read_bounded`), the XML scanner expands no entities and searches `;` only
+  13 bytes ahead (an unbounded `find(';')` was quadratic), PDF names are matched after `#XX` resolution and with the
+  PDF whitespace set including NUL (`/Obj#53tm`, `/ObjStm\0` evaded a substring or `is_ascii_whitespace` check).
+  lopdf's load cannot be interrupted, so every cap must act before it. Panic messages may quote document content:
+  `guarded()` mutes the process-wide hook for the extracting thread only.
+- 2026-11-13: SQLite plans: `addrs_name` must contain the selected column (`addr`) to be a covering scan, otherwise
+  the planner reads the table through `addrs_addr`. The digest walks `messages_date` (range on `received_at`) and
+  probes `labels` per row with a correlated `EXISTS`; the `IN (SELECT msg FROM labels ...)` form made it walk every
+  INBOX label row. Plan assertions for both live in `tests/mail_intel_e2e.rs::contact_and_digest_queries_use_indexes`.
+- 2026-11-13: Test fixtures for mail intelligence build raw MIME by hand (`MessageSpec.raw`) and ZIPs/PDFs in the test
+  (`zip_entries`, lopdf builder), because mail-builder cannot set `List-Unsubscribe` or calendar parts. A search that
+  names a granted but unindexed mailbox is `partial` ("indexing is not enabled"), so tests index every granted
+  mailbox. Fake IMAP messages need `add_message_at(.., now)` for date windows (the default date is old).

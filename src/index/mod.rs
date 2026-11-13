@@ -17,6 +17,7 @@ pub mod db;
 pub mod imap_idle;
 pub mod imap_sync;
 pub mod ingest;
+pub mod intel;
 pub mod query;
 pub mod schema;
 pub mod sync;

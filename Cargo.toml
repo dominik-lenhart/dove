@@ -78,6 +78,7 @@ tar = { version = "0.4", default-features = false }
 
 # Test support module (`dove::testing`), enabled for this crate's own tests via the self dev-dependency below.
 tempfile = { version = "3", optional = true }
+lopdf = { version = "0.47", default-features = false }
 
 [features]
 testing = ["dep:tempfile"]

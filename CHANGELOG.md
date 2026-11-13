@@ -43,6 +43,25 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
   `dove accounts reconnect <alias>` to use the organize and delete tools and `delete_draft` there.
 - The OAuth approval page shows a preset selector per mailbox; `organize` is pre-selected, `delete` and `send` are not,
   and `send` only appears while `allow_send = true`.
+- `search_contacts`: who the mailbox actually corresponds with, ranked by exchanged mail and recency, without no-reply
+  and other automated senders. Works on Gmail and IMAP mailboxes through the index.
+- `digest`: threads with new mail since a time, newest first, with snippets, per folder and category, paged with a
+  cursor.
+- Mail categories (`personal`, `newsletter`, `notification`, `calendar`) assigned at ingest from headers and parts,
+  a `category` filter and column in `search_messages`, and `category` in `get_message`.
+- Calendar invitations: `get_message` returns the event (method, summary, start, end, time zone, location,
+  organizer, attendee count, uid) from a `text/calendar` part.
+- Attachment text: PDF, DOCX, ODT, text and CSV attachments are read into the full-text index at ingest, so
+  `text` and the new `attachment_text` operator find words inside them. `get_attachment` gets `as_text` and
+  `max_chars` to return that text. Bounded in size, time and memory; configure with `index.attachment_text` (on by
+  default), `attachment_text_max_bytes`, `attachment_text_max_chars` and `attachment_text_timeout_secs`.
+
+### Changed
+
+- The first start after upgrading rebuilds every indexed mailbox once, to compute categories and attachment text.
+  The old index keeps answering searches until the new one is ready; results that need categories or attachment text
+  are reported as partial until then.
+- New dependency: `lopdf` (PDF text extraction, no default features).
 
 ## [0.1.0] - 2026-11-13
 

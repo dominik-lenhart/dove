@@ -3,6 +3,8 @@
 pub mod attachments;
 pub mod batch;
 pub mod compose;
+pub mod contacts;
+pub mod digest;
 pub mod drafts;
 pub mod drafts_imap;
 pub mod organize;
@@ -152,6 +154,8 @@ pub fn registry() -> Vec<ToolDef> {
     v.extend(read::defs());
     v.extend(attachments::defs());
     v.extend(search::defs());
+    v.extend(contacts::defs());
+    v.extend(digest::defs());
     v.extend(batch::defs());
     v.extend(drafts::defs());
     v.extend(watches::defs());

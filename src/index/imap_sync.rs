@@ -771,6 +771,7 @@ async fn fetch_groups_inner(
 ) -> Result<(), ImapError> {
     let max_bytes = app.cfg.index.max_message_bytes;
     let max_chars = app.cfg.index.max_body_chars;
+    let att = app.cfg.index.attachment_cfg();
     let push = |id: String, f: Fetched| out.lock().expect("lock").results.push((id, f));
     for (folder, items) in groups {
         let st = match s.select(&folder.name, true).await {
@@ -811,9 +812,12 @@ async fn fetch_groups_inner(
                 size_estimate: m.size as i64,
                 snippet: None,
             };
-            let doc = tokio::task::spawn_blocking(move || Doc::from_imap(meta, raw.as_deref(), max_bytes, max_chars))
-                .await
-                .map_err(|_| ImapError::Protocol("message could not be processed"))?;
+            let doc = tokio::task::spawn_blocking({
+                let att = att.clone();
+                move || Doc::from_imap(meta, raw.as_deref(), max_bytes, max_chars, &att)
+            })
+            .await
+            .map_err(|_| ImapError::Protocol("message could not be processed"))?;
             out.lock().expect("lock").current = None;
             push(id, Fetched::Doc(Box::new(doc)));
         }
