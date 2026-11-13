@@ -11,7 +11,7 @@ host against real Google yet.
 Contents: [Requirements](#requirements) · [Install](#install) · [Google Cloud](#google-cloud-setup) ·
 [Secrets](#secrets) · [Configuration](#configuration) · [Run](#run-the-service) · [Reverse proxy](#reverse-proxy) ·
 [Connect mailboxes](#connect-mailboxes) · [Projects, clients, grants](#projects-clients-and-grants) ·
-[Administration](#administration-access) · [Backup](#backup-and-restore) · [Upgrades](#upgrades-and-migrations) ·
+[Administration](#administration-access) · [Backup](#backup-and-restore) · [Upgrading](#upgrading) ·
 [KEK rotation](#kek-rotation) · [Deleting data](#deleting-data-logical-versus-physical) ·
 [Verified](#what-has-been-verified)
 
@@ -30,7 +30,17 @@ Contents: [Requirements](#requirements) · [Install](#install) · [Google Cloud]
 
 ## Install
 
-There are no published release binaries yet (signed releases are a goal, spec 13a). Build from source.
+Signed releases are published on GitHub for Linux and macOS (x86_64 and aarch64), together with a container image
+on GHCR. See [releasing.md](releasing.md) for how they are signed and how to verify them.
+
+One-line installer (checks the SHA-256 and, when `minisign` is installed, the signature; installs to
+`~/.local/bin`, or `/usr/local/bin` as root):
+
+```sh
+curl -fsSL https://github.com/dominik-lenhart/dove/releases/latest/download/install.sh | sh
+```
+
+To build from source instead, see the first block below.
 
 ### Binary with systemd
 
@@ -51,7 +61,8 @@ Do not enable the service yet; create secrets and the configuration first.
 ### Container
 
 ```sh
-docker build -f deploy/Containerfile -t dove-mcp:local .
+docker pull ghcr.io/dominik-lenhart/dove:0.1.0                   # a release image (linux/amd64, linux/arm64)
+docker build -f deploy/Containerfile -t dove-mcp:local .         # or a local source build
 ```
 
 The image is multi-stage, runs as UID/GID 65532, contains no shell, and works with `read_only: true`. Base images
@@ -392,16 +403,46 @@ Restore:
 Test a restore on a scratch machine before you need it. The mailboxes' Google grants stay valid on Google's side
 across a restore, but a mailbox removed after the backup comes back in Dove's state; run `accounts remove` again.
 
-## Upgrades and migrations
+## Upgrading
+
+Releases follow semantic versioning; read the [changelog](../CHANGELOG.md) for the target version first.
 
 Schema migrations are versioned and run at startup, each inside a transaction. A failed migration stops startup and
-leaves the store untouched. There are no down-migrations: to roll back to an older binary, restore the state backup
-you took before upgrading.
+leaves the store untouched. There are no down-migrations, and a binary refuses to start on a state store whose
+schema is newer than it knows. To roll back to an older version, restore the state backup you took before upgrading.
 
-1. Back up the state store (previous section).
-2. Install the new binary (`install -m 0755 ... /usr/local/bin/dove`) or build a new image.
-3. `systemctl restart dove` (or `docker compose up -d`). Read the journal for migration errors.
-4. `dove doctor`.
+Always start with a backup of the state store (previous section).
+
+### Binary with systemd
+
+```sh
+# 1. back up state.db first (see "Backup and restore"), then:
+sudo dove upgrade --check            # shows the newest release without installing it
+sudo dove upgrade                    # downloads, verifies and replaces /usr/local/bin/dove
+sudo systemctl restart dove          # migrations run now; the old process keeps running until this
+sudo journalctl -u dove -n 50        # look for migration errors
+dove doctor
+```
+
+`dove upgrade [--check] [--version X.Y.Z]` downloads the release archive, checks its SHA-256 and verifies the
+minisign signature of `SHA256SUMS` with the public key embedded in the binary before replacing itself. Use
+`--version` to install a specific release, including an older one (an older binary will refuse a newer schema).
+If you installed from source, rebuild and `install -m 0755 target/release/dove /usr/local/bin/dove` instead.
+
+### Compose
+
+The image in [`deploy/compose.yaml`](../deploy/compose.yaml) is pinned to a version tag. Change the tag, then:
+
+```sh
+# back up state.db first
+docker compose pull
+docker compose up -d
+docker compose logs --tail 50 dove   # look for migration errors
+docker compose exec --user 1000:65532 dove /usr/local/bin/dove doctor
+```
+
+Pin a tag, not `latest`: an unattended pull would then run a migration you did not plan for. `X.Y` tags follow the
+newest patch release of a minor version if you want patch updates only.
 
 ## KEK rotation
 
