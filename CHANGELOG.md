@@ -5,6 +5,19 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 
 ## [Unreleased]
 
+### Added
+
+- Local mode (`mode = "local"`): Dove on your own computer as your user, for MCP hosts on the same machine, over
+  `http://127.0.0.1:<port>` (plain HTTP only for that loopback origin; server mode is unchanged). `dove local init`
+  creates a per-user config, keys and data directory, `dove local start` runs it in the foreground, `dove local stop`
+  stops it, and `dove local install` / `uninstall` / `status` manage a login item (systemd user unit, launchd agent or
+  Task Scheduler logon task, no administrator rights). See the threat model in the deployment guide's Local mode section.
+  The `dove` client sends credentials to a plain-http loopback server only when your OS user holds that port
+  (Linux, Windows).
+- Windows support in the code: keys protected with DPAPI, private directories by access list, the admin channel as a
+  per-user named pipe with a Windows account check, and `dove upgrade` replacing the running `dove.exe`.
+- `dove mcp install --client claude-desktop` adds Dove to Claude Desktop's `claude_desktop_config.json`.
+
 ## [0.4.0] - 2026-11-13
 
 ### Added
@@ -21,14 +34,6 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
   updated by the release workflow for every stable release. It installs the macOS and Linux binaries.
 - `install.ps1` for Windows (SHA-256 and signature check, per-user install, no administrator rights), and `dove upgrade`
   reads Windows `.zip` releases. The Windows release build itself stays off until the Windows port lands.
-- Local mode (`mode = "local"`): Dove on your own computer as your user, for MCP hosts on the same machine, over
-  `http://127.0.0.1:<port>` (plain HTTP only for that loopback origin; server mode is unchanged). `dove local init`
-  creates a per-user config, keys and data directory, `dove local start` runs it in the foreground, and
-  `dove local install` / `uninstall` / `status` manage a login item (systemd user unit, launchd agent or Task
-  Scheduler logon task, no administrator rights). See the threat model in the deployment guide's Local mode section.
-- Windows support in the code: keys protected with DPAPI, private directories by access list, the admin channel as a
-  per-user named pipe with a Windows account check, and `dove upgrade` replacing the running `dove.exe`.
-- `dove mcp install --client claude-desktop` adds Dove to Claude Desktop's `claude_desktop_config.json`.
 
 ### Changed
 

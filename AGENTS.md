@@ -338,7 +338,7 @@ cargo fmt
 - 2026-11-13: Unix socket paths are limited to 103 bytes (macOS `sun_path`); the agent scratchpad paths are longer, so a
   manual local-mode run there fails to bind (`dove local init` now refuses such a `DOVE_LOCAL_HOME`). Use a short
   directory such as `/tmp/dl-<id>` for manual runs, set `DOVE_LOCAL_HOME` for every command, and remove it afterwards.
-  `dove local install` on this host writes the real `~/.config/systemd/user/dove.service`; always `dove local uninstall`
+  `dove local install` writes the real `~/.config/systemd/user/dove.service` of the user running it; always `dove local uninstall`
   after trying it.
 - 2026-11-13: The client's loopback owner check (`client::loopback`, P1) runs before every credential it sends to a
   plain-http loopback server; tests that serve such a server must run it in the test process (same uid). A test helper
