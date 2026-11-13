@@ -324,6 +324,12 @@ invitation, the OAuth approval and the token's grants remain what protects your 
 create the web invitation with the same ranges (`dove clients invite ... --allow-ip 160.79.104.0/21 --allow-ip
 153.61.208.0/20` for Claude), which binds the client's tokens to them.
 
+Both nginx configurations pin the client address to the TCP peer (`set_real_ip_from 192.0.2.1/32`) and log to their
+own file without query strings (`log_format dove_noquery`). Keep both when you adapt them. A `real_ip_header` rule
+that another site sets in the `http {}` context, such as Cloudflare's `CF-Connecting-IP`, otherwise applies to Dove
+too: a request from that network could then claim any address, including an allowed one. The server-wide access log
+usually records full request lines, including the Google callback's OAuth code, and is often world-readable.
+
 ## Tailscale
 
 Instead of Caddy or nginx you can publish Dove on your tailnet with Tailscale Serve. Tailscale terminates TLS with a

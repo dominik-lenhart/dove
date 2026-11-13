@@ -39,6 +39,17 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0
+      - name: Tagged commit must be on main
+        # A tag on a side branch would otherwise build and sign whatever that branch contains, and `dove upgrade`
+        # runs the result as root. This is a tripwire, not a guarantee: a tag carries its own copy of this file, so
+        # the real boundary is who can push tags (see docs/releasing.md, "Release trust").
+        run: |
+          set -eu
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$GITHUB_REF_NAME ($GITHUB_SHA) is not on main; tag a commit that main contains"
+            exit 1
+          fi
       - name: Tag must equal v + Cargo.toml version
         id: meta
         run: |

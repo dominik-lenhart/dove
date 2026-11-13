@@ -73,6 +73,8 @@ AmbientCapabilities=
 # PrivateTmp gives the service its own /tmp. The index keeps SQL temporaries in memory, so nothing needs a shared tmp.
 ProtectSystem=strict
 ReadWritePaths=/var/lib/dove /run/dove
+# Nothing Dove writes is ever executed: a file dropped into its data, runtime or temp directories cannot run.
+NoExecPaths=/var/lib/dove /run/dove /tmp /var/tmp /dev/shm
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
