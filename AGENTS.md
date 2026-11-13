@@ -321,5 +321,6 @@ cargo fmt
   its `generic-api-key` rule. Use `uuid::Uuid::new_v4()` in tests; a finding already in history needs a fingerprint line
   in `.gitleaksignore` (`<commit>:<file>:<rule>:<line>`). Check locally with the docker command above before pushing.
 - 2026-11-13: The production host blocks outgoing port 465; SMTP to Gmail and Strato runs on 587 STARTTLS here. Dove on
-  this host is published with `tailscale serve` on port 43395 only; ports 43361 and 43380 belong to other services.
-  `dove tailscale setup --port 43395 --dry-run` shows exactly what it would change.
+  this host is public at `https://dove.verge-one.com` through Angie (`deploy/nginx/dove-restricted.conf`, files under
+  `/etc/angie/`, allowlist timer `dove-allowlist.timer`); `/mcp` and the OAuth machine endpoints answer only Claude's and
+  ChatGPT's ranges plus the host's own IPs. The tailscale serve on 43395 is gone; 43361 and 43380 belong to other services.
