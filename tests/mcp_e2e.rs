@@ -79,6 +79,19 @@ async fn transport_auth_host_and_origin() {
         )
         .await;
     assert_eq!(v["result"]["protocolVersion"], "2025-06-18");
+    // Every tool the instructions name exists, so the guidance cannot drift from the tool list.
+    let instructions = v["result"]["instructions"].as_str().unwrap().to_string();
+    let tools = h.rpc(&token, "tools/list", json!({})).await;
+    let names: Vec<&str> =
+        tools["result"]["tools"].as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
+    let named: Vec<&str> = instructions
+        .split(|c: char| !(c.is_ascii_lowercase() || c == '_'))
+        .filter(|w| w.contains('_') && !w.ends_with("_id"))
+        .collect();
+    assert!(named.len() >= 5, "{named:?}");
+    for n in named {
+        assert!(names.contains(&n), "instructions name unknown tool {n}");
+    }
     let r = h.post_mcp(Some(&token), json!({"jsonrpc":"2.0","method":"notifications/initialized"}), &[]).await;
     assert_eq!(r.status(), 202);
     // A client response needs no answer; a message without a method is an invalid request.
