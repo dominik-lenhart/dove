@@ -3,7 +3,7 @@
 //! Every byte Dove sends to a mail server is built here from a typed operation. Reads use `BODY.PEEK` only, so
 //! `\Seen` is never set by reading; `UID STORE` sets `\Deleted` and `UID EXPUNGE` runs only for an [`OwnDraftUid`]
 //! or a [`CopiedUid`] (the source of a confirmed copy); other flag changes take typed [`StoreFlag`]s, which cannot
-//! name `\Deleted`; Gmail label changes take typed [`GmLabel`]s (the inbox or an existing user label, PLAN A52);
+//! name `\Deleted`; Gmail label changes take typed [`GmLabel`]s (the inbox or an existing user label, PLAN A57);
 //! `APPEND` takes a mailbox the session resolved from its Drafts or Sent target. Nothing else can be produced.
 
 use std::borrow::Cow;
@@ -95,7 +95,7 @@ impl Keyword {
     }
 }
 
-/// A Gmail label for `UID STORE +/-X-GM-LABELS` (Gmail mode, PLAN A52): the inbox, or a user label named by the wire
+/// A Gmail label for `UID STORE +/-X-GM-LABELS` (Gmail mode, PLAN A57): the inbox, or a user label named by the wire
 /// name of a folder the server listed (Dove creates no labels). Other system labels (`\Trash`, `\Spam`, `\Draft`,
 /// ...) cannot be expressed: Trash and Spam are reached only through `UID MOVE`.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -305,3 +305,15 @@ cargo fmt
   (`zip_entries`, lopdf builder), because mail-builder cannot set `List-Unsubscribe` or calendar parts. A search that
   names a granted but unindexed mailbox is `partial` ("indexing is not enabled"), so tests index every granted
   mailbox. Fake IMAP messages need `add_message_at(.., now)` for date windows (the default date is old).
+- 2026-11-13: Gmail over IMAP (PLAN A57): `ImapSettings.gmail` is set once at connect (`X-GM-EXT-1` plus a `\All`
+  folder) and the session learns it through `set_gmail` in `account::with_session_prio`; tools branch with
+  `account::gmail_mode`. In Gmail mode only `Special::All | Junk | Trash` are scanned, labels come from `X-GM-LABELS`
+  through `mail::message_labels`, and organize never reaches `expunge_copied` (the session refuses it, and refuses a
+  move without `MOVE`). `imap_folders.special` has a CHECK constraint: a new special needs a migration that rebuilds
+  the table (`V_GMAIL_IMAP`). The fake server's Gmail mode is `Opts { gmail: true, .. }` with `FakeImap::gmail_user`
+  (INBOX, `[Gmail]/All Mail`, Spam, Trash, Sent Mail, Drafts, Important, labels `Work` and `Privat/Kunden`): `gm_add`
+  places one message in All Mail and its label folders, `gm_relabel` changes its labels server side,
+  `gm_uid`/`gm_folders`/`gm_flags` look it up, and
+  `assert_gmail_deletes_only_in_drafts()` walks the command log (it also panics on any `UID COPY`).
+- 2026-11-13: Restoring a mutated file with its old content keeps its old mtime, so cargo reuses the mutated build and
+  the "fixed" run still fails (or a later mutant looks killed). `touch` the file after restoring it.

@@ -5,6 +5,15 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 
 ## [Unreleased]
 
+### Added
+
+- Gmail over IMAP with an app password: no Google Cloud project needed. `dove accounts connect-imap --email
+  you@gmail.com` uses the new `gmail` preset (`--preset gmail` for Google Workspace domains); Dove detects Gmail
+  (`X-GM-EXT-1`), requires All Mail in IMAP, indexes each message once from All Mail, Spam and Trash with its Gmail
+  labels (INBOX, user labels, IMPORTANT, SENT, ...), idles on All Mail, organizes through Gmail labels and `MOVE`
+  only (never `\Deleted` or EXPUNGE outside its own drafts) and stores no Sent copy. State store migration 6 widens
+  the folder table for the All Mail folder.
+
 ## [0.2.0] - 2026-11-13
 
 ### Added

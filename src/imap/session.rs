@@ -15,7 +15,7 @@ use super::ops::{AppendFlag, GmLabel, IMAP_VERBS, ImapOp, Part, StoreFlag};
 use super::{Credentials, ImapConnector, ImapError, Io, ServerEndpoint, TlsMode, utf7};
 
 /// Capability of Gmail's IMAP extensions (`X-GM-LABELS`, ...); its presence at connect puts an account in Gmail mode
-/// (PLAN A52).
+/// (PLAN A57).
 pub const GMAIL_CAP: &str = "X-GM-EXT-1";
 
 const MAX_LINE: usize = 64 * 1024;

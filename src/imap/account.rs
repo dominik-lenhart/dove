@@ -23,7 +23,7 @@ pub struct ImapSettings {
     #[serde(default)]
     pub smtp_username: Option<String>,
     pub save_sent_copy: bool,
-    /// Gmail mode (PLAN A52): the server advertised `X-GM-EXT-1` at connect. Fixed at connect; `reconnect` keeps it.
+    /// Gmail mode (PLAN A57): the server advertised `X-GM-EXT-1` at connect. Fixed at connect; `reconnect` keeps it.
     /// The index then reads only All Mail, Spam and Trash and takes labels from `X-GM-LABELS`.
     #[serde(default)]
     pub gmail: bool,
@@ -194,7 +194,7 @@ pub async fn load(app: &App, account_id: &str) -> Result<(ImapSettings, Credenti
     Ok((settings, creds))
 }
 
-/// Whether an IMAP account is in Gmail mode (PLAN A52), from its stored settings. Unknown accounts are `false`.
+/// Whether an IMAP account is in Gmail mode (PLAN A57), from its stored settings. Unknown accounts are `false`.
 pub async fn gmail_mode(app: &App, account_id: &str) -> Result<bool, ToolError> {
     let id = account_id.to_string();
     let s: Option<String> = app

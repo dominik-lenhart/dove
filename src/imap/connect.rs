@@ -213,7 +213,7 @@ pub async fn connect(call: &mut AdminCall<'_>, req: ConnectImap) -> anyhow::Resu
     let creds = Credentials { username: settings.username.clone(), password: req.password.clone() };
     let (folders, gmail) = verify_imap(&app, &settings, &creds).await?;
     if gmail {
-        // Gmail mode (PLAN A52), fixed from now on. Gmail files submitted mail in Sent itself, whatever the preset.
+        // Gmail mode (PLAN A57), fixed from now on. Gmail files submitted mail in Sent itself, whatever the preset.
         settings.gmail = true;
         settings.save_sent_copy = false;
     }

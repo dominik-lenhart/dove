@@ -1,5 +1,5 @@
 //! Compiled-in server presets by email domain (design "Account model and connect"). No network autodiscovery.
-//! Strato, iCloud and Gmail (app password, PLAN A52) are decided in the designs; further presets are deliberately left
+//! Strato, iCloud and Gmail (app password, PLAN A57) are decided in the designs; further presets are deliberately left
 //! out until verified.
 
 use super::{ServerEndpoint, TlsMode};

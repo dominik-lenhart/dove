@@ -300,7 +300,7 @@ CREATE INDEX sink_deliveries_due ON sink_deliveries(state, next_attempt_at);
 CREATE INDEX sink_deliveries_sink ON sink_deliveries(sink_id);
 "#;
 
-/// Gmail over IMAP (PLAN A52): `imap_folders.special` also takes `all` (Gmail's All Mail, `\All`). SQLite cannot change
+/// Gmail over IMAP (PLAN A57): `imap_folders.special` also takes `all` (Gmail's All Mail, `\All`). SQLite cannot change
 /// a CHECK constraint, so the table is rebuilt with the same rows and ids (nothing references it).
 const V_GMAIL_IMAP: &str = r#"
 CREATE TABLE imap_folders_v6 (

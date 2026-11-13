@@ -1,4 +1,4 @@
-//! Gmail over IMAP with an app password (design `docs/superpowers/specs/2026-11-13-gmail-imap-design.md`, PLAN A52):
+//! Gmail over IMAP with an app password (design `docs/superpowers/specs/2026-11-13-gmail-imap-design.md`, PLAN A57):
 //! detection at connect, the `gmail` preset, one index row per message from All Mail/Spam/Trash with labels from
 //! `X-GM-LABELS`, IDLE and the quick pass on All Mail, and organize through `X-GM-LABELS` and `UID MOVE` only. The
 //! fake server's Gmail mode keeps one copy per label folder, like Gmail; its command log proves Dove never sets
@@ -586,7 +586,7 @@ async fn drafts_and_send_on_gmail() {
 fn gmail_mode_code_cannot_delete() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let organize = std::fs::read_to_string(root.join("src/tools/organize.rs")).unwrap();
-    let start = organize.find("------ Gmail over IMAP (PLAN A52)").unwrap();
+    let start = organize.find("------ Gmail over IMAP (PLAN A57)").unwrap();
     let end = organize[start..].find("#[cfg(test)]").map(|i| i + start).unwrap();
     let gmail = &organize[start..end];
     for banned in ["Deleted", "xpunge", "delete_own", "UidCopy", "Copied", "copy"] {

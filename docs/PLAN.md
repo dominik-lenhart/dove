@@ -332,6 +332,27 @@ hosts or reference hardware.
   `\Deleted`/`EXPUNGE` after a confirmed copy does the same. The approval page applies a selected preset instead of
   the checkboxes (send stays its own checkbox, shown only with `allow_send`); the result is always narrowed to the
   invitation. `delete_draft` takes an optional `expected_revision` and removes the `own_drafts` row on success.
+- A57. Gmail over IMAP with an app password (design `docs/superpowers/specs/2026-11-13-gmail-imap-design.md`,
+  approved 2026-11-13). (a) Gmail mode is detected at connect from `X-GM-EXT-1`, stored as `ImapSettings.gmail`
+  (serde default false) and never changes afterwards (`reconnect` keeps it); it requires a selectable `\All` folder
+  (`Special::All`, `imap_folders.special = 'all'` after store migration `V_GMAIL_IMAP`, which rebuilds the table to
+  widen the CHECK). Gmail mode forces `save_sent_copy = false` even without the preset (Workspace domains), since
+  Gmail files every SMTP submission in Sent. (b) The sync scans only All Mail, Spam and Trash; other folders stay in
+  `imap_folders` for labels and move targets but get no checkpoints or rows. FETCHes in Gmail mode add `X-GM-LABELS`
+  (meta, flag refresh and CONDSTORE `CHANGEDSINCE`; Gmail bumps MODSEQ on label changes); labels map `\Inbox`,
+  `\Sent`, `\Draft`, `\Important`, `\Starred` to INBOX/SENT/DRAFT/IMPORTANT/STARRED, user labels to their decoded
+  name, other system labels are dropped; Trash/Spam keep the folder mapping (`mail::message_labels`). IDLE and the
+  quick freshness pass use All Mail. (c) Organize sources must be All Mail, Spam or Trash ids (label-folder copies are
+  `invalid_argument`). On All Mail: flags as before, labels via `UID STORE +/-X-GM-LABELS` (typed `GmLabel`: the inbox
+  or a `UserLabel`, which cannot start with `\` or be INBOX; only existing non-system folders, never under the All
+  Mail folder's parent such as `[Gmail]/`), archive/inbox/label moves as label changes (id unchanged; a label move adds
+  the label, then removes `\Inbox`). Trash/Spam only with `UID MOVE`; the session refuses a Gmail-mode move without
+  MOVE before any command and refuses the confirmed-copy expunge outright, so the COPY + `\Deleted` + EXPUNGE
+  fallback cannot run. Out of Trash/Spam: `UID MOVE` to INBOX, the label folder or All Mail, as the design says; the
+  returned `new_id` is the destination folder's id (for INBOX or a label a copy's id, valid for reading; the next
+  sync indexes the All Mail id). Labels cannot change on messages in Trash/Spam. (d) The label STORE is sent
+  without `.SILENT` (Gmail documents `+X-GM-LABELS`; `.SILENT` support is not documented). (e) `X-GM-THRID` is unused
+  (thread ids stay PLAN A47's).
 - A56. Mail intelligence (design 2026-11-13 section 4). (a) PDF text uses `lopdf` with default features off (about
   15 small crates, licences already allowed); DOCX and ODT use a hand-written ZIP reader (stored and deflate, no ZIP64,
   no encryption, sizes never trusted) and a tag scanner that expands only the five XML entities and numeric

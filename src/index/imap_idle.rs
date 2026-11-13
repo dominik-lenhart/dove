@@ -236,7 +236,7 @@ async fn connection(app: &Arc<App>, aid: &str, generation: i64, cancel: &Cancell
         let _ = tokio::time::timeout(timeout, s.logout()).await;
         return End::Stop;
     }
-    // Gmail mode idles on All Mail, where new inbox mail lands too (PLAN A52).
+    // Gmail mode idles on All Mail, where new inbox mail lands too (PLAN A57).
     let folder = match (settings.gmail, settings.all_folder.clone()) {
         (true, Some(all)) => all,
         _ => "INBOX".to_string(),

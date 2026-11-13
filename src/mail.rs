@@ -1,7 +1,7 @@
 //! Provider-neutral message access for tools: one `fetch_message` / `list_labels` API that dispatches on
 //! [`Provider`]. IMAP messages are presented with Gmail-compatible system labels (`UNREAD`, `STARRED`, `DRAFT`,
 //! `SENT`, `TRASH`, `SPAM`) plus their folder path, so shaping, filters and the index stay unchanged. Gmail-mode
-//! messages (PLAN A52) take their labels from `X-GM-LABELS` instead of the folder they were read from.
+//! messages (PLAN A57) take their labels from `X-GM-LABELS` instead of the folder they were read from.
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};

@@ -19,7 +19,7 @@
 //!   (`RECENT_FLAGS` + `ROTATE_FLAGS`) / `FLAG_CHUNK` + 1 FETCH commands per folder whatever its size, and a folder
 //!   of n messages is fully refreshed within ceil(n / `ROTATE_FLAGS`) scans.
 //!
-//! Gmail mode (PLAN A52): Gmail shows every label as a folder, so one message has a UID in INBOX, All Mail and each
+//! Gmail mode (PLAN A57): Gmail shows every label as a folder, so one message has a UID in INBOX, All Mail and each
 //! label folder. Only All Mail (`\All`), Spam and Trash are scanned (together they hold every message once); the other
 //! folders stay in `imap_folders` without checkpoints or rows, and labels come from `X-GM-LABELS`
 //! ([`mail::message_labels`]), which Gmail's MODSEQ covers, so CONDSTORE picks up label changes too.

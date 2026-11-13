@@ -6,7 +6,7 @@
 //! permanently: Gmail only gets `messages.trash`, and on IMAP the only expunge outside Drafts is of the sources of a
 //! copy the server confirmed (`imap::CopiedUid`), which completes a move on servers without `MOVE`.
 //!
-//! Gmail over IMAP (PLAN A52) never expunges outside Drafts: labels, archive and inbox are `X-GM-LABELS` changes on the
+//! Gmail over IMAP (PLAN A57) never expunges outside Drafts: labels, archive and inbox are `X-GM-LABELS` changes on the
 //! All Mail message (its id stays), Trash and Spam only `UID MOVE` (a server without `MOVE` is refused).
 
 use std::collections::BTreeMap;
@@ -690,7 +690,7 @@ async fn move_group(
     }
 }
 
-// ------------------------------------------------------------------ Gmail over IMAP (PLAN A52)
+// ------------------------------------------------------------------ Gmail over IMAP (PLAN A57)
 
 /// Where a message of a Gmail-mode mailbox can be organized from: All Mail (labels, archive, inbox, trash, spam) or
 /// Trash/Spam (moved out with `UID MOVE`). Label folders hold copies whose ids search never returns.
