@@ -398,7 +398,10 @@ hosts or reference hardware.
   the server default (Windows: this user's pipe). Every admin command names the instance that answered on stderr. (g) Login items: a
   `systemd --user` unit (`dove.service`, journal), a launchd agent `io.github.dominik-lenhart.dove` and a Task
   Scheduler logon task "Dove (<user>)" running `conhost --headless` (no console window), both writing
-  `<data>/dove.log` (rotated once at start past 10 MB). None needs administrator rights. (h) Windows `dove upgrade`
+  `<data>/dove.log` (rotated once at start past 10 MB). None needs administrator rights. `dove local stop`, install
+  and uninstall stop a running instance with the local-only admin verb `Shutdown` (graceful, exit code 0, so neither
+  `Restart=on-failure` nor launchd's `KeepAlive` restarts it); `schtasks /End` is only a fallback because it ends
+  `conhost`, not necessarily `dove.exe`. (h) Windows `dove upgrade`
   renames the running `dove.exe` to `.dove.exe.old-<id>`, moves the new file in (renaming back on failure), and every
   later start deletes leftovers that are no longer in use. (i) Not available on Windows: disabling crash dumps per
   process (Windows Error Reporting), Tailscale setup, the systemd hardening and service-user checks; the doctor's

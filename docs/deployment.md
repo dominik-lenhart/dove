@@ -495,6 +495,12 @@ stops Dove and removes it (config, keys and data stay):
 - Windows: a Task Scheduler task "Dove (<user>)" that starts at your logon without a console window; log in
   `%LOCALAPPDATA%\Dove\dove.log`.
 
+`dove local stop` stops the running service and leaves the login item in place (it starts Dove again at the next
+login). Stop, install and uninstall ask the service to stop over its admin channel and wait until it no longer
+answers; the service manager's own stop is only the fallback. On Windows this matters: ending the logon task stops
+`conhost`, which does not always take the `dove.exe` it started along. The admin `shutdown` request exists in local
+mode only; a server-mode service refuses it.
+
 ### Upgrading
 
 `dove upgrade`, then `dove local install` to restart the service on the new binary (`dove doctor` tells you when the
