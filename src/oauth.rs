@@ -38,6 +38,22 @@ use crate::util;
 pub const AUTHORIZE_PATH: &str = "/oauth/dove/authorize";
 pub const SCOPE: &str = "mail";
 const CSRF_COOKIE: &str = "__Host-dove_authz";
+/// Local mode's binding cookie (P5). The origin is plain `http://127.0.0.1:<port>`, and Safari has refused `Secure`
+/// cookies from plain-http loopback origins (WebKit bugs 231035, 232088, 281149), which would break every sign-in
+/// there; `__Host-` requires `Secure`. Over plain HTTP `Secure` protects nothing anyway; `HttpOnly`, `SameSite=Strict`
+/// and `Path=/` stay. Server mode keeps the `__Host-` cookie unchanged.
+const LOCAL_CSRF_COOKIE: &str = "dove_authz";
+
+/// The binding cookie's name for this instance.
+fn csrf_cookie_name(local: bool) -> &'static str {
+    if local { LOCAL_CSRF_COOKIE } else { CSRF_COOKIE }
+}
+
+/// The `Set-Cookie` value carrying the browser binding.
+fn csrf_set_cookie(local: bool, binding: &str) -> String {
+    let secure = if local { "" } else { " Secure;" };
+    format!("{}={binding}; Path=/;{secure} HttpOnly; SameSite=Strict; Max-Age=600", csrf_cookie_name(local))
+}
 const PENDING_TTL: Duration = Duration::from_secs(600);
 const MAX_PENDING: usize = 10_000;
 /// Open sign-in requests per source IP, so one client cannot crowd out everyone else.
@@ -513,7 +529,7 @@ async fn authorize_get(State(app): State<Arc<App>>, req: Request) -> Response {
         return fail("invalid_target", "resource must be this server's MCP endpoint");
     }
     // Scopes carry no authority here (the invitation does); unknown values are ignored, never granted.
-    let binding = cookie_value(&headers, CSRF_COOKIE)
+    let binding = cookie_value(&headers, csrf_cookie_name(app.cfg.is_local()))
         .filter(|v| v.len() == 22 && v.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')))
         .unwrap_or_else(util::new_id);
     let rid = util::new_id();
@@ -539,7 +555,7 @@ async fn authorize_get(State(app): State<Arc<App>>, req: Request) -> Response {
             return error_page(StatusCode::TOO_MANY_REQUESTS, "Too many open sign-in requests. Try again later.");
         }
     }
-    let cookie = format!("{CSRF_COOKIE}={binding}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=600");
+    let cookie = csrf_set_cookie(app.cfg.is_local(), &binding);
     if let Ok(v) = HeaderValue::from_str(&cookie) {
         resp.headers_mut().insert(header::SET_COOKIE, v);
     }
@@ -591,7 +607,7 @@ async fn authorize_post(State(app): State<Arc<App>>, req: Request) -> Response {
     };
     let get = |k: &str| form.get(k).map(String::as_str).unwrap_or("");
     let rid = get("rid").to_string();
-    let cookie = cookie_value(&headers, CSRF_COOKIE).unwrap_or_default();
+    let cookie = cookie_value(&headers, csrf_cookie_name(app.cfg.is_local())).unwrap_or_default();
     // Take the pending request out while working on it; it is put back when the flow continues.
     let pending = {
         let mut map = app.oauth.pending.lock().expect("lock");
@@ -1400,6 +1416,22 @@ async fn register(State(app): State<Arc<App>>, req: Request) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Server mode keeps the strict `__Host-` + `Secure` cookie; local mode (plain-http loopback) drops `Secure` and
+    /// the prefix that requires it, nothing else (P5).
+    #[test]
+    fn binding_cookie_is_strict_in_server_mode_and_plain_http_safe_in_local_mode() {
+        assert_eq!(
+            csrf_set_cookie(false, "b"),
+            "__Host-dove_authz=b; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=600"
+        );
+        assert_eq!(csrf_set_cookie(true, "b"), "dove_authz=b; Path=/; HttpOnly; SameSite=Strict; Max-Age=600");
+        // Each mode reads only its own cookie.
+        let mut h = HeaderMap::new();
+        h.insert(header::COOKIE, HeaderValue::from_static("dove_authz=local; __Host-dove_authz=server"));
+        assert_eq!(cookie_value(&h, csrf_cookie_name(true)).as_deref(), Some("local"));
+        assert_eq!(cookie_value(&h, csrf_cookie_name(false)).as_deref(), Some("server"));
+    }
 
     #[test]
     fn redirect_uri_rules() {

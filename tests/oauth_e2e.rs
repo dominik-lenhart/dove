@@ -152,7 +152,9 @@ impl Oauth {
     ) -> (String, String, String, String) {
         let r = self.authorize_get(&Self::params(client_id, chal)).await;
         assert_eq!(r.status(), 200);
-        let cookie = r.headers()["set-cookie"].to_str().unwrap().split(';').next().unwrap().to_string();
+        let set = r.headers()["set-cookie"].to_str().unwrap();
+        assert!(set.starts_with("__Host-dove_authz=") && set.contains("; Secure;"), "server mode cookie: {set}");
+        let cookie = set.split(';').next().unwrap().to_string();
         assert!(r.headers()["content-security-policy"].to_str().unwrap().contains("frame-ancestors 'none'"));
         let html = r.text().await.unwrap();
         let (rid, csrf) = (field(&html, "rid"), field(&html, "csrf"));
@@ -224,6 +226,77 @@ impl Oauth {
     async fn mcp_status(&self, token: &str) -> u16 {
         self.h.post_mcp(Some(token), json!({"jsonrpc":"2.0","id":1,"method":"ping"}), &[]).await.status().as_u16()
     }
+}
+
+/// Local mode's sign-in runs over plain http://127.0.0.1: its binding cookie has no `Secure` (Safari drops `Secure`
+/// cookies there) and the invitation step accepts it (P5).
+#[tokio::test]
+async fn local_mode_sign_in_uses_a_cookie_plain_http_browsers_keep() {
+    let h = Harness::start_local(|_| {}).await;
+    h.mailbox("info", "info@acme.test");
+    h.project("acme", &["info"]).await;
+    let origin = h.base.trim_start_matches("http://").to_string();
+    let web = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+    let inv = h
+        .admin(AdminRequest::ClientsInvite {
+            name: "desk".into(),
+            project: "acme".into(),
+            accounts: vec!["all".into()],
+            capabilities: "read".into(),
+            expires: None,
+            allow_ip: vec![],
+        })
+        .await
+        .unwrap()["invitation"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let r = web
+        .post(format!("{}/oauth/dove/register", h.base))
+        .header("host", &origin)
+        .json(&json!({ "redirect_uris": [REDIRECT], "client_name": "Test host" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+    let client_id = r.json::<Value>().await.unwrap()["client_id"].as_str().unwrap().to_string();
+    let chal = challenge(&verifier());
+    let resource = format!("{}/mcp", h.base);
+    let mut url = url::Url::parse(&format!("{}/oauth/dove/authorize", h.base)).unwrap();
+    url.query_pairs_mut().extend_pairs([
+        ("response_type", "code"),
+        ("client_id", client_id.as_str()),
+        ("redirect_uri", REDIRECT),
+        ("code_challenge", chal.as_str()),
+        ("code_challenge_method", "S256"),
+        ("state", "st"),
+        ("resource", resource.as_str()),
+    ]);
+    let r = web.get(url).header("host", &origin).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let set = r.headers()["set-cookie"].to_str().unwrap().to_string();
+    assert!(set.starts_with("dove_authz="), "{set}");
+    assert!(!set.contains("Secure"), "{set}");
+    assert!(set.contains("HttpOnly") && set.contains("SameSite=Strict"), "{set}");
+    let cookie = set.split(';').next().unwrap().to_string();
+    let html = r.text().await.unwrap();
+    let (rid, csrf) = (field(&html, "rid"), field(&html, "csrf"));
+    let r = web
+        .post(format!("{}/oauth/dove/authorize", h.base))
+        .header("host", &origin)
+        .header("cookie", &cookie)
+        .form(&[
+            ("rid", rid.as_str()),
+            ("csrf", &csrf),
+            ("step", "invitation"),
+            ("action", "continue"),
+            ("invitation", &inv),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert!(r.text().await.unwrap().contains("Approve"));
 }
 
 #[tokio::test]
