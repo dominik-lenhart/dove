@@ -16,20 +16,70 @@ configuration; read the changelog.
 
 ## What a release contains
 
-- `dove-<tag>-<target>.tar.gz` for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`,
-  `aarch64-apple-darwin`. Each holds `dove-<tag>-<target>/{dove,LICENSE,README.md}`.
-- `SHA256SUMS`, and `SHA256SUMS.minisig`, a minisign signature over it with the trusted comment `dove <tag>`.
-  The public key is committed at `deploy/release/minisign.pub` and embedded in `install.sh` and in `dove upgrade`.
-- `install.sh`.
-- GitHub build provenance attestations for the archives and the image.
+- `dove-<tag>-<target>.tar.gz` for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
+  `x86_64-unknown-linux-musl` (static, for Alpine), `aarch64-unknown-linux-musl`, `x86_64-apple-darwin`,
+  `aarch64-apple-darwin`. Each holds `dove-<tag>-<target>/{dove,LICENSE,README.md}`. The `-gnu` assets must stay:
+  `dove upgrade` of older binaries looks for them.
+- `dove-<tag>-x86_64-pc-windows-msvc.zip` with `dove.exe`, only while the Windows release is switched on (below).
+- `dove_<version>_amd64.deb` and `dove_<version>_arm64.deb` (cargo-deb, built from the gnu binaries): binary, hardened
+  systemd unit, sysusers/tmpfiles snippets. The package creates `/etc/dove` (0750) and the service account, never
+  secrets, and starts nothing.
+- `SHA256SUMS` (archives and `.deb` files), and `SHA256SUMS.minisig`, a minisign signature over it with the trusted
+  comment `dove <tag>`. The public key is committed at `deploy/release/minisign.pub` and embedded in `install.sh`,
+  `install.ps1` and in `dove upgrade`.
+- `install.sh` and `install.ps1`.
+- GitHub build provenance attestations for the archives, the `.deb` files and the image.
 - Image `ghcr.io/dominik-lenhart/dove` for linux/amd64 and linux/arm64, tags `X.Y.Z`, `X.Y` and `latest`,
-  assembled from the release's linux binaries (`deploy/Containerfile.release`).
+  assembled from the release's gnu binaries (`deploy/Containerfile.release`).
+- The Homebrew formula in `dominik-lenhart/homebrew-tap` (not a release asset, see below).
 
-Linux binaries are built on Ubuntu 22.04 (glibc 2.35), so they run on current distributions and in the distroless
-Debian 12 image. macOS binaries target macOS 11 and later. The Intel macOS build runs on a native Intel runner
-(`macos-15-intel`) because the vendored OpenSSL and SQLCipher C builds are least fragile when not cross-compiled.
-GitHub plans to retire that runner label in 2027; then build `x86_64-apple-darwin` on `macos-15` with
-`rustup target add x86_64-apple-darwin` instead.
+Linux gnu binaries are built on Ubuntu 22.04 (glibc 2.35), so they run on current distributions and in the distroless
+Debian 12 image; the musl builds are static. macOS binaries target macOS 11 and later. `x86_64-apple-darwin` is
+cross-compiled on the arm64 `macos-15` runner (the Intel runner took 21 of the 21 minutes of a release, the other
+targets about 6). `aarch64-pc-windows-msvc` is not built: it needs the `windows-11-arm` runner and an arm64
+OpenSSL/NASM setup nobody has tried yet.
+
+## Build caches
+
+Tag runs restore, and never save, the `rust-cache` caches that `release-cache.yml` saved on `main` (one cache per
+target, key `release-<target>`, shared through `.github/actions/release-build`). That workflow runs on pushes to `main`
+that change `Cargo.lock`, `rust-toolchain.toml` or the release build files, so the vendored OpenSSL/SQLCipher C build
+is compiled once, not per release. On pull requests touching the same files it builds all targets without saving, so
+a broken cross-compile shows up before release day. If a tag build is unexpectedly slow, check that the last run of
+`Release cache` on `main` succeeded; caches unused for seven days are evicted, so run it by hand (re-run a past run)
+after a quiet week.
+
+## Homebrew tap
+
+The `homebrew` job runs after the release exists, for stable tags only (prereleases never reach the tap). It renders
+`deploy/homebrew/dove.rb.in` with `deploy/homebrew/render.sh` from the release's `SHA256SUMS`, refusing to continue
+unless all four platforms are listed exactly once, and pushes `Formula/dove.rb` to `dominik-lenhart/homebrew-tap`
+with a write deploy key. The formula is generated: change the template, never the tap. If the job fails the release
+stays valid; fix the cause and re-run the job, or render by hand:
+
+```sh
+curl -fsSLO https://github.com/dominik-lenhart/dove/releases/download/vX.Y.Z/SHA256SUMS
+sh deploy/homebrew/render.sh X.Y.Z SHA256SUMS > Formula/dove.rb    # in a clone of the tap, then commit and push
+```
+
+Setup (done once, already in place): an ed25519 deploy key with write access on the tap repository
+(`gh repo deploy-key add <pub> -R dominik-lenhart/homebrew-tap --allow-write`) and its private half as the secret
+`HOMEBREW_TAP_DEPLOY_KEY` of this repository. To rotate it, generate a new pair in a temporary directory, replace
+both, delete the local files and the old deploy key.
+
+## Windows release switch
+
+The Windows zip is built only when `WINDOWS_RELEASE` in `release.yml` is `"true"`. It is `"false"` until the Windows
+port of the Rust code (local mode) is merged, because without it the target does not compile. Nothing else depends on
+it: the other assets, the checksum count, signing, the `.deb` files, the image and the Homebrew job work with or
+without the zip. Before flipping it, in one commit that also removes `continue-on-error: true` from the `windows` job of
+`ci.yml`:
+
+1. `Release cache` on a pull request builds `x86_64-pc-windows-msvc` successfully (add it to that workflow's matrix
+   first, so the check runs before a tag does).
+2. A release candidate tag (`vX.Y.Z-rc.1`) produces the zip, and `install.ps1` with `DOVE_VERSION=X.Y.Z-rc.1` installs
+   it on a Windows machine and `dove --version` runs.
+3. `dove upgrade` on that Windows install finds the `.zip` of the next release.
 
 ## One-time setup
 
@@ -59,8 +109,8 @@ repositories need GitHub Enterprise, public repositories get them for free.
    git push origin vX.Y.Z
    ```
 5. Watch the `Release` workflow. It fails at once if the tag is not `v` + the `Cargo.toml` version or the changelog has no
-   section for it. It builds four archives, signs `SHA256SUMS`, verifies the signature against the committed public
-   key, attests, creates the release and pushes the image.
+   section for it. It builds the archives and `.deb` packages, signs `SHA256SUMS`, verifies the signature against the committed public
+   key, attests, creates the release, pushes the image and updates the Homebrew tap.
 6. Verify the published artifacts (next section), then upgrade your own instance with `dove upgrade`.
 
 A failed run before "Create the release" can be re-run from the Actions page. After the release exists, delete it

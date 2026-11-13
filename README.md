@@ -93,9 +93,18 @@ You need a Linux server you control and an HTTPS name for it (or Tailscale). Abo
 curl -fsSL https://github.com/dominik-lenhart/dove/releases/latest/download/install.sh | sudo sh
 ```
 
-The installer picks the build for your OS and CPU and checks its SHA-256 and, when `minisign` is installed, its
-signature. Prefer a container? `ghcr.io/dominik-lenhart/dove` (amd64, arm64) with the Compose file in
-[`deploy/`](deploy/).
+The installer picks the build for your OS and CPU (a static musl build on Alpine and other musl systems) and checks
+its SHA-256 and, when `minisign` is installed, its signature. Other ways to get the same binary:
+
+- Debian and Ubuntu: download `dove_<version>_amd64.deb` or `_arm64.deb` from the
+  [latest release](https://github.com/dominik-lenhart/dove/releases/latest) and run `sudo apt install ./dove_*.deb`.
+  It installs the binary, the systemd unit and the `dove` service account, and creates `/etc/dove`; it generates no
+  secrets and starts nothing.
+- Homebrew (macOS and Linux): `brew install dominik-lenhart/tap/dove`. This installs the binary only, no service.
+- Windows: `irm https://github.com/dominik-lenhart/dove/releases/latest/download/install.ps1 | iex`. It installs
+  `dove.exe` for the current user, no administrator rights needed. Windows builds are not part of the releases until
+  the Windows port is released, see the [changelog](CHANGELOG.md).
+- Container: `ghcr.io/dominik-lenhart/dove` (amd64, arm64) with the Compose file in [`deploy/`](deploy/).
 
 **2. Configure and start**
 
