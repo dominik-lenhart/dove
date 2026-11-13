@@ -5,6 +5,44 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-13
+
+Security hardening from an internal audit. Read "Upgrading" before you update a server with webhook sinks.
+
+### Changed
+
+- Tools that return mail content (`get_message`, `get_thread`, `batch_read`, `search_messages`, `get_attachment`,
+  `digest`, `search_contacts`, `list_drafts`, `get_draft`) mark it as untrusted: structured results carry
+  `untrusted_content_notice`, and clients without a current `MCP-Protocol-Version` get the JSON inside the
+  `<untrusted_email_content>` envelope. Such clients that parsed the text content as JSON need the current protocol
+  version or `structuredContent`.
+- The OAuth approval page shows the full redirect URI and, for dynamically registered clients, when and from which
+  network they registered. A destination outside claude.ai, claude.com, chatgpt.com, chat.openai.com and loopback needs
+  an extra confirmation. Dynamically registered clients never get an error redirect before approval.
+- `/connect/redeem` checks an invitation's `--allow-ip` list before using it up.
+- Failed bearer authentication on `/mcp` is limited per client address (`limits.auth_failures_per_minute`, default 60,
+  IPv6 by /64): further failures get 429, valid tokens are always accepted. Loopback and unknown addresses are
+  exempt.
+- Organize tools have an hourly budget per client (`limits.client_organize_per_hour`, default 500 messages). Moving
+  mail out of Spam/Junk needs the `delete` action. Trash and Junk folders are recognized by name in 17 languages.
+- Webhook sinks belong to a project (`dove sinks add --project`, `dove sinks set-project`); clients only see sinks of
+  their own project. Sink URLs are sealed by the vault, re-sealed by `dove keys rotate`, and `dove sinks list` shows
+  only their origin.
+- `dove upgrade --version` refuses an older release unless `--allow-downgrade` is given.
+- `install.sh` and `install.ps1` require the exact trusted comment `dove <tag>`; the wget fallback is HTTPS only.
+- Only Dove and its HTTP/TLS/SQLite stack may write log lines. The mail and attachment parsers (lopdf, html5ever and
+  others) quoted untrusted content, such as PDF font dictionaries, in their warnings.
+- Deployment: the nginx templates take the client address from the TCP peer even when another site sets
+  `real_ip_header` in the `http` context, and log Dove requests without query strings (OAuth codes). The systemd and
+  `.deb` units forbid executing files from Dove's writable directories (`NoExecPaths=`). The release workflow refuses
+  a tag whose commit is not on `main`.
+
+### Upgrading
+
+- The state store migrates once on start. Existing webhook sinks keep their watches and queued pushes but serve no
+  client until you assign a project: `dove sinks set-project <name> --project <project>`.
+- An agent that moved mail out of Spam with only `organize` now needs `delete` for that mailbox.
+
 ## [0.5.0] - 2026-11-13
 
 ### Added
@@ -166,7 +204,8 @@ First release.
   release only after verifying its minisign signature. The CLI hints at a new release at most once a day
   (`DOVE_NO_UPDATE_CHECK=1` turns it off); the server never checks for updates.
 
-[Unreleased]: https://github.com/dominik-lenhart/dove/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/dominik-lenhart/dove/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/dominik-lenhart/dove/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/dominik-lenhart/dove/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/dominik-lenhart/dove/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/dominik-lenhart/dove/compare/v0.2.0...v0.3.0
