@@ -1,0 +1,103 @@
+name: Release cache
+
+# Keeps the release builds fast and checks them before a tag does.
+#
+# - push to main (only when Cargo.lock, the toolchain or the release build itself changed): build the four Linux
+#   targets in release mode and SAVE the build caches. Tag runs of release.yml can read caches saved on the default
+#   branch, so a release then only compiles the dove crate itself (the vendored OpenSSL/SQLCipher C build is the
+#   slow part). Same `shared-key` per target as release.yml (see .github/actions/release-build).
+# - pull request touching the same files: build all six release targets (cache restore only) so that a broken
+#   cross-compile (musl, x86_64-apple-darwin on the arm64 runner) shows up here and not on release day.
+#
+# Not part of the normal test run: ci.yml does that.
+on:
+  push:
+    branches: [main]
+    paths:
+      - Cargo.lock
+      - rust-toolchain.toml
+      - .github/workflows/release.yml
+      - .github/workflows/release-cache.yml
+      - .github/actions/release-build/**
+  pull_request:
+    paths:
+      - Cargo.lock
+      - rust-toolchain.toml
+      - .github/workflows/release.yml
+      - .github/workflows/release-cache.yml
+      - .github/actions/release-build/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-cache-${{ github.ref }}
+  cancel-in-progress: true
+
+# Keep these two equal to release.yml: rust-cache hashes CARGO* variables into its key.
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  linux:
+    name: ${{ github.event_name == 'push' && 'warm' || 'build' }} ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, runner: ubuntu-22.04 }
+          - { target: aarch64-unknown-linux-gnu, runner: ubuntu-22.04-arm }
+          - { target: x86_64-unknown-linux-musl, runner: ubuntu-22.04 }
+          - { target: aarch64-unknown-linux-musl, runner: ubuntu-22.04-arm }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/release-build
+        with:
+          target: ${{ matrix.target }}
+          save-cache: ${{ github.event_name == 'push' }}
+      - name: Static binary check (musl)
+        if: endsWith(matrix.target, '-linux-musl')
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -eu
+          bin="target/$TARGET/release/dove"
+          file "$bin"
+          file "$bin" | grep -q 'statically linked\|static-pie linked'
+          "$bin" --version
+          docker run --rm -v "$PWD/target/$TARGET/release:/d:ro" \
+            alpine@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf /d/dove --version
+
+  # Only on pull requests: the macOS builds take their time and tag runs restore no cache for them anyway.
+  macos:
+    name: build ${{ matrix.target }}
+    if: github.event_name == 'pull_request'
+    runs-on: macos-15
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/release-build
+        with:
+          target: ${{ matrix.target }}
+      - name: Architecture
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -eu
+          bin="target/$TARGET/release/dove"
+          archs=$(lipo -archs "$bin")
+          echo "architectures: $archs"
+          want=${TARGET%%-*}
+          if [ "$want" = aarch64 ]; then want=arm64; fi
+          if [ "$archs" != "$want" ]; then echo "::error::expected $want, got $archs"; exit 1; fi

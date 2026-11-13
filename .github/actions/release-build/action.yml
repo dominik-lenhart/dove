@@ -1,0 +1,66 @@
+name: Release build
+description: >-
+  Toolchain, build cache and release-profile build of the dove binary for one target. Shared by release.yml (tag
+  runs), release-cache.yml (cache warming on main, build check on pull requests) so the cache keys cannot drift apart.
+
+inputs:
+  target:
+    description: Rust target triple
+    required: true
+  save-cache:
+    description: Save the build cache after a successful build ("true" on main only; tag and PR runs only restore)
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    # Actions are pinned to full commit SHAs, as in ci.yml.
+    - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+      with:
+        toolchain: "1.100.0"
+        targets: ${{ inputs.target }}
+
+    # Static Linux builds link against musl. The vendored OpenSSL/SQLCipher and aws-lc C code is compiled with musl-gcc
+    # (same recipe on the x86_64 and the native arm64 runner).
+    - name: musl toolchain
+      if: contains(inputs.target, '-linux-musl')
+      shell: bash
+      run: |
+        set -eu
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq musl-tools
+        musl-gcc --version | head -n 1
+
+    # Windows: OpenSSL's Configure needs a native Perl (not the one from Git for Windows) and NASM.
+    - name: Windows build tools (perl, nasm)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        if (-not (Get-Command nasm -ErrorAction SilentlyContinue)) {
+          if (Test-Path 'C:\Program Files\NASM\nasm.exe') {
+            Add-Content -Path $env:GITHUB_PATH -Value 'C:\Program Files\NASM'
+          } else {
+            choco install nasm -y --no-progress
+            Add-Content -Path $env:GITHUB_PATH -Value 'C:\Program Files\NASM'
+          }
+        }
+        Add-Content -Path $env:GITHUB_ENV -Value 'OPENSSL_SRC_PERL=C:/Strawberry/perl/bin/perl.exe'
+
+    # One cache per target, named by shared-key so release.yml and release-cache.yml use the same one. The key also
+    # covers rustc's version, Cargo.lock and CARGO*/CC* variables, so the callers keep those identical.
+    - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      with:
+        shared-key: release-${{ inputs.target }}
+        save-if: ${{ inputs.save-cache }}
+
+    - name: Build
+      shell: bash
+      env:
+        TARGET: ${{ inputs.target }}
+        MACOSX_DEPLOYMENT_TARGET: "11.0"
+        CC_x86_64_unknown_linux_musl: musl-gcc
+        CC_aarch64_unknown_linux_musl: musl-gcc
+      run: |
+        set -eu
+        # x86_64-apple-darwin is cross-compiled on the arm64 runner: cc/openssl-src add -arch x86_64 for the target.
+        cargo build --release --locked --bin dove --target "$TARGET"
