@@ -148,6 +148,10 @@ async fn reconcile_arrival_label_and_deletion_during_backfill() {
     let v = search(&fx, json!({"select": ["subject"], "limit": 100})).await;
     assert_eq!(v["coverage"], "partial");
     assert_eq!(v["exceptions"][0]["stage"], "backfill");
+    // A backfill has no completion estimate; the entry says it resolves on its own and what is still queued.
+    assert_eq!(v["exceptions"][0]["resolves"], "automatic");
+    assert!(v["exceptions"][0]["hint"].as_str().unwrap().contains("first full indexing"), "{v}");
+    assert!(v["hint"].as_str().unwrap().starts_with("Every gap is temporary"), "{v}");
     assert_eq!(subjects(&v), vec!["Message 4", "Message 5", "Message 6"]);
     let code = h.err(&fx.token, "search_messages", json!({"coverage_policy": "require_complete"})).await;
     assert_eq!(code, "index_incomplete");
@@ -264,6 +268,44 @@ async fn failed_message_is_recorded_and_retried() {
     assert_eq!(v["coverage"], "partial");
     assert_eq!(v["exceptions"][0]["reason"], "messages pending retry");
     assert_eq!(h.err(&fx.token, "search_messages", json!({"count_only": true})).await, "index_incomplete");
+    // The exception says what happens next, from the real retry record and the scheduler (PLAN A59): the retry is
+    // neither before the record's `next_attempt_at` nor before the next sync pass, whichever is later.
+    let ex = v["exceptions"][0].clone();
+    assert_eq!((ex["count"].as_i64(), ex["resolves"].as_str()), (Some(1), Some("automatic")), "{ex}");
+    assert_eq!(ex["last_error"], "upstream_error", "{ex}");
+    let (attempt_at, run_at): (i64, i64) = h
+        .app()
+        .index
+        .write(|c| {
+            Ok((
+                c.query_row("SELECT next_attempt_at FROM pending", [], |r| r.get(0))?,
+                c.query_row("SELECT next_run_at FROM sync_state", [], |r| r.get(0))?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert!(attempt_at > 0 && run_at > 0);
+    let expected = attempt_at.max(run_at);
+    assert_eq!(ex["next_retry_at"], dove::util::rfc3339(expected), "{ex}");
+    let secs = ex["retry_after_seconds"].as_i64().unwrap();
+    assert!((expected - dove::util::now_unix() - 2..=expected - dove::util::now_unix()).contains(&secs), "{ex}");
+    // Both orders of the two times are covered: a record due far later than the next pass, and one due sooner.
+    for (attempt, run) in [(run_at + 5000, run_at), (run_at - 25, run_at)] {
+        h.app()
+            .index
+            .write(move |c| {
+                c.execute("UPDATE pending SET next_attempt_at = ?1", [attempt])?;
+                c.execute("UPDATE sync_state SET next_run_at = ?1", [run])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let ex = search(&fx, json!({"select": ["subject"]})).await["exceptions"][0].clone();
+        assert_eq!(ex["next_retry_at"], dove::util::rfc3339(attempt.max(run)), "{ex}");
+    }
+    let v = search(&fx, json!({"select": ["subject"]})).await;
+    assert!(v["hint"].as_str().unwrap().starts_with("Every gap is temporary"), "{v}");
+    h.app().index.write(|c| Ok(c.execute("UPDATE pending SET next_attempt_at = 0", [])?)).await.unwrap();
     // Once due, the next pass retries it.
     h.app().index.write(|c| Ok(c.execute("UPDATE pending SET next_attempt_at = 0", [])?)).await.unwrap();
     sync_account(h.app(), &fx.info).await.unwrap();
@@ -590,4 +632,64 @@ async fn scheduler_backfills_on_enable_and_wakes_after_writes() {
     let v = until(json!({"field": "is_draft", "op": "eq", "value": true})).await;
     assert_eq!(v["rows"], json!([["Draft one", true]]));
     engine.abort();
+}
+
+/// Indexing switched on in the store but no sync state yet (the scheduler creates it on its next tick): the entry
+/// says it starts within a scheduler tick. Messages queued but not fetched are not "pending retry": inside a
+/// backfill they only raise `queued` of the stage entry, in a ready mailbox they are their own entry.
+#[tokio::test]
+async fn queued_and_not_started_are_reported_as_arriving() {
+    let fx = setup(500, 2).await;
+    let h = &fx.h;
+    let aid = fx.info.clone();
+    h.app()
+        .store
+        .call(move |c| Ok(c.execute("UPDATE accounts SET index_enabled = 1 WHERE id = ?1", [aid])?))
+        .await
+        .unwrap();
+    let v = search(&fx, json!({"select": ["subject"]})).await;
+    let ex = &v["exceptions"][0];
+    assert_eq!((ex["stage"].as_str(), ex["resolves"].as_str()), (Some("pending"), Some("automatic")), "{v}");
+    assert_eq!(ex["retry_after_seconds"], dove::index::sync::TICK_SECS, "{v}");
+
+    // Remove the flag again and enable properly.
+    let aid = fx.info.clone();
+    h.app()
+        .store
+        .call(move |c| Ok(c.execute("UPDATE accounts SET index_enabled = 0 WHERE id = ?1", [aid])?))
+        .await
+        .unwrap();
+    enable(h).await;
+    let gen_id: i64 = h
+        .app()
+        .index
+        .write(|c| Ok(c.query_row("SELECT building_gen FROM sync_state", [], |r| r.get(0))?))
+        .await
+        .unwrap();
+    h.app()
+        .index
+        .write(move |c| Ok(c.execute("INSERT INTO pending(gen, gmail_id, seq) VALUES (?1, 'queued-1', 1)", [gen_id])?))
+        .await
+        .unwrap();
+    let v = search(&fx, json!({"select": ["subject"]})).await;
+    let exs = v["exceptions"].as_array().unwrap();
+    assert_eq!(exs.len(), 1, "a queued message in a backfill is no separate entry: {v}");
+    assert_eq!((exs[0]["stage"].as_str(), exs[0]["queued"].as_i64()), (Some("backfill"), Some(1)), "{v}");
+
+    // Ready mailbox, one message listed but not fetched yet.
+    h.app().index.write(|c| Ok(c.execute("DELETE FROM pending", [])?)).await.unwrap();
+    sync_account(h.app(), &fx.info).await.unwrap();
+    assert_eq!(status(h).await["stage"], "ready");
+    let gen_id: i64 =
+        h.app().index.write(|c| Ok(c.query_row("SELECT active_gen FROM sync_state", [], |r| r.get(0))?)).await.unwrap();
+    h.app()
+        .index
+        .write(move |c| Ok(c.execute("INSERT INTO pending(gen, gmail_id, seq) VALUES (?1, 'queued-1', 1)", [gen_id])?))
+        .await
+        .unwrap();
+    let v = search(&fx, json!({"select": ["subject"]})).await;
+    let exs = v["exceptions"].as_array().unwrap();
+    assert_eq!(exs.len(), 1, "{v}");
+    assert_eq!(exs[0]["reason"], "messages waiting to be indexed", "{v}");
+    assert_eq!((exs[0]["count"].as_i64(), exs[0]["resolves"].as_str()), (Some(1), Some("automatic")), "{v}");
 }

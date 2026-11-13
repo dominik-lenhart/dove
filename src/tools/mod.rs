@@ -1,9 +1,25 @@
 //! MCP tool registry, shared argument handling and message shaping (spec 5.3, 6.5).
 
+/// Tool-description text on how to act on coverage exceptions (PLAN A59); a macro because `concat!` takes literals.
+macro_rules! coverage_note {
+    () => {
+        concat!(
+            " When coverage is `partial`, every entry of `exceptions` and `account_errors` has `resolves`: ",
+            "`automatic` (Dove fixes it itself: retry after `retry_after_seconds` / `next_retry_at` / `next_sync_at`, ",
+            "or proceed and treat the result as incomplete; 0 means a sync pass is due or running now, and a first ",
+            "backfill has no completion estimate), `operator` (will not resolve on its own, e.g. reason ",
+            "`reauth_required`, `disabled` or indexing not enabled: do not wait, tell the user which mailbox needs ",
+            "the operator; other mailboxes are unaffected) or `never` (a message-level gap such as a body over the ",
+            "size limit: waiting changes nothing). `hint` sums this up."
+        )
+    };
+}
+
 pub mod attachments;
 pub mod batch;
 pub mod compose;
 pub mod contacts;
+pub mod coverage;
 pub mod digest;
 pub mod drafts;
 pub mod drafts_imap;

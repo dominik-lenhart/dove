@@ -34,6 +34,8 @@ const RETRY_BASE_SECS: i64 = 30;
 const MAX_BACKOFF_SECS: i64 = 15 * 60;
 /// Concurrent account sync jobs in the background scheduler.
 const MAX_JOBS: usize = 2;
+/// The scheduler looks for due accounts (and creates missing sync state) at least this often.
+pub const TICK_SECS: u64 = 1;
 
 #[derive(Debug, Clone)]
 pub struct SyncState {
@@ -954,7 +956,7 @@ pub async fn scheduler(app: Arc<App>) {
         }
         tokio::select! {
             _ = app.index.wake.notified() => {}
-            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            _ = tokio::time::sleep(Duration::from_secs(TICK_SECS)) => {}
         }
     }
 }

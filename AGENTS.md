@@ -359,3 +359,9 @@ cargo fmt
   printed whole PDF font dictionaries, ~1,100 warnings a day in production). `logging::LOG_TARGETS` is an allowlist
   (Dove plus the transport stack) applied after `DOVE_LOG`; never add a crate that parses mail or attachments.
   `tests/log_targets.rs` triggers real lopdf and html5ever warnings and checks none reach the log.
+- 2026-11-13: Coverage exceptions (`src/tools/coverage.rs`, PLAN A59) are built only there; search, digest and contacts
+  must not hand-write exception JSON. `pending` has no date, so a query's `received_at` range cannot exclude pending
+  rows; `attempts = 0` rows are "queued", only `attempts > 0` are retries, and a retry cannot run before the next
+  sync pass (`next_retry_at` = later of `next_attempt_at` and `sync_state.next_run_at`). Tests move those times with
+  `UPDATE pending/sync_state` and compare against the stored values, not wall-clock guesses. The tool-description text
+  about `resolves` is the `coverage_note!` macro in `src/tools/mod.rs`.
