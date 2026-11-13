@@ -488,6 +488,9 @@ pub enum ClientsCmd {
         expires: Option<String>,
         #[arg(long = "allow-ip")]
         allow_ip: Vec<String>,
+        /// Hide passwords, keys and one-time codes in overview results (snippets, subjects); full reads stay intact.
+        #[arg(long)]
+        redact_secrets: bool,
         #[command(flatten)]
         admin: AdminOpts,
     },
@@ -515,6 +518,15 @@ pub enum ClientsCmd {
         #[command(flatten)]
         admin: AdminOpts,
     },
+    /// Hide (`on`) or show (`off`) passwords, keys and one-time codes in a connection's overview results
+    /// (search_messages, digest and list_drafts subjects and snippets). Also works on an open invitation.
+    SetRedaction {
+        name: String,
+        #[arg(value_parser = ["on", "off"])]
+        mode: String,
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
     List {
         #[command(flatten)]
         admin: AdminOpts,
@@ -534,6 +546,9 @@ pub enum ClientsCmd {
         expires: Option<String>,
         #[arg(long = "allow-ip")]
         allow_ip: Vec<String>,
+        /// The connection hides passwords, keys and one-time codes in overview results.
+        #[arg(long)]
+        redact_secrets: bool,
         #[command(flatten)]
         admin: AdminOpts,
     },
@@ -765,19 +780,38 @@ fn admin_request(cmd: Command) -> anyhow::Result<(AdminOpts, AdminRequest)> {
             ProjectsCmd::Show { name, admin } => (admin, R::ProjectsShow { name }),
         },
         Command::Clients(c) => match c {
-            ClientsCmd::Create { name, project, grants, expires, allow_ip, admin } => {
-                (admin, R::ClientsCreate { name, project, grants: parse_grant_args(&grants)?, expires, allow_ip })
-            }
+            ClientsCmd::Create { name, project, grants, expires, allow_ip, redact_secrets, admin } => (
+                admin,
+                R::ClientsCreate {
+                    name,
+                    project,
+                    grants: parse_grant_args(&grants)?,
+                    expires,
+                    allow_ip,
+                    redact_secrets,
+                },
+            ),
             ClientsCmd::SetGrants { name, grants, admin } => {
                 (admin, R::ClientsSetGrants { name, grants: parse_grant_args(&grants)? })
             }
             ClientsCmd::Rotate { name, admin } => (admin, R::ClientsRotate { name }),
             ClientsCmd::Revoke { name, admin } => (admin, R::ClientsRevoke { name }),
             ClientsCmd::Show { name, admin } => (admin, R::ClientsShow { name }),
+            ClientsCmd::SetRedaction { name, mode, admin } => {
+                (admin, R::ClientsSetRedaction { name, enabled: mode == "on" })
+            }
             ClientsCmd::List { admin } => (admin, R::ClientsList),
-            ClientsCmd::Invite { name, project, accounts, capabilities, expires, allow_ip, admin } => (
+            ClientsCmd::Invite { name, project, accounts, capabilities, expires, allow_ip, redact_secrets, admin } => (
                 admin,
-                R::ClientsInvite { name, project, accounts: split_list(&accounts), capabilities, expires, allow_ip },
+                R::ClientsInvite {
+                    name,
+                    project,
+                    accounts: split_list(&accounts),
+                    capabilities,
+                    expires,
+                    allow_ip,
+                    redact_secrets,
+                },
             ),
         },
         Command::Audit(c) => match c {

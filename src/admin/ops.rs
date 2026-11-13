@@ -260,6 +260,7 @@ pub struct NewClient<'a> {
     pub allowed_cidrs: &'a [String],
     pub kind: &'a str,
     pub created_via: &'a str,
+    pub redact_secrets: bool,
 }
 
 pub fn validate_cidrs(cidrs: &[String]) -> anyhow::Result<String> {
@@ -288,9 +289,9 @@ pub fn client_create(
     let now = util::now_unix();
     let expires_at = nc.expires_in_secs.map(|s| now + s);
     tx.execute(
-        "INSERT INTO clients(id, name, project_id, kind, token_hash, allowed_cidrs, expires_at, created_at, created_via) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        params![id, nc.name, pid, nc.kind, hash, cidrs, expires_at, now, nc.created_via],
+        "INSERT INTO clients(id, name, project_id, kind, token_hash, allowed_cidrs, expires_at, created_at, created_via, \
+         redact_secrets) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![id, nc.name, pid, nc.kind, hash, cidrs, expires_at, now, nc.created_via, nc.redact_secrets],
     )
     .map_err(|e| if is_unique(&e) { anyhow!("client '{}' already exists", nc.name) } else { e.into() })?;
     write_grants(tx, &id, &grants)?;
@@ -299,7 +300,8 @@ pub fn client_create(
     Ok((
         id,
         token,
-        json!({ "client": nc.name, "project": nc.project, "grants": effective, "expires_at": expires_at.map(util::rfc3339) }),
+        json!({ "client": nc.name, "project": nc.project, "grants": effective,
+                "expires_at": expires_at.map(util::rfc3339), "redact_secrets": nc.redact_secrets }),
     ))
 }
 
@@ -314,6 +316,23 @@ pub fn client_set_grants(
     write_grants(tx, &cid, &resolved)?;
     tx.execute("UPDATE clients SET auth_epoch = auth_epoch + 1 WHERE id = ?1", [&cid])?;
     client_show(tx, name)
+}
+
+/// Sets secret redaction for a connection, or else for the open (unused, unexpired) invitation of that name, which
+/// passes it on at redemption. Takes effect on the next request (the caller is loaded per request).
+pub fn client_set_redaction(tx: &Transaction, name: &str, enabled: bool) -> anyhow::Result<Value> {
+    let n = tx.execute("UPDATE clients SET redact_secrets = ?1 WHERE name = ?2", params![enabled, name])?;
+    if n == 1 {
+        return client_show(tx, name);
+    }
+    let n = tx.execute(
+        "UPDATE invitations SET redact_secrets = ?1 WHERE connection_name = ?2 AND used_at IS NULL AND expires_at > ?3",
+        params![enabled, name, util::now_unix()],
+    )?;
+    if n == 0 {
+        bail!("no client or open invitation named '{name}'");
+    }
+    Ok(json!({ "invitation": name, "redact_secrets": enabled }))
 }
 
 pub fn client_rotate(tx: &Transaction, pepper: &Pepper, name: &str) -> anyhow::Result<(String, Value)> {
@@ -347,7 +366,7 @@ pub fn client_revoke(tx: &Transaction, name: &str) -> anyhow::Result<Value> {
 #[allow(clippy::type_complexity)]
 pub fn client_show(conn: &Connection, name: &str) -> anyhow::Result<Value> {
     let (cid, _) = client_row(conn, name)?;
-    let (project, kind, cidrs, expires_at, revoked_at, created_at, created_via, last_used_at, last_ip): (
+    let (project, kind, cidrs, expires_at, revoked_at, created_at, created_via, last_used_at, last_ip, redact): (
         String,
         String,
         String,
@@ -357,11 +376,26 @@ pub fn client_show(conn: &Connection, name: &str) -> anyhow::Result<Value> {
         String,
         Option<i64>,
         Option<String>,
+        bool,
     ) = conn.query_row(
         "SELECT p.name, c.kind, c.allowed_cidrs, c.expires_at, c.revoked_at, c.created_at, c.created_via, \
-         c.last_used_at, c.last_ip FROM clients c JOIN projects p ON p.id = c.project_id WHERE c.id = ?1",
+         c.last_used_at, c.last_ip, c.redact_secrets FROM clients c JOIN projects p ON p.id = c.project_id \
+         WHERE c.id = ?1",
         [&cid],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?)),
+        |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+                r.get(8)?,
+                r.get(9)?,
+            ))
+        },
     )?;
     let effective: Vec<Value> = crate::policy::load_mailboxes(conn, &cid)?
         .into_iter()
@@ -378,13 +412,13 @@ pub fn client_show(conn: &Connection, name: &str) -> anyhow::Result<Value> {
         "allowed_cidrs": serde_json::from_str::<Value>(&cidrs).unwrap_or(json!([])),
         "created_at": util::rfc3339(created_at), "expires_at": expires_at.map(util::rfc3339),
         "revoked_at": revoked_at.map(util::rfc3339), "last_used_at": last_used_at.map(util::rfc3339), "last_ip": last_ip,
-        "grants": granted, "effective": effective,
+        "grants": granted, "effective": effective, "redact_secrets": redact,
     }))
 }
 
 pub fn client_list(conn: &Connection) -> anyhow::Result<Value> {
     let mut stmt = conn.prepare(
-        "SELECT c.name, p.name, c.kind, c.revoked_at, c.expires_at, c.last_used_at FROM clients c \
+        "SELECT c.name, p.name, c.kind, c.revoked_at, c.expires_at, c.last_used_at, c.redact_secrets FROM clients c \
          JOIN projects p ON p.id = c.project_id ORDER BY p.name, c.name",
     )?;
     let now = util::now_unix();
@@ -399,7 +433,8 @@ pub fn client_list(conn: &Connection) -> anyhow::Result<Value> {
             "active"
         };
         Ok(json!({ "client": r.get::<_, String>(0)?, "project": r.get::<_, String>(1)?, "kind": r.get::<_, String>(2)?,
-                   "state": state, "last_used_at": r.get::<_, Option<i64>>(5)?.map(util::rfc3339) }))
+                   "state": state, "last_used_at": r.get::<_, Option<i64>>(5)?.map(util::rfc3339),
+                   "redact_secrets": r.get::<_, bool>(6)? }))
     })?;
     Ok(Value::Array(rows.collect::<Result<_, _>>()?))
 }

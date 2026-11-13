@@ -127,6 +127,9 @@ pub enum AdminRequest {
         expires: Option<String>,
         #[serde(default)]
         allow_ip: Vec<String>,
+        /// Hide secrets in overview results (PLAN A59).
+        #[serde(default)]
+        redact_secrets: bool,
     },
     ClientsSetGrants {
         name: String,
@@ -141,6 +144,12 @@ pub enum AdminRequest {
     ClientsShow {
         name: String,
     },
+    /// Turns secret redaction in overview results on or off for a connection, or for an open invitation of that
+    /// connection name (PLAN A59).
+    ClientsSetRedaction {
+        name: String,
+        enabled: bool,
+    },
     ClientsList,
     ClientsInvite {
         name: String,
@@ -151,6 +160,9 @@ pub enum AdminRequest {
         expires: Option<String>,
         #[serde(default)]
         allow_ip: Vec<String>,
+        /// The redeemed connection hides secrets in overview results (PLAN A59).
+        #[serde(default)]
+        redact_secrets: bool,
     },
 
     AuditTail {
@@ -248,6 +260,12 @@ impl AdminRequest {
             ClientsRotate { name } => ("clients.rotate", None, None, vec![name.clone()]),
             ClientsRevoke { name } => ("clients.revoke", None, None, vec![name.clone()]),
             ClientsShow { name } => ("clients.show", None, None, vec![name.clone()]),
+            ClientsSetRedaction { name, enabled } => (
+                if *enabled { "clients.redaction_on" } else { "clients.redaction_off" },
+                None,
+                None,
+                vec![name.clone()],
+            ),
             ClientsList => ("clients.list", None, None, vec![]),
             ClientsInvite { name, project, .. } => ("clients.invite", Some(project.clone()), None, vec![name.clone()]),
             AuditTail { .. } => ("audit.tail", None, None, vec![]),

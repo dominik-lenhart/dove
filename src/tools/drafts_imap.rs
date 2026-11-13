@@ -531,6 +531,7 @@ pub(super) async fn list_drafts(cx: &ToolCx, mb: &Mailbox, args: &Value) -> Resu
             Err(e) => return Err(e),
         }
     }
+    cx.redact_objects(&mut out);
     let text = out
         .iter()
         .map(|d| {

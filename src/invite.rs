@@ -45,6 +45,7 @@ pub struct NewInvite<'a> {
     pub capabilities: &'a str,
     pub expires_in_secs: Option<i64>,
     pub allow_ip: &'a [String],
+    pub redact_secrets: bool,
 }
 
 /// Creates an invitation (admin socket only). Returns the secret once and a description of the expansion.
@@ -97,7 +98,7 @@ pub fn create(tx: &Transaction, pepper: &Pepper, allow_send: bool, ni: &NewInvit
     let expires_at = now + TTL_SECS;
     tx.execute(
         "INSERT INTO invitations(id, secret_hash, project_id, connection_name, grants, expires_in_secs, allowed_cidrs, \
-         created_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+         created_at, expires_at, redact_secrets) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             id,
             pepper.hash(HASH_PURPOSE, &secret),
@@ -107,7 +108,8 @@ pub fn create(tx: &Transaction, pepper: &Pepper, allow_send: bool, ni: &NewInvit
             ni.expires_in_secs,
             cidrs,
             now,
-            expires_at
+            expires_at,
+            ni.redact_secrets
         ],
     )?;
     Ok(json!({
@@ -117,6 +119,7 @@ pub fn create(tx: &Transaction, pepper: &Pepper, allow_send: bool, ni: &NewInvit
         "grants": grants.iter().map(|g| json!({ "account": g.alias, "actions": g.actions })).collect::<Vec<_>>(),
         "invitation_expires_at": util::rfc3339(expires_at),
         "connection_expires_in_secs": ni.expires_in_secs,
+        "redact_secrets": ni.redact_secrets,
         "note": "Single use, valid 10 minutes. Give it to the user over a trusted channel. Redeem with \
                  `dove login --server <url> --profile <name>` or on the approval page of an MCP host's OAuth sign-in.",
     }))
@@ -132,6 +135,8 @@ pub struct Invitation {
     pub grants: Vec<InviteGrant>,
     pub expires_in_secs: Option<i64>,
     pub allowed_cidrs: String,
+    /// Copied to the connection; the approver cannot change it (PLAN A59).
+    pub redact_secrets: bool,
 }
 
 /// Looks up a usable invitation by its secret. Unknown, used and expired all yield `None`.
@@ -156,7 +161,7 @@ pub fn load(conn: &Connection, id: &str) -> anyhow::Result<Option<Invitation>> {
     let now = util::now_unix();
     let row = conn
         .query_row(
-            "SELECT i.project_id, p.name, i.connection_name, i.grants, i.expires_in_secs, i.allowed_cidrs \
+            "SELECT i.project_id, p.name, i.connection_name, i.grants, i.expires_in_secs, i.allowed_cidrs, i.redact_secrets \
              FROM invitations i JOIN projects p ON p.id = i.project_id \
              WHERE i.id = ?1 AND i.used_at IS NULL AND i.expires_at > ?2",
             params![id, now],
@@ -168,11 +173,13 @@ pub fn load(conn: &Connection, id: &str) -> anyhow::Result<Option<Invitation>> {
                     r.get::<_, String>(3)?,
                     r.get::<_, Option<i64>>(4)?,
                     r.get::<_, String>(5)?,
+                    r.get::<_, bool>(6)?,
                 ))
             },
         )
         .optional()?;
-    let Some((project_id, project_name, connection_name, grants, expires_in_secs, allowed_cidrs)) = row else {
+    let Some((project_id, project_name, connection_name, grants, expires_in_secs, allowed_cidrs, redact_secrets)) = row
+    else {
         return Ok(None);
     };
     let all: Vec<InviteGrant> = serde_json::from_str(&grants)?;
@@ -196,6 +203,7 @@ pub fn load(conn: &Connection, id: &str) -> anyhow::Result<Option<Invitation>> {
         grants,
         expires_in_secs,
         allowed_cidrs,
+        redact_secrets,
     }))
 }
 
@@ -242,9 +250,20 @@ pub fn consume(
     let hash = token.as_ref().map(|t| pepper.hash("client", t));
     let expires_at = inv.expires_in_secs.map(|s| now + s);
     tx.execute(
-        "INSERT INTO clients(id, name, project_id, kind, token_hash, allowed_cidrs, expires_at, created_at, created_via) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        params![client_id, inv.connection_name, inv.project_id, kind, hash, inv.allowed_cidrs, expires_at, now, created_via],
+        "INSERT INTO clients(id, name, project_id, kind, token_hash, allowed_cidrs, expires_at, created_at, created_via, \
+         redact_secrets) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            client_id,
+            inv.connection_name,
+            inv.project_id,
+            kind,
+            hash,
+            inv.allowed_cidrs,
+            expires_at,
+            now,
+            created_via,
+            inv.redact_secrets
+        ],
     )
     .map_err(|e| {
         if ops::is_unique(&e) { anyhow!("a connection named '{}' already exists", inv.connection_name) } else { e.into() }
@@ -417,6 +436,7 @@ mod tests {
                     capabilities: "read",
                     expires_in_secs: None,
                     allow_ip: &[],
+                    redact_secrets: false,
                 };
                 let secret = create(&tx, &app.pepper, false, &ni)?["invitation"].as_str().unwrap().to_string();
                 let inv = peek(&tx, &app.pepper, &secret)?.expect("valid");

@@ -125,7 +125,10 @@ pub fn defs() -> Vec<ToolDef> {
         ToolDef {
             name: "list_drafts",
             title: "List drafts",
-            description: "Drafts of a mailbox. own_only (default true) lists only drafts this project created.",
+            description: concat!(
+                "Drafts of a mailbox. own_only (default true) lists only drafts this project created. If this ",
+                "connection hides secrets, secrets in subjects read [redacted] (redacted=true); get_draft shows the draft."
+            ),
             capability: Capability::Read,
             read_only: true,
             destructive: false,
@@ -824,6 +827,7 @@ async fn list_drafts(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> 
             Err(e) => return Err(e),
         }
     }
+    cx.redact_objects(&mut drafts);
     let text = drafts
         .iter()
         .map(|d| {

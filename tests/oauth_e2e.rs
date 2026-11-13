@@ -96,6 +96,7 @@ impl Oauth {
                 capabilities: caps.into(),
                 expires: None,
                 allow_ip: vec![],
+                redact_secrets: false,
             })
             .await
             .unwrap();
@@ -246,6 +247,7 @@ async fn local_mode_sign_in_uses_a_cookie_plain_http_browsers_keep() {
             capabilities: "read".into(),
             expires: None,
             allow_ip: vec![],
+            redact_secrets: false,
         })
         .await
         .unwrap()["invitation"]
@@ -840,6 +842,7 @@ async fn removing_an_account_cancels_open_invitations_that_list_it() {
             capabilities: "read".into(),
             expires: None,
             allow_ip: vec![],
+            redact_secrets: false,
         })
         .await
         .unwrap()["invitation"]
@@ -902,6 +905,7 @@ async fn token_endpoint_enforces_the_connection_ip_allowlist() {
             capabilities: "read".into(),
             expires: None,
             allow_ip: vec!["192.0.2.0/24".into()],
+            redact_secrets: false,
         })
         .await
         .unwrap()["invitation"]

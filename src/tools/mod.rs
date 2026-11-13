@@ -15,7 +15,7 @@ pub mod watches;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -34,6 +34,8 @@ pub struct ToolCx {
     /// Dispatch deadline for writes, `deadline` minus [`write_reserve`].
     write_deadline: Instant,
     gate: Arc<CommitGate>,
+    /// Text fields redacted during this call (batch items share it); only the count reaches the audit record.
+    redactions: Arc<AtomicUsize>,
 }
 
 /// Time a write keeps after its upstream dispatch, to record the result, run the follow-up steps and answer
@@ -56,7 +58,7 @@ impl ToolCx {
         let budget = Duration::from_secs(app.cfg.limits.tool_call_timeout_secs);
         let deadline = started + budget;
         let write_deadline = deadline.checked_sub(write_reserve(budget)).unwrap_or(started);
-        Self { app, client, request_id, deadline, write_deadline, gate: Arc::default() }
+        Self { app, client, request_id, deadline, write_deadline, gate: Arc::default(), redactions: Arc::default() }
     }
 
     /// Deadline for the upstream part of a write (SMTP submission, Gmail write): earlier than `deadline`, so a
@@ -87,7 +89,62 @@ impl ToolCx {
     pub(crate) fn committed(&self) -> bool {
         self.gate.0.load(Ordering::SeqCst) == COMMITTED
     }
+
+    /// Overview redaction (PLAN A59): when the connection has `redact_secrets`, hides secrets in the subject and
+    /// snippet of each row and gives every row `redacted: true|false`. Call it on list and overview results only,
+    /// right before rendering; targeted reads stay unredacted.
+    pub fn redact_objects(&self, rows: &mut [Value]) {
+        if !self.client.redact_secrets {
+            return;
+        }
+        for row in rows {
+            let n = crate::redact::object_fields(row, REDACTED_FIELDS);
+            self.redactions.fetch_add(n, Ordering::Relaxed);
+            row["redacted"] = json!(n > 0);
+        }
+    }
+
+    /// [`ToolCx::redact_objects`] for a columnar result (`columns` and `rows`): redacts the subject and snippet
+    /// columns and appends a `redacted` column.
+    pub fn redact_table(&self, out: &mut Value) {
+        if !self.client.redact_secrets {
+            return;
+        }
+        let Some(cols) = out.get("columns").and_then(Value::as_array) else { return };
+        let idx: Vec<usize> = cols
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.as_str().is_some_and(|c| REDACTED_FIELDS.contains(&c)))
+            .map(|(i, _)| i)
+            .collect();
+        let Some(rows) = out.get_mut("rows").and_then(Value::as_array_mut) else { return };
+        for row in rows {
+            let Some(cells) = row.as_array_mut() else { continue };
+            let mut n = 0;
+            for &i in &idx {
+                if let Some(Value::String(s)) = cells.get_mut(i)
+                    && let Some((r, _)) = crate::redact::redact(s)
+                {
+                    *s = r;
+                    n += 1;
+                }
+            }
+            self.redactions.fetch_add(n, Ordering::Relaxed);
+            cells.push(json!(n > 0));
+        }
+        if let Some(cols) = out.get_mut("columns").and_then(Value::as_array_mut) {
+            cols.push(json!("redacted"));
+        }
+    }
+
+    /// Number of text fields redacted so far in this call.
+    pub fn redactions(&self) -> usize {
+        self.redactions.load(Ordering::Relaxed)
+    }
 }
+
+/// Overview fields that secret redaction covers (PLAN A59).
+pub const REDACTED_FIELDS: &[&str] = &["subject", "snippet"];
 
 /// The error for a call whose write started but whose result the caller will not see.
 pub fn unfinished_write() -> ToolError {

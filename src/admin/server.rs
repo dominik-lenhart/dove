@@ -233,7 +233,7 @@ async fn execute(call: &mut AdminCall<'_>, req: AdminRequest) -> anyhow::Result<
         }
         AccountsDisable { alias } => call.tx(move |tx| ops::account_set_enabled(tx, &alias, false)).await,
         AccountsEnable { alias } => call.tx(move |tx| ops::account_set_enabled(tx, &alias, true)).await,
-        ClientsCreate { name, project, grants, expires, allow_ip } => {
+        ClientsCreate { name, project, grants, expires, allow_ip, redact_secrets } => {
             let expires_in = parse_expiry(expires.as_deref())?;
             let pepper = app.pepper.clone();
             call.tx(move |tx| {
@@ -245,6 +245,7 @@ async fn execute(call: &mut AdminCall<'_>, req: AdminRequest) -> anyhow::Result<
                     allowed_cidrs: &allow_ip,
                     kind: "token",
                     created_via: "cli",
+                    redact_secrets,
                 };
                 let (_, token, mut v) = ops::client_create(tx, &pepper, allow_send, &nc)?;
                 v["token"] = json!(token);
@@ -265,7 +266,7 @@ async fn execute(call: &mut AdminCall<'_>, req: AdminRequest) -> anyhow::Result<
             .await
         }
         ClientsRevoke { name } => call.tx(move |tx| ops::client_revoke(tx, &name)).await,
-        ClientsInvite { name, project, accounts, capabilities, expires, allow_ip } => {
+        ClientsInvite { name, project, accounts, capabilities, expires, allow_ip, redact_secrets } => {
             let expires_in = parse_expiry(expires.as_deref())?;
             let pepper = app.pepper.clone();
             call.tx(move |tx| {
@@ -276,12 +277,14 @@ async fn execute(call: &mut AdminCall<'_>, req: AdminRequest) -> anyhow::Result<
                     capabilities: &capabilities,
                     expires_in_secs: expires_in,
                     allow_ip: &allow_ip,
+                    redact_secrets,
                 };
                 crate::invite::create(tx, &pepper, allow_send, &ni)
             })
             .await
         }
         ClientsShow { name } => call.read(move |c| ops::client_show(c, &name)).await,
+        ClientsSetRedaction { name, enabled } => call.tx(move |tx| ops::client_set_redaction(tx, &name, enabled)).await,
         ClientsList => call.read(ops::client_list).await,
         AuditTail { limit } => {
             call.read(move |c| Ok(json!(audit::tail(c, limit.unwrap_or(50).clamp(1, 10_000))?))).await
