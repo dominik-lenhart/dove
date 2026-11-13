@@ -18,10 +18,11 @@ use windows_sys::Win32::Security::Cryptography::{
 };
 use windows_sys::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, DACL_SECURITY_INFORMATION, EqualSid,
-    GetAce, GetAclInformation, GetLengthSid, GetSecurityDescriptorDacl, GetTokenInformation, IsValidSid,
-    IsWellKnownSid, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-    SECURITY_ATTRIBUTES, TOKEN_ELEVATION, TOKEN_INFORMATION_CLASS, TOKEN_QUERY, TokenElevation, TokenOwner, TokenUser,
-    WinBuiltinAdministratorsSid, WinCreatorOwnerSid, WinLocalSystemSid,
+    GetAce, GetAclInformation, GetLengthSid, GetSecurityDescriptorDacl, GetSidSubAuthority, GetSidSubAuthorityCount,
+    GetTokenInformation, IsValidSid, IsWellKnownSid, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, TOKEN_ELEVATION, TOKEN_INFORMATION_CLASS, TOKEN_QUERY,
+    TokenElevation, TokenIntegrityLevel, TokenOwner, TokenUser, WinBuiltinAdministratorsSid, WinCreatorOwnerSid,
+    WinLocalSystemSid,
 };
 use windows_sys::Win32::System::Pipes::{GetNamedPipeClientProcessId, GetNamedPipeServerProcessId};
 use windows_sys::Win32::System::Threading::{
@@ -152,8 +153,38 @@ pub fn is_elevated() -> bool {
     }
 }
 
-/// The user SID of process `pid`.
-pub fn process_user_sid(pid: u32) -> io::Result<Sid> {
+/// The mandatory integrity level of a token as its RID (`0x1000` low, `0x2000` medium, `0x3000` high, `0x4000`
+/// system): the last sub-authority of the label SID.
+fn token_integrity(token: &Handle) -> io::Result<u32> {
+    let buf = token_info(token, TokenIntegrityLevel)?;
+    // TOKEN_MANDATORY_LABEL starts with SID_AND_ATTRIBUTES, whose first field is the label SID pointer (into `buf`).
+    let sid = unsafe { *(buf.as_ptr() as *const PSID) };
+    if sid.is_null() || unsafe { IsValidSid(sid) } == 0 {
+        return Err(io::Error::other("invalid integrity label"));
+    }
+    let count = unsafe { *GetSidSubAuthorityCount(sid) };
+    if count == 0 {
+        return Err(io::Error::other("integrity label without a level"));
+    }
+    Ok(unsafe { *GetSidSubAuthority(sid, u32::from(count) - 1) })
+}
+
+/// A process's user and integrity level.
+pub struct Identity {
+    pub sid: Sid,
+    pub integrity: u32,
+}
+
+fn identity(token: &Handle) -> io::Result<Identity> {
+    Ok(Identity { sid: token_user(token)?, integrity: token_integrity(token)? })
+}
+
+/// This process's user and integrity level.
+pub fn current_identity() -> io::Result<Identity> {
+    identity(&own_token()?)
+}
+
+fn process_token(pid: u32) -> io::Result<Handle> {
     let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
     if process.is_null() {
         return Err(io::Error::last_os_error());
@@ -163,7 +194,17 @@ pub fn process_user_sid(pid: u32) -> io::Result<Sid> {
     if unsafe { OpenProcessToken(process.0, TOKEN_QUERY, &mut token) } == 0 {
         return Err(io::Error::last_os_error());
     }
-    token_user(&Handle(token))
+    Ok(Handle(token))
+}
+
+/// The user SID of process `pid`.
+pub fn process_user_sid(pid: u32) -> io::Result<Sid> {
+    token_user(&process_token(pid)?)
+}
+
+/// The user and integrity level of process `pid`.
+pub fn process_identity(pid: u32) -> io::Result<Identity> {
+    identity(&process_token(pid)?)
 }
 
 /// The user SID of the process at the other end of a connected named pipe server handle (the admin channel's peer
@@ -176,14 +217,15 @@ pub fn pipe_client_sid(pipe: RawHandle) -> io::Result<Sid> {
     process_user_sid(pid)
 }
 
-/// The user SID of the process that created the pipe a client handle is connected to. The CLI checks it before it
-/// sends anything, so a pipe squatted by another user never receives a request (a password, for example).
-pub fn pipe_server_sid(pipe: RawHandle) -> io::Result<Sid> {
+/// The user and integrity level of the process that created the pipe a client handle is connected to. The CLI checks
+/// them before it sends anything, so a pipe squatted by another user, or by a lower-integrity (sandboxed) process of
+/// the same user, never receives a request (a password, for example).
+pub fn pipe_server_identity(pipe: RawHandle) -> io::Result<Identity> {
     let mut pid = 0u32;
     if unsafe { GetNamedPipeServerProcessId(pipe as HANDLE, &mut pid) } == 0 {
         return Err(io::Error::last_os_error());
     }
-    process_user_sid(pid)
+    process_identity(pid)
 }
 
 /// A self-relative security descriptor built from SDDL.
@@ -506,6 +548,17 @@ pub(crate) mod tests {
         assert!(s.starts_with("S-1-5-"), "{s}");
         assert_eq!(current_user_sid().unwrap(), current_user_sid().unwrap());
         assert_eq!(process_user_sid(std::process::id()).unwrap(), current_user_sid().unwrap());
+    }
+
+    /// The integrity level is read from the label SID's last sub-authority: a normal or elevated process is medium
+    /// (0x2000) or high (0x3000), never 0 or a SID prefix value.
+    #[test]
+    fn integrity_level_is_a_mandatory_label_rid() {
+        let me = current_identity().unwrap();
+        assert!([0x2000, 0x2100, 0x3000, 0x4000].contains(&me.integrity), "{:#x}", me.integrity);
+        let same = process_identity(std::process::id()).unwrap();
+        assert_eq!(same.integrity, me.integrity);
+        assert_eq!(same.sid, me.sid);
     }
 
     #[test]

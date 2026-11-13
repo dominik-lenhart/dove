@@ -35,6 +35,22 @@ impl Peer {
     }
 }
 
+/// Whether the CLI may send a request to the admin pipe's server (Windows, P2): it must run as the same user, at an
+/// integrity level at least the client's. A low-integrity (sandboxed) process of the same user could otherwise create
+/// the pipe first and collect admin requests, IMAP passwords included. Kept platform-independent so it is tested
+/// everywhere.
+pub fn server_ok(server_sid: &str, server_integrity: u32, my_sid: &str, my_integrity: u32) -> Result<(), String> {
+    if server_sid.is_empty() || server_sid != my_sid {
+        return Err(format!("it is served by another Windows user ({server_sid})"));
+    }
+    if server_integrity < my_integrity {
+        return Err(format!(
+            "it is served at a lower integrity level ({server_integrity:#x}) than this program ({my_integrity:#x})"
+        ));
+    }
+    Ok(())
+}
+
 /// A connected admin stream.
 pub trait AdminStream: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> AdminStream for T {}
@@ -111,7 +127,11 @@ mod pipe {
         name: String,
         service_sid: String,
         sd: SecurityDescriptor,
-        next: NamedPipeServer,
+        /// The instance waiting for the next client; `None` after creating it failed (created again on the next
+        /// accept, P3).
+        next: Option<NamedPipeServer>,
+        #[cfg(test)]
+        pub(crate) fail_next_create: bool,
     }
 
     /// The pipe's DACL: full access for the service's user, nothing for anyone else (the default DACL of a pipe
@@ -140,14 +160,41 @@ mod pipe {
                 "cannot create the admin pipe {name} (is Dove already running, or did another program take the name?)"
             )
         })?;
-        Ok(Listener { name, service_sid, sd, next })
+        Ok(Listener {
+            name,
+            service_sid,
+            sd,
+            next: Some(next),
+            #[cfg(test)]
+            fail_next_create: false,
+        })
     }
 
     impl Listener {
+        fn create_next(&mut self) -> std::io::Result<NamedPipeServer> {
+            #[cfg(test)]
+            if std::mem::take(&mut self.fail_next_create) {
+                return Err(std::io::Error::other("injected failure"));
+            }
+            create(&self.name, &self.sd, false)
+        }
+
         pub async fn accept(&mut self) -> std::io::Result<(Box<dyn AdminStream>, Peer)> {
-            self.next.connect().await?;
-            let fresh = create(&self.name, &self.sd, false)?;
-            let connected = std::mem::replace(&mut self.next, fresh);
+            let waiting = match self.next.take() {
+                Some(s) => s,
+                None => self.create_next()?,
+            };
+            waiting.connect().await?;
+            // The connected client is served even when the next instance cannot be created now (P3): it would
+            // otherwise hang until it times out. The next accept tries again.
+            self.next = match self.create_next() {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    tracing::warn!(error = %e, "cannot create the next admin pipe instance; retrying on the next accept");
+                    None
+                }
+            };
+            let connected = waiting;
             let peer = match win::pipe_client_sid(connected.as_raw_handle()).and_then(|s| s.to_string_sid()) {
                 Ok(client) => Peer::Sid { client, service: self.service_sid.clone() },
                 Err(e) => {
@@ -161,7 +208,7 @@ mod pipe {
         /// The handle of the instance waiting for the next client (tests inspect its DACL).
         #[cfg(test)]
         pub(crate) fn raw_handle(&self) -> std::os::windows::io::RawHandle {
-            self.next.as_raw_handle()
+            self.next.as_ref().expect("a waiting instance").as_raw_handle()
         }
     }
 
@@ -181,12 +228,38 @@ mod pipe {
                 }
             }
         };
-        // Never talk to a pipe another user created under our name (it could collect a mailbox password).
-        let server = win::pipe_server_sid(client.as_raw_handle()).context("cannot identify the admin pipe's owner")?;
-        if server != win::current_user_sid()? {
-            bail!("the admin pipe {name} is served by another Windows user; refusing to use it");
+        // Never talk to a pipe another user, or a lower-integrity process of this user, created under our name: it
+        // could collect a mailbox password (P2).
+        let server =
+            win::pipe_server_identity(client.as_raw_handle()).context("cannot identify the admin pipe's owner")?;
+        let me = win::current_identity()?;
+        if let Err(why) =
+            super::server_ok(&server.sid.to_string_sid()?, server.integrity, &me.sid.to_string_sid()?, me.integrity)
+        {
+            bail!("refusing to use the admin pipe {name}: {why}");
         }
         Ok(Box::new(client))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::server_ok;
+
+    const ME: &str = "S-1-5-21-1111111111-2222222222-3333333333-1001";
+    const MEDIUM: u32 = 0x2000;
+
+    /// The CLI's check of the admin pipe's server (P2): same user and at least the client's integrity level.
+    #[test]
+    fn pipe_server_must_be_the_same_user_at_no_lower_integrity() {
+        server_ok(ME, MEDIUM, ME, MEDIUM).unwrap();
+        server_ok(ME, 0x3000, ME, MEDIUM).unwrap();
+        let other = server_ok("S-1-5-21-1111111111-2222222222-3333333333-1002", MEDIUM, ME, MEDIUM).unwrap_err();
+        assert!(other.contains("another Windows user"), "{other}");
+        assert!(server_ok("", MEDIUM, "", MEDIUM).is_err());
+        let low = server_ok(ME, 0x1000, ME, MEDIUM).unwrap_err();
+        assert!(low.contains("lower integrity"), "{low}");
+        assert!(server_ok(ME, MEDIUM, ME, 0x3000).is_err(), "an elevated CLI never talks to a medium pipe server");
     }
 }
 
@@ -260,8 +333,25 @@ mod windows_tests {
             client::send(&name, &AdminRequest::ProjectsCreate { name: format!("p{i}") }).await.unwrap();
         }
         let tail = app.store.call(|c| crate::audit::tail(c, 1)).await.unwrap();
+        task.abort();
         let me = win::current_user_sid().unwrap().to_string_sid().unwrap();
         assert_eq!(serde_json::to_value(tail).unwrap()[0]["actor"], format!("sid:{me}"));
+    }
+
+    /// When the next pipe instance cannot be created after a client connected, that client is still served, and the
+    /// listener recovers on the next accept (P3).
+    #[tokio::test]
+    async fn a_client_is_served_when_the_next_instance_fails() {
+        let (env, name) = env_with_pipe();
+        let mut l = bind(&name).unwrap();
+        l.fail_next_create = true;
+        let task = tokio::spawn(crate::admin::server::serve(env.app.clone(), l));
+        let v = tokio::time::timeout(std::time::Duration::from_secs(10), client::send(&name, &AdminRequest::Version))
+            .await
+            .expect("the connected client must not hang")
+            .unwrap();
+        assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+        client::send(&name, &AdminRequest::Version).await.unwrap();
         task.abort();
     }
 }
