@@ -335,9 +335,7 @@ impl<'a> Zip<'a> {
                 Ok(comp.to_vec())
             }
             8 => {
-                let mut out = Vec::new();
-                let mut dec = flate2::read::DeflateDecoder::new(comp).take(max as u64 + 1);
-                dec.read_to_end(&mut out).map_err(|_| bad)?;
+                let out = read_bounded(flate2::read::DeflateDecoder::new(comp), max).map_err(|_| bad)?;
                 if out.len() > max {
                     return Err(ExtractError::TooLarge);
                 }
@@ -346,6 +344,14 @@ impl<'a> Zip<'a> {
             _ => Err(bad),
         }
     }
+}
+
+/// Reads at most `max + 1` bytes: one more than allowed, so the caller can tell "exactly max" from "too much"
+/// without ever holding more. The bound on memory for an inflate bomb.
+fn read_bounded(r: impl Read, max: usize) -> std::io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    r.take(max as u64 + 1).read_to_end(&mut out)?;
+    Ok(out)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -786,6 +792,22 @@ mod tests {
         let mut out = String::new();
         push_unescaped("a &amp; b &#x41;&#66; &unknown; &lt", &mut out);
         assert_eq!(out, "a & b AB  &lt");
+    }
+
+    #[test]
+    fn inflating_never_reads_more_than_one_byte_past_the_limit() {
+        // An endless source that panics once more than a few bytes past the limit were requested.
+        struct Endless(usize);
+        impl Read for Endless {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.0 += buf.len();
+                assert!(self.0 < 1_000_000, "read far past the limit");
+                buf.fill(b'a');
+                Ok(buf.len())
+            }
+        }
+        let out = read_bounded(Endless(0), 1000).unwrap();
+        assert_eq!(out.len(), 1001);
     }
 
     #[test]
