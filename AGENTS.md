@@ -350,3 +350,17 @@ cargo fmt
   opening a SQLCipher connection outlasted a 100 ms deadline). `Index::read` enforces deadlines with a progress handler
   on the reader's own thread (rusqlite feature `hooks`). Tests of a deadline use a bounded query so a regression fails
   instead of hanging the runner.
+- 2026-11-13: Every `ToolDef` declares `mail_content`. For those tools `mcp::call_tool` adds `untrusted_content_notice`
+  (`tools::UNTRUSTED_NOTICE`) to `structuredContent` and their `outputSchema`, and wraps the legacy JSON text item (no
+  `MCP-Protocol-Version` counts as 2025-03-26) in the envelope. A new tool that returns mail text needs
+  `mail_content: true`, an enveloped `text`, and a line in `mail_content_is_marked_untrusted_in_every_protocol_version`
+  (`tests/mail_intel_e2e.rs`). Tests that compare a mail tool's whole `structuredContent` must include the notice.
+- 2026-11-13: OAuth hardening: a dynamically registered client never gets a 303 before approval (errors and denial render
+  a page); pre-registered clients keep RFC 6749 error redirects. The approval page asks for `confirm_redirect` when a
+  dynamic client's redirect is not `oauth::known_redirect` (HTTPS on `KNOWN_REDIRECT_HOSTS`, exact host, or loopback).
+  `tests/oauth_e2e.rs`'s `REDIRECT` is a known host on purpose; tests of unknown destinations use `with_redirect`.
+  `/connect/redeem` checks the invitation's `--allow-ip`; the approval page does not (A34: the browser is not the host).
+- 2026-11-13: Failed bearer auth on `/mcp` draws from a per-address bucket (`limits.auth_failures_per_minute`) checked with
+  `RateLimiter::exhausted` (no token taken) before the lookup; loopback and unknown addresses are exempt because behind
+  Tailscale Serve or in local mode they stand for every caller. Tests simulate addresses with `X-Forwarded-For` plus
+  `X-Dove-Proxy-Auth`.
