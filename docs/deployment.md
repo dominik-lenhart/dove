@@ -1,7 +1,8 @@
 # Deployment guide
 
 How to run your own Dove instance: one service on your server, your own Google Cloud project, your own proxy. There
-is no hosted Dove and no shared client id (spec section 1).
+is no hosted Dove and no shared client id (spec section 1). To run Dove on your own computer for local MCP hosts
+instead, see [Local mode](#local-mode).
 
 Read [`README.md`](../README.md) first for what Dove protects and what it does not. Everything below uses example
 values (`dove.example.com`, `info@example.com`); replace them. Status of this guide: the artifacts under `deploy/`
@@ -9,7 +10,7 @@ were checked as described in [What has been verified](#what-has-been-verified). 
 host against real Google yet.
 
 Contents: [Requirements](#requirements) · [Install](#install) · [Google Cloud](#google-cloud-setup) ·
-[Secrets](#secrets) · [Configuration](#configuration) · [Run](#run-the-service) · [Reverse proxy](#reverse-proxy) · [Tailscale](#tailscale) ·
+[Secrets](#secrets) · [Configuration](#configuration) · [Run](#run-the-service) · [Reverse proxy](#reverse-proxy) · [Tailscale](#tailscale) · [Local mode](#local-mode) ·
 [Connect mailboxes](#connect-mailboxes) · [Projects, clients, grants](#projects-clients-and-grants) ·
 [Administration](#administration-access) · [Backup](#backup-and-restore) · [Upgrading](#upgrading) ·
 [KEK rotation](#kek-rotation) · [Deleting data](#deleting-data-logical-versus-physical) ·
@@ -407,6 +408,101 @@ the service user (readable by root and the service only) would make the headers 
 HTTP listener in Dove, a Tailscale version that supports `unix:` targets, and certainty that Tailscale discards
 identity headers sent by the client. None of that can be tested without a real tailnet. The bearer token plus tailnet
 ACLs (who may reach the node at all) give the same protection without a header Dove cannot check. See PLAN A52.
+
+## Local mode
+
+Local mode runs Dove on your own computer (macOS, Linux or Windows) as your own user, for MCP hosts on the same
+machine: Claude Desktop, Claude Code, Codex, Cursor and others. There is no server, no domain, no TLS certificate and
+no reverse proxy. It is the same binary as server mode.
+
+### What local mode protects, and what it does not
+
+On a personal computer your agent usually runs as the same OS user as Dove. Local mode still protects your mail from
+remote callers (Dove listens on `127.0.0.1` only and accepts only that origin) and from leaked or over-scoped tokens,
+and it keeps grants, the audit log and "no permanent delete". But an agent that has a shell as your user can read
+Dove's files and keys and use its admin channel, exactly as you can. If you need that separation, run Dove on
+another machine or as another OS user (server mode). Dove never weakens server mode for local mode.
+
+Remote web connectors (ChatGPT, claude.ai on the web) cannot reach a local Dove; use server mode for them.
+
+### Set up
+
+Install the binary (`install.sh`, Homebrew, or `install.ps1` on Windows; see [Install](#install)), then:
+
+```sh
+dove local init                 # config, keys and data directory for your user (port 8787; --port to change)
+dove local install              # start Dove now and at every login (or: dove local start, in a terminal)
+dove local status
+```
+
+`dove local init` refuses to run when a config or key already exists, so it never replaces a key that encrypts your
+stored credentials. Then connect a mailbox and an agent as usual. Admin commands find the local service on their own:
+
+```sh
+dove accounts connect-imap personal --email you@example.com
+dove projects create assistant
+dove projects add-account assistant personal
+dove clients invite desktop --project assistant --accounts personal --capabilities assistant
+dove login --server http://127.0.0.1:8787 --profile desktop          # paste the invitation
+dove mcp install --client claude-desktop --profile desktop           # or claude-code, codex
+```
+
+Restart Claude Desktop afterwards (quit it from the tray or menu bar). `dove login` keeps the token in your OS
+credential store (Keychain, Credential Manager, Secret Service). For hosts that take an HTTP server with a header,
+`dove clients create` prints a token and the URL is `http://127.0.0.1:8787/mcp`.
+
+Gmail through the Gmail API needs your own Google Cloud OAuth client ([Google Cloud setup](#google-cloud-setup)) with
+the redirect URI `http://127.0.0.1:8787/oauth/google/callback`; Google allows loopback redirects for this. IMAP
+mailboxes, including Gmail with an app password, need nothing extra.
+
+### Where things are
+
+| | Config | Data, keys, log |
+| --- | --- | --- |
+| Linux | `~/.config/dove/dove.toml` | `~/.local/share/dove` (XDG variables respected) |
+| macOS | `~/Library/Application Support/Dove/dove.toml` | `~/Library/Application Support/Dove/data` |
+| Windows | `%APPDATA%\Dove\dove.toml` | `%LOCALAPPDATA%\Dove` |
+
+`DOVE_LOCAL_HOME=<dir>` puts everything in one directory instead (`<dir>/dove.toml`, `<dir>/data`). The keys are in
+`<data>/secrets`: 0600 files on macOS and Linux, files protected with Windows DPAPI for your Windows account on
+Windows (they cannot be decrypted by another account or on another computer, so back up your mailbox passwords, not
+these files). Data directories are 0700 on macOS and Linux; on Windows they are created owned by you with an access
+list for your account only, and Dove refuses to start when the data directory grants access to other accounts
+(Everyone, Users, Authenticated Users or another user; SYSTEM and Administrators are accepted).
+
+The config has `mode = "local"`. In local mode `public_url` may be `http://127.0.0.1:<port>` or
+`http://localhost:<port>` with the port of `listen`, and nothing else over plain HTTP; requests must carry exactly that
+Host. `X-Forwarded-For` is never trusted, so no proxy secret is needed.
+
+### Admin channel
+
+On macOS and Linux the admin socket is `<data>/admin.sock` inside the 0700 data directory, with the usual peer uid
+check. On Windows it is the named pipe `\\.\pipe\dove-admin-<your SID>`, whose access list admits only your account;
+Dove checks the Windows account of every client process, and the CLI checks that the pipe belongs to your account
+before it sends anything. There is no admin over HTTP.
+
+### Login item
+
+`dove local install` registers a per-user autostart that needs no administrator rights, and `dove local uninstall`
+stops Dove and removes it (config, keys and data stay):
+
+- Linux: a `systemd --user` unit, `~/.config/systemd/user/dove.service`; logs with `journalctl --user -u dove`.
+  systemd stops user services at logout unless lingering is on (`loginctl enable-linger`).
+- macOS: a launchd agent, `~/Library/LaunchAgents/io.github.dominik-lenhart.dove.plist`; log in `<data>/dove.log`.
+- Windows: a Task Scheduler task "Dove (<user>)" that starts at your logon without a console window; log in
+  `%LOCALAPPDATA%\Dove\dove.log`.
+
+### Upgrading
+
+`dove upgrade`, then `dove local install` to restart the service on the new binary (`dove doctor` tells you when the
+running service is older). On Windows the running `dove.exe` cannot be overwritten, so `dove upgrade` renames it aside
+and moves the new one in; the old file is deleted on a later start.
+
+### Limits on Windows
+
+Windows has no per-process switch to keep crash dumps (Windows Error Reporting) from containing memory, so a crash
+dump of Dove can hold decrypted secrets. The systemd sandbox, the service-user checks and Tailscale setup are server
+mode features and do not exist on Windows.
 
 ## Connect mailboxes
 
@@ -818,3 +914,4 @@ Checked in this repository's work, with the tool named; "not verified" means nob
 | Releases and `send_draft` (2026-11-13) | Tag runs of v0.1.0 and v0.2.0 on GitHub (four targets, minisign signature, attestations, GHCR multi-arch image); a v0.1.0 binary showed the update notice, `dove upgrade --check` exited 10 and `dove upgrade` installed v0.2.0; `send_draft` with `allow_send = true` and a `send` grant, once over Strato SMTP (copy filed in Sent, draft removed) and once over the Gmail API (draft removed, mail in Sent), both delivered to the other mailbox's inbox | Sending to third parties; `send_unknown` handling against a real server |
 | MCP hosts (2026-11-13) | Claude Code 2.1 through `dove mcp install --scope project` (stdio bridge) and through a direct HTTP entry with a bearer token; Codex CLI 0.166 through `dove mcp install` (user scope, and project scope once the project is trusted in Codex); `list_accounts` and `digest` called by the model | ChatGPT and Claude web connectors through the OAuth approval page |
 | Gmail over IMAP with an app password (2026-11-13) | A `@gmail.com` account with 2-Step Verification and an app password, SMTP on 587 STARTTLS (465 is blocked on the test host): `connect-imap` detected Gmail mode and the `\All` folder; the index held each message once with Gmail labels; `list_labels`, `search_messages` (label filter with a modified UTF-7 label `Dove Tést`), `digest` (archived mail left out); `update_messages` (star, read, unread, add and remove a label); `move_messages` archive, inbox, to a label, to Trash and back to the inbox, and from Trash to archive; `create_draft`, `update_draft` (the old revision is gone from All Mail too), `delete_draft` (nothing left in All Mail, Drafts or Trash); no errors in the service log | `send_draft` over Gmail SMTP; IDLE push latency; a large mailbox; a Workspace account; `[Google Mail]` folder prefix |
+| Local mode on Linux (2026-11-13) | `dove local init` with a temporary `DOVE_LOCAL_HOME`; `dove local install` wrote and started a `systemd --user` unit; `dove local status`, `projects create`, `doctor` over the per-user socket without `--socket`; the listener bound `127.0.0.1` only; Host `127.0.0.1:<port>` answered, `localhost:<port>` and another host got 421; `/mcp` without a token 401; `dove local uninstall` stopped it and removed the unit. `tests/local_e2e.rs` runs init, start, admin, SIGTERM and the real client (login, stdio bridge, `mcp install --client claude-desktop`) against a local-mode server | macOS (launchd agent); Claude Desktop itself loading the entry; a real mailbox in local mode |
