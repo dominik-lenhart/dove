@@ -1,0 +1,17 @@
+version: 2
+updates:
+  # Actions are pinned to full commit SHAs; Dependabot updates the SHA and the tag comment together.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      cargo:
+        patterns: ["*"]

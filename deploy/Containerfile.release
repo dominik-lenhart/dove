@@ -1,0 +1,43 @@
+# syntax=docker/dockerfile:1
+#
+# Dove MCP server image assembled from the release's prebuilt linux binaries (no Rust compile, so a multi-arch
+# build needs no emulation: nothing here runs on the target architecture). The release workflow builds it with a
+# context directory that holds the verified binaries:
+#   <context>/linux-amd64/dove
+#   <context>/linux-arm64/dove
+#   docker buildx build --platform linux/amd64,linux/arm64 -f deploy/Containerfile.release <context>
+# Local source builds use deploy/Containerfile instead. Keep both files in step (users, directories, labels).
+#
+# Base images are pinned by digest. The runtime base is the same as in deploy/Containerfile.
+
+# ---- skeleton stage ----------------------------------------------------------------------------------------
+# The distroless runtime has no shell, so the empty volume directories are made here (on the build host's
+# architecture) and copied over. busybox is only a tool; nothing from it reaches the final image.
+FROM --platform=$BUILDPLATFORM busybox:1.37@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec AS skeleton
+# Owned by the runtime user so that a fresh named volume inherits that ownership. The data directory must be
+# 0700: the service refuses any other mode.
+RUN install -d -m 0700 -o 65532 -g 65532 /out/var/lib/dove \
+ && install -d -m 0750 -o 65532 -g 65532 /out/run/dove \
+ && install -d -m 0755 /out/etc/dove /out/usr/local/bin
+
+# ---- runtime stage -----------------------------------------------------------------------------------------
+# Distroless: glibc and libgcc only. No shell, no package manager, no curl. UID/GID 65532 is the "nonroot" user.
+# The release binaries are linked against glibc 2.35 (ubuntu-22.04 runners), older than this image's 2.36.
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f AS runtime
+ARG TARGETARCH
+LABEL org.opencontainers.image.title="dove-mcp" \
+      org.opencontainers.image.description="Self-hosted MCP server giving AI agents token-scoped read/draft access to Gmail and IMAP/SMTP mailboxes" \
+      org.opencontainers.image.source="https://github.com/dominik-lenhart/dove" \
+      org.opencontainers.image.licenses="Apache-2.0"
+COPY --from=skeleton /out/ /
+COPY --chmod=0755 linux-${TARGETARCH}/dove /usr/local/bin/dove
+USER 65532:65532
+WORKDIR /var/lib/dove
+# State store and index (SQLite files). Mount a volume here; the root filesystem can stay read-only.
+# Admin Unix socket. Mount a tmpfs or volume here (see compose.yaml).
+VOLUME ["/var/lib/dove", "/run/dove"]
+# The service listens on 127.0.0.1:8787 inside the container's network namespace (spec 6.6). Nothing is published
+# by the image; a reverse proxy must share the namespace (see compose.yaml) or run on the host with host networking.
+# Secrets are files, never environment variables: mount them read-only and point config.toml at them.
+ENTRYPOINT ["/usr/local/bin/dove"]
+CMD ["serve", "--config", "/etc/dove/config.toml"]
