@@ -509,8 +509,10 @@ and moves the new one in; the old file is deleted on a later start.
 
 ### Limits on Windows
 
-Windows has no per-process switch to keep crash dumps (Windows Error Reporting) from containing memory, so a crash
-dump of Dove can hold decrypted secrets. The systemd sandbox, the service-user checks and Tailscale setup are server
+Windows has no per-process switch to disable crash dumps. At every start Dove excludes its executable from Windows
+Error Reporting for your user (`WerAddExcludedApplication`, best effort, logged when it fails), so a crash writes no
+WER report or dump. Crash dump settings an administrator made machine-wide (for example `LocalDumps` under
+`HKLM`) and debuggers attached by the same user are outside its reach; such a dump can hold decrypted secrets. The systemd sandbox, the service-user checks and Tailscale setup are server
 mode features and do not exist on Windows.
 
 ## Connect mailboxes

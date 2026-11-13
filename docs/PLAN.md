@@ -405,6 +405,7 @@ hosts or reference hardware.
   drops `Secure` cookies from plain-http loopback origins; `__Host-` requires `Secure`); server mode keeps
   `__Host-dove_authz; Secure`. (h) Windows `dove upgrade`
   renames the running `dove.exe` to `.dove.exe.old-<id>`, moves the new file in (renaming back on failure), and every
-  later start deletes leftovers that are no longer in use. (i) Not available on Windows: disabling crash dumps per
-  process (Windows Error Reporting), Tailscale setup, the systemd hardening and service-user checks; the doctor's
+  later start deletes leftovers that are no longer in use. (i) Windows has no per-process crash dump switch; the
+  service excludes its executable from Windows Error Reporting per user at every start (`WerAddExcludedApplication`,
+  best effort), machine-wide dump settings stay out of reach. Not available on Windows: Tailscale setup, the systemd hardening and service-user checks; the doctor's
   mode checks become a `data_dir_private` ACL check.
