@@ -290,7 +290,7 @@ pub enum DraftCmd {
 
 #[derive(Subcommand)]
 pub enum McpCmd {
-    /// Add `dove mcp stdio --profile <p>` to Claude Code or Codex (user scope by default).
+    /// Add `dove mcp stdio --profile <p>` to Claude Code, Codex or Claude Desktop (user scope by default).
     Install {
         #[arg(long)]
         profile: Option<String>,
@@ -885,7 +885,7 @@ fn mcp_install(name: Option<&str>, client: HostClient, scope: Scope, entry_name:
     if !entry.name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
         bail!("--name may use letters, digits, - and _");
     }
-    let path = install::config_path(client, scope, &profile::home_dir()?, &std::env::current_dir()?);
+    let path = install::config_path(client, scope, &profile::home_dir()?, &std::env::current_dir()?)?;
     let mode = if scope == Scope::User { 0o600 } else { 0o644 };
     let outcome = install::install(client, &path, &entry, mode)?;
     let verb = match outcome {
@@ -896,6 +896,9 @@ fn mcp_install(name: Option<&str>, client: HostClient, scope: Scope, entry_name:
     println!("{verb} MCP server '{}' in {}", entry.name, path.display());
     println!("Command: {} {}", entry.command, entry.args.join(" "));
     println!("No credential is written to this file; the bridge reads it from the profile's credential store.");
+    if client == HostClient::ClaudeDesktop {
+        println!("Restart Claude Desktop (quit it from the tray or menu bar) to load the new server.");
+    }
     if client == HostClient::Codex && scope == Scope::Project {
         println!(
             "Codex reads a project's .codex/config.toml only when the project is trusted: accept the trust prompt on \
