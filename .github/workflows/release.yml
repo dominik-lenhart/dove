@@ -92,7 +92,7 @@ jobs:
           # debian12 image (glibc 2.36). Native arm64 runner: no QEMU.
           - { target: x86_64-unknown-linux-gnu, runner: ubuntu-22.04 }
           - { target: aarch64-unknown-linux-gnu, runner: ubuntu-22.04-arm }
-          - { target: aarch64-apple-darwin, runner: macos-14 }
+          - { target: aarch64-apple-darwin, runner: macos-15 }
           # Native Intel runner: the vendored OpenSSL/SQLCipher C build then needs no cross toolchain flags.
           - { target: x86_64-apple-darwin, runner: macos-15-intel }
     env:

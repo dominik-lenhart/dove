@@ -28,7 +28,7 @@ configuration; read the changelog.
 Linux binaries are built on Ubuntu 22.04 (glibc 2.35), so they run on current distributions and in the distroless
 Debian 12 image. macOS binaries target macOS 11 and later. The Intel macOS build runs on a native Intel runner
 (`macos-15-intel`) because the vendored OpenSSL and SQLCipher C builds are least fragile when not cross-compiled.
-GitHub plans to retire that runner label in 2027; then build `x86_64-apple-darwin` on `macos-14` with
+GitHub plans to retire that runner label in 2027; then build `x86_64-apple-darwin` on `macos-15` with
 `rustup target add x86_64-apple-darwin` instead.
 
 ## One-time setup
