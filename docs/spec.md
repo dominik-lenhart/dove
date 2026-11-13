@@ -547,7 +547,8 @@ Plus `POST https://oauth2.googleapis.com/token` (code exchange, refresh) and
 
 The only other outbound destination is `POST` to the exact URLs (scheme, host, port, path) of the operator's webhook
 sinks (`dove sinks add`, watch push delivery, design 0.2 section 3). The gateway's sink allowlist is rebuilt from the
-state store whenever a sink is added or removed; agents name sinks but never supply URLs.
+state store whenever a sink is added or removed; agents name sinks of their own project but never supply URLs. Sink
+URLs are stored sealed (vault kind `sink_url`).
 
 Explicitly denied: every other send route, `messages` with POST, `messages/import`,
 `messages/{id}/trash`, `messages/{id}/modify`, `messages/batchModify`, `messages/batchDelete`, DELETE on messages or

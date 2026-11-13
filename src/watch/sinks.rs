@@ -1,7 +1,12 @@
 //! Operator-registered webhook sinks: push delivery of watch events (design 0.2 section 3).
 //!
-//! - Only the operator creates sinks (`dove sinks add <name> --url https://... --secret-file <path>`, admin socket).
-//!   Agents see sink names only and can name one on a watch; they never supply a URL.
+//! - Only the operator creates sinks (`dove sinks add <name> --project <p> --url https://... --secret-file <path>`,
+//!   admin socket). A sink belongs to one project: only that project's clients see its name and can name it on a
+//!   watch; for everyone else it is the same `not_found` as a sink that does not exist. Agents never supply a URL.
+//!   Sinks without a project (from before 0.6, or whose project was removed) serve no client until
+//!   `dove sinks set-project`.
+//! - The URL is sealed by the vault too (kind `sink_url`, scope = sink id): Slack, Discord or ntfy URLs carry
+//!   credentials. `dove sinks list` shows only its origin.
 //! - The signing secret is sealed by the vault (kind `sink_secret`, scope = sink id) and re-wrapped by
 //!   `dove keys rotate`, like account grants; the service never needs to read the operator's file again.
 //! - Delivery is an HTTPS POST of the content-free event JSON through the gateway, which allows exactly the
@@ -33,6 +38,8 @@ use crate::vault::Vault;
 
 /// Vault kind of a sealed sink secret (scope = sink id).
 const SECRET_KIND: &str = "sink_secret";
+/// Vault kind of a sealed sink URL (scope = sink id).
+const URL_KIND: &str = "sink_url";
 /// Shortest accepted signing secret (for example `openssl rand -hex 32` gives 64 characters).
 pub const MIN_SECRET_LEN: usize = 32;
 pub const MAX_SECRET_LEN: usize = 1024;
@@ -64,10 +71,30 @@ pub fn signature_header(secret: &[u8], timestamp: i64, body: &[u8]) -> String {
 
 // ------------------------------------------------------------------ admin verbs
 
-/// `sinks add`: validates name, URL and secret, seals the secret and allowlists the URL.
+/// `scheme://host[:port]` of a URL, the only part of a sink URL that is ever shown.
+fn origin(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(u) => u.origin().ascii_serialization(),
+        Err(_) => "(invalid)".into(),
+    }
+}
+
+fn open_url(vault: &Vault, sink_id: &str, sealed: &[u8]) -> anyhow::Result<String> {
+    let plain = vault.open_aux(URL_KIND, sink_id, sealed)?;
+    Ok(std::str::from_utf8(&plain)?.to_string())
+}
+
+fn project_id(tx: &Connection, project: &str) -> anyhow::Result<String> {
+    tx.query_row("SELECT id FROM projects WHERE name = ?1", [project], |r| r.get(0))
+        .optional()?
+        .ok_or_else(|| anyhow!("unknown project '{project}'"))
+}
+
+/// `sinks add`: validates name, project, URL and secret, seals URL and secret and allowlists the URL.
 pub async fn add(
     call: &mut AdminCall<'_>,
     name: String,
+    project: String,
     url: String,
     secret: Zeroizing<String>,
 ) -> anyhow::Result<Value> {
@@ -85,47 +112,61 @@ pub async fn add(
     }
     let id = util::new_id();
     let sealed = app.vault.seal_aux(SECRET_KIND, &id, secret.as_bytes())?;
-    let u = url.as_str().to_string();
+    let sealed_url = app.vault.seal_aux(URL_KIND, &id, url.as_str().as_bytes())?;
+    let shown = origin(url.as_str());
     let v = call
         .tx(move |tx| {
+            let pid = project_id(tx, &project)?;
             let exists: bool =
                 tx.query_row("SELECT EXISTS(SELECT 1 FROM sinks WHERE name = ?1)", [&name], |r| r.get(0))?;
             if exists {
                 bail!("a sink named '{name}' already exists; remove it first to change it");
             }
             let now = util::now_unix();
+            // `url` is the pre-0.6 plaintext column; it stays empty (V_SINK_PROJECTS).
             tx.execute(
-                "INSERT INTO sinks(id, name, url, secret, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![id, name, u, sealed, now],
+                "INSERT INTO sinks(id, name, url, url_sealed, secret, project_id, created_at) \
+                 VALUES (?1, ?2, '', ?3, ?4, ?5, ?6)",
+                params![id, name, sealed_url, sealed, pid, now],
             )?;
-            Ok(json!({ "sink": name, "url": u, "created_at": util::rfc3339(now) }))
+            Ok(json!({ "sink": name, "project": project, "origin": shown, "created_at": util::rfc3339(now) }))
         })
         .await?;
     reload_allowlist(&app).await?;
     Ok(v)
 }
 
-/// `sinks list`: names, URLs and delivery counters (never the secret).
+/// `sinks list`: names, projects, URL origins and delivery counters (never the secret or the full URL).
 pub async fn list(call: &AdminCall<'_>) -> anyhow::Result<Value> {
-    call.read(|c| {
+    let vault = call.app.vault.clone();
+    call.read(move |c| {
         let mut st = c.prepare(
-            "SELECT s.name, s.url, s.created_at, \
+            "SELECT s.name, s.id, s.url_sealed, s.created_at, \
              (SELECT count(*) FROM watches w WHERE w.sink_id = s.id AND w.state = 'active'), \
              (SELECT count(*) FROM sink_deliveries d WHERE d.sink_id = s.id AND d.state = 'pending'), \
              (SELECT count(*) FROM sink_deliveries d WHERE d.sink_id = s.id AND d.state = 'delivered'), \
-             (SELECT count(*) FROM sink_deliveries d WHERE d.sink_id = s.id AND d.state = 'failed') \
+             (SELECT count(*) FROM sink_deliveries d WHERE d.sink_id = s.id AND d.state = 'failed'), \
+             (SELECT p.name FROM projects p WHERE p.id = s.project_id) \
              FROM sinks s ORDER BY s.name",
         )?;
         let rows = st.query_map([], |r| {
-            Ok(json!({
+            let (id, sealed): (String, Option<Vec<u8>>) = (r.get(1)?, r.get(2)?);
+            let shown = sealed.and_then(|b| open_url(&vault, &id, &b).ok()).map(|u| origin(&u));
+            let project: Option<String> = r.get(8)?;
+            let mut v = json!({
                 "sink": r.get::<_, String>(0)?,
-                "url": r.get::<_, String>(1)?,
-                "created_at": util::rfc3339(r.get(2)?),
-                "active_watches": r.get::<_, i64>(3)?,
-                "pending": r.get::<_, i64>(4)?,
-                "delivered": r.get::<_, i64>(5)?,
-                "failed": r.get::<_, i64>(6)?,
-            }))
+                "project": project,
+                "origin": shown.unwrap_or_else(|| "(unreadable)".into()),
+                "created_at": util::rfc3339(r.get(3)?),
+                "active_watches": r.get::<_, i64>(4)?,
+                "pending": r.get::<_, i64>(5)?,
+                "delivered": r.get::<_, i64>(6)?,
+                "failed": r.get::<_, i64>(7)?,
+            });
+            if project.is_none() {
+                v["note"] = json!("no project: no client can use this sink; run dove sinks set-project");
+            }
+            Ok(v)
         })?;
         Ok(Value::Array(rows.collect::<Result<_, _>>()?))
     })
@@ -151,17 +192,65 @@ pub async fn remove(call: &mut AdminCall<'_>, name: String) -> anyhow::Result<Va
     Ok(v)
 }
 
+/// `sinks set-project`: moves a sink to a project (also the way to make a pre-0.6 sink usable). Watches of clients
+/// outside the new project lose it (pull only) and their queued deliveries are dropped.
+pub async fn set_project(call: &mut AdminCall<'_>, name: String, project: String) -> anyhow::Result<Value> {
+    call.tx(move |tx| {
+        let id: String = tx
+            .query_row("SELECT id FROM sinks WHERE name = ?1", [&name], |r| r.get(0))
+            .optional()?
+            .ok_or_else(|| anyhow!("unknown sink '{name}'"))?;
+        let pid = project_id(tx, &project)?;
+        tx.execute("UPDATE sinks SET project_id = ?1 WHERE id = ?2", params![pid, id])?;
+        let outside = "SELECT id FROM clients WHERE project_id IS NOT ?2";
+        tx.execute(
+            &format!(
+                "DELETE FROM sink_deliveries WHERE sink_id = ?1 AND state = 'pending' AND event_seq IN \
+                 (SELECT seq FROM watch_events WHERE client_id IN ({outside}))"
+            ),
+            params![id, pid],
+        )?;
+        let detached = tx.execute(
+            &format!("UPDATE watches SET sink_id = NULL WHERE sink_id = ?1 AND client_id IN ({outside})"),
+            params![id, pid],
+        )?;
+        Ok(json!({ "sink": name, "project": project, "watches_without_push": detached }))
+    })
+    .await
+}
+
+/// Seals plaintext URLs left by releases before 0.6 (`V_SINK_PROJECTS`) and empties the old column. Runs at startup,
+/// before the allowlist is built. Returns how many rows it sealed.
+pub fn seal_legacy_urls(conn: &mut Connection, vault: &Vault) -> anyhow::Result<usize> {
+    let tx = conn.transaction()?;
+    let rows: Vec<(String, String)> = {
+        let mut st = tx.prepare("SELECT id, url FROM sinks WHERE url_sealed IS NULL")?;
+        st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?
+    };
+    for (id, url) in &rows {
+        let sealed = vault.seal_aux(URL_KIND, id, url.as_bytes())?;
+        tx.execute("UPDATE sinks SET url_sealed = ?1, url = '' WHERE id = ?2", params![sealed, id])?;
+    }
+    tx.commit()?;
+    Ok(rows.len())
+}
+
 /// The registered sink URLs that still validate.
-pub fn registered_urls(conn: &Connection, plain_loopback: bool) -> anyhow::Result<Vec<SinkUrl>> {
-    let mut st = conn.prepare("SELECT url FROM sinks")?;
-    let urls: Vec<String> = st.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
-    Ok(urls.iter().filter_map(|u| SinkUrl::parse(u, plain_loopback).ok()).collect())
+pub fn registered_urls(conn: &Connection, vault: &Vault, plain_loopback: bool) -> anyhow::Result<Vec<SinkUrl>> {
+    let mut st = conn.prepare("SELECT id, url_sealed FROM sinks WHERE url_sealed IS NOT NULL")?;
+    let rows: Vec<(String, Vec<u8>)> = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+    Ok(rows
+        .iter()
+        .filter_map(|(id, b)| open_url(vault, id, b).ok())
+        .filter_map(|u| SinkUrl::parse(&u, plain_loopback).ok())
+        .collect())
 }
 
 /// Installs the operator's current sink URLs as the gateway's sink allowlist.
 pub async fn reload_allowlist(app: &Arc<App>) -> anyhow::Result<()> {
     let plain = app.google.gateway().plain_http_sinks();
-    let urls = app.store.call(move |c| registered_urls(c, plain)).await?;
+    let vault = app.vault.clone();
+    let urls = app.store.call(move |c| registered_urls(c, &vault, plain)).await?;
     app.google.gateway().set_sink_allowlist(urls);
     Ok(())
 }
@@ -172,12 +261,14 @@ fn blob_version(b: &[u8]) -> Option<u32> {
     b.get(..4).map(|v| u32::from_be_bytes(v.try_into().expect("4 bytes")))
 }
 
-/// Re-seals sink secrets and watch filters under the current KEK version (`dove keys rotate`). Returns how many
-/// rows changed.
+/// Re-seals sink secrets, sink URLs and watch filters under the current KEK version (`dove keys rotate`). Returns how
+/// many values changed.
 pub fn rewrap_sealed(tx: &Connection, vault: &Vault) -> anyhow::Result<usize> {
     let current = vault.current_kek_version();
     let mut n = 0;
-    for (table, col, kind) in [("sinks", "secret", SECRET_KIND), ("watches", "filter", super::FILTER_KIND)] {
+    for (table, col, kind) in
+        [("sinks", "secret", SECRET_KIND), ("sinks", "url_sealed", URL_KIND), ("watches", "filter", super::FILTER_KIND)]
+    {
         let rows: Vec<(String, Vec<u8>)> = {
             let mut st = tx.prepare(&format!("SELECT id, {col} FROM {table} WHERE {col} IS NOT NULL"))?;
             st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?
@@ -195,10 +286,14 @@ pub fn rewrap_sealed(tx: &Connection, vault: &Vault) -> anyhow::Result<usize> {
     Ok(n)
 }
 
-/// KEK versions still used by sink secrets and watch filters.
+/// KEK versions still used by sink secrets, sink URLs and watch filters.
 pub fn sealed_versions(conn: &Connection) -> anyhow::Result<Vec<u32>> {
     let mut out = Vec::new();
-    for sql in ["SELECT secret FROM sinks", "SELECT filter FROM watches WHERE filter IS NOT NULL"] {
+    for sql in [
+        "SELECT secret FROM sinks",
+        "SELECT url_sealed FROM sinks WHERE url_sealed IS NOT NULL",
+        "SELECT filter FROM watches WHERE filter IS NOT NULL",
+    ] {
         let mut st = conn.prepare(sql)?;
         for b in st.query_map([], |r| r.get::<_, Vec<u8>>(0))? {
             if let Some(v) = blob_version(&b?)
@@ -226,7 +321,7 @@ struct Due {
     event: EventRow,
     sink_id: String,
     sink_name: String,
-    url: String,
+    url: Option<Vec<u8>>,
     secret: Vec<u8>,
     attempts: i64,
 }
@@ -244,7 +339,7 @@ pub async fn deliver_due(app: &Arc<App>, now: i64) -> anyhow::Result<DeliveryRep
         .store
         .call(move |c| {
             let mut st = c.prepare_cached(&format!(
-                "SELECT {}, d.sink_id, s.name, s.url, s.secret, d.attempts FROM sink_deliveries d \
+                "SELECT {}, d.sink_id, s.name, s.url_sealed, s.secret, d.attempts FROM sink_deliveries d \
                  JOIN watch_events e ON e.seq = d.event_seq JOIN accounts a ON a.id = e.account_id \
                  JOIN sinks s ON s.id = d.sink_id \
                  WHERE d.state = 'pending' AND d.next_attempt_at <= ?1 ORDER BY d.next_attempt_at, d.event_seq LIMIT ?2",
@@ -312,6 +407,10 @@ async fn deliver_one(app: &Arc<App>, d: &Due) -> Outcome {
         tracing::error!(sink = %d.sink_name, "a sink secret could not be opened; delivery failed");
         return Outcome::Fail(None);
     };
+    let Some(Ok(url)) = d.url.as_deref().map(|b| open_url(&app.vault, &d.sink_id, b)) else {
+        tracing::error!(sink = %d.sink_name, "a sink URL could not be opened; delivery failed");
+        return Outcome::Fail(None);
+    };
     let body = match serde_json::to_vec(&d.event.to_json()) {
         Ok(b) => b,
         Err(_) => return Outcome::Fail(None),
@@ -322,7 +421,7 @@ async fn deliver_one(app: &Arc<App>, d: &Due) -> Outcome {
         (EVENT_ID_HEADER, super::event_id(d.event.seq)),
         (SIGNATURE_HEADER, signature_header(&secret, t, &body)),
     ];
-    let r = app.google.gateway().post_sink(&d.url, &headers, body, Instant::now() + DELIVERY_TIMEOUT).await;
+    let r = app.google.gateway().post_sink(&url, &headers, body, Instant::now() + DELIVERY_TIMEOUT).await;
     let outcome = match r {
         Ok(s) if (200..300).contains(&s) => Outcome::Delivered(s),
         Ok(s) if s == 408 || s == 429 || s >= 500 => Outcome::Retry(Some(s)),

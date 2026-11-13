@@ -1,6 +1,6 @@
 //! Versioned schema migrations for the durable state store. Never edit a released migration; append a new one.
 
-pub const MIGRATIONS: &[&str] = &[V1, V2, V3, V_SEND_IDENTITIES, V_WATCHES, V_GMAIL_IMAP];
+pub const MIGRATIONS: &[&str] = &[V1, V2, V3, V_SEND_IDENTITIES, V_WATCHES, V_GMAIL_IMAP, V_SINK_PROJECTS];
 
 const V1: &str = r#"
 CREATE TABLE accounts (
@@ -315,4 +315,22 @@ INSERT INTO imap_folders_v6(account_id, folder_id, name, special)
     SELECT account_id, folder_id, name, special FROM imap_folders;
 DROP TABLE imap_folders;
 ALTER TABLE imap_folders_v6 RENAME TO imap_folders;
+"#;
+
+/// Sinks belong to a project and their URL is sealed (security review 2026-11-13).
+///
+/// - `sinks.project_id`: only clients of this project can see and use the sink. NULL (every sink from before this
+///   migration, or one whose project was removed) means no client can, until the operator runs
+///   `dove sinks set-project`.
+/// - `sinks.url_sealed`: the URL sealed by the vault (`seal_aux`, kind `sink_url`, scope = sink id), since Slack,
+///   Discord or ntfy URLs carry credentials. The old `url` column cannot be dropped in SQL before the URL is sealed,
+///   and sealing needs the KEK: at startup `watch::sinks::seal_legacy_urls` seals every row whose `url_sealed` is NULL
+///   and empties `url`, which then stays `''` for good.
+///
+/// No table rebuild: `watches` and `sink_deliveries` reference `sinks`, and dropping it would run their ON DELETE
+/// actions.
+const V_SINK_PROJECTS: &str = r#"
+ALTER TABLE sinks ADD COLUMN project_id TEXT REFERENCES projects(id) ON DELETE SET NULL;
+ALTER TABLE sinks ADD COLUMN url_sealed BLOB;
+CREATE INDEX sinks_project ON sinks(project_id);
 "#;

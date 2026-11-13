@@ -70,8 +70,10 @@ impl App {
         let notifier = Notifier::new(cfg.notifier.webhook_url.clone(), store.clone());
         let vault = Vault::new(kek);
         let gateway = Arc::new(Gateway::new(upstream, &cfg.limits));
-        // Webhook sinks are the only non-Google destinations; the operator's list is the allowlist.
-        gateway.set_sink_allowlist(store.call_blocking(|c| crate::watch::sinks::registered_urls(c, false))?);
+        // Sink URLs from before 0.6 are sealed first (V_SINK_PROJECTS). Webhook sinks are the only non-Google
+        // destinations; the operator's list is the allowlist.
+        store.call_blocking(|c| crate::watch::sinks::seal_legacy_urls(c, &vault))?;
+        gateway.set_sink_allowlist(store.call_blocking(|c| crate::watch::sinks::registered_urls(c, &vault, false))?);
         let tokens = TokenManager::new(
             store.clone(),
             vault.clone(),

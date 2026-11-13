@@ -230,7 +230,7 @@ async fn create_watch_validates_its_arguments_and_limits() {
     );
     assert_eq!(
         bad(json!({ "account": "info", "kind": "from", "from": "a@b.test", "sink": "https://evil.test/" })).await,
-        "invalid_argument"
+        "not_found"
     );
     // The mailbox must be indexed.
     h.admin(AdminRequest::IndexDisable { alias: "info".into() }).await.unwrap();
@@ -373,8 +373,13 @@ fn verify(secret: &str, header: &str, body: &[u8]) -> bool {
 }
 
 async fn add_sink(h: &Harness, name: &str, url: &str) -> Result<Value, String> {
+    add_sink_to(h, name, "acme", url).await
+}
+
+async fn add_sink_to(h: &Harness, name: &str, project: &str, url: &str) -> Result<Value, String> {
     h.admin(AdminRequest::SinksAdd {
         name: name.into(),
+        project: project.into(),
         url: url.into(),
         secret: Password(zeroize::Zeroizing::new(SECRET.into())),
     })
@@ -402,6 +407,7 @@ async fn sink_delivery_is_signed_content_free_and_bounded() {
     let short = h
         .admin(AdminRequest::SinksAdd {
             name: "s".into(),
+            project: "acme".into(),
             url: url.clone(),
             secret: Password(zeroize::Zeroizing::new("short".into())),
         })
@@ -410,8 +416,9 @@ async fn sink_delivery_is_signed_content_free_and_bounded() {
     add_sink(h, "hook", &url).await.unwrap();
     assert!(add_sink(h, "hook", &url).await.unwrap_err().contains("exists"));
     let listed = h.admin(AdminRequest::SinksList).await.unwrap();
-    assert_eq!(listed[0]["url"], url);
+    assert_eq!((&listed[0]["origin"], &listed[0]["project"]), (&json!(rx.base), &json!("acme")));
     assert!(!listed.to_string().contains(SECRET), "the secret is never shown");
+    assert!(!listed.to_string().contains("/hooks/dove"), "only the URL's origin is shown");
     // Agents see sink names only.
     let v = h.ok(&fx.token, "list_watches", json!({})).await;
     assert_eq!(v["sinks"], json!(["hook"]));
@@ -486,6 +493,7 @@ async fn sink_delivery_is_signed_content_free_and_bounded() {
 #[tokio::test]
 async fn gateway_posts_only_to_registered_sink_urls() {
     let h = Harness::start().await;
+    h.admin(AdminRequest::ProjectsCreate { name: "acme".into() }).await.unwrap();
     let rx = Receiver::start().await;
     let other = Receiver::start().await;
     let gw = h.app().google.gateway();
@@ -645,9 +653,11 @@ async fn keys_rotate_rewraps_sink_secrets_and_watch_filters() {
     watch::sinks::reload_allowlist(fx.h.app()).await.unwrap();
 
     let v = fx.h.admin(AdminRequest::KeysRotate).await.unwrap();
-    // Two Gmail grants, one sink secret, one watch filter.
-    assert_eq!(v["rewrapped"], 4, "{v}");
+    // Two Gmail grants, one sink secret, one sink URL, one watch filter.
+    assert_eq!(v["rewrapped"], 5, "{v}");
     assert_eq!(v["versions_in_use"], json!([2]));
+    let (_, _, sealed_url, _) = sink_row(&fx.h);
+    assert_eq!(&sealed_url.unwrap()[..4], &2u32.to_be_bytes(), "the URL is sealed under the new version");
     // Both still open: the watch matches and the push is signed with the original secret.
     fx.h.google.add_message(OWNER, spec("carol@example.com", "after rotate", None));
     fx.sync().await;
@@ -788,4 +798,108 @@ async fn rebuilds_and_backfills_do_not_fire() {
     fx.h.google.add_message(OWNER, spec("carol@example.com", "Later", None));
     fx.sync().await;
     assert_eq!(of_watch(&fx.events(&fx.token, json!({})).await, &w).len(), 1);
+}
+
+fn sink_row(h: &Harness) -> (String, String, Option<Vec<u8>>, Option<String>) {
+    h.app()
+        .store
+        .call_blocking(|c| {
+            Ok(c.query_row("SELECT id, url, url_sealed, project_id FROM sinks WHERE name = 'hook'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?)
+        })
+        .unwrap()
+}
+
+/// A sink belongs to one project: other projects' clients neither see it nor can name it (the same `not_found` as an
+/// unknown sink), and moving it to another project takes it off the old project's watches. Its URL is sealed: the
+/// state store never holds it in plaintext.
+#[tokio::test]
+async fn sinks_belong_to_one_project_and_keep_their_url_sealed() {
+    let fx = gmail().await;
+    let h = &fx.h;
+    h.project("beta", &["info"]).await;
+    let beta = h.token("beta", "beta-agent", vec![g("info", "read")]).await;
+    let rx = Receiver::start().await;
+    h.app().google.gateway().allow_plain_http_sinks_for_tests();
+    let url = format!("{}/hooks/dove-T0-credential-path", rx.base);
+    assert!(add_sink_to(h, "hook", "nope", &url).await.unwrap_err().contains("unknown project"));
+    add_sink(h, "hook", &url).await.unwrap();
+
+    assert_eq!(h.ok(&fx.token, "list_watches", json!({})).await["sinks"], json!(["hook"]));
+    assert_eq!(h.ok(&beta, "list_watches", json!({})).await["sinks"], json!([]));
+    let with_sink = |sink: &str| json!({ "account": "info", "kind": "from", "from": "a@b.test", "sink": sink });
+    assert_eq!(h.err(&beta, "create_watch", with_sink("hook")).await, "not_found");
+    assert_eq!(h.err(&beta, "create_watch", with_sink("unknown")).await, "not_found");
+    let w = fx.watch(with_sink("hook")).await;
+
+    // Sealed: the plaintext column is empty, the sealed value is not the URL, and the database files never saw it.
+    let (_, plain, sealed, _) = sink_row(h);
+    assert_eq!(plain, "");
+    let sealed = sealed.expect("sealed URL");
+    assert!(!sealed.windows(16).any(|x| url.as_bytes().windows(16).any(|y| x == y)));
+    let db = h.app().cfg.state_db_path();
+    for p in [db.clone(), db.with_extension("db-wal")] {
+        let bytes = std::fs::read(&p).unwrap_or_default();
+        assert!(!bytes.windows(20).any(|x| x == b"dove-T0-credential-p"), "{} holds the URL", p.display());
+    }
+
+    // Moving the sink to beta: acme's watch keeps working without push, beta can now use it.
+    let v = h.admin(AdminRequest::SinksSetProject { name: "hook".into(), project: "beta".into() }).await.unwrap();
+    assert_eq!(v["watches_without_push"], 1);
+    let ws = h.ok(&fx.token, "list_watches", json!({})).await;
+    assert_eq!(
+        (&ws["watches"][0]["watch_id"], &ws["watches"][0]["sink"], &ws["sinks"]),
+        (&json!(w), &Value::Null, &json!([]))
+    );
+    assert_eq!(h.err(&fx.token, "create_watch", with_sink("hook")).await, "not_found");
+    assert_eq!(h.ok(&beta, "list_watches", json!({})).await["sinks"], json!(["hook"]));
+    h.ok(&beta, "create_watch", with_sink("hook")).await;
+}
+
+/// Sinks from before 0.6 (plaintext URL, no project) are sealed at startup and serve no client, not even through a
+/// watch that already names them, until the operator assigns a project.
+#[tokio::test]
+async fn sinks_from_before_0_6_are_sealed_at_startup_and_unusable_until_assigned() {
+    let mut fx = gmail().await;
+    let rx = Receiver::start().await;
+    fx.h.app().google.gateway().allow_plain_http_sinks_for_tests();
+    let url = format!("{}/hooks/legacy", rx.base);
+    add_sink(&fx.h, "hook", &url).await.unwrap();
+    fx.watch(json!({ "account": "info", "kind": "from", "from": "carol@example.com", "sink": "hook" })).await;
+    // Turn the row into what a 0.5 store holds after the migration: plaintext URL, nothing sealed, no project.
+    let u = url.clone();
+    fx.h.app()
+        .store
+        .call_blocking(move |c| Ok(c.execute("UPDATE sinks SET url = ?1, url_sealed = NULL, project_id = NULL", [u])?))
+        .unwrap();
+    fx.h.restart().await;
+    fx.h.app().google.gateway().allow_plain_http_sinks_for_tests();
+    watch::sinks::reload_allowlist(fx.h.app()).await.unwrap();
+    let h = &fx.h;
+
+    let (id, plain, sealed, project) = sink_row(h);
+    assert_eq!((plain.as_str(), project), ("", None));
+    let opened = h.app().vault.open_aux("sink_url", &id, &sealed.unwrap()).unwrap();
+    assert_eq!(opened.as_slice(), url.as_bytes());
+    let listed = h.admin(AdminRequest::SinksList).await.unwrap();
+    assert_eq!((&listed[0]["project"], &listed[0]["origin"]), (&Value::Null, &json!(rx.base)));
+    assert!(listed[0]["note"].as_str().unwrap().contains("set-project"));
+
+    // No client sees it or can name it, and the watch that names it queues nothing.
+    assert_eq!(h.ok(&fx.token, "list_watches", json!({})).await["sinks"], json!([]));
+    let with_sink = json!({ "account": "info", "kind": "from", "from": "a@b.test", "sink": "hook" });
+    assert_eq!(h.err(&fx.token, "create_watch", with_sink.clone()).await, "not_found");
+    h.google.add_message(OWNER, spec("carol@example.com", "One", None));
+    fx.sync().await;
+    assert_eq!(watch::sinks::deliver_due(h.app(), util::now_unix()).await.unwrap().attempted, 0);
+    assert!(rx.hits().is_empty());
+
+    // Assigned: the existing watch pushes again, through the sealed URL.
+    let v = h.admin(AdminRequest::SinksSetProject { name: "hook".into(), project: "acme".into() }).await.unwrap();
+    assert_eq!(v["watches_without_push"], 0);
+    h.google.add_message(OWNER, spec("carol@example.com", "Two", None));
+    fx.sync().await;
+    assert_eq!(watch::sinks::deliver_due(h.app(), util::now_unix()).await.unwrap().delivered, 1);
+    assert_eq!(rx.hits().len(), 1);
 }

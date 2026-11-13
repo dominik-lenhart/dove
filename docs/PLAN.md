@@ -422,3 +422,11 @@ hosts or reference hardware.
   `delete` gate any trash/junk word stem in the name counts too (`TRASH_STEMS`, `JUNK_STEMS`; a false hit only asks
   for more permission). Stored `imap_folders.special` values change only at connect/reconnect (no migration): the
   gate and the trash/spam targets read the names at call time.
+  (d) Sinks belong to a project (`sinks.project_id`, store migration 7 `V_SINK_PROJECTS`): `create_watch` and
+  `list_watches` see only sinks of the caller's project, another project's sink is the same `not_found` as an unknown
+  name, and a delivery is queued only when the sink's project is the watch owner's project. `dove sinks add` requires
+  `--project`; `dove sinks set-project` moves a sink and takes it off other projects' watches. The URL is sealed
+  (`seal_aux`, kind `sink_url`, scope = sink id) and re-wrapped by `dove keys rotate`. Existing rows keep their id,
+  watches and queued deliveries (no table rebuild: dropping `sinks` would run the ON DELETE actions of `watches` and
+  `sink_deliveries`); at startup `watch::sinks::seal_legacy_urls` seals their plaintext URL and empties the old `url`
+  column, and their project stays NULL, meaning no client can use them until the operator assigns one.

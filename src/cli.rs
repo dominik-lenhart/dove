@@ -653,6 +653,9 @@ pub enum SinksCmd {
     /// Register a webhook sink: an HTTPS URL that receives signed, content-free watch events.
     Add {
         name: String,
+        /// Project whose clients may use the sink (other projects never see it).
+        #[arg(long)]
+        project: String,
         /// HTTPS URL (no query or fragment). Only this exact URL is ever contacted.
         #[arg(long)]
         url: String,
@@ -670,6 +673,15 @@ pub enum SinksCmd {
     /// Remove a sink. Watches that named it keep working without push.
     Remove {
         name: String,
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+    /// Move a sink to a project; needed for sinks created before 0.6, which belong to no project and serve no
+    /// client. Watches of other projects' clients lose the sink (pull only).
+    SetProject {
+        name: String,
+        #[arg(long)]
+        project: String,
         #[command(flatten)]
         admin: AdminOpts,
     },
@@ -793,10 +805,11 @@ fn admin_request(cmd: Command) -> anyhow::Result<(AdminOpts, AdminRequest)> {
             }
         },
         Command::Sinks(c) => match c {
-            SinksCmd::Add { name, url, secret_file, admin } => {
+            SinksCmd::Add { name, project, url, secret_file, admin } => {
                 let secret = crate::secrets::read_secret_string(&secret_file)?;
-                (admin, R::SinksAdd { name, url, secret: crate::admin::Password(secret) })
+                (admin, R::SinksAdd { name, project, url, secret: crate::admin::Password(secret) })
             }
+            SinksCmd::SetProject { name, project, admin } => (admin, R::SinksSetProject { name, project }),
             SinksCmd::List { admin } => (admin, R::SinksList),
             SinksCmd::Remove { name, admin } => (admin, R::SinksRemove { name }),
         },
@@ -987,6 +1000,21 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(std::iter::once("dove").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn sinks_add_needs_a_project() {
+        let add = ["sinks", "add", "n8n", "--url", "https://hooks.example.com/x", "--secret-file", "/tmp/s"];
+        assert!(parse(&add).is_err(), "--project is required");
+        let with_project: Vec<&str> = add.iter().copied().chain(["--project", "acme"]).collect();
+        let Command::Sinks(SinksCmd::Add { project, .. }) = parse(&with_project).unwrap().command else { panic!() };
+        assert_eq!(project, "acme");
+        let Command::Sinks(SinksCmd::SetProject { name, project, .. }) =
+            parse(&["sinks", "set-project", "n8n", "--project", "beta"]).unwrap().command
+        else {
+            panic!()
+        };
+        assert_eq!((name.as_str(), project.as_str()), ("n8n", "beta"));
     }
 
     #[test]

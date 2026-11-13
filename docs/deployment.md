@@ -745,17 +745,26 @@ seconds. Mail sent by the mailbox itself, drafts, and spam or trash never fire a
 kind, account alias, message id, thread id and received time, never a subject, sender or body: the agent reads the
 message with its own token. Events are kept 14 days and pulled with `list_watch_events` (opaque cursor).
 
-Push delivery is optional and set up by the operator only. A sink is a name, an HTTPS URL and a signing secret:
+Push delivery is optional and set up by the operator only. A sink is a name, a project, an HTTPS URL and a signing
+secret:
 
 ```sh
 umask 077; openssl rand -hex 32 > ~/dove-hook.secret
-dove sinks add n8n --url https://hooks.example.com/dove --secret-file ~/dove-hook.secret
-dove sinks list        # URL, active watches, pending/delivered/failed deliveries (never the secret)
+dove sinks add n8n --project acme --url https://hooks.example.com/dove --secret-file ~/dove-hook.secret
+dove sinks list        # project, URL origin, active watches, pending/delivered/failed deliveries (never the secret)
+dove sinks set-project n8n --project other   # move it; the old project's watches keep working without push
 dove sinks remove n8n  # watches that used it keep working without push
 ```
 
-The CLI reads the secret file (no group or other access: 0400 or 0600) and the service stores it sealed with the
-KEK (`dove keys rotate` re-wraps it); the file is not needed afterwards. Surrounding whitespace, such as the final
+A sink belongs to one project: only clients of that project see its name and can name it on a watch; for clients
+of other projects it does not exist (`not_found`, like an unknown name). The URL is stored sealed with the KEK like the
+secret, because Slack, Discord or ntfy URLs carry credentials, and `dove sinks list` shows only its origin. The CLI
+reads the secret file (no group or other access: 0400 or 0600) and the service stores it sealed with the KEK
+(`dove keys rotate` re-wraps URL and secret); the file is not needed afterwards.
+
+Upgrading from 0.5 or earlier: existing sinks have their URL sealed at the first start and belong to no project, so
+no client can use them and their watches push nothing (events stay pullable) until you assign one with
+`dove sinks set-project <name> --project <project>`. `dove sinks list` marks them. Surrounding whitespace, such as the final
 newline, is not part of the secret: give the receiver the same trimmed value. Only `https` URLs without credentials, query
 or fragment are accepted, and the service POSTs to exactly the registered URLs and nowhere else. Agents see sink
 names in `list_watches` and may name one in `create_watch`; they can never supply a URL.
