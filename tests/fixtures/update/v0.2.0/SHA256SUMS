@@ -1,2 +1,4 @@
 f4f1e26c2e2dcb7112185ed3ea10e84cf17e668b44640135b97aba862f698c6f  dove-v0.2.0-aarch64-apple-darwin.tar.gz
 c9a5ed38ad311aecd87bed96334a3d19a9354f932be3e9899412d3f85ad5b9ec  dove-v0.2.0-x86_64-unknown-linux-gnu.tar.gz
+b3bc7d5f2152d5a4472a3aa26bf26fdab584f36818b7e4e90bb09df39c84b977  dove-v0.2.0-x86_64-unknown-linux-musl.tar.gz
+9b689f3be7fb2487c108cb956f17f52a695b54c1719f62e6a66ca136b71067f4  dove-v0.2.0-x86_64-pc-windows-msvc.zip

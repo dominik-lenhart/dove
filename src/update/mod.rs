@@ -42,12 +42,19 @@ pub fn repo_slug() -> &'static str {
     REPOSITORY_URL.strip_prefix("https://github.com/").unwrap_or(REPOSITORY_URL).trim_end_matches('/')
 }
 
-/// Release target triple of this build, when releases are published for it.
+/// Release target triple of this build, when releases are published for it. A musl build keeps choosing musl
+/// assets and a glibc build glibc ones, so an upgrade never swaps the libc a binary was built for.
 pub fn current_target() -> Option<&'static str> {
     if cfg!(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")) {
         Some("x86_64-unknown-linux-gnu")
     } else if cfg!(all(target_os = "linux", target_env = "gnu", target_arch = "aarch64")) {
         Some("aarch64-unknown-linux-gnu")
+    } else if cfg!(all(target_os = "linux", target_env = "musl", target_arch = "x86_64")) {
+        Some("x86_64-unknown-linux-musl")
+    } else if cfg!(all(target_os = "linux", target_env = "musl", target_arch = "aarch64")) {
+        Some("aarch64-unknown-linux-musl")
+    } else if cfg!(all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")) {
+        Some("x86_64-pc-windows-msvc")
     } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
         Some("x86_64-apple-darwin")
     } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
@@ -169,9 +176,20 @@ pub fn decide(current: &Version, latest: Option<&Version>, requested: Option<&Ve
     }
 }
 
+/// Windows releases are `.zip` archives holding `dove.exe`; every other target is a `.tar.gz` holding `dove`.
+pub fn is_zip_target(target: &str) -> bool {
+    target.contains("-windows-")
+}
+
 /// Archive file name of a release for a target.
 pub fn archive_name(tag: &str, target: &str) -> String {
-    format!("dove-{tag}-{target}.tar.gz")
+    let ext = if is_zip_target(target) { "zip" } else { "tar.gz" };
+    format!("dove-{tag}-{target}.{ext}")
+}
+
+/// Name of the binary inside the archive of a target.
+pub fn binary_name(target: &str) -> &'static str {
+    if is_zip_target(target) { "dove.exe" } else { "dove" }
 }
 
 /// Downloads a release for `src.target` and returns the verified `dove` binary.
@@ -271,6 +289,9 @@ pub fn expected_sha256(sums: &[u8], name: &str) -> anyhow::Result<Option<String>
 /// below `dove-<tag>-<target>/`; any other entry type, absolute path or `..` component rejects the whole archive.
 /// Nothing is written to disk here.
 pub fn extract_binary(archive: &[u8], tag: &str, target: &str) -> anyhow::Result<Vec<u8>> {
+    if is_zip_target(target) {
+        return extract_zip_binary(archive, tag, target);
+    }
     let top = format!("dove-{tag}-{target}");
     let wanted = Path::new(&top).join("dove");
     let gz = flate2::read::GzDecoder::new(archive).take(MAX_UNPACKED_BYTES);
@@ -315,6 +336,64 @@ pub fn extract_binary(archive: &[u8], tag: &str, target: &str) -> anyhow::Result
         bail!("the dove binary in the release archive is empty");
     }
     Ok(binary)
+}
+
+/// The zip twin of [`extract_binary`] for Windows releases: only directories and regular files below
+/// `dove-<tag>-<target>/` are allowed, `..`, backslashes, drive letters, absolute paths and symlinks reject the whole
+/// archive, and only `dove.exe` is decompressed (bounded).
+fn extract_zip_binary(archive: &[u8], tag: &str, target: &str) -> anyhow::Result<Vec<u8>> {
+    let top = format!("dove-{tag}-{target}");
+    let wanted = format!("{top}/{}", binary_name(target));
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(archive)).context("release archive is not a valid zip")?;
+    // The reader keeps one entry per name, which would hide a second `dove.exe`; refuse such archives outright.
+    if zip.has_duplicate_names() {
+        bail!("release archive contains {wanted} twice (duplicate entry names)");
+    }
+    let mut index: Option<usize> = None;
+    for i in 0..zip.len() {
+        let e = zip.by_index_raw(i).context("release archive is damaged")?;
+        let name = e.name().map_err(|_| anyhow!("release archive has an unreadable entry name"))?.into_owned();
+        let is_dir = name.ends_with('/');
+        let trimmed = name.strip_suffix('/').unwrap_or(&name);
+        let unsafe_name = trimmed.is_empty()
+            || name.starts_with('/')
+            || name.bytes().any(|b| b == b'\\' || b == b':' || b == 0)
+            || trimmed.split('/').any(|c| c.is_empty() || c == "." || c == "..");
+        if unsafe_name {
+            bail!("release archive contains an unsafe path ({name:?}): refusing to install");
+        }
+        if trimmed != top && !trimmed.starts_with(&format!("{top}/")) {
+            bail!("release archive contains an entry outside {top}/: refusing to install");
+        }
+        if is_dir {
+            continue;
+        }
+        // The file type bits of the unix mode mark a symlink or special file. A plain file has S_IFREG, or none at all
+        // (zips made on Windows, and Python's `writestr`, leave them out).
+        if e.unix_mode().is_some_and(|m| !matches!(m & 0o170000, 0 | 0o100000)) || e.is_symlink() {
+            bail!("release archive contains a link or special file ({name}): refusing to install");
+        }
+        if name == wanted {
+            if index.is_some() {
+                bail!("release archive contains {wanted} twice");
+            }
+            if e.size() > MAX_BINARY_BYTES {
+                bail!("the dove binary in the release archive is too large");
+            }
+            index = Some(i);
+        }
+    }
+    let index = index.ok_or_else(|| anyhow!("release archive has no {wanted}"))?;
+    let entry = zip.by_index(index).context("release archive is damaged")?;
+    let mut data = Vec::new();
+    entry.take(MAX_BINARY_BYTES + 1).read_to_end(&mut data).context("release archive is damaged")?;
+    if data.len() as u64 > MAX_BINARY_BYTES {
+        bail!("the dove binary in the release archive is too large");
+    }
+    if data.is_empty() {
+        bail!("the dove binary in the release archive is empty");
+    }
+    Ok(data)
 }
 
 fn sudo_hint(dir: &Path) -> String {
@@ -581,6 +660,98 @@ mod tests {
         refused(&[("dove-v1.0.0-t/README.md", F, b"r"), ("dove-v1.0.0-t/dove", L, b"")], "link or special file");
         refused(&[("dove-v1.0.0-t/dove/x", F, bin)], "has no");
         assert!(extract_binary(b"not a gzip stream", "v1.0.0", "t").is_err());
+    }
+
+    #[test]
+    fn archive_and_binary_names_follow_the_target() {
+        assert_eq!(archive_name("v1.0.0", "x86_64-unknown-linux-gnu"), "dove-v1.0.0-x86_64-unknown-linux-gnu.tar.gz");
+        assert_eq!(
+            archive_name("v1.0.0", "aarch64-unknown-linux-musl"),
+            "dove-v1.0.0-aarch64-unknown-linux-musl.tar.gz"
+        );
+        assert_eq!(archive_name("v1.0.0", "aarch64-apple-darwin"), "dove-v1.0.0-aarch64-apple-darwin.tar.gz");
+        assert_eq!(archive_name("v1.0.0", "x86_64-pc-windows-msvc"), "dove-v1.0.0-x86_64-pc-windows-msvc.zip");
+        assert_eq!(binary_name("x86_64-pc-windows-msvc"), "dove.exe");
+        assert_eq!(binary_name("x86_64-unknown-linux-musl"), "dove");
+    }
+
+    /// A build keeps the libc it was made for: this test binary's own triple maps to the same libc.
+    #[test]
+    fn current_target_keeps_the_libc() {
+        let t = current_target().expect("tests run on a release platform");
+        assert_eq!(t.ends_with("-musl"), cfg!(target_env = "musl"), "{t}");
+        assert_eq!(t.ends_with("-gnu"), cfg!(all(target_os = "linux", target_env = "gnu")), "{t}");
+        assert_eq!(t.contains("-windows-"), cfg!(windows), "{t}");
+        assert_eq!(t.starts_with("x86_64-"), cfg!(target_arch = "x86_64"), "{t}");
+    }
+
+    /// Builds a zip from (path, data, unix mode); a mode of 0o120777 makes a symlink entry whose target is `data`.
+    fn zip_archive(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (path, data, mode) in entries {
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated)
+                .unix_permissions(*mode);
+            if path.ends_with('/') {
+                w.add_directory(*path, opts).unwrap();
+            } else if *mode == 0o120777 {
+                w.add_symlink(*path, std::str::from_utf8(data).unwrap(), opts).unwrap();
+            } else {
+                w.start_file(*path, opts).unwrap();
+                w.write_all(data).unwrap();
+            }
+        }
+        w.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn zip_archive_shape_rules() {
+        const T: &str = "x86_64-pc-windows-msvc";
+        let ok = |e: &[(&str, &[u8], u32)]| extract_binary(&zip_archive(e), "v1.0.0", T);
+        let bin: &[u8] = b"MZ binary";
+        let top = "dove-v1.0.0-x86_64-pc-windows-msvc";
+        let exe = format!("{top}/dove.exe");
+        assert_eq!(
+            ok(&[(&format!("{top}/"), b"", 0o755), (&exe, bin, 0o644), (&format!("{top}/README.md"), b"r", 0o644)])
+                .unwrap(),
+            bin
+        );
+        // Zips made on Windows carry no unix mode at all.
+        let no_mode = {
+            let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            w.start_file(&exe, zip::write::SimpleFileOptions::default()).unwrap();
+            std::io::Write::write_all(&mut w, bin).unwrap();
+            w.finish().unwrap().into_inner()
+        };
+        assert_eq!(extract_binary(&no_mode, "v1.0.0", T).unwrap(), bin);
+
+        let refused = |e: &[(&str, &[u8], u32)], why: &str| {
+            let err = format!("{:#}", ok(e).unwrap_err());
+            assert!(err.contains(why), "{err}");
+        };
+        refused(&[(&exe, bin, 0o644), ("other/dove.exe", bin, 0o644)], "outside dove-v1.0.0-x86_64-pc-windows-msvc/");
+        refused(&[("dove-v0.9.0-x86_64-pc-windows-msvc/dove.exe", bin, 0o644)], "outside");
+        refused(&[(&format!("{top}/../../evil.exe"), bin, 0o644)], "unsafe path");
+        refused(&[(&format!("{top}\\dove.exe"), bin, 0o644)], "unsafe path");
+        refused(&[("/etc/dove.exe", bin, 0o644)], "unsafe path");
+        refused(&[("C:evil.exe", bin, 0o644)], "unsafe path");
+        refused(&[(&format!("{top}//dove.exe"), bin, 0o644)], "unsafe path");
+        refused(&[(&format!("{top}/README.md"), b"r", 0o644)], "has no dove-v1.0.0-x86_64-pc-windows-msvc/dove.exe");
+        refused(&[(&exe, b"", 0o644)], "empty");
+        refused(&[(&format!("{top}/README.md"), b"r", 0o644), (&exe, b"/bin/sh", 0o120777)], "link or special file");
+        refused(&[(&format!("{top}/dove.exe/x"), bin, 0o644)], "has no");
+        // The writer refuses duplicate names, so rename one entry in the bytes (same length, names are not checksummed).
+        let mut twice = zip_archive(&[(&exe, bin, 0o644), (&format!("{top}/dove.exf"), bin, 0o644)]);
+        for i in (0..twice.len() - 8).filter(|i| &twice[*i..*i + 8] == b"dove.exf").collect::<Vec<_>>() {
+            twice[i..i + 8].copy_from_slice(b"dove.exe");
+        }
+        let err = format!("{:#}", extract_binary(&twice, "v1.0.0", T).unwrap_err());
+        assert!(err.contains("twice"), "{err}");
+        assert!(extract_binary(b"not a zip", "v1.0.0", T).is_err());
+        // The tar rules do not apply to a zip target and vice versa.
+        assert!(extract_binary(&tar_gz(&[("dove-v1.0.0-t/dove", tar::EntryType::Regular, bin)]), "v1.0.0", T).is_err());
+        assert!(extract_binary(&zip_archive(&[(&exe, bin, 0o644)]), "v1.0.0", "t").is_err());
     }
 
     #[test]
