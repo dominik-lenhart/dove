@@ -393,8 +393,9 @@ hosts or reference hardware.
   first makes startup fail) and remote clients rejected. The server reads each client's user SID from its process
   token (`GetNamedPipeClientProcessId`) and admits only its own SID; the CLI checks the server's SID the same way
   before sending (a squatting pipe could collect a mailbox password). `admin.operator_uid` is ignored on Windows. (f)
-  The CLI's admin endpoint: `--socket`/`DOVE_ADMIN_SOCKET`, else `/run/dove/admin.sock` when it exists, else the
-  socket of this user's local config, else the server default (Windows: this user's pipe). (g) Login items: a
+  The CLI's admin endpoint (`cli::choose_admin_socket`): `--socket`/`DOVE_ADMIN_SOCKET`; a visible
+  `/run/dove/admin.sock` together with a local config is refused (choose with `--socket`); else whichever exists; else
+  the server default (Windows: this user's pipe). Every admin command names the instance that answered on stderr. (g) Login items: a
   `systemd --user` unit (`dove.service`, journal), a launchd agent `io.github.dominik-lenhart.dove` and a Task
   Scheduler logon task "Dove (<user>)" running `conhost --headless` (no console window), both writing
   `<data>/dove.log` (rotated once at start past 10 MB). None needs administrator rights. (h) Windows `dove upgrade`

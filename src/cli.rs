@@ -28,28 +28,54 @@ pub struct AdminOpts {
 }
 
 impl AdminOpts {
-    pub fn socket(&self) -> PathBuf {
+    /// The admin endpoint for this command (see [`resolve_admin_socket`]).
+    pub fn target(&self) -> anyhow::Result<AdminTarget> {
         resolve_admin_socket(self.socket.clone())
     }
 }
 
-/// The admin endpoint to use: an explicit `--socket`/`DOVE_ADMIN_SOCKET`; else the server-mode socket when it exists;
-/// else the one in this user's local-mode config; else the server-mode default (Windows: this user's pipe).
-pub fn resolve_admin_socket(explicit: Option<PathBuf>) -> PathBuf {
-    if let Some(p) = explicit {
-        return p;
+/// Which Dove instance an admin command talks to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdminTarget {
+    /// `--socket` / `DOVE_ADMIN_SOCKET`.
+    Explicit(PathBuf),
+    /// The server-mode service (`/run/dove/admin.sock`, or the default when nothing else is found).
+    Server(PathBuf),
+    /// This user's local-mode instance (`dove local init`).
+    Local(PathBuf),
+}
+
+impl AdminTarget {
+    pub fn path(&self) -> &std::path::Path {
+        match self {
+            AdminTarget::Explicit(p) | AdminTarget::Server(p) | AdminTarget::Local(p) => p,
+        }
     }
+
+    /// The stderr line naming the instance that answered (L3).
+    pub fn answered_by(&self) -> String {
+        match self {
+            AdminTarget::Explicit(p) => format!("dove: answered by the admin socket {}", p.display()),
+            AdminTarget::Server(p) => format!("dove: answered by the server instance ({})", p.display()),
+            AdminTarget::Local(p) => format!("dove: answered by your local instance ({})", p.display()),
+        }
+    }
+}
+
+/// The admin endpoint from the environment: `--socket`/`DOVE_ADMIN_SOCKET`, else the server-mode socket or this
+/// user's local-mode instance, refusing to guess when both exist.
+pub fn resolve_admin_socket(explicit: Option<PathBuf>) -> anyhow::Result<AdminTarget> {
     #[cfg(unix)]
-    if std::path::Path::new(config::DEFAULT_ADMIN_SOCKET).exists() {
-        return PathBuf::from(config::DEFAULT_ADMIN_SOCKET);
-    }
-    if let Ok(paths) = crate::platform::paths::local_paths()
-        && paths.config_file.exists()
-    {
-        return config::Config::load(&paths.config_file)
-            .map(|c| c.admin.socket_path)
-            .unwrap_or_else(|_| paths.admin_socket());
-    }
+    let server = std::path::Path::new(config::DEFAULT_ADMIN_SOCKET).exists();
+    #[cfg(windows)]
+    let server = false;
+    let local = crate::platform::paths::local_paths().ok().filter(|p| p.config_file.exists()).map(|paths| {
+        config::Config::load(&paths.config_file).map(|c| c.admin.socket_path).unwrap_or_else(|_| paths.admin_socket())
+    });
+    choose_admin_socket(explicit, server, local, default_server_socket())
+}
+
+fn default_server_socket() -> PathBuf {
     #[cfg(unix)]
     {
         PathBuf::from(config::DEFAULT_ADMIN_SOCKET)
@@ -58,6 +84,36 @@ pub fn resolve_admin_socket(explicit: Option<PathBuf>) -> PathBuf {
     {
         PathBuf::from(crate::platform::paths::default_admin_pipe())
     }
+}
+
+/// The decision behind [`resolve_admin_socket`]: an explicit socket wins; a visible server-mode socket and a local
+/// config together are ambiguous and refused (L3: an admin command must never switch instances silently); else
+/// whichever exists; else the server default.
+pub fn choose_admin_socket(
+    explicit: Option<PathBuf>,
+    server_socket_exists: bool,
+    local_socket: Option<PathBuf>,
+    server_default: PathBuf,
+) -> anyhow::Result<AdminTarget> {
+    Ok(match (explicit, server_socket_exists, local_socket) {
+        (Some(p), _, _) => AdminTarget::Explicit(p),
+        (None, true, Some(local)) => anyhow::bail!(
+            "both a server-mode Dove ({}) and your local-mode Dove ({}) are present; choose one with --socket",
+            server_default.display(),
+            local.display()
+        ),
+        (None, true, None) => AdminTarget::Server(server_default),
+        (None, false, Some(local)) => AdminTarget::Local(local),
+        (None, false, None) => AdminTarget::Server(server_default),
+    })
+}
+
+/// Sends one admin request and names the instance that answered on stderr.
+async fn admin_send(admin: &AdminOpts, req: &AdminRequest) -> anyhow::Result<Value> {
+    let target = admin.target()?;
+    let v = admin_client::send(target.path(), req).await?;
+    eprintln!("{}", target.answered_by());
+    Ok(v)
 }
 
 #[derive(Subcommand)]
@@ -367,7 +423,7 @@ fn read_password(prompt: &str, from_stdin: bool) -> anyhow::Result<crate::admin:
 
 /// `accounts reconnect`: Gmail accounts get a new authorization link; IMAP accounts are asked for the password.
 async fn reconnect(alias: String, password_stdin: bool, admin: &AdminOpts) -> anyhow::Result<Value> {
-    let list = admin_client::send(&admin.socket(), &AdminRequest::AccountsList).await?;
+    let list = admin_send(admin, &AdminRequest::AccountsList).await?;
     let provider = list
         .as_array()
         .and_then(|a| a.iter().find(|r| r["alias"] == alias.as_str()))
@@ -380,7 +436,7 @@ async fn reconnect(alias: String, password_stdin: bool, admin: &AdminOpts) -> an
     } else {
         AdminRequest::AccountsReconnect { alias }
     };
-    admin_client::send(&admin.socket(), &req).await
+    admin_send(admin, &req).await
 }
 
 #[derive(Subcommand)]
@@ -813,7 +869,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<u8> {
             let opts = crate::update::UpgradeOpts {
                 check: a.check,
                 version: a.version,
-                socket: resolve_admin_socket(a.socket),
+                // Best effort: an ambiguous setup only skips the restart hint.
+                socket: resolve_admin_socket(a.socket).ok().map(|t| t.path().to_path_buf()),
             };
             crate::update::run_upgrade(opts).await
         }
@@ -864,7 +921,7 @@ async fn run_command(command: Command) -> anyhow::Result<()> {
             crate::tailscale::setup(&opts, &crate::tailscale::Tailscale::from_path(), &mut std::io::stdout()).await
         }
         Command::Doctor { profile: None, admin } => {
-            let mut v = admin_client::send(&admin.socket(), &AdminRequest::Doctor).await?;
+            let mut v = admin_send(&admin, &AdminRequest::Doctor).await?;
             add_binary_version(&mut v);
             if !is_local(&v) {
                 crate::tailscale::add_doctor_check(&mut v, &crate::tailscale::Tailscale::from_path()).await;
@@ -879,7 +936,7 @@ async fn run_command(command: Command) -> anyhow::Result<()> {
         }
         other => {
             let (opts, req) = admin_request(other)?;
-            let v = admin_client::send(&opts.socket(), &req).await?;
+            let v = admin_send(&opts, &req).await?;
             print(&v, opts.json);
             Ok(())
         }
@@ -890,6 +947,28 @@ async fn run_command(command: Command) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use crate::imap::TlsMode;
+
+    /// The admin endpoint's order (L3): explicit wins, a server socket and a local config together are refused
+    /// instead of silently picking one, otherwise whichever exists, and the server default last.
+    #[test]
+    fn admin_socket_resolution_order() {
+        let server = || PathBuf::from("/run/dove/admin.sock");
+        let local = || Some(PathBuf::from("/home/a/.local/share/dove/admin.sock"));
+        let mine = PathBuf::from("/tmp/x.sock");
+        for (srv, loc) in [(true, local()), (false, local()), (true, None), (false, None)] {
+            assert_eq!(
+                choose_admin_socket(Some(mine.clone()), srv, loc, server()).unwrap(),
+                AdminTarget::Explicit(mine.clone())
+            );
+        }
+        let err = choose_admin_socket(None, true, local(), server()).unwrap_err().to_string();
+        assert!(err.contains("--socket") && err.contains("/run/dove/admin.sock"), "{err}");
+        assert_eq!(choose_admin_socket(None, true, None, server()).unwrap(), AdminTarget::Server(server()));
+        assert_eq!(choose_admin_socket(None, false, local(), server()).unwrap(), AdminTarget::Local(local().unwrap()));
+        assert_eq!(choose_admin_socket(None, false, None, server()).unwrap(), AdminTarget::Server(server()));
+        assert!(AdminTarget::Local(local().unwrap()).answered_by().contains("local instance"));
+        assert!(AdminTarget::Server(server()).answered_by().contains("server instance"));
+    }
 
     #[test]
     fn port_override_uses_the_preset_host() {

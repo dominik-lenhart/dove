@@ -162,6 +162,8 @@ async fn local_init_start_admin_and_stop() {
     if !Path::new(dove::config::DEFAULT_ADMIN_SOCKET).exists() {
         let o = e.ok(&["projects", "list", "--json"], "").await;
         assert!(o.stdout.contains("assistant"), "{}", o.stdout);
+        // Which instance answered is always named on stderr (L3).
+        assert!(o.stderr.contains(&format!("answered by your local instance ({sock_s})")), "{}", o.stderr);
     }
 
     // Plain HTTP on the loopback origin, and only with that exact Host.
