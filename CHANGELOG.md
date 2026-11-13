@@ -5,6 +5,33 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-13
+
+Agent feedback: answering "whom have I not replied to?" took many calls, broad searches were dominated by the
+user's own mail, `coverage: partial` did not say whether to wait, and snippets could show credentials.
+
+### Added
+
+- `search_messages` thread view: `group_by: "thread"` returns one row per mailbox and thread with the latest
+  message's columns, `message_count`, `matched_count` and reply status (`last_sender_is_self`, `last_inbound_at`,
+  `last_outbound_at`, `awaiting_reply`). The thread filter `awaiting_reply: true|false` keeps threads whose latest
+  non-draft message is or is not from the mailbox itself. It is a rule over indexed mail, not a judgement whether a
+  reply is needed; a reply sent from another mailbox is not seen.
+- `from_self` as a filter and a column: the mailbox's own address, its IMAP aliases, or the `SENT` label.
+- `dove search --from-self`, `--not-from-self`, `--threads` and `--awaiting-reply`.
+- Optional secret redaction per connection (`dove clients set-redaction <name> on|off`, `--redact-secrets` on
+  `clients create` and `clients invite`, off by default). Passwords, keys and one-time codes in subjects and snippets
+  of `search_messages`, `digest` and `list_drafts` read `[redacted]`, and rows say `redacted: true`. `get_message`,
+  `get_thread`, `get_draft` and attachments stay complete. The detector is heuristic: secrets without a label or a
+  known format are not caught.
+
+### Changed
+
+- Coverage exceptions and `account_errors` in `search_messages`, `digest` and `search_contacts` carry `resolves`
+  (`automatic`, `operator` or `never`), a `hint`, and where known `next_sync_at`, `next_retry_at` and
+  `retry_after_seconds`; partial results carry a top-level `hint`. Messages listed but not fetched yet during a
+  backfill are reported as `queued`, not as "pending retry".
+
 ## [0.6.0] - 2026-11-13
 
 Security hardening from an internal audit. Read "Upgrading" before you update a server with webhook sinks.
@@ -204,7 +231,8 @@ First release.
   release only after verifying its minisign signature. The CLI hints at a new release at most once a day
   (`DOVE_NO_UPDATE_CHECK=1` turns it off); the server never checks for updates.
 
-[Unreleased]: https://github.com/dominik-lenhart/dove/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/dominik-lenhart/dove/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/dominik-lenhart/dove/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/dominik-lenhart/dove/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/dominik-lenhart/dove/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/dominik-lenhart/dove/compare/v0.3.0...v0.4.0
