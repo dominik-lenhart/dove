@@ -5,6 +5,7 @@ pub mod batch;
 pub mod compose;
 pub mod drafts;
 pub mod drafts_imap;
+pub mod organize;
 pub mod read;
 pub mod search;
 
@@ -152,6 +153,7 @@ pub fn registry() -> Vec<ToolDef> {
     v.extend(search::defs());
     v.extend(batch::defs());
     v.extend(drafts::defs());
+    v.extend(organize::defs());
     v
 }
 

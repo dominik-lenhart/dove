@@ -31,7 +31,7 @@ use crate::app::App;
 use crate::config::OAuthConfig;
 use crate::http::{html_escape, page};
 use crate::invite::{self, audit_auth};
-use crate::policy::Actions;
+use crate::policy::{Actions, PRESETS};
 use crate::tokens::{self, Pepper};
 use crate::util;
 
@@ -414,7 +414,7 @@ fn invitation_page(p: &Pending, rid: &str, error: Option<&str>) -> Response {
     html(StatusCode::OK, page("Connect to Dove", &body), origin_of(&p.redirect_uri).as_deref())
 }
 
-fn approval_page(p: &Pending, rid: &str, inv: &invite::Invitation, error: Option<&str>) -> Response {
+fn approval_page(p: &Pending, rid: &str, inv: &invite::Invitation, allow_send: bool, error: Option<&str>) -> Response {
     let err = error.map(|e| format!("<p role=\"alert\"><b>{}</b></p>", html_escape(e))).unwrap_or_default();
     let mut rows = String::new();
     // Fields are named by the immutable account id, never by position: the list can change between render and
@@ -422,26 +422,39 @@ fn approval_page(p: &Pending, rid: &str, inv: &invite::Invitation, error: Option
     for g in &inv.grants {
         let a = Actions::parse(&g.actions).unwrap_or_default();
         let id = html_escape(&g.account_id);
+        // Presets the invitation covers; "custom" (the default) means the checkboxes decide.
+        let mut options = String::from("<option value=\"custom\" selected>custom (checkboxes)</option>");
+        for (name, _) in PRESETS {
+            if Actions::preset(name).is_some_and(|p| p.intersect(&a) == p) {
+                options.push_str(&format!("<option value=\"{name}\">{name}</option>"));
+            }
+        }
         rows.push_str(&format!(
-            "<li><label><input type=\"checkbox\" name=\"read.{id}\" checked> <b>{}</b>: read</label>",
+            "<li><b>{}</b> <label>preset <select name=\"preset.{id}\">{options}</select></label> \
+             <label><input type=\"checkbox\" name=\"read.{id}\" checked> read</label>",
             html_escape(&g.alias)
         ));
-        if a.draft {
-            rows.push_str(&format!(
-                " <label><input type=\"checkbox\" name=\"draft.{id}\" checked> create and edit drafts</label>"
-            ));
-        }
-        if a.send {
-            rows.push_str(&format!(
-                " <label><input type=\"checkbox\" name=\"send.{id}\" checked> send own drafts</label>"
-            ));
+        // Defaults (design 2026-11-13): draft and organize on, delete and send off.
+        for (on, field, checked, label) in [
+            (a.draft, "draft", true, "create and edit drafts"),
+            (a.organize, "organize", true, "organize (read/unread, flags, labels, move, archive)"),
+            (a.delete, "delete", false, "move to Trash"),
+            (a.send && allow_send, "send", false, "send own drafts"),
+        ] {
+            if on {
+                rows.push_str(&format!(
+                    " <label><input type=\"checkbox\" name=\"{field}.{id}\"{}> {label}</label>",
+                    if checked { " checked" } else { "" }
+                ));
+            }
         }
         rows.push_str("</li>");
     }
     let body = format!(
         "{app}{err}<p>Project: <b>{project}</b><br>Connection name: <b>{conn}</b></p>\
          <form method=\"post\" action=\"{AUTHORIZE_PATH}\">{hidden}\
-         <p>Mailboxes and actions this application may use:</p><ul>{rows}</ul>\
+         <p>Mailboxes and actions this application may use. A preset other than custom replaces the checkboxes \
+         (send stays a separate choice).</p><ul>{rows}</ul>\
          <p><button name=\"action\" value=\"approve\">Approve</button> \
          <button name=\"action\" value=\"cancel\">Deny</button></p></form>",
         app = app_description(&p.app, &p.redirect_uri),
@@ -622,7 +635,7 @@ async fn authorize_post(State(app): State<Arc<App>>, req: Request) -> Response {
                 Ok(Some(inv)) if !inv.grants.is_empty() => {
                     p.invitation_id = Some(inv.id.clone());
                     p.shown = inv.grants.clone();
-                    let r = approval_page(&p, &rid, &inv, None);
+                    let r = approval_page(&p, &rid, &inv, app.cfg.allow_send, None);
                     put_back(p);
                     r
                 }
@@ -670,6 +683,7 @@ async fn approve(
     let dynamic = p.app.dynamic;
     let shown = p.shown.clone();
     let code_ttl = app.cfg.oauth.code_ttl_secs;
+    let allow_send = app.cfg.allow_send;
     let form = form.clone();
     let result = app
         .store
@@ -698,10 +712,16 @@ async fn approve(
             let mut selected = BTreeMap::new();
             for g in &inv.grants {
                 let id = &g.account_id;
-                let a = Actions {
-                    read: checked(format!("read.{id}")),
-                    draft: checked(format!("draft.{id}")),
-                    send: checked(format!("send.{id}")),
+                let send = allow_send && checked(format!("send.{id}"));
+                let a = match form.get(&format!("preset.{id}")).and_then(|p| Actions::preset(p)) {
+                    Some(p) => Actions { send, ..p },
+                    None => Actions {
+                        read: checked(format!("read.{id}")),
+                        draft: checked(format!("draft.{id}")),
+                        organize: checked(format!("organize.{id}")),
+                        delete: checked(format!("delete.{id}")),
+                        send,
+                    },
                 };
                 selected.insert(g.account_id.clone(), a);
             }
@@ -750,7 +770,7 @@ async fn approve(
             redirect_to(&p.redirect_uri, &params)
         }
         Ok(Approval::NothingSelected(inv)) => {
-            let r = approval_page(&p, &rid, &inv, Some("Select at least one mailbox, or deny."));
+            let r = approval_page(&p, &rid, &inv, app.cfg.allow_send, Some("Select at least one mailbox, or deny."));
             app.oauth.pending.lock().expect("lock").insert(rid, p);
             r
         }

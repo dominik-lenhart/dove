@@ -17,46 +17,137 @@ use crate::util;
 pub enum Capability {
     Read,
     Draft,
+    Organize,
+    Delete,
     Send,
 }
 
+impl Capability {
+    pub const ALL: [Capability; 5] =
+        [Capability::Read, Capability::Draft, Capability::Organize, Capability::Delete, Capability::Send];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Capability::Read => "read",
+            Capability::Draft => "draft",
+            Capability::Organize => "organize",
+            Capability::Delete => "delete",
+            Capability::Send => "send",
+        }
+    }
+}
+
+/// The actions one grant allows on one mailbox (design 2026-11-13 section 1). Stored expanded as a comma list.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct Actions {
     pub read: bool,
     pub draft: bool,
+    pub organize: bool,
+    pub delete: bool,
     pub send: bool,
 }
 
+/// Presets: input sugar for `--grant` and the approval page. Never stored, so a preset changed later never widens
+/// an existing grant. `send` is in none of them.
+pub const PRESETS: &[(&str, &str)] = &[
+    ("reader", "read"),
+    ("drafter", "read,draft"),
+    ("assistant", "read,draft,organize"),
+    ("full", "read,draft,organize,delete"),
+];
+
 impl Actions {
-    /// Parses `read,draft[,send]`. Enforces draft => read and send => read + draft (FR-P2).
+    /// Parses a stored action list (`read,draft,organize`). Presets are not accepted here; see
+    /// [`Actions::parse_grant`] for operator input. Enforces the dependency rules.
     pub fn parse(s: &str) -> Result<Self, String> {
         let mut a = Actions::default();
         for part in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
-            match part {
-                "read" => a.read = true,
-                "draft" => a.draft = true,
-                "send" => a.send = true,
-                other => {
-                    return Err(format!("unknown action '{other}' (expected read, draft or send)"));
-                }
+            if !a.set(part) {
+                return Err(format!(
+                    "unknown action '{}' (expected read, draft, organize, delete or send)",
+                    part.chars().take(32).collect::<String>()
+                ));
             }
         }
-        if !a.read && !a.draft && !a.send {
+        a.validate()?;
+        Ok(a)
+    }
+
+    /// Parses operator input: actions and presets, mixed (`assistant,send`, `reader,organize`). Unknown words are an
+    /// error that names the accepted ones.
+    pub fn parse_grant(s: &str) -> Result<Self, String> {
+        let mut a = Actions::default();
+        for part in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+            let word = part.to_ascii_lowercase();
+            if let Some((_, expanded)) = PRESETS.iter().find(|(name, _)| *name == word) {
+                for w in expanded.split(',') {
+                    a.set(w);
+                }
+            } else if !a.set(&word) {
+                return Err(format!(
+                    "unknown action or preset '{}' (actions: read, draft, organize, delete, send; presets: reader, \
+                     drafter, assistant, full)",
+                    part.chars().take(32).collect::<String>()
+                ));
+            }
+        }
+        a.validate()?;
+        Ok(a)
+    }
+
+    /// The actions of a preset by name.
+    pub fn preset(name: &str) -> Option<Self> {
+        PRESETS.iter().find(|(n, _)| *n == name).map(|(_, a)| Actions::parse(a).expect("valid preset"))
+    }
+
+    fn set(&mut self, word: &str) -> bool {
+        match word {
+            "read" => self.read = true,
+            "draft" => self.draft = true,
+            "organize" => self.organize = true,
+            "delete" => self.delete = true,
+            "send" => self.send = true,
+            _ => return false,
+        }
+        true
+    }
+
+    /// draft => read, organize => read, delete => organize, send => draft (FR-P2, design section 1).
+    fn validate(&self) -> Result<(), String> {
+        if *self == Actions::default() {
             return Err("empty action list".into());
         }
-        if a.draft && !a.read {
+        if self.draft && !self.read {
             return Err("draft requires read".into());
         }
-        if a.send && !(a.read && a.draft) {
+        if self.organize && !self.read {
+            return Err("organize requires read".into());
+        }
+        if self.delete && !self.organize {
+            return Err("delete requires organize".into());
+        }
+        if self.send && !(self.read && self.draft) {
             return Err("send requires read and draft".into());
         }
-        Ok(a)
+        Ok(())
+    }
+
+    /// Actions in both sets. The result still satisfies the dependency rules (or is empty).
+    pub fn intersect(&self, other: &Actions) -> Actions {
+        let read = self.read && other.read;
+        let draft = read && self.draft && other.draft;
+        let organize = read && self.organize && other.organize;
+        let delete = organize && self.delete && other.delete;
+        let send = draft && self.send && other.send;
+        Actions { read, draft, organize, delete, send }
     }
 
     pub fn has(&self, cap: Capability) -> bool {
         match cap {
             Capability::Read => self.read,
             Capability::Draft => self.draft,
+            Capability::Organize => self.organize,
+            Capability::Delete => self.delete,
             Capability::Send => self.send,
         }
     }
@@ -64,16 +155,7 @@ impl Actions {
 
 impl std::fmt::Display for Actions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut parts = Vec::new();
-        if self.read {
-            parts.push("read");
-        }
-        if self.draft {
-            parts.push("draft");
-        }
-        if self.send {
-            parts.push("send");
-        }
+        let parts: Vec<&str> = Capability::ALL.iter().filter(|c| self.has(**c)).map(|c| c.as_str()).collect();
         f.write_str(&parts.join(","))
     }
 }
@@ -159,7 +241,7 @@ impl ClientCtx {
         if !self.effective(m, cap) {
             return Err(ToolError::new(
                 ErrorCode::Forbidden,
-                format!("this connection lacks {cap:?} on this mailbox").to_lowercase(),
+                format!("this connection lacks {} on this mailbox", cap.as_str()),
             ));
         }
         if m.status != "active" {
@@ -328,6 +410,54 @@ mod tests {
         assert!(Actions::parse("read,draft,send").is_ok());
         assert!(Actions::parse("read,admin").is_err());
         assert_eq!(Actions::parse("draft,read").unwrap().to_string(), "read,draft");
+        // New actions and their dependencies.
+        assert_eq!(Actions::parse("read,organize").unwrap().to_string(), "read,organize");
+        assert_eq!(Actions::parse("delete,organize,read").unwrap().to_string(), "read,organize,delete");
+        assert!(Actions::parse("organize").is_err());
+        assert!(Actions::parse("read,delete").is_err());
+        assert!(Actions::parse("read,organize,send").is_err());
+        // Stored lists never take presets.
+        assert!(Actions::parse("full").is_err());
+        assert!(Actions::parse("").is_err());
+    }
+
+    #[test]
+    fn presets_expand_and_mix() {
+        let p = |s: &str| Actions::parse_grant(s).map(|a| a.to_string());
+        assert_eq!(p("reader").unwrap(), "read");
+        assert_eq!(p("drafter").unwrap(), "read,draft");
+        assert_eq!(p("assistant").unwrap(), "read,draft,organize");
+        assert_eq!(p("full").unwrap(), "read,draft,organize,delete");
+        assert_eq!(p("assistant,send").unwrap(), "read,draft,organize,send");
+        assert_eq!(p("full,send").unwrap(), "read,draft,organize,delete,send");
+        assert_eq!(p("reader,organize").unwrap(), "read,organize");
+        assert_eq!(p("Read, Draft").unwrap(), "read,draft");
+        assert_eq!(p("read,draft,organize").unwrap(), "read,draft,organize");
+        // Send is in no preset.
+        for (name, _) in PRESETS {
+            assert!(!Actions::parse_grant(name).unwrap().send, "{name}");
+        }
+        let e = Actions::parse_grant("assistent").unwrap_err();
+        assert!(e.contains("assistent") && e.contains("presets"), "{e}");
+        assert!(Actions::parse_grant("reader,send").unwrap_err().contains("send requires"));
+        assert!(Actions::parse_grant("reader,delete").unwrap_err().contains("delete requires organize"));
+        assert!(Actions::parse_grant("read,admin").is_err());
+        // Every expansion is a valid stored list.
+        for (name, _) in PRESETS {
+            let a = Actions::parse_grant(name).unwrap();
+            assert_eq!(Actions::parse(&a.to_string()).unwrap(), a);
+        }
+    }
+
+    #[test]
+    fn intersect_keeps_dependencies() {
+        let full = Actions::parse_grant("full,send").unwrap();
+        let no_read = Actions { delete: true, organize: true, ..Default::default() };
+        assert_eq!(full.intersect(&no_read), Actions::default());
+        let no_org = Actions::parse("read,draft,send").unwrap();
+        let a = Actions { delete: true, ..full }.intersect(&Actions { organize: false, ..full });
+        assert_eq!(a.to_string(), "read,draft,send");
+        assert_eq!(full.intersect(&no_org).to_string(), "read,draft,send");
     }
 
     #[test]
@@ -360,6 +490,8 @@ mod tests {
                 mb("2", "billing", "read", "active"),
                 mb("3", "ops", "read,draft,send", "active"),
                 mb("4", "old", "read", "reauth_required"),
+                mb("5", "tidy", "read,organize", "active"),
+                mb("6", "bin", "read,organize,delete", "active"),
             ],
             allow_send,
         }
@@ -379,5 +511,13 @@ mod tests {
         let c = ctx(true);
         assert!(c.authorize(Capability::Send, "ops").is_ok());
         assert_eq!(c.authorize(Capability::Send, "info").unwrap_err().code, ErrorCode::Forbidden);
+        // Organize and delete are separate grants.
+        assert!(c.authorize(Capability::Organize, "tidy").is_ok());
+        assert_eq!(c.authorize(Capability::Delete, "tidy").unwrap_err().code, ErrorCode::Forbidden);
+        assert_eq!(c.authorize(Capability::Organize, "info").unwrap_err().code, ErrorCode::Forbidden);
+        assert!(c.authorize(Capability::Delete, "bin").is_ok());
+        assert_eq!(c.authorize(Capability::Delete, "nowhere").unwrap_err().code, ErrorCode::NotFound);
+        let names: Vec<&str> = c.with_capability(Capability::Delete).map(|m| m.alias.as_str()).collect();
+        assert_eq!(names, vec!["bin"]);
     }
 }

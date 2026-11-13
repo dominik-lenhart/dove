@@ -1,4 +1,4 @@
-//! Draft tools: create_draft, update_draft, send_draft (spec 5.3, 6.3, 7.6, 7.7).
+//! Draft tools: create_draft, update_draft, send_draft, delete_draft (spec 5.3, 6.3, 7.6, 7.7; design 2026-11-13).
 //!
 //! Writes are never replayed automatically. create_draft is idempotent per request_key; update and send re-read the
 //! draft fresh, compare it with the last Dove-written revision and the caller's expected revision, and are
@@ -138,6 +138,25 @@ pub fn defs() -> Vec<ToolDef> {
                 )
             },
             handler: |cx, args| detached(cx, args, |cx, args| Box::pin(send_draft(cx, args))),
+        },
+        ToolDef {
+            name: "delete_draft",
+            title: "Delete draft",
+            description: concat!(
+                "Delete a draft this project created and nobody changed since (optionally conditional on ",
+                "expected_revision). Gmail moves it to Trash; IMAP removes it from Drafts. Drafts written or changed ",
+                "by a person are never deleted (draft_conflict)."
+            ),
+            capability: Capability::Draft,
+            read_only: false,
+            destructive: true,
+            input_schema: || {
+                json!({ "type": "object", "properties": {
+                    "account": account_schema(), "draft_id": { "type": "string" }, "expected_revision": { "type": "string" }
+                }, "required": ["account", "draft_id"], "additionalProperties": false })
+            },
+            output_schema: || object_schema(json!({ "draft_id": {"type":"string"}, "deleted": {"type":"boolean"} })),
+            handler: |cx, args| detached(cx, args, |cx, args| Box::pin(delete_draft(cx, args))),
         },
     ]
 }
@@ -1011,6 +1030,93 @@ async fn send_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
                 ))
             }
         }
+    }
+}
+
+// ------------------------------------------------------------------ delete
+
+async fn delete_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
+    only_keys(&args, &["account", "draft_id", "expected_revision"])?;
+    let mb = account_arg(cx, &args, Capability::Draft)?.clone();
+    let draft_id = gmail_id_arg(&args, "draft_id")?.to_string();
+    let expected = opt_str(&args, "expected_revision")?.map(str::to_string);
+    let usable = |own: &OwnRow| match own.state.as_str() {
+        "active" => Ok(()),
+        // A sent draft no longer exists as a draft.
+        "sent" => Err(ToolError::not_found()),
+        _ => Err(ToolError::new(
+            ErrorCode::OutcomeUnknown,
+            "an earlier operation on this draft has an unknown outcome; read it with get_draft",
+        )),
+    };
+    usable(&own_row(cx, &mb, &draft_id).await?)?;
+    if mb.provider == Provider::Gmail {
+        // Gmail drafts go to Trash (`messages.trash`), which needs gmail.modify.
+        super::organize::require_gmail_modify(cx, &mb).await?;
+    }
+    let lock = cx.app.draft_locks.get(&mb.account_id, &draft_id);
+    let _guard = lock.lock().await;
+    let own = own_row(cx, &mb, &draft_id).await?;
+    usable(&own)?;
+    let expected = expected.unwrap_or_else(|| own.message_id.clone());
+    let res = match mb.provider {
+        Provider::Gmail => {
+            fresh_checked(cx, &mb, &draft_id, &own, &expected).await?;
+            cx.commit()?;
+            let mid = own.message_id.clone();
+            cx.app
+                .google
+                .write(&mb.account_id, || GmailOp::TrashMessage(&mid), &json!({}), cx.write_deadline())
+                .await
+                .map(|_| ())
+                .map_err(|WriteError { error, .. }| error)
+        }
+        Provider::Imap => {
+            let c = super::drafts_imap::fresh_checked(cx, &mb, &own, &expected).await?;
+            cx.commit()?;
+            super::drafts_imap::delete(cx, &mb, c.id).await
+        }
+    };
+    let (aid, did, rev) = (mb.account_id.clone(), draft_id.clone(), own.message_id.clone());
+    match res {
+        Ok(()) => {
+            let _ = cx
+                .app
+                .store
+                .call(move |c| {
+                    Ok(c.execute(
+                        "DELETE FROM own_drafts WHERE account_id = ?1 AND draft_id = ?2 AND message_id = ?3 AND state = 'active'",
+                        params![aid, did, rev],
+                    )?)
+                })
+                .await;
+            crate::index::wake(&cx.app, &mb.account_id);
+            Ok(ToolOutput {
+                extra: Vec::new(),
+                text: format!("Deleted draft {draft_id}."),
+                structured: json!({ "account": mb.alias, "draft_id": draft_id, "deleted": true }),
+                audit: AuditInfo {
+                    account: Some(mb.alias.clone()),
+                    object_ids: vec![draft_id],
+                    result_count: Some(1),
+                    ..Default::default()
+                },
+            })
+        }
+        Err(e) if e.code == ErrorCode::OutcomeUnknown => {
+            let _ = cx
+                .app
+                .store
+                .call(move |c| {
+                    Ok(c.execute(
+                        "UPDATE own_drafts SET state = 'update_unknown' WHERE account_id = ?1 AND draft_id = ?2",
+                        params![aid, did],
+                    )?)
+                })
+                .await;
+            Err(e)
+        }
+        Err(e) => Err(e),
     }
 }
 

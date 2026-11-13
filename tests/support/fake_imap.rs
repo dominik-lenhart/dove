@@ -2,7 +2,7 @@
 //!
 //! Implements the subset Dove uses: CAPABILITY, LOGIN/AUTHENTICATE PLAIN, LIST (SPECIAL-USE), STATUS,
 //! SELECT/EXAMINE (CONDSTORE), UID SEARCH, UID FETCH (incl. CHANGEDSINCE/VANISHED), APPEND (APPENDUID), UID STORE,
-//! UID EXPUNGE, ENABLE QRESYNC, NOOP, LOGOUT, IDLE/DONE (pushes EXISTS, EXPUNGE/VANISHED and FETCH for the selected
+//! UID EXPUNGE, UID COPY / UID MOVE (COPYUID; MOVE optional), ENABLE QRESYNC, NOOP, LOGOUT, IDLE/DONE (pushes EXISTS, EXPUNGE/VANISHED and FETCH for the selected
 //! folder; optional server-side IDLE timeout with BYE; `kick_idle` drops idling connections); SMTP EHLO, AUTH PLAIN/LOGIN, MAIL, RCPT, DATA, RSET, QUIT.
 //! Non-PEEK body fetches set `\Seen` like a real server, so tests can prove Dove never sets it.
 
@@ -33,6 +33,8 @@ pub const IMAP_VERBS: &[&str] = &[
     "APPEND",
     "UID STORE",
     "UID EXPUNGE",
+    "UID MOVE",
+    "UID COPY",
     "NOOP",
     "LOGOUT",
     "ENABLE",
@@ -88,6 +90,10 @@ pub struct Opts {
     /// Report `VANISHED (EARLIER)` as wide ranges: every UID from 1 to `UIDNEXT + WIDE_VANISHED` that is not in
     /// the folder (RFC 7162 lets a server include UIDs that never existed).
     pub wide_vanished: bool,
+    /// Offer MOVE (RFC 6851). Without it Dove moves with COPY, STORE \Deleted and UID EXPUNGE.
+    pub move_cap: bool,
+    /// Report COPYUID for COPY and MOVE (UIDPLUS servers do; off simulates a server that omits it).
+    pub copyuid: bool,
 }
 
 /// How far past `UIDNEXT` the ranges of [`Opts::wide_vanished`] reach.
@@ -105,6 +111,8 @@ impl Default for Opts {
             idle: true,
             idle_timeout: None,
             wide_vanished: false,
+            move_cap: true,
+            copyuid: true,
         }
     }
 }
@@ -636,7 +644,8 @@ impl FakeImap {
     }
 
     /// Fails unless every IMAP and SMTP command was on the allowlist: FETCH only with BODY.PEEK (no RFC822 content
-    /// items), STORE only `+FLAGS.SILENT (\Deleted)`, APPEND only to the Drafts or Sent folder.
+    /// items), STORE `\Deleted` only alone and other STOREs with organize flags only, APPEND only to the Drafts or
+    /// Sent folder.
     pub fn assert_only_allowlisted(&self) {
         let (cmds, smtp, specials) = self.with(|st| {
             let specials: Vec<(String, Option<String>)> = st
@@ -655,7 +664,13 @@ impl FakeImap {
                 assert!(!up.replace("RFC822.SIZE", "").contains("RFC822"), "RFC822 content fetch: {c}");
             }
             if verb == "UID STORE" {
-                assert!(up.ends_with("+FLAGS.SILENT (\\DELETED)"), "STORE other than \\Deleted: {c}");
+                // \Deleted only alone (own draft or confirmed copy source); other stores carry organize flags only.
+                if up.contains("\\DELETED") {
+                    assert!(up.ends_with("+FLAGS.SILENT (\\DELETED)"), "STORE with \\Deleted and more: {c}");
+                } else {
+                    assert!(up.contains(" +FLAGS.SILENT (") || up.contains(" -FLAGS.SILENT ("), "STORE form: {c}");
+                    assert!(!up.contains("\\DRAFT") && !up.contains("\\RECENT"), "STORE of a system flag: {c}");
+                }
             }
             if verb == "APPEND" {
                 let ok = specials.iter().any(|(raw, sp)| {
@@ -699,6 +714,9 @@ fn caps(o: &Opts) -> String {
     }
     if o.idle {
         c.push("IDLE");
+    }
+    if o.move_cap {
+        c.push("MOVE");
     }
     c.join(" ")
 }
@@ -1080,6 +1098,70 @@ fn handle(
             } else {
                 out.line(ok("appended"));
             }
+        }
+        "UID COPY" | "UID MOVE" => {
+            let Some((sel, ro)) = conn.selected.clone() else {
+                out.line(format!("{tag} BAD no mailbox selected"));
+                return (out.0, false);
+            };
+            if verb == "UID MOVE" && (!s.opts.move_cap || ro) {
+                out.line(format!("{tag} {} move not possible", if ro { "NO" } else { "BAD" }));
+                return (out.0, false);
+            }
+            let (copyuid, qresync) = (s.opts.copyuid, conn.qresync);
+            let dest = args.get(1).map(Tok::s).unwrap_or_default();
+            let user = s.users.get_mut(authed.as_ref().unwrap()).unwrap();
+            let (Some(si), Some(di)) = (
+                user.folders.iter().position(|f| f.raw_name == sel),
+                user.folders.iter().position(|f| f.raw_name == dest),
+            ) else {
+                out.line(format!("{tag} NO [TRYCREATE] no such mailbox"));
+                return (out.0, false);
+            };
+            let max = user.folders[si].msgs.iter().map(|m| m.uid).max().unwrap_or(0);
+            let set = parse_set(&args.first().map(Tok::s).unwrap_or_default(), max);
+            let picked: Vec<Msg> = user.folders[si].msgs.iter().filter(|m| in_set(&set, m.uid)).cloned().collect();
+            let (mut src_uids, mut dst_uids) = (Vec::new(), Vec::new());
+            for m in &picked {
+                let d = &mut user.folders[di];
+                let uid = d.uidnext;
+                d.uidnext += 1;
+                let modseq = d.bump();
+                d.msgs.push(Msg { uid, modseq, ..m.clone() });
+                src_uids.push(m.uid.to_string());
+                dst_uids.push(uid.to_string());
+            }
+            let code = (copyuid && !picked.is_empty()).then(|| {
+                format!("COPYUID {} {} {}", user.folders[di].uidvalidity, src_uids.join(","), dst_uids.join(","))
+            });
+            if verb == "UID COPY" {
+                match code {
+                    Some(c) => out.line(format!("{tag} OK [{c}] copied")),
+                    None => out.line(ok("copied")),
+                }
+                return (out.0, false);
+            }
+            if let Some(c) = code {
+                out.line(format!("* OK [{c}] moved"));
+            }
+            let f = &mut user.folders[si];
+            let ms = f.bump();
+            let mut seq = 0;
+            let mut gone = Vec::new();
+            f.msgs.retain(|m| {
+                seq += 1;
+                let del = in_set(&set, m.uid);
+                if del {
+                    gone.push((seq, m.uid));
+                    seq -= 1;
+                }
+                !del
+            });
+            for (sq, uid) in gone {
+                f.vanished.push((uid, ms));
+                out.line(if qresync { format!("* VANISHED {uid}") } else { format!("* {sq} EXPUNGE") });
+            }
+            out.line(ok("moved"));
         }
         _ => {
             let Some((sel, ro)) = conn.selected.clone() else {

@@ -1,15 +1,17 @@
 //! The IMAP and SMTP command allowlist (design "Command allowlist"), the counterpart of `gmail::gateway`.
 //!
 //! Every byte Dove sends to a mail server is built here from a typed operation. Reads use `BODY.PEEK` only, so
-//! `\Seen` is never set; `UID STORE`/`UID EXPUNGE` exist only for an [`OwnDraftUid`]; `APPEND` takes a mailbox the
-//! session resolved from its Drafts or Sent target. Nothing else can be produced.
+//! `\Seen` is never set by reading; `UID STORE` sets `\Deleted` and `UID EXPUNGE` runs only for an [`OwnDraftUid`]
+//! or a [`CopiedUid`] (the source of a confirmed copy); other flag changes take typed [`StoreFlag`]s, which cannot
+//! name `\Deleted`; `APPEND` takes a mailbox the session resolved from its Drafts or Sent target. Nothing else can be
+//! produced.
 
 use std::borrow::Cow;
 
 use zeroize::Zeroizing;
 
 use super::ImapError;
-use super::session::OwnDraftUid;
+use super::session::{CopiedUid, OwnDraftUid};
 use crate::util;
 
 /// Command verbs Dove's IMAP client may send.
@@ -29,6 +31,8 @@ pub const IMAP_VERBS: &[&str] = &[
     "APPEND",
     "UID STORE",
     "UID EXPUNGE",
+    "UID MOVE",
+    "UID COPY",
     "NOOP",
     "LOGOUT",
     "ENABLE",
@@ -64,6 +68,41 @@ impl Command<'_> {
 pub enum AppendFlag {
     Seen,
     Draft,
+}
+
+/// A flag the organize tools may set or clear. `\Deleted`, `\Draft` and `\Recent` cannot be expressed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoreFlag {
+    Seen,
+    Flagged,
+    Keyword(Keyword),
+}
+
+/// A user keyword (RFC 3501 flag-keyword): an atom of at most 64 characters that is not a system flag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Keyword(String);
+
+impl Keyword {
+    pub fn new(s: &str) -> Option<Self> {
+        let ok = (1..=64).contains(&s.len())
+            && !s.starts_with('\\')
+            && s.bytes()
+                .all(|b| b.is_ascii_graphic() && !matches!(b, b'(' | b')' | b'{' | b'%' | b'*' | b'"' | b'\\' | b']'));
+        ok.then(|| Self(s.to_string()))
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl StoreFlag {
+    fn wire(&self) -> &str {
+        match self {
+            StoreFlag::Seen => "\\Seen",
+            StoreFlag::Flagged => "\\Flagged",
+            StoreFlag::Keyword(k) => k.as_str(),
+        }
+    }
 }
 
 pub(crate) enum ImapOp<'a> {
@@ -108,6 +147,26 @@ pub(crate) enum ImapOp<'a> {
     },
     UidStoreDeleted(&'a OwnDraftUid),
     UidExpunge(&'a OwnDraftUid),
+    /// `UID STORE <uids> +FLAGS.SILENT (...)` / `-FLAGS.SILENT (...)` with organize flags only.
+    UidStoreFlags {
+        uids: &'a [u32],
+        add: bool,
+        flags: &'a [StoreFlag],
+    },
+    /// `UID MOVE <uids> <mailbox>` (RFC 6851).
+    UidMove {
+        uids: &'a [u32],
+        mailbox: &'a str,
+    },
+    /// `UID COPY <uids> <mailbox>`: the first step of a move on servers without MOVE.
+    UidCopy {
+        uids: &'a [u32],
+        mailbox: &'a str,
+    },
+    /// `\Deleted` on the sources of a confirmed copy (move without MOVE).
+    UidStoreDeletedCopied(&'a [CopiedUid]),
+    /// `UID EXPUNGE` of exactly the sources of a confirmed copy.
+    UidExpungeCopied(&'a [CopiedUid]),
     Noop,
     Logout,
     EnableQresync,
@@ -236,6 +295,32 @@ impl<'a> ImapOp<'a> {
                 ("UID STORE", vec![text(format!("UID STORE {} +FLAGS.SILENT (\\Deleted)", own.uid()))])
             }
             ImapOp::UidExpunge(own) => ("UID EXPUNGE", vec![text(format!("UID EXPUNGE {}", own.uid()))]),
+            ImapOp::UidStoreFlags { uids, add, flags } => {
+                let f: Vec<&str> = flags.iter().map(StoreFlag::wire).collect();
+                (
+                    "UID STORE",
+                    vec![text(format!(
+                        "UID STORE {} {}FLAGS.SILENT ({})",
+                        uid_set(uids),
+                        if add { '+' } else { '-' },
+                        f.join(" ")
+                    ))],
+                )
+            }
+            ImapOp::UidMove { uids, mailbox: m } => {
+                ("UID MOVE", vec![text(format!("UID MOVE {} ", uid_set(uids))), mailbox(m)])
+            }
+            ImapOp::UidCopy { uids, mailbox: m } => {
+                ("UID COPY", vec![text(format!("UID COPY {} ", uid_set(uids))), mailbox(m)])
+            }
+            ImapOp::UidStoreDeletedCopied(c) => {
+                let uids: Vec<u32> = c.iter().map(CopiedUid::uid).collect();
+                ("UID STORE", vec![text(format!("UID STORE {} +FLAGS.SILENT (\\Deleted)", uid_set(&uids)))])
+            }
+            ImapOp::UidExpungeCopied(c) => {
+                let uids: Vec<u32> = c.iter().map(CopiedUid::uid).collect();
+                ("UID EXPUNGE", vec![text(format!("UID EXPUNGE {}", uid_set(&uids)))])
+            }
             ImapOp::Noop => ("NOOP", vec![text("NOOP")]),
             ImapOp::Logout => ("LOGOUT", vec![text("LOGOUT")]),
             ImapOp::EnableQresync => ("ENABLE", vec![text("ENABLE QRESYNC")]),
@@ -346,9 +431,14 @@ mod tests {
             ImapOp::EnableQresync => 18,
             ImapOp::Idle => 19,
             ImapOp::Done => 20,
+            ImapOp::UidStoreFlags { .. } => 21,
+            ImapOp::UidMove { .. } => 22,
+            ImapOp::UidCopy { .. } => 23,
+            ImapOp::UidStoreDeletedCopied(_) => 24,
+            ImapOp::UidExpungeCopied(_) => 25,
         }
     }
-    const VARIANTS: usize = 21;
+    const VARIANTS: usize = 26;
 
     fn wire(c: &Command<'_>) -> String {
         c.parts
@@ -364,7 +454,10 @@ mod tests {
     #[test]
     fn every_imap_op_is_allowlisted() {
         let own = OwnDraftUid::new_for_drafts(7, 42);
+        let copied = CopiedUid::for_ops_tests(&[5, 6, 8]);
         let uids = [3, 1, 2, 9];
+        let kw = Keyword::new("$Follow-up").unwrap();
+        let flags = [StoreFlag::Seen, StoreFlag::Flagged, StoreFlag::Keyword(kw)];
         let samples = vec![
             ImapOp::Capability,
             ImapOp::Login { username: "u", password: "p\"a\\\u{df} w" },
@@ -384,6 +477,12 @@ mod tests {
             ImapOp::Append { mailbox: "Drafts", flags: &[AppendFlag::Draft, AppendFlag::Seen], message: b"x" },
             ImapOp::UidStoreDeleted(&own),
             ImapOp::UidExpunge(&own),
+            ImapOp::UidStoreFlags { uids: &uids, add: true, flags: &flags },
+            ImapOp::UidStoreFlags { uids: &uids, add: false, flags: &flags[..1] },
+            ImapOp::UidMove { uids: &uids, mailbox: "Trash" },
+            ImapOp::UidCopy { uids: &uids, mailbox: "Gel&APY-scht" },
+            ImapOp::UidStoreDeletedCopied(&copied),
+            ImapOp::UidExpungeCopied(&copied),
             ImapOp::Noop,
             ImapOp::Logout,
             ImapOp::EnableQresync,
@@ -404,7 +503,20 @@ mod tests {
                 assert!(!upper.replace("RFC822.SIZE", "").contains("RFC822"), "{line}");
             }
             if c.verb == "UID STORE" {
-                assert!(line.ends_with("+FLAGS.SILENT (\\Deleted)"), "{line}");
+                // \Deleted only in the two guarded forms (an own draft or the sources of a confirmed copy).
+                if line.contains("\\Deleted") {
+                    assert!(line.ends_with("+FLAGS.SILENT (\\Deleted)"), "{line}");
+                    assert!(
+                        line == "UID STORE 42 +FLAGS.SILENT (\\Deleted)"
+                            || line == "UID STORE 5:6,8 +FLAGS.SILENT (\\Deleted)",
+                        "{line}"
+                    );
+                } else {
+                    assert!(line.contains("FLAGS.SILENT ("), "{line}");
+                }
+            }
+            if c.verb == "UID EXPUNGE" {
+                assert!(line == "UID EXPUNGE 42" || line == "UID EXPUNGE 5:6,8", "{line}");
             }
             if matches!(c.verb, "IDLE" | "DONE") {
                 // Exactly the bare verb: nothing else can ride on the push connection.
@@ -415,6 +527,22 @@ mod tests {
         }
         assert!(seen.iter().all(|s| *s), "a variant has no sample: {seen:?}");
         assert_eq!(uid_set(&uids), "1:3,9");
+        assert_eq!(
+            wire(&ImapOp::UidStoreFlags { uids: &uids, add: true, flags: &flags }.render()),
+            "UID STORE 1:3,9 +FLAGS.SILENT (\\Seen \\Flagged $Follow-up)"
+        );
+        assert_eq!(wire(&ImapOp::UidMove { uids: &[4], mailbox: "Trash" }.render()), "UID MOVE 4 \"Trash\"");
+    }
+
+    #[test]
+    fn keywords_cannot_smuggle_flags_or_syntax() {
+        for bad in ["\\Deleted", "\\Seen", "a b", "a)", "(a", "x\"y", "a]", "a*", "a%", "{3}", "", &"k".repeat(65), "ä"]
+        {
+            assert!(Keyword::new(bad).is_none(), "{bad}");
+        }
+        for good in ["$Forwarded", "Work", "follow-up", "$label1"] {
+            assert!(Keyword::new(good).is_some(), "{good}");
+        }
     }
 
     #[test]

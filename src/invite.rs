@@ -200,19 +200,17 @@ pub fn load(conn: &Connection, id: &str) -> anyhow::Result<Option<Invitation>> {
 }
 
 /// Intersects the invited grants with what the approver selected. Nothing outside the invitation can be added:
-/// unknown accounts are ignored and every action must already be invited. Draft needs read, send needs draft.
+/// unknown accounts are ignored and every action must already be invited. The dependency rules hold for the result
+/// (draft and organize need read, delete needs organize, send needs draft).
 pub fn narrow(invited: &[InviteGrant], selected: &BTreeMap<String, Actions>) -> Vec<InviteGrant> {
     let mut out = Vec::new();
     for g in invited {
         let Some(want) = selected.get(&g.account_id) else { continue };
         let Ok(have) = Actions::parse(&g.actions) else { continue };
-        let read = have.read && want.read;
-        let draft = read && have.draft && want.draft;
-        let send = draft && have.send && want.send;
-        if !read {
+        let a = have.intersect(want);
+        if !a.read {
             continue;
         }
-        let a = Actions { read, draft, send };
         out.push(InviteGrant { account_id: g.account_id.clone(), alias: g.alias.clone(), actions: a.to_string() });
     }
     out
@@ -421,17 +419,20 @@ mod tests {
 
     #[test]
     fn narrowing_never_broadens() {
-        let invited = vec![g("a", "read,draft"), g("b", "read")];
+        let all = |s: &str| Actions::parse_grant(s).unwrap();
+        let invited = vec![g("a", "read,draft"), g("b", "read"), g("c", "read,organize,delete")];
         let mut sel = BTreeMap::new();
-        sel.insert("a".to_string(), Actions { read: true, draft: true, send: true });
-        sel.insert("b".to_string(), Actions { read: true, draft: true, send: false });
-        sel.insert("x".to_string(), Actions { read: true, draft: true, send: true });
+        sel.insert("a".to_string(), all("full,send"));
+        sel.insert("b".to_string(), all("assistant"));
+        sel.insert("c".to_string(), all("full,send"));
+        sel.insert("x".to_string(), all("full,send"));
         let out = narrow(&invited, &sel);
-        assert_eq!(out, vec![g("a", "read,draft"), g("b", "read")]);
-        // Dropping read drops the mailbox; dropping draft keeps read.
+        assert_eq!(out, vec![g("a", "read,draft"), g("b", "read"), g("c", "read,organize,delete")]);
+        // Dropping read drops the mailbox; dropping draft keeps read; dropping organize drops delete.
         let mut sel = BTreeMap::new();
-        sel.insert("a".to_string(), Actions { read: true, draft: false, send: false });
-        sel.insert("b".to_string(), Actions { read: false, draft: true, send: false });
-        assert_eq!(narrow(&invited, &sel), vec![g("a", "read")]);
+        sel.insert("a".to_string(), Actions { read: true, ..Default::default() });
+        sel.insert("b".to_string(), Actions { draft: true, ..Default::default() });
+        sel.insert("c".to_string(), Actions { read: true, delete: true, ..Default::default() });
+        assert_eq!(narrow(&invited, &sel), vec![g("a", "read"), g("c", "read")]);
     }
 }

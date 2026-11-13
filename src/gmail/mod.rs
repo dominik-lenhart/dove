@@ -15,8 +15,11 @@ use tokens::TokenManager;
 
 pub const SCOPE_READONLY: &str = "https://www.googleapis.com/auth/gmail.readonly";
 pub const SCOPE_COMPOSE: &str = "https://www.googleapis.com/auth/gmail.compose";
-/// Scopes requested at connect. Both Gmail scopes must be granted (spec 7.3 step 8).
-pub const REQUIRED_SCOPES: &[&str] = &["openid", "email", SCOPE_READONLY, SCOPE_COMPOSE];
+/// Labels, read state, archive and Trash (organize/delete tools, design 2026-11-13 section 1). Optional at connect:
+/// a grant without it keeps read/draft/send and gets `account_unavailable` for organize and delete.
+pub const SCOPE_MODIFY: &str = "https://www.googleapis.com/auth/gmail.modify";
+/// Scopes requested at connect. Readonly and compose must be granted (spec 7.3 step 8); modify is requested too.
+pub const REQUIRED_SCOPES: &[&str] = &["openid", "email", SCOPE_READONLY, SCOPE_COMPOSE, SCOPE_MODIFY];
 
 /// Bundles the gateway, token manager and JWKS cache.
 pub struct Google {

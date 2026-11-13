@@ -294,7 +294,8 @@ pub enum ClientsCmd {
         name: String,
         #[arg(long)]
         project: String,
-        /// alias=read[,draft[,send]], repeatable.
+        /// alias=<actions or preset>, repeatable. Actions: read, draft, organize, delete, send. Presets: reader,
+        /// drafter, assistant, full (send is never in a preset: `work=assistant,send`).
         #[arg(long = "grant", required = true)]
         grants: Vec<String>,
         #[arg(long)]
@@ -307,6 +308,7 @@ pub enum ClientsCmd {
     /// Atomically replace the whole grant set.
     SetGrants {
         name: String,
+        /// alias=<actions or preset>, repeatable (as for `create`).
         #[arg(long = "grant", required = true)]
         grants: Vec<String>,
         #[command(flatten)]
@@ -339,6 +341,7 @@ pub enum ClientsCmd {
         /// `all` (expanded once, now) or a comma-separated alias list.
         #[arg(long, default_value = "all")]
         accounts: String,
+        /// Actions and presets for every invited mailbox (`read`, `assistant`, `full,send`, ...).
         #[arg(long, default_value = "read")]
         capabilities: String,
         #[arg(long)]

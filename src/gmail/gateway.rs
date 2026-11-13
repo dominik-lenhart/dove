@@ -72,6 +72,16 @@ pub enum GmailOp<'a> {
     UpdateDraft(&'a str),
     SendDraft(SendPermit),
     SendAs,
+    /// `POST messages/{id}/modify` (labels, read state; needs `gmail.modify`).
+    ModifyMessage(&'a str),
+    /// `POST messages/batchModify`.
+    BatchModify,
+    /// `POST messages/{id}/trash` (recoverable; there is no permanent delete).
+    TrashMessage(&'a str),
+    /// `POST messages/{id}/untrash`.
+    UntrashMessage(&'a str),
+    /// `POST threads/{id}/modify`.
+    ModifyThread(&'a str),
 }
 
 /// Gmail ids are short URL-safe tokens. Anything else is rejected before a request is built.
@@ -95,6 +105,11 @@ impl GmailOp<'_> {
             GmailOp::UpdateDraft(id) => (Method::PUT, format!("drafts/{}", seg(id)?)),
             GmailOp::SendDraft(_) => (Method::POST, "drafts/send".into()),
             GmailOp::SendAs => (Method::GET, "settings/sendAs".into()),
+            GmailOp::ModifyMessage(id) => (Method::POST, format!("messages/{}/modify", seg(id)?)),
+            GmailOp::BatchModify => (Method::POST, "messages/batchModify".into()),
+            GmailOp::TrashMessage(id) => (Method::POST, format!("messages/{}/trash", seg(id)?)),
+            GmailOp::UntrashMessage(id) => (Method::POST, format!("messages/{}/untrash", seg(id)?)),
+            GmailOp::ModifyThread(id) => (Method::POST, format!("threads/{}/modify", seg(id)?)),
         })
     }
 
@@ -112,6 +127,11 @@ impl GmailOp<'_> {
             GmailOp::UpdateDraft(_) => "drafts.update",
             GmailOp::SendDraft(_) => "drafts.send",
             GmailOp::SendAs => "settings.sendAs.list",
+            GmailOp::ModifyMessage(_) => "messages.modify",
+            GmailOp::BatchModify => "messages.batchModify",
+            GmailOp::TrashMessage(_) => "messages.trash",
+            GmailOp::UntrashMessage(_) => "messages.untrash",
+            GmailOp::ModifyThread(_) => "threads.modify",
         }
     }
 }
@@ -491,5 +511,60 @@ mod tests {
         assert_eq!((m, p.as_str()), (Method::PUT, "drafts/r123"));
         let (m, p) = GmailOp::SendDraft(SendPermit(())).method_path().unwrap();
         assert_eq!((m, p.as_str()), (Method::POST, "drafts/send"));
+    }
+
+    /// The organize/delete additions are exactly the five design entries; there is no DELETE anywhere.
+    #[test]
+    fn organize_ops_are_exactly_allowlisted() {
+        fn index(op: &GmailOp<'_>) -> usize {
+            match op {
+                GmailOp::Profile => 0,
+                GmailOp::ListMessages => 1,
+                GmailOp::GetMessage(_) => 2,
+                GmailOp::History => 3,
+                GmailOp::GetThread(_) => 4,
+                GmailOp::Labels => 5,
+                GmailOp::ListDrafts => 6,
+                GmailOp::GetDraft(_) => 7,
+                GmailOp::CreateDraft => 8,
+                GmailOp::UpdateDraft(_) => 9,
+                GmailOp::SendDraft(_) => 10,
+                GmailOp::SendAs => 11,
+                GmailOp::ModifyMessage(_) => 12,
+                GmailOp::BatchModify => 13,
+                GmailOp::TrashMessage(_) => 14,
+                GmailOp::UntrashMessage(_) => 15,
+                GmailOp::ModifyThread(_) => 16,
+            }
+        }
+        let ops = vec![
+            (GmailOp::Profile, "GET profile"),
+            (GmailOp::ListMessages, "GET messages"),
+            (GmailOp::GetMessage("m1"), "GET messages/m1"),
+            (GmailOp::History, "GET history"),
+            (GmailOp::GetThread("t1"), "GET threads/t1"),
+            (GmailOp::Labels, "GET labels"),
+            (GmailOp::ListDrafts, "GET drafts"),
+            (GmailOp::GetDraft("r1"), "GET drafts/r1"),
+            (GmailOp::CreateDraft, "POST drafts"),
+            (GmailOp::UpdateDraft("r1"), "PUT drafts/r1"),
+            (GmailOp::SendDraft(SendPermit(())), "POST drafts/send"),
+            (GmailOp::SendAs, "GET settings/sendAs"),
+            (GmailOp::ModifyMessage("m1"), "POST messages/m1/modify"),
+            (GmailOp::BatchModify, "POST messages/batchModify"),
+            (GmailOp::TrashMessage("m1"), "POST messages/m1/trash"),
+            (GmailOp::UntrashMessage("m1"), "POST messages/m1/untrash"),
+            (GmailOp::ModifyThread("t1"), "POST threads/t1/modify"),
+        ];
+        let mut seen = [false; 17];
+        for (op, want) in &ops {
+            seen[index(op)] = true;
+            let (m, p) = op.method_path().unwrap();
+            assert_ne!(m, Method::DELETE);
+            assert_eq!(format!("{m} {p}"), *want);
+        }
+        assert!(seen.iter().all(|s| *s));
+        assert!(matches!(GmailOp::TrashMessage("a/../b").method_path(), Err(GatewayError::InvalidId)));
+        assert!(matches!(GmailOp::ModifyThread("x?y").method_path(), Err(GatewayError::InvalidId)));
     }
 }

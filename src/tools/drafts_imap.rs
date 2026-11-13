@@ -6,9 +6,10 @@
 //! stored bytes causes no false conflict. A missing UID, a changed hash, a changed UIDVALIDITY or a different Drafts
 //! folder all mean the draft is not provably Dove's any more: `draft_conflict`, human-owned from then on.
 //!
-//! Deleting: [`OwnDraftUid`] is the only way to `UID STORE \Deleted` / `UID EXPUNGE`, and this module is the only
-//! place that constructs one, always for the previous revision of an own draft (after its replacement is recorded) or
-//! the sent draft (after the send). Nothing else is ever deleted.
+//! Deleting: [`OwnDraftUid`] is the only way to `UID STORE \Deleted` / `UID EXPUNGE` in Drafts, and this module is
+//! the only place that constructs one, always for the previous revision of an own draft (after its replacement is
+//! recorded), the sent draft (after the send) or an own draft the agent deletes (`delete_draft`, after the fresh
+//! ownership check). Nothing else in Drafts is ever deleted.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -149,12 +150,17 @@ async fn report(cx: &ToolCx, mb: &Mailbox, key: String, message: String) {
     let _ = cx.app.notifier.notify_once(&key, &message).await;
 }
 
-/// Flags and expunges exactly one Dove-owned draft UID. Failures are reported, never retried blindly.
-async fn delete_own_draft(cx: &ToolCx, conn: &Conn, mb: &Mailbox, draft_id: &str, id: ImapMsgId) {
+/// Flags and expunges exactly one Dove-owned draft UID.
+async fn expunge_own(cx: &ToolCx, conn: &Conn, id: ImapMsgId) -> Result<(), ImapError> {
     // The caller proved ownership: the own_drafts record names this id, its content hash matched, and its folder is
     // the account's Drafts folder (checked again by `delete_own` through UIDVALIDITY).
     let own = OwnDraftUid::new_for_drafts(id.uidvalidity, id.uid);
-    if conn.run(cx, move |s| Box::pin(s.delete_own(own))).await.is_err() {
+    conn.run(cx, move |s| Box::pin(s.delete_own(own))).await
+}
+
+/// [`expunge_own`] as a cleanup step: failures are reported, never retried blindly.
+async fn delete_own_draft(cx: &ToolCx, conn: &Conn, mb: &Mailbox, draft_id: &str, id: ImapMsgId) {
+    if expunge_own(cx, conn, id).await.is_err() {
         report(
             cx,
             mb,
@@ -238,6 +244,19 @@ pub(super) async fn fresh_checked(
             .with_details(json!({ "current_revision": own.message_id })));
     }
     Ok(Checked { fetched, id })
+}
+
+// ------------------------------------------------------------------ delete
+
+/// `delete_draft` on IMAP: the caller ran [`fresh_checked`] under the draft lock; this expunges exactly that UID.
+pub(super) async fn delete(cx: &ToolCx, mb: &Mailbox, id: ImapMsgId) -> Result<(), ToolError> {
+    let conn = Conn::load(cx, mb).await?;
+    expunge_own(cx, &conn, id).await.map_err(|e| match e {
+        // UIDVALIDITY changed or the Drafts folder is gone: the UID no longer names Dove's draft.
+        ImapError::Missing => not_ours(None),
+        ImapError::NotDispatched | ImapError::Network | ImapError::Tls | ImapError::Auth => ToolError::from(e),
+        _ => ToolError::new(ErrorCode::OutcomeUnknown, "the draft may or may not have been deleted; check Drafts"),
+    })
 }
 
 // ------------------------------------------------------------------ update

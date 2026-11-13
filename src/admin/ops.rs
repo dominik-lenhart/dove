@@ -192,12 +192,13 @@ pub struct GrantSpec {
     pub actions: String,
 }
 
-/// Parses `alias=read,draft` CLI arguments.
+/// Parses `alias=read,draft` / `alias=assistant,send` CLI arguments (expanded later by [`resolve_grants`]).
 pub fn parse_grant_args(args: &[String]) -> anyhow::Result<Vec<GrantSpec>> {
     args.iter()
         .map(|g| {
-            let (a, actions) =
-                g.split_once('=').ok_or_else(|| anyhow!("grant '{g}' must look like alias=read,draft"))?;
+            let (a, actions) = g
+                .split_once('=')
+                .ok_or_else(|| anyhow!("grant '{g}' must look like alias=read,draft or alias=assistant"))?;
             Ok(GrantSpec { account: a.trim().to_string(), actions: actions.trim().to_string() })
         })
         .collect()
@@ -215,7 +216,8 @@ pub fn resolve_grants(
     }
     let mut out = BTreeMap::new();
     for g in grants {
-        let actions = Actions::parse(&g.actions).map_err(|e| anyhow!("grant {}: {e}", g.account))?;
+        // Presets are input sugar: the expanded list is what gets stored.
+        let actions = Actions::parse_grant(&g.actions).map_err(|e| anyhow!("grant {}: {e}", g.account))?;
         if actions.send && !allow_send {
             bail!("grant {}: send requires allow_send = true in the server configuration (spec 6.3)", g.account);
         }
