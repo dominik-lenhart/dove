@@ -335,3 +335,8 @@ cargo fmt
   -e CARGO_TARGET_DIR=/src/target/win-gnu -e CARGO_BUILD_JOBS=3 dove-t-mingw:local cargo clippy
   --target x86_64-pc-windows-gnu --all-targets -- -D warnings` (about 4 min cold). This compiles, it does not run:
   the `cfg(windows)` tests (DACLs, DPAPI, the admin pipe, replacing a running exe) only run on a Windows machine.
+- 2026-11-13: Unix socket paths are limited to 103 bytes (macOS `sun_path`); the agent scratchpad paths are longer, so a
+  manual local-mode run there fails to bind (`dove local init` now refuses such a `DOVE_LOCAL_HOME`). Use a short
+  directory such as `/tmp/dl-<id>` for manual runs, set `DOVE_LOCAL_HOME` for every command, and remove it afterwards.
+  `dove local install` on this host writes the real `~/.config/systemd/user/dove.service`; always `dove local uninstall`
+  after trying it.
