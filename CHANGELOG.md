@@ -11,8 +11,18 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
   Claude's and ChatGPT's servers (plus addresses you list) reach `/mcp` and the OAuth machine endpoints, with OpenAI's
   published ranges refreshed hourly.
 
+### Changed
+
+- The MCP instructions now tell hosts to use Dove for any question about the owner's mail and name the entry points
+  (`list_accounts`, `digest`, `search_messages`, `create_draft`), so ChatGPT and Claude pick it without extra prompting.
+- The reference proxy configs (`deploy/Caddyfile`, `deploy/nginx/dove.conf`, `dove-restricted.conf`) add
+  `Referrer-Policy: no-referrer` only to responses that have none, instead of overriding Dove's own header.
+
 ### Fixed
 
+- The OAuth approval page could not be submitted in a browser ("origin not allowed"): under `no-referrer` browsers send
+  `Origin: null` with a form POST. The approval page now uses `same-origin`; everything else keeps `no-referrer`. Behind
+  nginx or Caddy also update the proxy config (see Changed), or the proxy's header still wins.
 - `dove doctor` checked the public URL through `/healthz`, which the proxy allowlists never forward, so the check
   always failed behind a proxy; it now fetches the protected-resource metadata.
 
