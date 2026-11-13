@@ -147,6 +147,19 @@ claude mcp add --transport http dove https://dove.example.com/mcp --header "Auth
 ChatGPT and Claude on the web connect through Dove's OAuth approval page instead; `dove clients invite` creates the
 link. The [deployment guide](docs/deployment.md) covers proxies, Compose, backups and upgrades in detail.
 
+**No server? Run it on your own computer.** Local mode runs Dove as your user on macOS, Linux or Windows, for Claude
+Desktop, Claude Code, Codex and other MCP hosts on the same machine, over `http://127.0.0.1` without a domain or proxy:
+
+```sh
+dove local init && dove local install       # per-user config, keys and autostart
+dove accounts connect-imap personal --email you@example.com
+dove mcp install --client claude-desktop --profile desktop   # after `dove clients invite` and `dove login`
+```
+
+An agent with a shell as the same OS user can read Dove's files and use its admin channel, so local mode protects
+against remote callers and leaked tokens, not against your own agent's shell. Details and the full steps:
+[Local mode](docs/deployment.md#local-mode).
+
 ## What agents can do
 
 | Tool | What it does | Needs |
@@ -202,7 +215,7 @@ else exists. Full threat model: [`docs/spec.md`](docs/spec.md), section 6.
 | --- | --- |
 | Leaked or over-trusted tokens: scoped, expiring, revocable, optionally IP-bound, rate-limited, audited | A compromised host: whoever controls the machine can use the credentials in memory |
 | A copied state store: secrets encrypted under keys that are not in it, tokens stored as keyed hashes | Prompt injection itself: Dove limits its reach, but a steered agent can use every permission its token holds |
-| An agent shell trying to administer Dove: admin only over a Unix socket with an OS user check | What your model provider does with the mail an agent reads |
+| An agent shell trying to administer Dove: admin only over a Unix socket (Windows: named pipe) with an OS user check, when the agent runs as another OS user | What your model provider does with the mail an agent reads |
 | DNS rebinding, OAuth callback attacks, header injection into drafts, mail content in logs | Your mailbox provider's own account security |
 
 For Gmail, note that Google's `gmail.compose` scope itself includes sending; Dove's send gates are a policy layer in
