@@ -131,6 +131,7 @@ pub fn init(paths: &LocalPaths, port: u16) -> anyhow::Result<()> {
     if port == 0 {
         bail!("--port must not be 0");
     }
+    check_socket_path(&paths.admin_socket())?;
     let secrets_dir = paths.secrets_dir();
     let keys = ["kek", "pepper", "index_key"].map(|n| secrets_dir.join(n));
     for p in std::iter::once(&paths.config_file).chain(&keys) {
@@ -154,6 +155,22 @@ pub fn init(paths: &LocalPaths, port: u16) -> anyhow::Result<()> {
     crate::platform::write_private_new(&paths.config_file, text.as_bytes())?;
     let cfg = Config::load(&paths.config_file)?;
     cfg.validate().context("the new local config does not validate")?;
+    Ok(())
+}
+
+/// Longest Unix socket path that binds everywhere (`sun_path` is 104 bytes on macOS, 108 on Linux, NUL included).
+pub const MAX_SOCKET_PATH: usize = 103;
+
+/// Refuses a data directory whose admin socket path is too long to bind, before anything is written: the service
+/// would otherwise fail at every start.
+fn check_socket_path(socket: &Path) -> anyhow::Result<()> {
+    if cfg!(unix) && socket.as_os_str().len() > MAX_SOCKET_PATH {
+        bail!(
+            "the admin socket path {} is longer than {MAX_SOCKET_PATH} bytes, which Unix sockets do not allow; set \
+             DOVE_LOCAL_HOME to a shorter directory. Nothing was changed.",
+            socket.display()
+        );
+    }
     Ok(())
 }
 
@@ -538,6 +555,25 @@ mod tests {
         assert!(err.contains("kek already exists"), "{err}");
         assert_eq!(std::fs::read(p.secrets_dir().join("kek")).unwrap(), kek);
         assert!(!p.config_file.exists());
+    }
+
+    /// A socket path the service could never bind is refused before anything is written.
+    #[cfg(unix)]
+    #[test]
+    fn init_refuses_a_socket_path_too_long_to_bind() {
+        let d = tempfile::tempdir().unwrap();
+        let long = d.path().join("x".repeat(MAX_SOCKET_PATH));
+        let p = paths(&long);
+        let err = init(&p, 48787).unwrap_err().to_string();
+        assert!(err.contains("DOVE_LOCAL_HOME"), "{err}");
+        assert!(!long.exists(), "nothing is created");
+        // Exactly at the limit it still works, and the service can bind there.
+        let base = d.path().to_string_lossy().len();
+        let fit = d.path().join("y".repeat(MAX_SOCKET_PATH - base - "/".len() - "/data/admin.sock".len()));
+        let p = paths(&fit);
+        assert_eq!(p.admin_socket().as_os_str().len(), MAX_SOCKET_PATH);
+        init(&p, 48787).unwrap();
+        std::os::unix::net::UnixListener::bind(p.admin_socket()).unwrap();
     }
 
     #[test]
