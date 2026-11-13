@@ -244,3 +244,19 @@ cargo fmt
   `shutdown_background()` when the notice check ran; try the notice in a pty with `script -qec "<cmd>" /dev/null`.
   The notice never runs privileged (euid 0, euid != uid, `SUDO_UID` set: `sudo -E` keeps the user's HOME), and its
   cache writes never follow symlinks (owned real dir, `O_EXCL|O_NOFOLLOW` temp file, rename onto the literal path).
+- 2026-11-13: Sending identities live in `src/identity.rs` (tables `account_aliases`, `account_signatures`, migration
+  `V_SEND_IDENTITIES`). The IMAP sender is checked twice, at `create_draft` (`dispatch_create`) and again in
+  `drafts_imap::prepare_send`, where the From header decides the SMTP envelope sender (login address unless the alias
+  has `envelope`). `from.email` is already lowercased there, so a mutation that drops the `to_lowercase` in
+  `signature_for` survives (equivalent mutant). `update_draft` never signs; the signature goes in before the
+  quote/forward join in `dispatch_create`. Admin audit rows for alias/signature verbs hold no address and no text.
+- 2026-11-13: `src/tailscale.rs` is CLI-side only (the service never calls `tailscale`). `PUBLIC_PATHS` is the one list of
+  public routes; `allowlists_do_not_drift` compares it with `deploy/Caddyfile`, `deploy/nginx/dove.conf` and the
+  `.route(...)` literals in `src/http.rs`, `src/mcp.rs`, `src/oauth.rs`: a new route needs a line in all of them (and
+  must be a string literal or `AUTHORIZE_PATH`). Tests fake `tailscale` with a shell script that keeps serve state in
+  files (`tests/tailscale_e2e.rs`); write it once per process (writing an executable per test races with other tests'
+  forks, ETXTBSY) and keep `/usr/bin:/bin` in the child's PATH (the script needs `cat`, `awk`). Never run the real
+  `tailscale serve`/`funnel` here: the host's Tailscale serves other things (read-only `status --json` and
+  `serve status --json` are fine). Real node JSON: `Self.DNSName` has a trailing dot, `CertDomains` empty means HTTPS
+  is off, `Self.CapMap` has a `funnel` key when Funnel is allowed, serve state keys are `host:port`.
+
