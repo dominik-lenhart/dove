@@ -14,6 +14,24 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
   listener on the same profile from running the command twice. Pin it to an agent session with
   `claude -p --resume <session-id> --fork-session`.
 
+### Changed
+
+- `search_messages`, `digest` and `search_contacts` argument errors name the argument and say how to fix it. The
+  message starts with the path (`where.all[1].op: ...`), lists what is valid (the operators of that field, the
+  columns, the fields, what the tool takes) and, where useful, carries a valid example in `details.example`. Known
+  mix-ups get a pointer: `contains` has no substring match (use `terms`), `sender` is `from`, `query` and
+  `page_token` are `where` and `cursor`, `limit` over 100 pages with `next_cursor`, a time without offset needs
+  `Z` or an offset.
+- These tools accept arguments that have exactly one reading: one mailbox name where a list is expected, `account`
+  for `accounts` (and `accounts` with one name for `search_contacts`), lists and `where` written as JSON text,
+  `"true"`/`"20"` for `true`/`20`, field, operator and enum names in any case, one value where a list is expected
+  and a one-element list where a string is, a list of words for `terms`, a single `order_by` object or
+  `"received_at desc"`. `received_at` and `digest`'s `since` take a calendar date (`2026-11-01`, that UTC day) and
+  `since` also a span back from now (`7d`, `36h`). Several values for a one-value argument, a time without offset
+  and unknown account names are still refused; unknown and out-of-scope mailboxes remain the identical `not_found`.
+- The audit record of a refused call carries `~invalid=<argument path>` in `object_ids` (for example
+  `~invalid=where.all[].op`): which argument failed, never its value.
+
 ## [0.8.1] - 2026-11-14
 
 ### Changed

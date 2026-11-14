@@ -742,7 +742,12 @@ fn parse_expr(v: &Value, depth: usize, b: &mut Budget, path: &str) -> Result<Exp
 
 /// Parses a `where` object. `{}` or null means "match all visible rows".
 pub fn parse_where(v: Option<&Value>) -> Result<Option<Expr>, ToolError> {
-    match v {
+    // The whole `where` sent as JSON text has one reading.
+    let parsed = match v {
+        Some(Value::String(s)) => crate::tools::lenient::json_text(s, '{'),
+        _ => None,
+    };
+    match parsed.as_ref().or(v) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::Object(o)) if o.is_empty() => Ok(None),
         Some(v) => Ok(Some(parse_expr(v, 0, &mut Budget { preds: 0 }, "where")?)),

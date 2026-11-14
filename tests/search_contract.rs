@@ -1018,6 +1018,19 @@ async fn search_accepts_arguments_that_have_one_reading() {
         .search(json!({"accounts": ["info", "billing"], "where": from_anna.to_string(), "select": ["message_id"], "limit": 100}))
         .await;
     assert_eq!(as_text["rows"].as_array().unwrap().len(), expect.len());
+    // A whole `where` as JSON text, also when empty; category names in any case.
+    assert_eq!(
+        fx.search(json!({"where": "{}", "count_only": true, "accounts": ["info", "billing"]})).await["count"],
+        fx.search(json!({"count_only": true, "accounts": ["info", "billing"]})).await["count"]
+    );
+    assert_eq!(
+        fx.keys(pred("category", "eq", json!("Newsletter"))).await,
+        fx.keys(pred("category", "eq", json!("newsletter"))).await
+    );
+    assert_eq!(
+        fx.keys(pred("category", "in", json!(["PERSONAL"]))).await,
+        fx.keys(pred("category", "in", json!(["personal"]))).await
+    );
     let n = fx.search(json!({"count_only": "TRUE", "accounts": ["info", "billing"], "where": from_anna.clone()})).await;
     assert_eq!(n["count"], json!(expect.len()));
     assert_eq!(

@@ -70,7 +70,6 @@ pub fn defs() -> Vec<ToolDef> {
 const DIGEST_SPEC: Spec<'static> = Spec {
     aliases: &[("account", "accounts"), ("folder", "folders")],
     lists: &["accounts", "folders"],
-    objects: &[],
     bools: &[],
     ints: &["limit"],
 };

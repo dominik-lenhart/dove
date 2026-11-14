@@ -19,8 +19,6 @@ pub struct Spec<'a> {
     pub aliases: &'a [(&'a str, &'a str)],
     /// Lists: one non-list value becomes a one-element list; JSON text of a list is parsed.
     pub lists: &'a [&'a str],
-    /// Objects: JSON text of an object is parsed.
-    pub objects: &'a [&'a str],
     /// Booleans: `"true"` and `"false"` in any case.
     pub bools: &'a [&'a str],
     /// Non-negative integers: digit strings and whole floats.
@@ -52,14 +50,6 @@ pub fn normalize(args: &Value, spec: &Spec<'_>) -> Result<Value, ToolError> {
             o @ Value::Object(_) => Value::Array(vec![o]),
             other => other,
         };
-    }
-    for key in spec.objects {
-        let Some(v) = obj.get_mut(*key) else { continue };
-        if let Value::String(s) = v
-            && let Some(parsed) = json_text(s, '{')
-        {
-            *v = parsed;
-        }
     }
     for key in spec.bools {
         if let Some(v) = obj.get_mut(*key)
@@ -138,7 +128,6 @@ mod tests {
         Spec {
             aliases: &[("account", "accounts")],
             lists: &["accounts", "order_by"],
-            objects: &["where"],
             bools: &["count_only"],
             ints: &["limit"],
         }
@@ -147,24 +136,19 @@ mod tests {
     #[test]
     fn reshapes_only_what_has_one_reading() {
         let a = json!({
-            "account": "info", "order_by": {"field": "size_bytes"}, "where": "{\"all\": []}",
-            "count_only": "TRUE", "limit": "20"
+            "account": "info", "order_by": {"field": "size_bytes"}, "count_only": "TRUE", "limit": "20"
         });
         let n = normalize(&a, &spec()).unwrap();
         assert_eq!(
             n,
-            json!({"accounts": ["info"], "order_by": [{"field": "size_bytes"}], "where": {"all": []},
+            json!({"accounts": ["info"], "order_by": [{"field": "size_bytes"}],
                    "count_only": true, "limit": 20})
         );
         // JSON text of a list; text that is not JSON stays a plain value; broken JSON is left for the strict parser.
         let n = normalize(&json!({"accounts": "[\"a\", \"b\"]"}), &spec()).unwrap();
         assert_eq!(n["accounts"], json!(["a", "b"]));
-        let n = normalize(
-            &json!({"accounts": "[broken", "where": "{broken", "limit": "20x", "count_only": "yes"}),
-            &spec(),
-        )
-        .unwrap();
-        assert_eq!(n, json!({"accounts": ["[broken"], "where": "{broken", "limit": "20x", "count_only": "yes"}));
+        let n = normalize(&json!({"accounts": "[broken", "limit": "20x", "count_only": "yes"}), &spec()).unwrap();
+        assert_eq!(n, json!({"accounts": ["[broken"], "limit": "20x", "count_only": "yes"}));
         // Whole floats are integers; negatives and fractions are not touched.
         assert_eq!(normalize(&json!({"limit": 20.0}), &spec()).unwrap()["limit"], json!(20));
         assert_eq!(normalize(&json!({"limit": 2.5}), &spec()).unwrap()["limit"], json!(2.5));

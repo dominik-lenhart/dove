@@ -127,7 +127,6 @@ fn input_schema() -> Value {
 const SEARCH_SPEC: Spec<'static> = Spec {
     aliases: &[("account", "accounts")],
     lists: &["accounts", "select", "order_by"],
-    objects: &["where"],
     bools: &["count_only", "include_spam_trash", "awaiting_reply"],
     ints: &["limit", "max_lag_seconds"],
 };

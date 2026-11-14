@@ -61,8 +61,7 @@ pub fn defs() -> Vec<ToolDef> {
     }]
 }
 
-const CONTACTS_SPEC: Spec<'static> =
-    Spec { aliases: &[], lists: &[], objects: &[], bools: &["include_automated"], ints: &["limit"] };
+const CONTACTS_SPEC: Spec<'static> = Spec { aliases: &[], lists: &[], bools: &["include_automated"], ints: &["limit"] };
 
 const CONTACTS_HINTS: &[(&str, &str)] = &[
     ("accounts", "Use 'account' (one mailbox alias or address)."),

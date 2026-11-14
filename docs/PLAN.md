@@ -569,3 +569,29 @@ hosts or reference hardware.
   The notice and `--check` print `brew upgrade dove` for it. Only the formula named `dove` counts. The check is on
   the path, not on `brew --prefix`, so it needs no `brew` binary and works with `/opt/homebrew`, `/usr/local` and
   Linuxbrew alike.
+- A68. Search arguments that agents can call correctly (owner request 2026-11-14; production audit of 7 days: 141 ok
+  calls and 14 `invalid_argument` for `search_messages`, about 9 %). The audit keeps no query text, so the likely
+  mistakes come from the code and the schema: `contains` or `eq` on text fields (the operators are `terms`,
+  `phrase`, `prefix`), `query`, `q` or `page_token` as top-level arguments, `account` (the spelling of
+  `search_contacts`) for `accounts`, `received_at` as a date or without offset, `limit` above 100, `cursor` with
+  other arguments, `where` as a list or as JSON text, `eq` with a list and `in` with a string, `select` with
+  `body_text` or `date`, `order_by` as one object, and `where`/`gmail_query` mixed up between the two sources.
+  (a) Errors: `ToolError::invalid_at(path, text)` gives `message = "<path>: <what to do>"` and
+  `details.field = <path>`; examples go in `details.example`, enumerable values in `details.allowed`. The code stays
+  `invalid_argument` (spec 5.4). Paths are built from the tool's own structure (`where.all[1].op`, `select[0]`),
+  never from caller text. (b) Leniency only where the reading is unique: `tools::lenient::normalize` reshapes
+  arguments before the strict parsers run (one value to a list, JSON text, `"true"`, digit strings, an alias name);
+  the strict parsers accept names in any case and the value shapes listed in the changelog. A date means its UTC day:
+  `gte`/`lt` use the day's start, `gt`/`lte` its last millisecond, `eq` is refused (no single value). Not accepted:
+  a time without offset (the zone is unknown), several values for `eq`/`phrase`/`prefix`/`account`, `contains`
+  mapped to `terms` (it would silently change substring to word matching), inferring `group_by` or `source` from
+  other arguments (existing contract tests pin the errors, and the row shape would change silently), a
+  `limit` above the maximum clamped (the error tells how to page instead). Authorization is untouched: account
+  names are still resolved by `ClientCtx::resolve` and unknown and ungranted names are the same `not_found`.
+  (c) The tool description is unchanged; the `where` schema text now lists the operators per field group, the date
+  forms and the missing substring match (about 70 tokens). (d) Audit: the existing `object_ids` column holds
+  `~invalid=<path with list indices removed>`, derived by `ToolError::audit_field`, which refuses anything that is
+  not a plain path of lowercase names (no schema change, no value, no index). It applies to every tool that raises
+  `invalid_at`, which includes the shared argument helpers (`opt_str`, `opt_u64`, `opt_bool`, `opt_str_list`,
+  `only_keys`). With this the next audit review can group refusals by argument.
+

@@ -432,3 +432,12 @@ cargo fmt
   (prompt after `--`, since `--allowedTools` is variadic). Tests run the real binary in
   `tests/client_e2e.rs::watch_listen_runs_the_command_once_per_event_with_ids_only`; generate events there with
   `index::sync::sync_account` after `IndexEnable`. Never build the prompt from mail content.
+- 2026-11-14: Argument errors (PLAN A68): raise `ToolError::invalid_at(path, text)`, never `invalid("'x' ...")`, so the message
+  starts with the path and `details.field` feeds the audit (`~invalid=<path>` via `ToolError::audit_field`, which drops
+  anything that is not a plain lowercase path). Build the path from the tool's own structure, never from caller text, and
+  never echo a value into it. New leniency goes in `tools::lenient::normalize` (argument level) or `index::query::parse_*`
+  (value level) and only where the reading is unique; add the case to `tests/search_contract.rs`
+  (`search_accepts_arguments_that_have_one_reading`) and keep the not-found scope tests green. When mutation-checking from a
+  script, set `PATH` with explicit absolute directories (`~` is not expanded inside a joined PATH string): a missing
+  `cargo` makes every mutant look killed.
+
