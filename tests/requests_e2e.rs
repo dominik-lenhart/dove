@@ -689,7 +689,11 @@ async fn approved_revision_is_binding() {
         states(&h, &id).await,
         (
             "done".into(),
-            vec![st("failed", Some("draft_changed")), st("failed", Some("not_found")), st("failed", Some("draft_changed"))]
+            vec![
+                st("failed", Some("draft_changed")),
+                st("failed", Some("not_found")),
+                st("failed", Some("draft_changed"))
+            ]
         )
     );
     assert_eq!(states(&h, &sid).await, ("done".into(), vec![st("failed", Some("not_found"))]));
@@ -811,7 +815,11 @@ async fn revoked_client_lost_grant_and_removed_mailbox_stop_items() {
     }
     let (od, orev) = &ops_items[0];
     let ops_req = h
-        .ok(&other, "request_send", json!({"account":"ops","items":[{"draft_id":od,"expected_revision":orev,"send_at":at(t)}]}))
+        .ok(
+            &other,
+            "request_send",
+            json!({"account":"ops","items":[{"draft_id":od,"expected_revision":orev,"send_at":at(t)}]}),
+        )
         .await["request_id"]
         .as_str()
         .unwrap()
@@ -823,7 +831,11 @@ async fn revoked_client_lost_grant_and_removed_mailbox_stop_items() {
     h.admin(AdminRequest::AccountsRemove { alias: "ops".into() }).await.unwrap();
     let gone: i64 = {
         let r = ops_req.clone();
-        h.app().store.call(move |c| Ok(c.query_row("SELECT count(*) FROM requests WHERE id = ?1", [r], |x| x.get(0))?)).await.unwrap()
+        h.app()
+            .store
+            .call(move |c| Ok(c.query_row("SELECT count(*) FROM requests WHERE id = ?1", [r], |x| x.get(0))?))
+            .await
+            .unwrap()
     };
     assert_eq!(gone, 0, "rows of a removed mailbox are deleted with it");
     assert!(audit_text(&h).await.contains(&ops_req), "the cancellation was audited before the rows went");
@@ -905,4 +917,240 @@ async fn concurrent_passes_send_once() {
     assert_eq!(states(&h, &id).await, ("done".into(), vec![st("sent", None); 3]));
     assert_eq!(h.google.count("POST", "drafts/send"), 3);
     assert_eq!(send_items_audit(&h).await.len(), 3);
+}
+
+// ------------------------------------------------------------------ unless_reply
+
+use dove::index::sync::sync_account;
+use support::fake_google::MessageSpec;
+
+fn msg(from: &str, labels: &[&str], at_ms: i64) -> MessageSpec {
+    MessageSpec {
+        from: from.into(),
+        to: vec![MB.into()],
+        subject: "Offer".into(),
+        text: Some("hello there".into()),
+        labels: labels.iter().map(|l| l.to_string()).collect(),
+        thread_id: Some("thr1".into()),
+        internal_date_ms: at_ms,
+        ..Default::default()
+    }
+}
+
+struct Reply {
+    h: Harness,
+    token: String,
+    info: String,
+    inbound: String,
+}
+
+impl Reply {
+    /// `info` is indexed and has bob's mail in `thr1`, two minutes old.
+    async fn start() -> Self {
+        let h = Harness::start().await;
+        let info = h.mailbox("info", MB);
+        h.project("acme", &["info"]).await;
+        let token = h.token("acme", "agent", vec![g("info", "read,draft")]).await;
+        let inbound = h.google.add_message(MB, msg("bob@example.com", &["INBOX"], (util::now_unix() - 120) * 1000));
+        h.admin(AdminRequest::IndexEnable { alias: "info".into() }).await.unwrap();
+        let s = Self { h, token, info, inbound };
+        s.sync().await;
+        s
+    }
+
+    async fn sync(&self) {
+        let r = sync_account(self.h.app(), &self.info).await.unwrap();
+        assert_eq!((r.stage.as_str(), r.error.as_deref()), ("ready", None), "{r:?}");
+    }
+
+    /// `request_send` arguments with `unless_reply` for a new reply draft to bob's mail at `t`.
+    async fn reply_args(&self, t: i64) -> Value {
+        let inbound = &self.inbound;
+        let d = self
+            .h
+            .ok(
+                &self.token,
+                "create_draft",
+                json!({"account":"info","request_key":uuid::Uuid::new_v4().to_string(),
+                       "reply_to_message_id":inbound,"body_text":"Thanks"}),
+            )
+            .await;
+        let mut args = send_args(&[(d["draft_id"].as_str().unwrap(), d["revision"].as_str().unwrap(), t)]);
+        args["unless_reply"] = json!(true);
+        args
+    }
+
+    /// A reply draft requested with `unless_reply` for `t`; returns the request id.
+    async fn request(&self, t: i64) -> String {
+        let args = self.reply_args(t).await;
+        self.h.ok(&self.token, "request_send", args).await["request_id"].as_str().unwrap().to_string()
+    }
+
+    async fn approve(&self, id: &str) {
+        let v = show(&self.h, id).await;
+        approve(&self.h, id, shown_of(&v), None, dove::admin::Late::Skip).await.unwrap();
+    }
+
+    async fn set_index_enabled(&self, on: bool) {
+        self.h
+            .app()
+            .store
+            .call(move |c| Ok(c.execute("UPDATE accounts SET index_enabled = ?1 WHERE alias = 'info'", [on])?))
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn reply_before_send_skips_the_item() {
+    let r = Reply::start().await;
+    let t = util::now_unix() + 60;
+    let id = r.request(t).await;
+    r.approve(&id).await;
+    // The messages that existed at request time never count, even when synced again.
+    assert_eq!(run(&r.h, t - 1).await, TickReport::default());
+    r.h.google.add_message(MB, msg("bob@example.com", &["INBOX"], 0));
+    r.sync().await;
+    assert_eq!(run(&r.h, t).await, report(0, 0, 1, 0, 0, 0));
+    assert_eq!(states(&r.h, &id).await, ("done".into(), vec![st("skipped", Some("replied"))]));
+    assert_eq!(r.h.google.count("POST", "drafts/send"), 0);
+}
+
+#[tokio::test]
+async fn own_follow_up_does_not_skip() {
+    let r = Reply::start().await;
+    let t = util::now_unix() + 60;
+    // A message already in the thread at request time never counts, even when its date is after the baseline
+    // (sender clock skew): the baseline ids hold it.
+    r.h.google.add_message(MB, msg("bob@example.com", &["INBOX"], (util::now_unix() + 30) * 1000));
+    r.sync().await;
+    let id = r.request(t).await;
+    r.approve(&id).await;
+    r.h.google.add_message(MB, msg(MB, &["SENT"], 0));
+    r.sync().await;
+    assert_eq!(run(&r.h, t).await, report(1, 0, 0, 0, 0, 0));
+    assert_eq!(states(&r.h, &id).await, ("done".into(), vec![st("sent", None)]));
+    assert_eq!(r.h.google.count("POST", "drafts/send"), 1);
+}
+
+#[tokio::test]
+async fn reply_between_request_and_approval_skips() {
+    let r = Reply::start().await;
+    let t = util::now_unix() + 60;
+    let id = r.request(t).await;
+    r.h.google.add_message(MB, msg("carol@example.com", &["INBOX"], 0));
+    r.sync().await;
+    r.approve(&id).await;
+    assert_eq!(run(&r.h, t).await, report(0, 0, 1, 0, 0, 0));
+    assert_eq!(states(&r.h, &id).await.1, vec![st("skipped", Some("replied"))]);
+    assert_eq!(r.h.google.count("POST", "drafts/send"), 0);
+}
+
+#[tokio::test]
+async fn stale_index_fails_closed() {
+    let r = Reply::start().await;
+    let t = util::now_unix() + 60;
+    let id = r.request(t).await;
+    r.approve(&id).await;
+    let aid = r.info.clone();
+    r.h.app()
+        .index
+        .write(move |c| {
+            c.execute("UPDATE sync_state SET last_success_at = last_success_at - 3600 WHERE account_id = ?1", [aid])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    r.h.app().index.take_woken();
+    assert_eq!(run(&r.h, t).await, report(0, 0, 0, 0, 0, 1));
+    assert!(r.h.app().index.take_woken().contains(&r.info), "a sync was asked for");
+    assert_eq!(states(&r.h, &id).await.1, vec![st("scheduled", Some("waiting_for_sync"))]);
+    assert_eq!(run(&r.h, t + 60).await, report(0, 0, 0, 0, 0, 1), "still waiting, never sent on doubt");
+    assert_eq!(run(&r.h, t + 3601).await, report(0, 0, 1, 0, 0, 0));
+    assert_eq!(states(&r.h, &id).await, ("done".into(), vec![st("skipped", Some("condition_unknown"))]));
+    assert_eq!(r.h.google.count("POST", "drafts/send"), 0);
+}
+
+#[tokio::test]
+async fn indexing_switched_off_after_approval() {
+    // Disabling purges the index; the account flag alone (before the purge ran) must already stop the send, and so
+    // must an index without sync state while the flag is on (between enabling and its first state).
+    for how in ["flag", "disable", "no_state"] {
+        let r = Reply::start().await;
+        let t = util::now_unix() + 60;
+        let id = r.request(t).await;
+        r.approve(&id).await;
+        match how {
+            "flag" => r.set_index_enabled(false).await,
+            "disable" => {
+                r.h.admin(AdminRequest::IndexDisable { alias: "info".into() }).await.unwrap();
+            }
+            _ => {
+                let aid = r.info.clone();
+                r.h.app()
+                    .index
+                    .write(move |c| Ok(c.execute("DELETE FROM sync_state WHERE account_id = ?1", [aid]).map(|_| ())?))
+                    .await
+                    .unwrap();
+            }
+        }
+        assert_eq!(run(&r.h, t).await, report(0, 0, 1, 0, 0, 0), "{how}");
+        assert_eq!(states(&r.h, &id).await.1, vec![st("skipped", Some("condition_unknown"))]);
+        assert_eq!(r.h.google.count("POST", "drafts/send"), 0);
+    }
+}
+
+#[tokio::test]
+async fn unless_reply_needs_an_indexed_thread() {
+    let r = Reply::start().await;
+    let t = util::now_unix() + 60;
+    let field =
+        |v: &Value| (v["code"].as_str().map(str::to_string), v["details"]["field"].as_str().map(str::to_string));
+    let want = (Some("invalid_argument".to_string()), Some("unless_reply".to_string()));
+    // A new mail (no thread) has nothing to wait for.
+    let (d, rev) = draft(&r.h, &r.token, "info").await;
+    let mut args = send_args(&[(&d, &rev, t)]);
+    args["unless_reply"] = json!(true);
+    assert_eq!(field(&error(&r.h, &r.token, "request_send", args).await), want);
+    // A reply to a message the index has not seen yet: no baseline can be taken.
+    let fresh = r.h.google.add_message(
+        MB,
+        MessageSpec {
+            thread_id: Some("thr2".into()),
+            ..msg("dan@example.com", &["INBOX"], (util::now_unix() - 10) * 1000)
+        },
+    );
+    let d =
+        r.h.ok(
+            &r.token,
+            "create_draft",
+            json!({"account":"info","request_key":uuid::Uuid::new_v4().to_string(),
+                   "reply_to_message_id":fresh,"body_text":"Thanks"}),
+        )
+        .await;
+    let mut args = send_args(&[(d["draft_id"].as_str().unwrap(), d["revision"].as_str().unwrap(), t)]);
+    args["unless_reply"] = json!(true);
+    assert_eq!(field(&error(&r.h, &r.token, "request_send", args).await), want);
+    // Indexing switched off: the account flag alone (before the purge ran) refuses the condition.
+    let args = r.reply_args(t).await;
+    r.set_index_enabled(false).await;
+    assert_eq!(field(&error(&r.h, &r.token, "request_send", args.clone()).await), want);
+    r.set_index_enabled(true).await;
+    r.h.ok(&r.token, "request_send", args).await;
+}
+
+#[tokio::test]
+async fn index_enabled_again_waits_for_its_first_sync() {
+    // Re-enabled after approval: the new generation is still building and has never completed a sync, so the item
+    // waits for it (a partial index cannot prove that nobody answered) and is skipped when the grace runs out.
+    let r = Reply::start().await;
+    let t = util::now_unix() + 60;
+    let id = r.request(t).await;
+    r.approve(&id).await;
+    r.h.admin(AdminRequest::IndexDisable { alias: "info".into() }).await.unwrap();
+    r.h.admin(AdminRequest::IndexEnable { alias: "info".into() }).await.unwrap();
+    assert_eq!(run(&r.h, t).await, report(0, 0, 0, 0, 0, 1));
+    assert_eq!(run(&r.h, t + 3601).await, report(0, 0, 1, 0, 0, 0));
+    assert_eq!(states(&r.h, &id).await.1, vec![st("skipped", Some("condition_unknown"))]);
+    assert_eq!(r.h.google.count("POST", "drafts/send"), 0);
 }
