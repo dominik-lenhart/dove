@@ -8,7 +8,7 @@
 //!   request's canonical JSON); a valid assertion from the session's own passkey runs exactly that request, once.
 //! - Nothing secret (tokens, challenges, client data) reaches logs or audit rows; failures are fixed codes.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -134,6 +134,44 @@ pub struct Pools {
     login: Pool<[u8; 32]>,
     enrol: Pool<EnrolPending>,
     stepup: Pool<StepUp>,
+    seen: SeenSessions,
+}
+
+const SEEN_CAP: usize = 64;
+
+/// Hashes of session tokens the gate has found valid, with their expiry, kept in memory (at most [`SEEN_CAP`]). Only
+/// the request budget uses them: once an address is over its budget, a request whose cookie is listed here still
+/// passes the guard and draws from a budget of its own, without a state-store lookup (PLAN A74 (i)). They prove
+/// nothing: the gate looks the session up as always, so a revoked session that is still listed is refused there.
+#[derive(Default)]
+struct SeenSessions(Mutex<HashMap<Vec<u8>, i64>>);
+
+impl SeenSessions {
+    fn note(&self, token: &str, expires_at: i64) {
+        let now = util::now_unix();
+        let mut m = self.0.lock().expect("lock");
+        if m.len() >= SEEN_CAP {
+            m.retain(|_, exp| *exp > now);
+        }
+        if m.len() >= SEEN_CAP
+            && let Some(k) = m.iter().min_by_key(|(_, exp)| **exp).map(|(k, _)| k.clone())
+        {
+            m.remove(&k);
+        }
+        m.insert(store::token_hash(token), expires_at);
+    }
+
+    fn bucket(&self, token: &str) -> Option<String> {
+        let h = store::token_hash(token);
+        let m = self.0.lock().expect("lock");
+        let listed = m.get(&h).is_some_and(|exp| *exp > util::now_unix());
+        listed.then(|| format!("admin-session:{}", util::b64url(&h[..12])))
+    }
+}
+
+/// The request-budget key of a browser whose session the gate has seen valid, or `None`. No state-store access.
+pub fn seen_session_bucket(app: &App, headers: &HeaderMap) -> Option<String> {
+    app.admin_ui.auth.seen.bucket(&cookie_token(headers)?)
 }
 
 fn new_ceremony_id() -> String {
@@ -202,7 +240,9 @@ fn cookie_token(headers: &HeaderMap) -> Option<String> {
 pub async fn session_from_headers(app: &Arc<App>, headers: &HeaderMap) -> Option<WebSession> {
     let token = cookie_token(headers)?;
     let csrf = csrf_for(&token);
-    let s = app.store.call(move |c| store::session_lookup(c, &token, util::now_unix())).await.ok()??;
+    let t = token.clone();
+    let s = app.store.call(move |c| store::session_lookup(c, &t, util::now_unix())).await.ok()??;
+    app.admin_ui.auth.seen.note(&token, s.expires_at);
     Some(WebSession { id: s.id, passkey_id: s.passkey_id, label: s.label, expires_at: s.expires_at, csrf })
 }
 

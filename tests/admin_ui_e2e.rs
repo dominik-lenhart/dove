@@ -327,8 +327,15 @@ async fn rate_and_login_failure_limits_per_address() {
         stranger.get("/admin/login").await;
     }
     assert_eq!(stranger.get("/admin/login").await.status, 429);
-    assert_eq!(owner.get("/admin/settings").await.status, 200);
-    assert_eq!(owner.get("/admin/requests").await.status, 200);
+    // A made-up cookie is not a session the gate has seen: still 429, and no state-store lookup on this path.
+    stranger.cookie = Some(util::b64url(&[9u8; 32]));
+    assert_eq!(stranger.get("/admin").await.status, 429);
+    // The signed-in browser draws from a budget of its own (40 per minute here), which also runs out.
+    let mut own = vec![];
+    for _ in 0..42 {
+        own.push(owner.get("/admin/settings").await.status);
+    }
+    assert!(own[..40].iter().all(|c| *c == 200) && own[40..].iter().all(|c| *c == 429), "{own:?}");
 }
 
 // ------------------------------------------------------------------ enrolment and sign-in
