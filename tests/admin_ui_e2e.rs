@@ -315,6 +315,20 @@ async fn rate_and_login_failure_limits_per_address() {
         codes.push(e.get("/admin/login").await.status);
     }
     assert!(codes[..40].iter().all(|c| *c == 200) && codes[40..].iter().all(|c| *c == 429), "{codes:?}");
+    // A signed-in browser behind the same address is still served once the budget is spent (behind Tailscale Serve
+    // every caller shares 127.0.0.1); anonymous requests from it are not.
+    let mut owner = Browser::new(&h);
+    owner.extra = e.extra.clone();
+    owner.extra[0].1 = "203.0.113.11".into();
+    let mut stranger = Browser::new(&h);
+    stranger.extra = owner.extra.clone();
+    login(&mut owner, &mut a).await;
+    for _ in 0..45 {
+        stranger.get("/admin/login").await;
+    }
+    assert_eq!(stranger.get("/admin/login").await.status, 429);
+    assert_eq!(owner.get("/admin/settings").await.status, 200);
+    assert_eq!(owner.get("/admin/requests").await.status, 200);
 }
 
 // ------------------------------------------------------------------ enrolment and sign-in

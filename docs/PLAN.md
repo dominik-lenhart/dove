@@ -770,8 +770,10 @@ hosts or reference hardware.
   (i) The per-address limits are shared by every caller behind Tailscale Serve (all `127.0.0.1`), and a process on
   the host can spend them. So the sign-in failure limit never refuses a valid assertion: options are always issued,
   the assertion is verified, and only failures are charged; once the bucket is empty, failures answer 429 instead of
-  401 (the same rule as `/mcp` bearer failures). A local process can still use up the shared request budget (120 per
-  minute) or evict the bounded challenge pools; that is a nuisance, not a bypass, and the CLI is unaffected.
+  401 (the same rule as `/mcp` bearer failures). Over the request budget (120 per minute) a signed-in browser is still served;
+  the session is looked up only once the budget is spent. What a flooding local process can still do is delay a new sign-in: use up the anonymous budget or evict login challenges (64 entries,
+  120 s). Before sign-in the owner cannot be told apart from it behind Serve. That is a nuisance, not a bypass;
+  existing sessions and the CLI are unaffected.
   (j) Unknown paths under `/admin` answer 404 before the session check (the plan said after): the route list is
   public in the source anyway. (k) The Overview shows the last doctor result (cached in memory); "Run checks" runs it.
   (l) The UI is refused in local mode and `dove tailscale setup --admin` refuses while Funnel is on for the port.

@@ -170,6 +170,10 @@ pub async fn guard(app: Arc<App>, req: Request, next: Next) -> Response {
         let key = format!("admin:{}", ip.map(|i| i.to_string()).unwrap_or_else(|| "unknown".into()));
         let per_minute = ui.requests_per_minute;
         match app.rate_limiter.check(&key, per_minute, per_minute) {
+            // Over the address budget, a signed-in browser is still served: behind Tailscale Serve every caller is
+            // 127.0.0.1, and anonymous traffic from a local process must not lock out the owner's session (PLAN A74
+            // (i)). The session is looked up only once the budget is spent.
+            Some(_) if auth::session_from_headers(&app, req.headers()).await.is_some() => next.run(req).await,
             Some(_) => plain(StatusCode::TOO_MANY_REQUESTS, "too many requests; try again in a minute"),
             None => next.run(req).await,
         }

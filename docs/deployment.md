@@ -1071,8 +1071,9 @@ admin socket; the CLI keeps working without the UI.
 
 **Limits.** `requests_per_minute` (120) and `login_failures_per_hour` (10) are per client address. A valid passkey
 always signs in, but after too many failures the failures answer "too many attempts". A process on the Dove host can
-reach the loopback listener directly. It cannot sign in without your passkey, but it can use up the shared
-per-address budget behind Tailscale Serve. If the UI answers "too many requests", wait a minute or use the CLI.
+reach the loopback listener directly. It cannot sign in without your passkey, but behind Tailscale Serve it can use up
+the budget for anonymous requests, which delays a new sign-in. Browsers that are already signed in keep working. If the
+sign-in page answers "too many requests", wait a minute or use the CLI.
 
 ## Backup and restore
 
