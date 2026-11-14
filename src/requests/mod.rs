@@ -1,4 +1,5 @@
-//! Agent requests (design 2026-11-14 section 4, PLAN A71). Stage 1: scheduled send of a client's own drafts.
+//! Agent requests (design 2026-11-14 section 4, PLAN A71, A73). Stage 1: scheduled send of a client's own drafts.
+//! Stage 2: access requests and temporary grants ([`access`]).
 //!
 //! An agent asks with `request_send`; the operator approves with `dove requests approve` (admin socket only); the
 //! worker ([`worker::tick`]) sends exactly the approved revision of each approved item at its time, or not at all.
@@ -13,6 +14,7 @@
 //! Nothing here carries mail content. The agent's note is sealed with the vault ([`NOTE_KIND`]) and shown to the
 //! operator only; audit records carry ids and result codes.
 
+pub mod access;
 pub mod admin;
 pub mod worker;
 
@@ -196,6 +198,9 @@ pub struct RequestView {
     pub expires_at: String,
     pub decided_at: Option<String>,
     pub items: Vec<ItemView>,
+    /// Kind `access`: the asked grants, their state and the expiry of approved temporary grants.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access: Option<access::AccessView>,
 }
 
 pub fn load_items(c: &Connection, request_id: &str) -> anyhow::Result<Vec<ItemView>> {
@@ -216,7 +221,8 @@ pub fn load_items(c: &Connection, request_id: &str) -> anyhow::Result<Vec<ItemVi
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
-const VIEW_COLS: &str = "r.id, r.kind, r.status, a.alias, r.unless_reply, r.created_at, r.expires_at, r.decided_at";
+const VIEW_COLS: &str =
+    "r.id, r.kind, r.status, a.alias, r.unless_reply, r.created_at, r.expires_at, r.decided_at, r.payload";
 
 fn view_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RequestView> {
     Ok(RequestView {
@@ -229,7 +235,17 @@ fn view_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RequestView> {
         expires_at: util::rfc3339(r.get(6)?),
         decided_at: r.get::<_, Option<i64>>(7)?.map(util::rfc3339),
         items: vec![],
+        access: None,
     })
+}
+
+/// Fills in what is not in the request row: items (send) or the access view (access).
+fn complete(c: &Connection, v: &mut RequestView, payload: &str) -> anyhow::Result<()> {
+    v.items = load_items(c, &v.request_id)?;
+    if v.kind == "access" {
+        v.access = Some(access::view(c, &v.request_id, &v.status, payload, util::now_unix())?);
+    }
+    Ok(())
 }
 
 /// The client's own requests, newest first (at most 200), optionally with one status.
@@ -238,10 +254,12 @@ pub fn list_for_client(c: &Connection, client_id: &str, status: Option<&str>) ->
         "SELECT {VIEW_COLS} FROM requests r LEFT JOIN accounts a ON a.id = r.account_id \
          WHERE r.client_id = ?1 AND (?2 IS NULL OR r.status = ?2) ORDER BY r.created_at DESC, r.id LIMIT 200"
     ))?;
-    let mut out: Vec<RequestView> =
-        st.query_map(params![client_id, status], view_from_row)?.collect::<Result<_, _>>()?;
-    for v in &mut out {
-        v.items = load_items(c, &v.request_id)?;
+    let rows: Vec<(RequestView, String)> =
+        st.query_map(params![client_id, status], |r| Ok((view_from_row(r)?, r.get(8)?)))?.collect::<Result<_, _>>()?;
+    let mut out = Vec::with_capacity(rows.len());
+    for (mut v, payload) in rows {
+        complete(c, &mut v, &payload)?;
+        out.push(v);
     }
     Ok(out)
 }
@@ -255,12 +273,12 @@ pub fn view_for_client(c: &Connection, client_id: &str, id: &str) -> anyhow::Res
                  WHERE r.client_id = ?1 AND r.id = ?2"
             ),
             params![client_id, id],
-            view_from_row,
+            |r| Ok((view_from_row(r)?, r.get::<_, String>(8)?)),
         )
         .optional()?;
     match v {
-        Some(mut v) => {
-            v.items = load_items(c, &v.request_id)?;
+        Some((mut v, payload)) => {
+            complete(c, &mut v, &payload)?;
             Ok(Some(v))
         }
         None => Ok(None),
@@ -278,8 +296,9 @@ pub fn cancel_by_client(tx: &Transaction, client_id: &str, id: &str, now: i64) -
     Ok(true)
 }
 
-/// Cancels one request in `status`: pending → `cancelled` with all items; approved → its unsent items. Items carry
-/// `reason`. Returns whether anything changed.
+/// Cancels one request in `status`: pending → `cancelled` with all items; approved → its unsent items and its
+/// temporary grants (an access request; the agent may give rights back early). Items carry `reason`. Returns whether
+/// anything changed.
 pub(crate) fn cancel_one(tx: &Transaction, id: &str, status: &str, reason: &str, now: i64) -> anyhow::Result<bool> {
     let n = match status {
         "pending" => {
@@ -293,23 +312,26 @@ pub(crate) fn cancel_one(tx: &Transaction, id: &str, status: &str, reason: &str,
                 params![reason, now, id],
             )? + 1
         }
-        "approved" => tx.execute(
-            "UPDATE request_items SET state = 'cancelled', reason = ?1, updated_at = ?2 \
-             WHERE request_id = ?3 AND state IN ('pending', 'scheduled')",
-            params![reason, now, id],
-        )?,
+        "approved" => {
+            tx.execute(
+                "UPDATE request_items SET state = 'cancelled', reason = ?1, updated_at = ?2 \
+                 WHERE request_id = ?3 AND state IN ('pending', 'scheduled')",
+                params![reason, now, id],
+            )? + access::drop_extras(tx, access::Scope::Request(id))?
+        }
         _ => 0,
     };
     close_if_finished(tx, id)?;
     Ok(n > 0)
 }
 
-/// An approved request is `done` once no item can still lead to a send.
-pub fn close_if_finished(tx: &Transaction, request_id: &str) -> anyhow::Result<()> {
+/// An approved request is `done` once no item can still lead to a send and no temporary grant of it is left.
+pub fn close_if_finished(tx: &Connection, request_id: &str) -> anyhow::Result<()> {
     tx.execute(
         &format!(
             "UPDATE requests SET status = 'done' WHERE id = ?1 AND status = 'approved' \
-             AND NOT EXISTS (SELECT 1 FROM request_items WHERE request_id = ?1 AND state IN {OPEN_ITEM_STATES})"
+             AND NOT EXISTS (SELECT 1 FROM request_items WHERE request_id = ?1 AND state IN {OPEN_ITEM_STATES}) \
+             AND NOT EXISTS (SELECT 1 FROM client_grant_extras WHERE request_id = ?1)"
         ),
         [request_id],
     )?;
@@ -340,9 +362,11 @@ pub fn cancel_for_client(tx: &Transaction, client_id: &str, now: i64) -> anyhow:
     cancel_where(tx, "client_id", client_id, "client_revoked", now)
 }
 
-/// On removing a mailbox: the requests that name it are cancelled like on revoke.
+/// On removing a mailbox: the requests that name it are cancelled like on revoke; access requests that name it are
+/// cancelled (pending) or lose their temporary grant on it (approved).
 pub fn cancel_for_account(tx: &Transaction, account_id: &str, now: i64) -> anyhow::Result<usize> {
-    cancel_where(tx, "account_id", account_id, "account_removed", now)
+    Ok(cancel_where(tx, "account_id", account_id, "account_removed", now)?
+        + access::cancel_naming_account(tx, account_id, None, "account_removed", now)?)
 }
 
 /// On disabling a mailbox: as [`cancel_for_account`], with the reason `account_disabled`.

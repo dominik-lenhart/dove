@@ -3,6 +3,10 @@
 //! `show` reads each draft fresh through the `get_draft` code path, as the requesting client, and returns its content
 //! to the admin socket only (the audit record holds the request id). `approve` binds the approval to the revisions the
 //! operator was shown: if any chosen draft changed in between, nothing is approved.
+//!
+//! Access requests (stage 2, PLAN A73): `show` lists each asked grant with what the client holds now; `approve` writes
+//! a permanent grant into `client_mailboxes` (old ∪ approved, through `write_grants`) or one temporary grant per chosen
+//! mailbox into `client_grant_extras`. The operator may untick mailboxes (`items`) and shorten the duration.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
@@ -27,33 +31,42 @@ pub fn list(c: &Connection, status: Option<&str>) -> anyhow::Result<Value> {
     }
     let mut st = c.prepare(
         "SELECT r.id, r.kind, r.status, cl.name, p.name, a.alias, r.unless_reply, r.created_at, r.expires_at, \
-         r.decided_at, r.decided_by, r.note_sealed IS NOT NULL \
+         r.decided_at, r.decided_by, r.note_sealed IS NOT NULL, r.payload \
          FROM requests r JOIN clients cl ON cl.id = r.client_id JOIN projects p ON p.id = r.project_id \
          LEFT JOIN accounts a ON a.id = r.account_id \
          WHERE (?1 IS NULL OR r.status = ?1) ORDER BY r.created_at DESC, r.id LIMIT 500",
     )?;
-    let rows: Vec<Value> = st
+    let rows: Vec<(Value, String)> = st
         .query_map([status], |r| {
-            Ok(json!({
-                "request_id": r.get::<_, String>(0)?,
-                "kind": r.get::<_, String>(1)?,
-                "status": r.get::<_, String>(2)?,
-                "client": r.get::<_, String>(3)?,
-                "project": r.get::<_, String>(4)?,
-                "account": r.get::<_, Option<String>>(5)?,
-                "unless_reply": r.get::<_, bool>(6)?,
-                "created_at": util::rfc3339(r.get(7)?),
-                "expires_at": util::rfc3339(r.get(8)?),
-                "decided_at": r.get::<_, Option<i64>>(9)?.map(util::rfc3339),
-                "decided_by": r.get::<_, Option<String>>(10)?,
-                "has_note": r.get::<_, bool>(11)?,
-            }))
+            Ok((
+                json!({
+                    "request_id": r.get::<_, String>(0)?,
+                    "kind": r.get::<_, String>(1)?,
+                    "status": r.get::<_, String>(2)?,
+                    "client": r.get::<_, String>(3)?,
+                    "project": r.get::<_, String>(4)?,
+                    "account": r.get::<_, Option<String>>(5)?,
+                    "unless_reply": r.get::<_, bool>(6)?,
+                    "created_at": util::rfc3339(r.get(7)?),
+                    "expires_at": util::rfc3339(r.get(8)?),
+                    "decided_at": r.get::<_, Option<i64>>(9)?.map(util::rfc3339),
+                    "decided_by": r.get::<_, Option<String>>(10)?,
+                    "has_note": r.get::<_, bool>(11)?,
+                }),
+                r.get::<_, String>(12)?,
+            ))
         })?
         .collect::<Result<_, _>>()?;
     let mut out = Vec::with_capacity(rows.len());
-    for mut v in rows {
-        let items = super::load_items(c, v["request_id"].as_str().unwrap_or_default())?;
-        v["items"] = json!(items);
+    let now = util::now_unix();
+    for (mut v, payload) in rows {
+        let id = v["request_id"].as_str().unwrap_or_default().to_string();
+        if v["kind"] == "access" {
+            let st = v["status"].as_str().unwrap_or_default().to_string();
+            v["access"] = json!(super::access::view(c, &id, &st, &payload, now)?);
+        } else {
+            v["items"] = json!(super::load_items(c, &id)?);
+        }
         out.push(v);
     }
     Ok(json!(out))
@@ -74,6 +87,7 @@ struct Stored {
     expires_at: i64,
     decided_at: Option<i64>,
     decided_by: Option<String>,
+    payload: String,
     items: Vec<StoredItem>,
 }
 
@@ -92,7 +106,7 @@ fn load(c: &Connection, id: &str) -> anyhow::Result<Stored> {
     let mut s = c
         .query_row(
             "SELECT r.client_id, cl.name, p.name, r.account_id, a.alias, r.kind, r.status, r.unless_reply, \
-             r.note_sealed, r.created_at, r.expires_at, r.decided_at, r.decided_by \
+             r.note_sealed, r.created_at, r.expires_at, r.decided_at, r.decided_by, r.payload \
              FROM requests r JOIN clients cl ON cl.id = r.client_id JOIN projects p ON p.id = r.project_id \
              LEFT JOIN accounts a ON a.id = r.account_id WHERE r.id = ?1",
             [id],
@@ -111,6 +125,7 @@ fn load(c: &Connection, id: &str) -> anyhow::Result<Stored> {
                     expires_at: r.get(10)?,
                     decided_at: r.get(11)?,
                     decided_by: r.get(12)?,
+                    payload: r.get(13)?,
                     items: vec![],
                 })
             },
@@ -220,6 +235,33 @@ pub async fn show(call: &mut AdminCall<'_>, id: String) -> anyhow::Result<Value>
         }
         None => None,
     };
+    if s.kind == "access" {
+        let (cid, rid, status, payload) = (s.client_id.clone(), id.clone(), s.status.clone(), s.payload.clone());
+        let (view, rights) = call
+            .read(move |c| {
+                let now = util::now_unix();
+                let view = super::access::view(c, &rid, &status, &payload, now)?;
+                let rights = super::access::current_rights(c, &cid, &super::access::Payload::parse(&payload)?, now)?;
+                Ok((view, rights))
+            })
+            .await?;
+        let grants: Vec<Value> = view
+            .grants
+            .iter()
+            .zip(rights)
+            .map(|(g, mut r)| {
+                r["idx"] = json!(g.idx);
+                r["state"] = json!(g.state);
+                r
+            })
+            .collect();
+        return Ok(json!({
+            "request_id": id, "kind": s.kind, "status": s.status, "client": s.client, "project": s.project,
+            "note": note, "duration_minutes": view.duration_minutes, "granted_until": view.expires_at,
+            "created_at": util::rfc3339(s.created_at), "expires_at": util::rfc3339(s.expires_at),
+            "decided_at": s.decided_at.map(util::rfc3339), "decided_by": s.decided_by, "grants": grants,
+        }));
+    }
     // Content is read only for items that can still be approved or sent.
     let live: Vec<&StoredItem> =
         s.items.iter().filter(|i| matches!(i.state.as_str(), "pending" | "scheduled")).collect();
@@ -265,11 +307,18 @@ pub async fn approve(
     shown: Vec<ShownItem>,
     chosen: Option<Vec<u32>>,
     late: Late,
+    duration_minutes: Option<u32>,
 ) -> anyhow::Result<Value> {
     let rid = id.clone();
     let s = call.read(move |c| load(c, &rid)).await?;
+    if s.kind == "access" {
+        return approve_access(call, id, chosen, duration_minutes).await;
+    }
     if s.kind != "send" {
-        bail!("only send requests can be approved in this version");
+        bail!("request {id} has an unknown kind");
+    }
+    if duration_minutes.is_some() {
+        bail!("--duration applies to access requests only");
     }
     if s.status != "pending" {
         bail!("request {id} is {}, not pending", s.status);
@@ -387,6 +436,134 @@ pub async fn approve(
     .await
 }
 
+/// Approves an access request: the chosen grants (`None`: all), for `duration_minutes` (shorter than asked only) or as
+/// asked. Everything is re-checked inside one transaction: the request is pending and unexpired, the client is live,
+/// and each chosen mailbox still exists, is in the client's project and its actions pass `resolve_grants` (grant
+/// syntax, `send` only with `allow_send`). A permanent approval adds to `client_mailboxes`; a temporary one writes
+/// `client_grant_extras` rows. Either way the client's epoch moves.
+async fn approve_access(
+    call: &mut AdminCall<'_>,
+    id: String,
+    chosen: Option<Vec<u32>>,
+    duration_minutes: Option<u32>,
+) -> anyhow::Result<Value> {
+    let decided_by = call.actor.name.clone();
+    let allow_send = call.app.cfg.allow_send;
+    call.tx(move |tx| {
+        let now = util::now_unix();
+        let (status, expires_at, client_id, project_id, payload): (String, i64, String, String, String) = tx
+            .query_row(
+                "SELECT status, expires_at, client_id, project_id, payload FROM requests WHERE id = ?1 AND kind = 'access'",
+                [&id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )?;
+        if status != "pending" {
+            bail!("request {id} is {status}, not pending");
+        }
+        if expires_at <= now {
+            bail!("request {id} expired at {}; nothing was approved", util::rfc3339(expires_at));
+        }
+        let mut p = super::access::Payload::parse(&payload)?;
+        let chosen: Vec<u32> = match chosen {
+            Some(mut c) => {
+                c.sort_unstable();
+                c.dedup();
+                if let Some(i) = c.iter().find(|i| **i as usize >= p.grants.len()) {
+                    bail!("item {i} is not a grant of request {id}");
+                }
+                c
+            }
+            None => (0..p.grants.len() as u32).collect(),
+        };
+        if chosen.is_empty() {
+            bail!("no grant chosen; to refuse the request use `dove requests deny`");
+        }
+        let duration = match (duration_minutes, p.duration_secs) {
+            (None, asked) => asked,
+            (Some(m), _) if m == 0 || i64::from(m) > super::access::MAX_DURATION_MINUTES => {
+                bail!("--duration must be between 1 minute and 30 days")
+            }
+            (Some(m), Some(asked)) if i64::from(m) * 60 > asked => {
+                bail!("--duration may only shorten the asked {} minute(s); nothing was approved", asked / 60)
+            }
+            (Some(m), _) => Some(i64::from(m) * 60),
+        };
+        if crate::policy::load_client(tx, &client_id, allow_send)?.is_none() {
+            bail!("the connection is revoked or expired; nothing was approved");
+        }
+        // The same validation as `clients set-grants`: grant syntax, project membership, the send gate.
+        let mut specs = Vec::with_capacity(chosen.len());
+        for i in &chosen {
+            let g = &p.grants[*i as usize];
+            let alias: Option<String> =
+                tx.query_row("SELECT alias FROM accounts WHERE id = ?1", [&g.account_id], |r| r.get(0)).optional()?;
+            let alias = alias.ok_or_else(|| anyhow!("item {i}'s mailbox no longer exists; nothing was approved"))?;
+            specs.push(crate::admin::ops::GrantSpec { account: alias, actions: g.actions.clone() });
+        }
+        let approved = crate::admin::ops::resolve_grants(tx, &project_id, &specs, allow_send)?;
+        let granted_until = match duration {
+            None => {
+                // Permanent: old ∪ approved per mailbox, written through `write_grants`; nothing is ever removed.
+                let existing: BTreeMap<String, (String, crate::policy::Actions)> = {
+                    let mut st = tx.prepare(
+                        "SELECT cm.account_id, a.alias, cm.actions FROM client_mailboxes cm \
+                         JOIN accounts a ON a.id = cm.account_id WHERE cm.client_id = ?1",
+                    )?;
+                    let rows: Vec<(String, String, String)> = st
+                        .query_map([&client_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                        .collect::<Result<_, _>>()?;
+                    let mut m = BTreeMap::new();
+                    for (aid, alias, a) in rows {
+                        let a = crate::policy::Actions::parse(&a)
+                            .map_err(|_| anyhow!("a stored grant of this connection is unreadable; nothing was approved"))?;
+                        m.insert(aid, (alias, a));
+                    }
+                    m
+                };
+                let old: BTreeMap<String, crate::policy::Actions> =
+                    existing.iter().map(|(k, (_, a))| (k.clone(), *a)).collect();
+                let new: BTreeMap<String, crate::policy::Actions> =
+                    approved.iter().map(|(k, (_, a))| (k.clone(), *a)).collect();
+                let merged = super::access::merged(&old, &new);
+                let full: BTreeMap<String, (String, crate::policy::Actions)> = merged
+                    .into_iter()
+                    .map(|(aid, a)| {
+                        let alias = existing
+                            .get(&aid)
+                            .map(|(al, _)| al.clone())
+                            .or_else(|| approved.get(&aid).map(|(al, _)| al.clone()))
+                            .unwrap_or_default();
+                        (aid, (alias, a))
+                    })
+                    .collect();
+                crate::admin::ops::write_grants(tx, &client_id, &full)?;
+                None
+            }
+            Some(secs) => {
+                let until = now + secs;
+                for (aid, (_, a)) in &approved {
+                    tx.execute(
+                        "INSERT INTO client_grant_extras(client_id, account_id, request_id, actions, granted_at, expires_at) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![client_id, aid, id, a.to_string(), now, until],
+                    )?;
+                }
+                Some(until)
+            }
+        };
+        p.decision = Some(super::access::Decision { granted: chosen, expires_at: granted_until });
+        let status = if granted_until.is_some() { "approved" } else { "done" };
+        tx.execute(
+            "UPDATE requests SET status = ?1, decided_at = ?2, decided_by = ?3, payload = ?4 WHERE id = ?5",
+            params![status, now, decided_by, serde_json::to_string(&p)?, id],
+        )?;
+        tx.execute("UPDATE clients SET auth_epoch = auth_epoch + 1 WHERE id = ?1", [&client_id])?;
+        let view = super::access::view(tx, &id, status, &serde_json::to_string(&p)?, now)?;
+        Ok(json!({ "request_id": id, "status": status, "access": view }))
+    })
+    .await
+}
+
 /// Whether item `i` may be approved from its fresh read `cur`, given the revision `shown` to the operator. The same
 /// revision reads the same way, so a body cut off now was cut off in the show the approval is based on: refused, as
 /// the operator did not see all of it.
@@ -473,6 +650,10 @@ pub async fn cancel(call: &mut AdminCall<'_>, id: String, items: Option<Vec<u32>
         let status = status.ok_or_else(|| anyhow!("unknown request '{}'", id.chars().take(80).collect::<String>()))?;
         if !matches!(status.as_str(), "pending" | "approved") {
             bail!("request {id} is {status}; nothing left to cancel");
+        }
+        let kind: String = tx.query_row("SELECT kind FROM requests WHERE id = ?1", [&id], |r| r.get(0))?;
+        if kind == "access" && items.is_some() {
+            bail!("an access request is cancelled as a whole (without --items)");
         }
         match &items {
             None => {

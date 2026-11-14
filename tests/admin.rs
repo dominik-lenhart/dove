@@ -194,7 +194,13 @@ async fn every_admin_action_writes_exactly_one_audit_record() {
         AdminRequest::AuditVerify,
         AdminRequest::RequestsList { status: None },
         AdminRequest::RequestsShow { id: "r_unknown".into() }, // fails: unknown
-        AdminRequest::RequestsApprove { id: "r_unknown".into(), shown: vec![], items: None, late: Default::default() },
+        AdminRequest::RequestsApprove {
+            id: "r_unknown".into(),
+            shown: vec![],
+            items: None,
+            late: Default::default(),
+            duration_minutes: None,
+        },
         AdminRequest::RequestsDeny { id: "r_unknown".into() },
         AdminRequest::RequestsCancel { id: "r_unknown".into(), items: None },
     ];
@@ -258,5 +264,35 @@ async fn server_mode_refuses_shutdown_over_the_admin_socket() {
             .iter()
             .any(|r| r["tool_or_action"] == "service.shutdown" && r["result_code"] == "error"),
         "{last}"
+    );
+}
+
+/// The CLI and the service can briefly be different versions: an approve request from a CLI before access requests
+/// (no `duration_minutes`) still parses, and a newer CLI only sends the field when it is set, so an older service
+/// (`deny_unknown_fields`) still parses every send approval.
+#[test]
+fn requests_approve_stays_compatible_across_versions() {
+    let old =
+        r#"{"verb":"requests_approve","id":"r_1","shown":[{"idx":0,"revision":"rev"}],"items":[0],"late":"skip"}"#;
+    let parsed: AdminRequest = serde_json::from_str(old).unwrap();
+    let AdminRequest::RequestsApprove { duration_minutes, items, .. } = &parsed else { panic!("{parsed:?}") };
+    assert_eq!((duration_minutes, items.as_deref()), (&None, Some(&[0u32][..])));
+    let minimal: AdminRequest = serde_json::from_str(r#"{"verb":"requests_approve","id":"r_1","shown":[]}"#).unwrap();
+    assert!(matches!(minimal, AdminRequest::RequestsApprove { duration_minutes: None, items: None, .. }));
+    let v = serde_json::to_value(&parsed).unwrap();
+    assert!(v.get("duration_minutes").is_none(), "{v}");
+    let with = AdminRequest::RequestsApprove {
+        id: "r_1".into(),
+        shown: vec![],
+        items: None,
+        late: Default::default(),
+        duration_minutes: Some(60),
+    };
+    let v = serde_json::to_value(&with).unwrap();
+    assert_eq!(v["duration_minutes"], 60);
+    assert!(serde_json::from_value::<AdminRequest>(v).is_ok());
+    // Unknown fields are still refused.
+    assert!(
+        serde_json::from_str::<AdminRequest>(r#"{"verb":"requests_approve","id":"r_1","shown":[],"x":1}"#).is_err()
     );
 }

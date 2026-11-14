@@ -366,7 +366,7 @@ async fn approve(
     items: Option<Vec<u32>>,
     late: dove::admin::Late,
 ) -> Result<Value, String> {
-    h.admin(AdminRequest::RequestsApprove { id: id.into(), shown, items, late }).await
+    h.admin(AdminRequest::RequestsApprove { id: id.into(), shown, items, late, duration_minutes: None }).await
 }
 
 /// (request status, item states with reasons) as stored.
@@ -667,7 +667,7 @@ async fn run(h: &Harness, now: i64) -> TickReport {
 }
 
 fn report(sent: usize, failed: usize, skipped: usize, missed: usize, unknown: usize, deferred: usize) -> TickReport {
-    TickReport { sent, failed, skipped, missed, unknown, expired: 0, deferred }
+    TickReport { sent, failed, skipped, missed, unknown, expired: 0, deferred, grants_expired: 0 }
 }
 
 async fn send_items_audit(h: &Harness) -> Vec<(String, String, String)> {

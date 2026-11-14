@@ -1,8 +1,13 @@
-//! Request tools: request_send, list_requests, cancel_request (design 2026-11-14 section 4.2, PLAN A71).
+//! Request tools: request_send, request_access, list_requests, cancel_request (design 2026-11-14 section 4.2, PLAN
+//! A71, A73).
 //!
 //! `request_send` needs `draft` on the mailbox, not `send`, and works with `allow_send = false`: nothing is sent before
 //! the operator approved exactly these drafts with `dove requests approve`. Creating a request makes no upstream call;
 //! the draft is read fresh at approval and again at send time.
+//!
+//! `request_access` asks for actions on mailboxes of the client's project, for a while or for good. It changes no
+//! right: only the operator's approval on the admin socket does. An unknown alias and an alias outside the project
+//! are the identical `not_found`, and no tool lists the mailboxes one could ask for.
 
 use std::collections::HashSet;
 
@@ -15,11 +20,12 @@ use super::{
 };
 use crate::error::{ErrorCode, ToolError};
 use crate::policy::Capability;
+use crate::requests::access::{self, AskedGrant, NewAccess, Payload};
 use crate::requests::{self, CreateError, NewItem, NewSend};
 use crate::util;
 
 /// The tools that `[requests] enabled = false` hides and refuses.
-pub const NAMES: &[&str] = &["request_send", "list_requests", "cancel_request"];
+pub const NAMES: &[&str] = &["request_send", "request_access", "list_requests", "cancel_request"];
 
 pub fn defs() -> Vec<ToolDef> {
     vec![
@@ -63,12 +69,46 @@ pub fn defs() -> Vec<ToolDef> {
             handler: |cx, args| Box::pin(request_send(cx, args)),
         },
         ToolDef {
+            name: "request_access",
+            title: "Ask for more access",
+            description: concat!(
+                "Ask the owner for rights on mailboxes of this project: read, draft, organize, delete, send or a preset ",
+                "(reader, drafter, assistant, full), e.g. actions \"read,draft\". With duration_minutes (1 to 43200, ",
+                "30 days) the rights end on their own; without it the request is for a permanent grant. Nothing changes ",
+                "until the owner approves; the owner may shorten the time or leave out mailboxes. The owner tells you ",
+                "the mailbox alias; there is no list of mailboxes you could ask for. Follow the outcome with list_requests."
+            ),
+            capability: Capability::Read,
+            read_only: false,
+            destructive: false,
+            mail_content: false,
+            input_schema: || {
+                json!({ "type": "object", "properties": {
+                    "grants": { "type": "array", "minItems": 1, "items": { "type": "object", "properties": {
+                        "account": { "type": "string", "description": "Mailbox alias or address, as the owner named it." },
+                        "actions": { "type": "string", "description": "Comma list of actions or presets, e.g. read,draft or assistant." }
+                    }, "required": ["account", "actions"], "additionalProperties": false } },
+                    "duration_minutes": { "type": "integer", "minimum": 1, "maximum": access::MAX_DURATION_MINUTES,
+                        "description": "How long the rights should last. Omit to ask for a permanent grant." },
+                    "note": { "type": "string", "maxLength": requests::MAX_NOTE_CHARS, "description": "Short note for the owner (why you need it)." }
+                }, "required": ["grants"], "additionalProperties": false })
+            },
+            output_schema: || {
+                object_schema(
+                    json!({ "request_id": {"type":"string"}, "status": {"type":"string"}, "grants": {"type":"array"} }),
+                )
+            },
+            handler: |cx, args| Box::pin(request_access(cx, args)),
+        },
+        ToolDef {
             name: "list_requests",
             title: "List my requests",
             description: concat!(
                 "Your requests with their status (pending, approved, denied, cancelled, expired, done) and, per item, ",
                 "its state (pending, scheduled, sending, sent, skipped, failed, missed, send_unknown, cancelled, denied) ",
-                "and reason code. send_unknown means the send may have happened: never retry it, check Sent."
+                "and reason code. send_unknown means the send may have happened: never retry it, check Sent. Access ",
+                "requests list each asked grant (pending, granted, active, ended, not_approved) and when temporary ",
+                "rights end."
             ),
             capability: Capability::Read,
             read_only: true,
@@ -85,7 +125,7 @@ pub fn defs() -> Vec<ToolDef> {
         ToolDef {
             name: "cancel_request",
             title: "Cancel a request",
-            description: "Cancel a pending request, or the items of an approved request that were not sent yet.",
+            description: "Cancel a pending request, or the items of an approved request that were not sent yet. Cancelling an approved temporary access request gives its rights back at once.",
             capability: Capability::Read,
             read_only: false,
             destructive: true,
@@ -364,6 +404,162 @@ async fn request_send(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError>
             account: Some(mb.alias.clone()),
             object_ids: vec![id.clone(), format!("items:{}", items.len())],
             result_count: Some(items.len() as i64),
+            ..Default::default()
+        },
+        extra: vec![],
+    })
+}
+
+/// Seals an agent's note with the request id as scope, after checking its length.
+fn seal_note(cx: &ToolCx, id: &str, note: Option<&str>) -> Result<Option<Vec<u8>>, ToolError> {
+    let Some(n) = note else { return Ok(None) };
+    if n.chars().count() > requests::MAX_NOTE_CHARS {
+        return Err(ToolError::invalid_at("note", format!("must be at most {} characters", requests::MAX_NOTE_CHARS)));
+    }
+    cx.app.vault.seal_aux(requests::NOTE_KIND, id, n.as_bytes()).map(Some).map_err(crate::error::internal_from)
+}
+
+/// One parsed grant of `request_access`: the account as named and the expanded actions.
+struct GrantArg {
+    account: String,
+    actions: crate::policy::Actions,
+}
+
+fn parse_grants(args: &Value, max: usize, allow_send: bool) -> Result<Vec<GrantArg>, ToolError> {
+    let grants = match args.get("grants") {
+        Some(Value::Array(a)) if !a.is_empty() && a.len() <= max => a,
+        _ => return Err(ToolError::invalid_at("grants", format!("must be a list of 1 to {max} grants"))),
+    };
+    let mut out = Vec::with_capacity(grants.len());
+    for (i, g) in grants.iter().enumerate() {
+        let path = format!("grants[{i}]");
+        let Some(obj) = g.as_object() else {
+            return Err(ToolError::invalid_at(path, "must be an object {account, actions}"));
+        };
+        if obj.keys().any(|k| k != "account" && k != "actions") {
+            return Err(ToolError::invalid_at(path, "takes only account and actions"));
+        }
+        let account = arg_str(g, "account")
+            .map_err(|_| ToolError::invalid_at(format!("{path}.account"), "is required and must be a string"))?;
+        let words = arg_str(g, "actions")
+            .map_err(|_| ToolError::invalid_at(format!("{path}.actions"), "is required and must be a string"))?;
+        // The grant syntax of `clients set-grants`; the parser's message names only the accepted words.
+        let actions = crate::policy::Actions::parse_grant(words)
+            .map_err(|e| ToolError::invalid_at(format!("{path}.actions"), e))?;
+        if actions.send && !allow_send {
+            return Err(ToolError::invalid_at(
+                format!("{path}.actions"),
+                "send cannot be granted on this server (allow_send is off); ask for draft and use request_send",
+            ));
+        }
+        out.push(GrantArg { account: account.trim().to_string(), actions });
+    }
+    Ok(out)
+}
+
+async fn request_access(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
+    only_keys(&args, &["grants", "duration_minutes", "note"])?;
+    let grants = parse_grants(&args, cx.app.cfg.limits.request_items as usize, cx.app.cfg.allow_send)?;
+    let duration = match args.get("duration_minutes") {
+        None | Some(Value::Null) => None,
+        Some(v) => match v.as_i64() {
+            Some(m) if (1..=access::MAX_DURATION_MINUTES).contains(&m) => Some(m),
+            _ => {
+                return Err(ToolError::invalid_at(
+                    "duration_minutes",
+                    format!(
+                        "must be an integer from 1 to {} (30 days); omit it for a permanent grant",
+                        access::MAX_DURATION_MINUTES
+                    ),
+                ));
+            }
+        },
+    };
+    let note = opt_str(&args, "note")?.map(str::to_string);
+
+    // Accounts are looked up in the client's project only, by alias or address: an unknown name and a name outside
+    // the project are the same not_found. The client's own grants play no part (asking is for what it lacks).
+    let pid = cx.client.project_id.clone();
+    let names: Vec<String> = grants.iter().map(|g| g.account.clone()).collect();
+    let found: Vec<Option<(String, String)>> = cx
+        .app
+        .store
+        .call(move |c| {
+            let mut st = c.prepare(
+                "SELECT a.id, a.alias FROM accounts a JOIN project_accounts pa ON pa.account_id = a.id \
+                 WHERE pa.project_id = ?1 AND (a.alias = ?2 OR a.email = ?2)",
+            )?;
+            let mut out = Vec::with_capacity(names.len());
+            for n in &names {
+                out.push(st.query_row(params![pid, n], |r| Ok((r.get(0)?, r.get(1)?))).optional()?);
+            }
+            Ok(out)
+        })
+        .await?;
+    let mut asked: Vec<AskedGrant> = Vec::with_capacity(grants.len());
+    let mut aliases: Vec<String> = Vec::with_capacity(grants.len());
+    for (i, (g, f)) in grants.iter().zip(found).enumerate() {
+        let Some((account_id, alias)) = f else { return Err(ToolError::not_found()) };
+        if asked.iter().any(|a| a.account_id == account_id) {
+            return Err(ToolError::invalid_at(format!("grants[{i}].account"), "names a mailbox twice"));
+        }
+        asked.push(AskedGrant { account_id, actions: g.actions.to_string() });
+        aliases.push(alias);
+    }
+
+    let id = requests::new_request_id();
+    let note_sealed = seal_note(cx, &id, note.as_deref())?;
+    let new = NewAccess {
+        id: id.clone(),
+        client_id: cx.client.client_id.clone(),
+        project_id: cx.client.project_id.clone(),
+        note_sealed,
+        payload: Payload { grants: asked.clone(), duration_secs: duration.map(|m| m * 60), decision: None },
+    };
+    let app = cx.app.clone();
+    let now = util::now_unix();
+    let created = cx
+        .app
+        .store
+        .call(move |c| {
+            let tx = c.transaction()?;
+            let r = access::create(&tx, &app.cfg, new, now);
+            if r.is_ok() {
+                tx.commit()?;
+            }
+            Ok(r)
+        })
+        .await?;
+    match created {
+        Ok(_) => {}
+        Err(CreateError::TooManyOpen) => {
+            return Err(ToolError::invalid(format!(
+                "this connection already has {} open requests; wait for decisions or cancel one",
+                cx.app.cfg.limits.client_open_requests
+            )));
+        }
+        Err(CreateError::DraftAlreadyRequested(_)) => return Err(ToolError::internal()),
+        Err(CreateError::Store(e)) => return Err(crate::error::internal_from(e)),
+    }
+    let out: Vec<Value> = asked
+        .iter()
+        .zip(&aliases)
+        .enumerate()
+        .map(|(i, (g, alias))| json!({ "idx": i, "account": alias, "actions": g.actions }))
+        .collect();
+    let how = match duration {
+        Some(m) => format!("for {m} minute(s) from approval"),
+        None => "permanently".to_string(),
+    };
+    Ok(ToolOutput {
+        text: format!(
+            "Request {id} is pending: {} grant(s) {how}, waiting for the owner's approval. Nothing changes before that; follow it with list_requests.",
+            asked.len()
+        ),
+        structured: json!({ "request_id": id, "status": "pending", "duration_minutes": duration, "grants": out }),
+        audit: AuditInfo {
+            object_ids: vec![id.clone(), format!("grants:{}", asked.len())],
+            result_count: Some(asked.len() as i64),
             ..Default::default()
         },
         extra: vec![],

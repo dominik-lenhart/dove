@@ -291,7 +291,7 @@ pub fn end_reason(
         _ => {}
     }
     // The same effective grants the policy uses for requests (grant ∩ project membership).
-    let readable = policy::load_mailboxes(conn, client_id)?
+    let readable = policy::load_mailboxes_at(conn, client_id, now)?
         .iter()
         .any(|m| m.account_id == account_id && m.actions.has(Capability::Read));
     Ok(if readable { None } else { Some("access_lost") })

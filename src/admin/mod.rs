@@ -238,6 +238,10 @@ pub enum AdminRequest {
         items: Option<Vec<u32>>,
         #[serde(default)]
         late: Late,
+        /// Access requests: grant for this many minutes instead of what the agent asked (shorter only; on a request
+        /// for a permanent grant it makes the grant temporary). Optional so a CLI from before stage 2 still parses.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_minutes: Option<u32>,
     },
     RequestsDeny {
         id: String,
