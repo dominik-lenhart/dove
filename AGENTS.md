@@ -432,3 +432,12 @@ cargo fmt
   (prompt after `--`, since `--allowedTools` is variadic). Tests run the real binary in
   `tests/client_e2e.rs::watch_listen_runs_the_command_once_per_event_with_ids_only`; generate events there with
   `index::sync::sync_account` after `IndexEnable`. Never build the prompt from mail content.
+- 2026-11-14: Benchmarks live in `tests/bench_index.rs` (all `#[ignore]`, release, via `heavy`; results and how to run in
+  `docs/benchmarks.md`, PLAN A71). The 250k corpus goes through `doc_from_raw_answer` + `ingest::upsert` on the real
+  writer, not a fake Google (it would keep ~2 GB of MIME in the process); a harness has no sync scheduler, so
+  `last_success_at` goes stale after 60 s and `require_complete` calls fail with `index_incomplete` unless the query
+  passes a large `max_lag_seconds`. Peak RSS per phase: write `5` to `/proc/self/clear_refs`, then read `VmHWM`.
+  A change to `query.rs` or the index schema should be checked with `DOVE_BENCH_FAST=1 DOVE_BENCH_EXPLAIN=1
+  DOVE_BENCH_MESSAGES=50000 heavy cargo test --release --test bench_index -- --ignored --nocapture bench_index`
+  (about 3 min); latency of large result sets grows with the match count because the plans materialize and sort them.
+
