@@ -450,7 +450,7 @@ fn resolve_target(
         }
     };
     let replied = match owners {
-        Some(o) => watch::first_reply(c, gen_id, &thread_id, &baseline, o)?.is_some(),
+        Some(o) => watch::first_reply(c, gen_id, &thread_id, &baseline, o, watch::Replies::OutsideSpamTrash)?.is_some(),
         None => false,
     };
     Ok(Some(Ok(Resolved { thread_id, baseline, replied })))

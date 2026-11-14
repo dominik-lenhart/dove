@@ -659,3 +659,12 @@ hosts or reference hardware.
   dispatch up to the write deadline after a claim made at the end of the grace (bounded by
   `upstream_request_timeout_secs`). (g) The note's vault scope is the request id, so `NewSend` carries the id.
   (h) `notify_sink` (design 4.6) ships with stage 3.
+  (i) `unless_reply` treats the index as stale while the serving generation has any row in `pending`: a message whose
+  fetch failed sits there with an unknown thread while `last_success_at` still advances (`sync::commit_results`, IMAP
+  `hydrate`), and it may be the reply. Checked in the same index read as the reply. The item waits and asks for a sync;
+  a retry that never succeeds ends it as `skipped: condition_unknown`, and while one is stuck no `unless_reply` item of
+  that mailbox can go out (the fail-closed side). Known limit, not changed: the `no_reply_by` watch (A70) has the same
+  gap and can fire while the reply waits for a retry. Its event only tells an agent to look, and the agent then reads
+  the thread live. (j) For `unless_reply` a reply in Trash or Spam counts (`watch::Replies::Any`); the watch keeps
+  ignoring both (`Replies::OutsideSpamTrash`). The index has one `spam_trash` flag, so spam in the thread skips the
+  send too.

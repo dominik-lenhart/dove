@@ -221,21 +221,33 @@ impl Baseline {
     }
 }
 
-/// The first message of `thread_id` in generation `gen_id` that answers after `baseline`: not a draft, not in spam or
-/// trash, not from the owner ([`is_own`]). Returns its agent message id.
+/// Which replies [`first_reply`] counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Replies {
+    /// Watches: a message in spam or trash is no reply worth an event.
+    OutsideSpamTrash,
+    /// Scheduled sends (`unless_reply`): a reply the owner already moved to Trash still answered the thread. The
+    /// index has one flag for spam and trash, so spam counts too: the send is then skipped, the fail-closed side.
+    Any,
+}
+
+/// The first message of `thread_id` in generation `gen_id` that answers after `baseline`: not a draft, not from the
+/// owner ([`is_own`]), and outside spam and trash unless `which` is [`Replies::Any`]. Returns its agent message id.
 pub fn first_reply(
     c: &Connection,
     gen_id: i64,
     thread_id: &str,
     baseline: &Baseline,
     owners: &HashSet<String>,
+    which: Replies,
 ) -> anyhow::Result<Option<String>> {
+    let any = which == Replies::Any;
     let rows: Vec<(i64, String, i64)> = c
         .prepare_cached(
             "SELECT id, gmail_id, received_at FROM messages WHERE gen = ?1 AND thread_id = ?2 AND received_at >= ?3 \
-             AND is_draft = 0 AND spam_trash = 0 ORDER BY received_at, id",
+             AND is_draft = 0 AND (?4 OR spam_trash = 0) ORDER BY received_at, id",
         )?
-        .query_map(params![gen_id, thread_id, baseline.ms], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .query_map(params![gen_id, thread_id, baseline.ms, any], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<Result<_, _>>()?;
     let mut from = c.prepare_cached("SELECT addr FROM addrs WHERE msg = ?1 AND role = ?2")?;
     for (row, id, received_at) in rows {
@@ -678,7 +690,7 @@ async fn no_reply_due(app: &Arc<App>, now: i64) -> anyhow::Result<usize> {
                 let tx = c.unchecked_transaction()?;
                 let Some(s) = crate::index::sync::load_state(&tx, &a)? else { return Ok(None) };
                 let Some(g) = s.active_gen else { return Ok(None) };
-                let replied = first_reply(&tx, g, &t, &b, &owners)?.is_some();
+                let replied = first_reply(&tx, g, &t, &b, &owners, Replies::OutsideSpamTrash)?.is_some();
                 Ok(Some((replied, s.last_success_at.unwrap_or(0))))
             })
             .await

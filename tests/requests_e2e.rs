@@ -1154,3 +1154,172 @@ async fn index_enabled_again_waits_for_its_first_sync() {
     assert_eq!(states(&r.h, &id).await.1, vec![st("skipped", Some("condition_unknown"))]);
     assert_eq!(r.h.google.count("POST", "drafts/send"), 0);
 }
+
+/// Rows in the index's retry queue (messages whose fetch failed), and making them due now.
+async fn pending_rows(h: &Harness) -> i64 {
+    h.app().index.write(|c| Ok(c.query_row("SELECT count(*) FROM pending", [], |r| r.get(0))?)).await.unwrap()
+}
+
+async fn retry_now(h: &Harness) {
+    h.app().index.write(|c| Ok(c.execute("UPDATE pending SET next_attempt_at = 0", []).map(|_| ())?)).await.unwrap();
+}
+
+/// A reply whose fetch failed waits in the index's retry queue while the sync still counts as a success: the index
+/// cannot prove that nobody answered, so the item waits for the retry, and is never sent on that doubt.
+#[tokio::test]
+async fn reply_waiting_for_a_retry_blocks_the_send() {
+    for resolves in [true, false] {
+        let r = Reply::start().await;
+        let t = util::now_unix() + 60;
+        let id = r.request(t).await;
+        r.approve(&id).await;
+        let reply = r.h.google.add_message(MB, msg("bob@example.com", &["INBOX"], 0));
+        r.h.google.fail_next("GET", &format!("/messages/{reply}"), Fault::Status(400, json!({"error": {}})));
+        r.sync().await;
+        assert_eq!(pending_rows(&r.h).await, 1, "the reply waits for a retry");
+        assert_eq!(run(&r.h, t).await, report(0, 0, 0, 0, 0, 1), "resolves={resolves}");
+        assert_eq!(states(&r.h, &id).await.1, vec![st("scheduled", Some("waiting_for_sync"))]);
+        if resolves {
+            retry_now(&r.h).await;
+            r.sync().await;
+            assert_eq!(pending_rows(&r.h).await, 0);
+            assert_eq!(run(&r.h, t + 30).await, report(0, 0, 1, 0, 0, 0));
+            assert_eq!(states(&r.h, &id).await, ("done".into(), vec![st("skipped", Some("replied"))]));
+        } else {
+            assert_eq!(run(&r.h, t + 3601).await, report(0, 0, 1, 0, 0, 0));
+            assert_eq!(states(&r.h, &id).await, ("done".into(), vec![st("skipped", Some("condition_unknown"))]));
+        }
+        assert_eq!(r.h.google.count("POST", "drafts/send"), 0);
+    }
+}
+
+/// A reply the owner already moved to Trash (or that landed in Spam) still answered the thread: the send is skipped.
+#[tokio::test]
+async fn reply_in_trash_or_spam_skips_the_item() {
+    for label in ["TRASH", "SPAM"] {
+        let r = Reply::start().await;
+        let t = util::now_unix() + 60;
+        let id = r.request(t).await;
+        r.approve(&id).await;
+        r.h.google.add_message(MB, msg("bob@example.com", &[label], 0));
+        r.sync().await;
+        assert_eq!(run(&r.h, t).await, report(0, 0, 1, 0, 0, 0), "{label}");
+        assert_eq!(states(&r.h, &id).await.1, vec![st("skipped", Some("replied"))]);
+        assert_eq!(r.h.google.count("POST", "drafts/send"), 0);
+    }
+}
+
+// ------------------------------------------------------------------ unless_reply over IMAP
+
+use support::fake_imap::Fault as ImapFault;
+
+fn imap_raw(from: &str, subject: &str, msg_id: &str, refs: Option<&str>) -> Vec<u8> {
+    let refs = refs.map(|r| format!("In-Reply-To: {r}\r\nReferences: {r}\r\n")).unwrap_or_default();
+    format!(
+        "From: {from}\r\nTo: {MB}\r\nSubject: {subject}\r\nMessage-ID: {msg_id}\r\n{refs}\
+         Date: Thu, 12 Nov 2026 10:00:00 +0000\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n\
+         Hello there.\r\n"
+    )
+    .into_bytes()
+}
+
+/// `info` over IMAP, indexed, with bob's mail `<q@example.org>` in INBOX and an approved `unless_reply` request for a
+/// reply to it at `t`.
+struct ImapReply {
+    h: Harness,
+    u: support::harness::FakeImapUser,
+    id: String,
+    t: i64,
+}
+
+impl ImapReply {
+    async fn start() -> Self {
+        let h = Harness::start().await;
+        let u = h.imap_mailbox("info", MB).await;
+        h.project("acme", &["info"]).await;
+        let token = h.token("acme", "agent", vec![g("info", "read,draft")]).await;
+        let now = util::now_unix();
+        h.imap.add_message_at(
+            &u.user,
+            "INBOX",
+            &imap_raw("bob@example.com", "Offer", "<q@example.org>", None),
+            &[],
+            now - 120,
+        );
+        h.admin(AdminRequest::IndexEnable { alias: "info".into() }).await.unwrap();
+        let r = Self { h, u, id: String::new(), t: now + 60 };
+        r.sync().await;
+        let rows = r.h.ok(&token, "search_messages", json!({ "select": ["message_id"] })).await;
+        let inbound = rows["rows"][0][0].as_str().unwrap().to_string();
+        let d =
+            r.h.ok(
+                &token,
+                "create_draft",
+                json!({"account":"info","request_key":uuid::Uuid::new_v4().to_string(),
+                       "reply_to_message_id":inbound,"to":["bob@example.com"],"body_text":"Thanks"}),
+            )
+            .await;
+        let mut args = send_args(&[(d["draft_id"].as_str().unwrap(), d["revision"].as_str().unwrap(), r.t)]);
+        args["unless_reply"] = json!(true);
+        let id = r.h.ok(&token, "request_send", args).await["request_id"].as_str().unwrap().to_string();
+        let v = show(&r.h, &id).await;
+        approve(&r.h, &id, shown_of(&v), None, dove::admin::Late::Skip).await.unwrap();
+        Self { id, ..r }
+    }
+
+    async fn sync(&self) {
+        let r = dove::index::imap_sync::sync_steps(self.h.app(), &self.u.account_id, usize::MAX).await.unwrap();
+        assert_eq!(r.error, None, "{r:?}");
+    }
+
+    /// Bob's answer to `<q@example.org>` in `folder`, dated now.
+    fn reply(&self, folder: &str) -> u32 {
+        let raw = imap_raw("bob@example.com", "Re: Offer", "<q-re@example.org>", Some("<q@example.org>"));
+        self.h.imap.add_message_at(&self.u.user, folder, &raw, &[], util::now_unix())
+    }
+}
+
+#[tokio::test]
+async fn imap_reply_waiting_for_a_retry_blocks_the_send() {
+    for resolves in [true, false] {
+        let r = ImapReply::start().await;
+        let uid = r.reply("INBOX");
+        r.h.imap.fail_next_containing("UID FETCH", &format!("UID FETCH {uid} (UID BODY.PEEK[])"), ImapFault::Bad);
+        r.sync().await;
+        assert_eq!(pending_rows(&r.h).await, 1, "the reply waits for a retry");
+        assert_eq!(run(&r.h, r.t).await, report(0, 0, 0, 0, 0, 1), "resolves={resolves}");
+        assert_eq!(states(&r.h, &r.id).await.1, vec![st("scheduled", Some("waiting_for_sync"))]);
+        if resolves {
+            retry_now(&r.h).await;
+            r.sync().await;
+            assert_eq!(pending_rows(&r.h).await, 0);
+            assert_eq!(run(&r.h, r.t + 30).await, report(0, 0, 1, 0, 0, 0));
+            assert_eq!(states(&r.h, &r.id).await, ("done".into(), vec![st("skipped", Some("replied"))]));
+        } else {
+            assert_eq!(run(&r.h, r.t + 3601).await, report(0, 0, 1, 0, 0, 0));
+            assert_eq!(states(&r.h, &r.id).await, ("done".into(), vec![st("skipped", Some("condition_unknown"))]));
+        }
+        assert!(r.h.imap.sent_mails().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn imap_reply_in_trash_skips_the_item() {
+    let r = ImapReply::start().await;
+    // Without a reply the item would go out: the fixture itself does not skip.
+    r.sync().await;
+    r.reply("Trash");
+    r.sync().await;
+    assert_eq!(run(&r.h, r.t).await, report(0, 0, 1, 0, 0, 0));
+    assert_eq!(states(&r.h, &r.id).await.1, vec![st("skipped", Some("replied"))]);
+    assert!(r.h.imap.sent_mails().is_empty());
+}
+
+#[tokio::test]
+async fn imap_unless_reply_sends_without_a_reply() {
+    let r = ImapReply::start().await;
+    r.sync().await;
+    let rep = run(&r.h, r.t).await;
+    assert_eq!(rep, report(1, 0, 0, 0, 0, 0), "{:?}", states(&r.h, &r.id).await);
+    assert_eq!(r.h.imap.sent_mails().len(), 1);
+}

@@ -404,7 +404,8 @@ enum Condition {
 }
 
 /// Whether the item's thread got a message from someone else after the request was created (the `no_reply_by` rule,
-/// PLAN A70), decided only on an index synced within [`FRESH_SECS`]. Fails closed: never `NoReply` on doubt.
+/// PLAN A70, except that replies in spam or trash count), decided only on an index synced within [`FRESH_SECS`] with
+/// no message waiting in its retry queue. Fails closed: never `NoReply` on doubt.
 async fn reply_condition(app: &Arc<App>, item: &Due, mb: &policy::Mailbox, now: i64) -> Condition {
     let (Some(thread_id), Some(ms)) = (item.thread_id.clone(), item.baseline_ms) else { return Condition::Unknown };
     if !mb.index_enabled {
@@ -425,14 +426,17 @@ async fn reply_condition(app: &Arc<App>, item: &Due, mb: &policy::Mailbox, now: 
             let tx = c.unchecked_transaction()?;
             let Some(s) = crate::index::sync::load_state(&tx, &a)? else { return Ok(None) };
             let Some(g) = s.serving_gen() else { return Ok(None) };
-            let replied = watch::first_reply(&tx, g, &thread_id, &baseline, &owners)?.is_some();
-            Ok(Some((replied, s.last_success_at)))
+            let replied = watch::first_reply(&tx, g, &thread_id, &baseline, &owners, watch::Replies::Any)?.is_some();
+            // A message whose fetch failed waits in `pending` (unknown thread) while `last_success_at` advances: it may
+            // be the reply, so the index cannot prove that nobody answered until it is resolved.
+            let gaps: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM pending WHERE gen = ?1)", [g], |r| r.get(0))?;
+            Ok(Some((replied, s.last_success_at, gaps)))
         })
         .await;
     match r {
         Ok(None) => Condition::Unknown,
-        Ok(Some((true, _))) => Condition::Replied,
-        Ok(Some((false, Some(synced)))) if synced >= now - FRESH_SECS => Condition::NoReply,
-        Ok(Some((false, _))) | Err(_) => Condition::Stale,
+        Ok(Some((true, _, _))) => Condition::Replied,
+        Ok(Some((false, Some(synced), false))) if synced >= now - FRESH_SECS => Condition::NoReply,
+        Ok(Some((false, _, _))) | Err(_) => Condition::Stale,
     }
 }
