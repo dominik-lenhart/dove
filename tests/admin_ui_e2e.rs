@@ -105,6 +105,153 @@ async fn admin_is_404_unless_enabled_and_on_its_own_host() {
     assert_eq!(r.status, 421);
 }
 
+/// One HTTP/1.1 request written by hand (duplicate headers, paths a client library would normalise); the status.
+async fn raw_status(h: &Harness, head: &str) -> u16 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let addr = h.base.strip_prefix("http://").unwrap();
+    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+    s.write_all(format!("{head}\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+    let mut out = Vec::new();
+    s.read_to_end(&mut out).await.unwrap();
+    let text = String::from_utf8_lossy(&out);
+    text.split_whitespace().nth(1).unwrap_or("0").parse().unwrap()
+}
+
+/// The session gate sits on the admin routes only. As a layer it also wrapped the router's fallback, and every
+/// unknown path of the public listener answered with a redirect to the admin sign-in page.
+#[tokio::test]
+async fn unknown_paths_are_404_and_the_public_listener_is_unchanged() {
+    let off = Harness::start().await;
+    let h = start().await;
+    let mut b = Browser::new(&h);
+    enrol(&h, &mut b, "phone").await;
+    assert_eq!(b.get("/admin/settings").await.status, 200);
+    // Unknown admin paths: 404 with or without a session, never a redirect, and with the UI's headers.
+    for p in ["/admin/unknown", "/admin/settings/", "/admin//settings", "/admin/requests/r_x/approve/x"] {
+        let r = b.get(p).await;
+        assert_eq!(r.status, 404, "{p} with a session");
+        assert_eq!(r.header("content-security-policy"), CSP, "{p}");
+        assert_eq!(Browser::new(&h).get(p).await.status, 404, "{p} without");
+    }
+    // The public host answers every path exactly as it does while the UI is off.
+    let cookie = format!("Cookie: {COOKIE}={}", b.cookie.clone().unwrap());
+    for (method, path) in [
+        ("GET", "/nonexistent"),
+        ("POST", "/nonexistent"),
+        ("GET", "/mcp/x"),
+        ("GET", "//admin/settings"),
+        ("GET", "/ADMIN/settings"),
+        ("GET", "/admin%2fsettings"),
+        ("GET", "/%61dmin/settings"),
+        ("GET", "/mcp/../admin/settings"),
+    ] {
+        let head = format!("{method} {path} HTTP/1.1\r\nHost: {HOST}\r\nContent-Length: 0\r\n{cookie}");
+        let (on, was) = (raw_status(&h, &head).await, raw_status(&off, &head).await);
+        assert_eq!(on, was, "{method} {path}");
+        assert_eq!(on, 404, "{method} {path}");
+    }
+}
+
+#[tokio::test]
+async fn two_hosts_and_funnel_requests_find_nothing() {
+    let h = start().await;
+    let mut b = Browser::new(&h);
+    enrol(&h, &mut b, "phone").await;
+    let cookie = format!("Cookie: {COOKIE}={}", b.cookie.clone().unwrap());
+    let one = format!("GET /admin/settings HTTP/1.1\r\nHost: {AHOST}\r\n{cookie}");
+    assert_eq!(raw_status(&h, &one).await, 200);
+    // Two Host headers: a proxy and Dove could each act on a different one.
+    for second in [HOST, AHOST] {
+        let two = format!("GET /admin/settings HTTP/1.1\r\nHost: {AHOST}\r\nHost: {second}\r\n{cookie}");
+        assert_eq!(raw_status(&h, &two).await, 404, "second Host {second}");
+    }
+    // Funnel switched on after setup: Tailscale marks such requests, and they find no admin UI, session or not.
+    b.extra = vec![("tailscale-funnel-request".into(), "?1".into())];
+    for p in ["/admin", "/admin/login", "/admin/settings", "/admin/static/admin.js"] {
+        assert_eq!(b.get(p).await.status, 404, "{p} through Funnel");
+    }
+    assert_eq!(b.post_json("/admin/login/options", json!({})).await.status, 404);
+    b.extra.clear();
+    assert_eq!(b.get("/admin/settings").await.status, 200);
+}
+
+/// A process on the host shares the loopback listener with the owner behind Tailscale Serve. It can use any address
+/// in 127.0.0.0/8 and ask for any number of sign-in challenges; neither gives it a second budget or pushes the
+/// owner's pending sign-in out.
+#[tokio::test]
+async fn loopback_is_one_caller_and_a_flood_does_not_end_a_pending_sign_in() {
+    let h = start_with(|c| c.admin_ui.requests_per_minute = 40).await;
+    let mut a = SoftAuthenticator::es256(ORIGIN);
+    a.counter_step = 0; // a synced passkey: the counter stays 0, so only the challenge makes an assertion single use
+    enrol_with(&h, &mut Browser::new(&h), "phone", &mut a).await;
+    let secret = h.app().proxy_secret.as_ref().unwrap().to_string();
+    let from =
+        |ip: &str| vec![("x-forwarded-for".into(), ip.to_string()), ("x-dove-proxy-auth".into(), secret.clone())];
+
+    // The owner starts a sign-in, then 150 challenges are issued to three other addresses.
+    let mut owner = Browser::new(&h);
+    owner.extra = from("203.0.113.20");
+    let (id, ch) = login_options(&mut owner).await;
+    let mut issued = 0;
+    for ip in ["203.0.113.21", "203.0.113.22", "203.0.113.23", "203.0.113.24"] {
+        let mut s = Browser::new(&h);
+        s.extra = from(ip);
+        for _ in 0..40 {
+            issued += usize::from(s.post_json("/admin/login/options", json!({})).await.status == 200);
+        }
+    }
+    assert_eq!(issued, 160);
+    let ok = a.assert(&ch);
+    assert_eq!(login_finish(&mut owner, &id, &ok).await.status, 200, "the pending sign-in survived");
+    // Single use: the same verified assertion does not sign in a second time.
+    assert_eq!(login_finish(&mut Browser::new(&h), &id, &ok).await.status, 401, "replay");
+    // An id Dove did not issue, and a challenge signed for another id.
+    let (id2, ch2) = login_options(&mut owner).await;
+    let mut forged = util::b64url_decode(id2.as_str().unwrap()).unwrap();
+    forged[35] ^= 1; // the expiry
+    let r = login_finish(&mut Browser::new(&h), &json!(util::b64url(&forged)), &a.assert(&ch2)).await;
+    assert_eq!(r.status, 401, "tampered id");
+    let (id3, _) = login_options(&mut owner).await;
+    assert_eq!(login_finish(&mut Browser::new(&h), &id3, &a.assert(&ch2)).await.status, 401, "another id's challenge");
+    assert_eq!(login_finish(&mut Browser::new(&h), &id2, &a.assert(&ch2)).await.status, 200, "untampered");
+
+    // 127.0.0.0/8 and ::1 are one caller: 40 requests from 127.0.0.2 leave nothing for 127.0.0.3, ::1 or 127.0.0.1.
+    let mut local = Browser::new(&h);
+    local.extra = from("127.0.0.2");
+    let mut codes = vec![];
+    for _ in 0..45 {
+        codes.push(local.get("/admin/login").await.status);
+    }
+    assert!(codes.iter().filter(|c| **c == 200).count() <= 40 && codes[40..].iter().all(|c| *c == 429), "{codes:?}");
+    for ip in ["127.0.0.3", "::1", "::ffff:127.0.0.9"] {
+        local.extra = from(ip);
+        assert_eq!(local.get("/admin/login").await.status, 429, "{ip}");
+    }
+    assert_eq!(Browser::new(&h).get("/admin/login").await.status, 429, "the direct loopback caller");
+    // Another address is another caller.
+    local.extra = from("203.0.113.30");
+    assert_eq!(local.get("/admin/login").await.status, 200);
+}
+
+/// Switching the UI off ends every session: one from before must not work when the UI comes back.
+#[tokio::test]
+async fn sessions_do_not_outlive_a_disabled_ui() {
+    let mut h = start().await;
+    let mut b = Browser::new(&h);
+    enrol(&h, &mut b, "phone").await;
+    h.restart().await;
+    b.base = h.base.clone();
+    assert_eq!(b.get("/admin/settings").await.status, 200, "a restart alone keeps the session");
+    h.restart_with(|c| c.admin_ui.enabled = false).await;
+    b.base = h.base.clone();
+    assert_eq!(b.get("/admin/settings").await.status, 404);
+    h.restart_with(|c| c.admin_ui.enabled = true).await;
+    b.base = h.base.clone();
+    let r = b.get("/admin/settings").await;
+    assert_eq!((r.status, r.header("location").as_str()), (303, "/admin/login"));
+    assert_eq!(count(&h, "SELECT count(*) FROM admin_passkeys").await, 1, "passkeys stay");
+}
+
 #[tokio::test]
 async fn admin_ui_cannot_be_enabled_in_local_mode() {
     let env = dove::testing::TestEnv::new();

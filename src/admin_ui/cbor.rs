@@ -10,6 +10,9 @@ use std::fmt;
 
 /// Deepest nesting accepted (an attestation object is three levels deep).
 pub const MAX_DEPTH: usize = 8;
+/// Most elements of one array or pairs of one map. CTAP2 structures Dove reads have a handful; the cap bounds the
+/// duplicate-key check, which compares each key with every earlier one.
+pub const MAX_ITEMS: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Value {
@@ -30,6 +33,7 @@ pub enum Error {
     Unsupported,
     TooDeep,
     DuplicateKey,
+    TooManyItems,
     InvalidUtf8,
     TrailingBytes,
 }
@@ -40,6 +44,7 @@ impl fmt::Display for Error {
             Error::Truncated => "truncated CBOR",
             Error::Unsupported => "unsupported CBOR item",
             Error::TooDeep => "CBOR nested too deeply",
+            Error::TooManyItems => "CBOR array or map too long",
             Error::DuplicateKey => "duplicate CBOR map key",
             Error::InvalidUtf8 => "CBOR text is not UTF-8",
             Error::TrailingBytes => "bytes after the CBOR item",
@@ -148,6 +153,15 @@ impl Reader<'_> {
         Ok(n)
     }
 
+    /// The element count of an array or map: a [`length`](Self::length) of at most [`MAX_ITEMS`].
+    fn count(&mut self, info: u8, min_each: usize) -> Result<usize, Error> {
+        let n = self.length(info, min_each)?;
+        if n > MAX_ITEMS {
+            return Err(Error::TooManyItems);
+        }
+        Ok(n)
+    }
+
     fn item(&mut self, depth: usize) -> Result<Value, Error> {
         if depth > MAX_DEPTH {
             return Err(Error::TooDeep);
@@ -167,7 +181,7 @@ impl Reader<'_> {
                 Ok(Value::Text(s.to_string()))
             }
             4 => {
-                let n = self.length(info, 1)?;
+                let n = self.count(info, 1)?;
                 let mut v = Vec::with_capacity(n);
                 for _ in 0..n {
                     v.push(self.item(depth + 1)?);
@@ -175,7 +189,7 @@ impl Reader<'_> {
                 Ok(Value::Array(v))
             }
             5 => {
-                let n = self.length(info, 2)?;
+                let n = self.count(info, 2)?;
                 let mut m: Vec<(Value, Value)> = Vec::with_capacity(n);
                 for _ in 0..n {
                     let k = self.item(depth + 1)?;
@@ -288,6 +302,19 @@ mod tests {
     #[test]
     fn structure_is_checked() {
         assert_eq!(d("a2010201ff"), Err(Error::DuplicateKey), "a repeated key");
+        // Arrays and maps hold at most MAX_ITEMS elements (the duplicate-key check is quadratic).
+        let array = |n: u8| [vec![0x98, n], vec![0x00; usize::from(n)]].concat();
+        assert!(matches!(decode(&array(64)), Ok(Value::Array(v)) if v.len() == 64));
+        assert_eq!(decode(&array(65)), Err(Error::TooManyItems));
+        let map = |n: u8| {
+            let mut m = vec![0xb8, n];
+            for i in 0..n {
+                m.extend_from_slice(&[0x18, i, 0x00]);
+            }
+            m
+        };
+        assert!(matches!(decode(&map(64)), Ok(Value::Map(m)) if m.len() == 64));
+        assert_eq!(decode(&map(65)), Err(Error::TooManyItems));
         assert_eq!(d("0000"), Err(Error::TrailingBytes));
         assert_eq!(decode_prefix(&hex("0000")), Ok((Value::Int(0), 1)));
         // Declared lengths larger than the input are refused before any allocation.

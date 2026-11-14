@@ -125,8 +125,25 @@ pub fn routes(app: Arc<App>) -> Router<Arc<App>> {
         .route("/admin/settings", get(pages::settings))
         .route("/admin/settings/passkeys/{name}/remove", post(pages::passkey_remove))
         .route("/admin/settings/sessions/revoke", post(pages::sessions_revoke))
-        .layer(middleware::from_fn_with_state(app, gate))
-        .layer(DefaultBodyLimit::max(BODY_LIMIT))
+        // `route_layer`, not `layer`: a layer would also wrap the fallback, and merged into the public router that
+        // fallback answers every unknown path of the listener (a 303 to the sign-in page instead of 404).
+        .route_layer(middleware::from_fn_with_state(app, gate))
+        .route_layer(DefaultBodyLimit::max(BODY_LIMIT))
+}
+
+/// Header Tailscale sets on requests that came in through Funnel (the public internet).
+const FUNNEL_HEADER: &str = "tailscale-funnel-request";
+
+/// The rate-limit key of a client address. Every loopback address is one caller: behind Tailscale Serve the owner
+/// is `127.0.0.1`, and a local process can pick any source address in `127.0.0.0/8`.
+pub(crate) fn addr_key(ip: Option<std::net::IpAddr>) -> String {
+    use std::net::IpAddr;
+    match ip {
+        Some(i) if i.is_loopback() => "loopback".into(),
+        Some(IpAddr::V6(v6)) if v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()) => "loopback".into(),
+        Some(i) => i.to_string(),
+        None => "unknown".into(),
+    }
 }
 
 const CSS: &str = include_str!("static/admin.css");
@@ -155,9 +172,16 @@ fn plain(status: StatusCode, text: &'static str) -> Response {
 /// The `/admin` part of `http::guard`. Runs after the client address is decided and the proxy secret removed.
 pub async fn guard(app: Arc<App>, req: Request, next: Next) -> Response {
     let ui = &app.cfg.admin_ui;
-    let host = req.headers().get(header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("");
+    // Exactly one Host: with two, a proxy and Dove could each believe a different one.
+    let mut hosts = req.headers().get_all(header::HOST).iter();
+    let host = match (hosts.next(), hosts.next()) {
+        (Some(h), None) => h.to_str().unwrap_or(""),
+        _ => "",
+    };
     let host_ok = ui.host().is_some_and(|h| h.eq_ignore_ascii_case(host));
-    let resp = if !ui.enabled || app.cfg.is_local() || !host_ok {
+    // Funnel switched on after setup would put `/admin` on the internet; such requests find nothing here.
+    let funnel = req.headers().contains_key(FUNNEL_HEADER);
+    let resp = if !ui.enabled || app.cfg.is_local() || !host_ok || funnel {
         plain(StatusCode::NOT_FOUND, "not found")
     } else if req.headers().contains_key(header::AUTHORIZATION) {
         // An agent token is never an admin credential, not even next to a valid session.
@@ -167,7 +191,7 @@ pub async fn guard(app: Arc<App>, req: Request, next: Next) -> Response {
         plain(StatusCode::FORBIDDEN, "origin not allowed")
     } else {
         let ip = crate::http::request_ip(&req);
-        let key = format!("admin:{}", ip.map(|i| i.to_string()).unwrap_or_else(|| "unknown".into()));
+        let key = format!("admin:{}", addr_key(ip));
         let per_minute = ui.requests_per_minute;
         match app.rate_limiter.check(&key, per_minute, per_minute) {
             // Over the address budget, a browser whose session the gate has already seen valid draws from a budget of

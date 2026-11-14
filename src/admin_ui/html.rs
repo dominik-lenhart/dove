@@ -34,8 +34,8 @@ impl Markup {
         &self.0
     }
 
-    #[doc(hidden)]
-    pub fn from_format(args: fmt::Arguments<'_>) -> Self {
+    /// Only for [`h!`]: the caller must have escaped every argument.
+    pub(crate) fn from_format(args: fmt::Arguments<'_>) -> Self {
         Markup(fmt::format(args))
     }
 }
@@ -100,13 +100,12 @@ impl<T: Render + ?Sized> fmt::Display for Esc<'_, T> {
 }
 
 /// Builds [`Markup`] from a literal template with positional `{}` arguments, each escaped.
-#[macro_export]
 macro_rules! h {
     ($fmt:literal $(, $arg:expr)* $(,)?) => {
         $crate::admin_ui::html::Markup::from_format(format_args!($fmt $(, $crate::admin_ui::html::Esc(&$arg))*))
     };
 }
-pub use h;
+pub(crate) use h;
 
 fn unsafe_char(c: char) -> bool {
     (c.is_control() && c != '\n' && c != '\t')

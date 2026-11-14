@@ -1,7 +1,9 @@
 //! Passkey sign-in, enrolment, sessions and step-up confirmation for the admin UI (design 5.2, PLAN A74).
 //!
-//! - Challenges are generated here, kept in bounded in-memory pools, used once (taken out before they are checked)
-//!   and short-lived.
+//! - Challenges are generated here, used once and short-lived. Enrolment and step-up challenges sit in bounded
+//!   in-memory pools (taken out before they are checked). Sign-in challenges are public, so they keep no state a
+//!   stranger could fill or push out: the id carries the challenge under a MAC ([`LoginChallenges`]), and a
+//!   challenge is spent when an assertion over it verified.
 //! - The session cookie carries 32 random bytes; the store keeps only their SHA-256. The CSRF token is derived from
 //!   the cookie token by a one-way hash, so it needs no storage and reveals nothing about the cookie.
 //! - Step-up: the server keeps the exact `AdminRequest` under the challenge (challenge = SHA-256 of a nonce and the
@@ -19,6 +21,7 @@ use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -34,8 +37,9 @@ use crate::audit::{self, AuditRecord};
 use crate::http::ClientIp;
 use crate::util;
 
-const LOGIN_TTL: Duration = Duration::from_secs(120);
-const LOGIN_POOL: usize = 64;
+const LOGIN_TTL_SECS: i64 = 120;
+/// Spent sign-in challenges kept until they expire. Only a verified assertion adds one.
+const LOGIN_SPENT_CAP: usize = 256;
 const ENROL_TTL: Duration = Duration::from_secs(300);
 const ENROL_POOL: usize = 16;
 const STEPUP_TTL: Duration = Duration::from_secs(120);
@@ -129,9 +133,70 @@ struct StepUp {
     return_to: String,
 }
 
+/// Sign-in challenges without server state. `/admin/login/options` is public, and behind Tailscale Serve every
+/// caller is `127.0.0.1`; a pool of pending challenges could be filled or emptied by any local process, which
+/// would keep the owner out. The ceremony id is `challenge || expiry || HMAC(key, expiry || challenge)` under a
+/// key that lives as long as the process. Single use: a challenge is recorded as spent once an assertion over it
+/// verified (only a passkey holder gets that far), until it expires.
+pub struct LoginChallenges {
+    key: [u8; 32],
+    spent: Mutex<HashMap<[u8; 32], i64>>,
+}
+
+impl Default for LoginChallenges {
+    fn default() -> Self {
+        Self { key: util::random_bytes::<32>(), spent: Mutex::default() }
+    }
+}
+
+impl LoginChallenges {
+    fn mac(&self, expires: i64, challenge: &[u8; 32]) -> Hmac<Sha256> {
+        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&self.key).expect("any key length");
+        mac.update(b"dove-admin-login\0");
+        mac.update(&expires.to_be_bytes());
+        mac.update(challenge);
+        mac
+    }
+
+    /// A new challenge and its ceremony id.
+    fn issue(&self, now: i64) -> (String, [u8; 32]) {
+        let challenge = util::random_bytes::<32>();
+        let expires = now + LOGIN_TTL_SECS;
+        let mut id = Vec::with_capacity(72);
+        id.extend_from_slice(&challenge);
+        id.extend_from_slice(&expires.to_be_bytes());
+        id.extend_from_slice(&self.mac(expires, &challenge).finalize().into_bytes());
+        (util::b64url(&id), challenge)
+    }
+
+    /// The challenge of an id this process issued and that has not expired or been spent.
+    fn open(&self, id: &str, now: i64) -> Option<[u8; 32]> {
+        let raw = b64(id).filter(|r| r.len() == 72)?;
+        let challenge: [u8; 32] = raw[..32].try_into().ok()?;
+        let expires = i64::from_be_bytes(raw[32..40].try_into().ok()?);
+        self.mac(expires, &challenge).verify_slice(&raw[40..]).ok()?;
+        if expires <= now || self.spent.lock().expect("lock").contains_key(&challenge) {
+            return None;
+        }
+        Some(challenge)
+    }
+
+    /// Marks a challenge spent after its assertion verified. False when it was spent already (the same assertion
+    /// arriving twice) or the list is full.
+    fn spend(&self, challenge: [u8; 32], now: i64) -> bool {
+        let mut m = self.spent.lock().expect("lock");
+        m.retain(|_, exp| *exp > now);
+        if m.len() >= LOGIN_SPENT_CAP || m.contains_key(&challenge) {
+            return false;
+        }
+        m.insert(challenge, now + LOGIN_TTL_SECS);
+        true
+    }
+}
+
 #[derive(Default)]
 pub struct Pools {
-    login: Pool<[u8; 32]>,
+    login: LoginChallenges,
     enrol: Pool<EnrolPending>,
     stepup: Pool<StepUp>,
     seen: SeenSessions,
@@ -279,7 +344,7 @@ fn json_error(status: StatusCode, msg: &str) -> Response {
 }
 
 fn login_fail_key(ip: Option<IpAddr>) -> String {
-    format!("admin-login-fail:{}", ip.map(|i| i.to_string()).unwrap_or_else(|| "unknown".into()))
+    format!("admin-login-fail:{}", super::addr_key(ip))
 }
 
 /// Charges a failed sign-in or enrolment to the per-address bucket and returns the status to answer: `refused`, or
@@ -419,9 +484,7 @@ pub async fn login_page(State(app): State<Arc<App>>, headers: HeaderMap) -> Resp
 
 pub async fn login_options(State(app): State<Arc<App>>) -> Response {
     let Some((rp_id, _)) = rp(&app) else { return json_error(StatusCode::NOT_FOUND, "not found") };
-    let challenge = util::random_bytes::<32>();
-    let id = new_ceremony_id();
-    app.admin_ui.auth.login.put_evicting(LOGIN_POOL, LOGIN_TTL, id.clone(), challenge);
+    let (id, challenge) = app.admin_ui.auth.login.issue(util::now_unix());
     // No allowCredentials: the page is public and must not list credential ids (discoverable credentials).
     Json(json!({ "id": id, "publicKey": {
         "challenge": util::b64url(&challenge), "rpId": rp_id, "userVerification": "required",
@@ -456,7 +519,7 @@ pub async fn login_finish(
 /// The checks of a sign-in; on success the new session's cookie token (audited inside the session's transaction).
 async fn login_check(app: &Arc<App>, body: &[u8], ip: Option<IpAddr>) -> Result<String, &'static str> {
     let f: Finish<AssertionJson> = serde_json::from_slice(body).map_err(|_| "body")?;
-    let challenge = app.admin_ui.auth.login.take(&f.id).ok_or("challenge")?;
+    let challenge = app.admin_ui.auth.login.open(&f.id, util::now_unix()).ok_or("challenge")?;
     let a = f.credential.decode().ok_or("encoding")?;
     let cid = a.credential_id.clone();
     let passkey = app
@@ -466,6 +529,10 @@ async fn login_check(app: &Arc<App>, body: &[u8], ip: Option<IpAddr>) -> Result<
         .map_err(|_| "store")?
         .ok_or("unknown_credential")?;
     let asserted = check_assertion(app, &challenge, &passkey, &a).map_err(webauthn::Error::code)?;
+    // Single use: the same verified assertion never signs in twice.
+    if !app.admin_ui.auth.login.spend(challenge, util::now_unix()) {
+        return Err("challenge");
+    }
     let token = util::b64url(&util::random_bytes::<32>());
     let t = token.clone();
     app.store
@@ -733,6 +800,40 @@ mod tests {
             assert!(b.put_bounded(5, Duration::from_secs(60), format!("b{i}"), (2 + i, 0), |v| v.0 == 2 + i, 2));
         }
         assert!(!b.put_bounded(5, Duration::from_secs(60), "c".into(), (9, 0), |v| v.0 == 9, 2), "full: refused");
+    }
+
+    #[test]
+    fn login_challenges_are_bound_to_this_process_expire_and_are_spent_once() {
+        let l = LoginChallenges::default();
+        let (id, ch) = l.issue(1000);
+        assert_eq!(l.open(&id, 1000), Some(ch));
+        assert_eq!(l.open(&id, 1000 + LOGIN_TTL_SECS - 1), Some(ch), "opening spends nothing");
+        assert_eq!(l.open(&id, 1000 + LOGIN_TTL_SECS), None, "expired");
+        // Every part is under the MAC: the challenge, the expiry and the MAC itself.
+        let raw = b64(&id).unwrap();
+        assert_eq!(raw.len(), 72);
+        for i in [0, 31, 32, 39, 40, 71] {
+            let mut bent = raw.clone();
+            bent[i] ^= 1;
+            assert_eq!(l.open(&util::b64url(&bent), 1000), None, "byte {i}");
+        }
+        assert_eq!(l.open(&util::b64url(&raw[..71]), 1000), None);
+        assert_eq!(l.open("", 1000), None);
+        // Another process (another key) does not accept it.
+        assert_eq!(LoginChallenges::default().open(&id, 1000), None);
+        // Spent once, then closed until it would have expired anyway.
+        assert!(l.spend(ch, 1001));
+        assert!(!l.spend(ch, 1002), "spent twice");
+        assert_eq!(l.open(&id, 1003), None, "spent");
+        // The list only holds verified sign-ins; full, it refuses instead of forgetting one.
+        let full = LoginChallenges::default();
+        for i in 0..LOGIN_SPENT_CAP {
+            let mut c = [0u8; 32];
+            c[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            assert!(full.spend(c, 1000));
+        }
+        assert!(!full.spend([0xff; 32], 1000), "full");
+        assert!(full.spend([0xff; 32], 1000 + LOGIN_TTL_SECS), "expired entries make room");
     }
 
     #[test]

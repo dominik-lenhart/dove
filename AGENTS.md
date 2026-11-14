@@ -506,3 +506,11 @@ cargo fmt
   127.0.0.1), so a test with many refused assertions raises `login_failures_per_hour`. The W3C WebAuthn vectors in
   `tests/fixtures/webauthn/` were made without user verification: only the verifier's own tests pass `require_uv =
   false`.
+- 2026-11-14: Middleware on a router that is merged into the public one must be `route_layer`: axum's `layer` also
+  wraps the fallback, and the merged router then runs it for every unknown path of the listener (the admin gate
+  answered a public `/nonexistent` with a redirect to its sign-in page). A new merged router needs a test that an
+  unknown public path answers the same with the feature on and off (`raw_status` in `tests/admin_ui_e2e.rs` writes
+  the request by hand: duplicate `Host`, paths reqwest would normalise). Admin rate-limit keys come from
+  `admin_ui::addr_key` (all of loopback is one caller); simulate other addresses with `X-Forwarded-For` plus
+  `X-Dove-Proxy-Auth`. Sign-in challenges are stateless (`auth::LoginChallenges`); never add a public endpoint that
+  stores per-request state in a pool that evicts.

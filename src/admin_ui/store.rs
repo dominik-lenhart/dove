@@ -57,7 +57,9 @@ pub fn enrol_link(tx: &Transaction, name: &str, origin: &str) -> anyhow::Result<
         "name": name,
         "open_this_link": format!("{origin}/admin/enroll#{token}"),
         "expires_in_minutes": ENROL_TTL_SECS / 60,
-        "next": "Open the link on the device that holds (or will hold) the passkey, within 5 minutes. It works once.",
+        "next": "Open the link on the device that holds (or will hold) the passkey, within 5 minutes. It works once. \
+                 If the page says the link was already used and that was not you, remove the passkey at once: \
+                 dove admin passkey remove <name>",
     }))
 }
 

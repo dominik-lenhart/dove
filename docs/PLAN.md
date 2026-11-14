@@ -772,9 +772,13 @@ hosts or reference hardware.
   the assertion is verified, and only failures are charged; once the bucket is empty, failures answer 429 instead of
   401 (the same rule as `/mcp` bearer failures). Over the request budget (120 per minute) a browser whose session the
   gate has already found valid (an in-memory list of at most 64 token hashes) draws from a per-session budget of the
-  same size instead; that path never touches the state store, and the gate still checks the session itself. What a flooding local process can still do is delay a new sign-in: use up the anonymous budget or evict login challenges (64 entries,
-  120 s). Before sign-in the owner cannot be told apart from it behind Serve. That is a nuisance, not a bypass;
-  existing sessions and the CLI are unaffected.
+  same size instead; that path never touches the state store, and the gate still checks the session itself. Every
+  loopback address (`127.0.0.0/8`, `::1`) is one rate-limit key, since a local process can pick its source address.
+  Sign-in challenges keep no server state a stranger could fill or push out: the ceremony id is the challenge and
+  its expiry (120 s) under an HMAC with a per-process key, and a challenge is recorded as spent once an assertion
+  over it verified (at most 256 entries, refused when full; only a passkey holder adds one). What a flooding local
+  process can still do is delay a new sign-in by using up the anonymous budget. Before sign-in the owner cannot be
+  told apart from it behind Serve. That is a nuisance, not a bypass; existing sessions and the CLI are unaffected.
   (j) Unknown paths under `/admin` answer 404 before the session check (the plan said after): the route list is
   public in the source anyway. (k) The Overview shows the last doctor result (cached in memory); "Run checks" runs it.
   (l) The UI is refused in local mode and `dove tailscale setup --admin` refuses while Funnel is on for the port.
@@ -782,3 +786,15 @@ hosts or reference hardware.
   connection has now; approval (with an optional shorter time in minutes) goes through the same passkey confirmation
   as a send, and "End access now" is `requests cancel`. The send path refuses a duration and the access path takes
   no revisions, so a forged `kind` field fails in the verb.
+  Review follow-ups (independent security review of PR #19): (n) The session gate is a `route_layer`. As a `layer`
+  it also wrapped the router's fallback, which after the merge answered every unknown path of the public listener
+  with a redirect to the sign-in page (visible through a Funnel prefix mount); unknown paths now answer 404 on both
+  hosts, as (j) says. (o) `/admin` answers 404 to a request that carries `Tailscale-Funnel-Request` (Tailscale sets
+  it on Funnel traffic), so Funnel switched on after setup does not publish the UI, and to a request with more than
+  one `Host`. (p) Starting with the UI off deletes every admin session, so a session never comes back when the UI
+  is switched on again. (q) CBOR arrays and maps hold at most 64 elements (the duplicate-key check is quadratic).
+  (r) Known and accepted: the `__Host-` cookie is not bound to a port, so another HTTPS service on the same tailnet
+  name could overwrite it (the owner is signed out; `Origin` checks keep writes and reads closed); an enrolment
+  link is full admin for whoever opens it first within five minutes, so `passkey add` tells the operator to remove
+  the passkey if the link was used by someone else; without a proxy secret a loopback caller chooses its
+  `X-Forwarded-For` (older behaviour, A30), which with (i) no longer buys a second budget on loopback.

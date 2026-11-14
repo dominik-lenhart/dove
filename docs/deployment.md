@@ -1075,6 +1075,12 @@ reach the loopback listener directly. It cannot sign in without your passkey, bu
 the budget for anonymous requests, which delays a new sign-in. Browsers that are already signed in keep working. If the
 sign-in page answers "too many requests", wait a minute or use the CLI.
 
+**Funnel and other services on the same name.** Dove answers 404 on `/admin` to any request that came in through
+Tailscale Funnel, so turning Funnel on later for the admin port does not publish the UI (`dove doctor` reports it).
+The session cookie belongs to the host name, not to the port: another HTTPS service on the same tailnet name could
+replace it, which signs you out but gives that service nothing. If `passkey add` printed a link and the page says it
+was already used, and that was not you, remove that passkey at once with `sudo dove admin passkey remove <name>`.
+
 ## Backup and restore
 
 What the state store (`/var/lib/dove/state.db`) holds: wrapped per-mailbox keys, encrypted refresh tokens, keyed

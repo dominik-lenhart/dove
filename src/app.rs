@@ -69,6 +69,11 @@ impl App {
             None => None,
         };
         let store = Store::open(&cfg.state_db_path())?;
+        // Switching the admin UI off signs every browser out: a session from before must not work again when the
+        // UI is switched back on.
+        if !cfg.admin_ui.enabled {
+            store.call_blocking(|c| Ok(c.execute("DELETE FROM admin_sessions", [])?))?;
+        }
         let notifier = Notifier::new(cfg.notifier.webhook_url.clone(), store.clone());
         let vault = Vault::new(kek);
         let gateway = Arc::new(Gateway::new(upstream, &cfg.limits));
