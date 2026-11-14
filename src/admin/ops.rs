@@ -183,7 +183,7 @@ pub fn account_set_enabled(tx: &Transaction, alias: &str, enabled: bool) -> anyh
     tx.execute("UPDATE accounts SET status = ?1 WHERE id = ?2", params![new_status, aid])?;
     if !enabled {
         // Scheduled sends from a disabled mailbox are cancelled, not held until it comes back (design 4.1).
-        let requests = crate::requests::cancel_for_account(tx, &aid, util::now_unix())?;
+        let requests = crate::requests::cancel_for_disabled_account(tx, &aid, util::now_unix())?;
         return Ok(json!({ "account": alias, "status": new_status, "requests_cancelled": requests }));
     }
     Ok(json!({ "account": alias, "status": new_status }))

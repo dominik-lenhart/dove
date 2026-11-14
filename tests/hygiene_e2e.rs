@@ -71,12 +71,24 @@ async fn canaries_never_reach_logs_audit_or_plaintext_state() {
             json!({"account":"info","request_key":uuid::Uuid::new_v4().to_string(),"to":[sender],"subject":subject,"body_text":draft_body}),
         )
         .await;
-    h.ok(
-        &token,
-        "update_draft",
-        json!({"account":"info","draft_id":d["draft_id"],"expected_revision":d["revision"],"changes":{"body_text":"CANARY-DRAFT-2"}}),
-    )
-    .await;
+    let u = h
+        .ok(
+            &token,
+            "update_draft",
+            json!({"account":"info","draft_id":d["draft_id"],"expected_revision":d["revision"],"changes":{"body_text":"CANARY-DRAFT-2"}}),
+        )
+        .await;
+    // A request note is agent free text that may quote mail: sealed, shown to the operator only (PLAN A71).
+    let send_at = dove::util::rfc3339(dove::util::now_unix() + 3600);
+    let req = h
+        .ok(
+            &token,
+            "request_send",
+            json!({"account":"info","note":"CANARY-NOTE-77ab","items":[{"draft_id":d["draft_id"],
+                   "expected_revision":u["revision"],"send_at":send_at}]}),
+        )
+        .await;
+    let _request_id = req["request_id"].as_str().unwrap().to_string();
     // Failing calls carry canaries in arguments too.
     let _ = h.call(&token, "get_message", json!({"account":"CANARY-ALIAS-ARG","message_id":"CANARYID1"})).await;
     let bogus_token = dove::tokens::generate("dove_");
@@ -154,6 +166,7 @@ async fn canaries_never_reach_logs_audit_or_plaintext_state() {
         "canary-sender".into(),
         "Canary Name".into(),
         "CANARY-DRAFT".into(),
+        "CANARY-NOTE".into(),
         "CANARY-ALIAS-ARG".into(),
         code.into(),
         q["state"].clone(),
@@ -186,7 +199,7 @@ async fn canaries_never_reach_logs_audit_or_plaintext_state() {
         if p.is_file() {
             files += 1;
             let b = file_bytes(&p);
-            for c in [subject, "CANARY-BODY-91c2", "canary-sender-55", "wire money"] {
+            for c in [subject, "CANARY-BODY-91c2", "canary-sender-55", "wire money", "CANARY-NOTE"] {
                 assert!(!contains(&b, c), "content canary {c:?} in plaintext file {}", p.display());
             }
         }

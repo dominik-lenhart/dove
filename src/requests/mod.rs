@@ -331,9 +331,14 @@ pub fn cancel_for_client(tx: &Transaction, client_id: &str, now: i64) -> anyhow:
     cancel_where(tx, "client_id", client_id, "client_revoked", now)
 }
 
-/// On removing or disabling a mailbox: the requests that name it are cancelled like on revoke.
+/// On removing a mailbox: the requests that name it are cancelled like on revoke.
 pub fn cancel_for_account(tx: &Transaction, account_id: &str, now: i64) -> anyhow::Result<usize> {
     cancel_where(tx, "account_id", account_id, "account_removed", now)
+}
+
+/// On disabling a mailbox: as [`cancel_for_account`], with the reason `account_disabled`.
+pub fn cancel_for_disabled_account(tx: &Transaction, account_id: &str, now: i64) -> anyhow::Result<usize> {
+    cancel_where(tx, "account_id", account_id, "account_disabled", now)
 }
 
 /// Writes one audit record for a request event (ids and a result code only).
