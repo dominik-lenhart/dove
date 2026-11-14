@@ -13,6 +13,17 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
   skipped on the first start, failing commands are retried up to `--max-attempts`, and a lock file keeps a second
   listener on the same profile from running the command twice. Pin it to an agent session with
   `claude -p --resume <session-id> --fork-session`.
+- `create_watch` with `kind: no_reply_by` takes a `message_id` instead of a `thread_id`: "tell me if nobody answers
+  this mail by Friday". The event names that message, so the agent can read it and follow up; a reply from someone
+  else ends the watch quietly, and a message that is already answered ends it at once (`end_reason: replied`). CLI:
+  `dove watch create --no-reply-to <message-id> --deadline <time>`.
+
+### Fixed
+
+- Watches no longer treat the owner's own mail from a Gmail send-as address as someone else's: mail with the `SENT`
+  label (or in the IMAP Sent folder) never fires a watch and never counts as a reply, like `from_self` in search.
+- A `no_reply_by` watch no longer fires when the reply arrived in the same second as the watched message (IMAP dates
+  have no milliseconds) and the sync hook had not seen it, for example because it was indexed during a rebuild.
 
 ## [0.8.1] - 2026-11-14
 

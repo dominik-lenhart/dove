@@ -770,14 +770,16 @@ configuration, and neither MCP calls nor the CLI can change it. See the README b
 
 Agents can watch a mailbox instead of polling search (`create_watch`): a new message in a thread from someone else
 (`thread_reply`), new mail from an address or domain (`from`), new mail matching a typed search (`query`), or no
-reply in a thread before a deadline (`no_reply_by`, fires once). Watches need the search index on the mailbox
+reply before a deadline (`no_reply_by`, fires once): in a thread, or to one message such as the agent's own sent
+mail, where a reply ends the watch quietly and the owner's own follow-ups do not count. Watches need the search index on the mailbox
 (`dove index enable <alias>`), belong to the token that created them and end on their own when they expire (30 days
 by default, 180 at most), when the token is revoked or loses `read` on the mailbox, and when the mailbox is disabled,
 stops being indexed or is removed. A token may have 50 active watches.
 
 Events are produced when the sync engine commits new mail to the index (Gmail history sync, IMAP polling and IDLE,
 so IDLE mailboxes report new INBOX mail within seconds) and, for `no_reply_by`, by a background tick every 15
-seconds. Mail sent by the mailbox itself, drafts, and spam or trash never fire a watch. An event holds the watch id,
+seconds. Mail sent by the mailbox itself (its address, an IMAP alias, or anything with Gmail's `SENT` label or in the IMAP
+Sent folder), drafts, and spam or trash never fire a watch. An event holds the watch id,
 kind, account alias, message id, thread id and received time, never a subject, sender or body: the agent reads the
 message with its own token. Events are kept 14 days and pulled with `list_watch_events` (opaque cursor).
 
@@ -817,7 +819,8 @@ Each event is one `POST` with `Content-Type: application/json`, a `Dove-Event-Id
  "thread_id": "18c2f0a1b2c3d4e5", "received_at": "2026-11-13T09:12:44.123Z", "created_at": "2026-11-13T09:12:47Z"}
 ```
 
-`message_id` and `received_at` are `null` for `no_reply_by`. Any 2xx answer counts as delivered. Timeouts (10 s),
+For `no_reply_by`, `message_id` and `received_at` name the unanswered message when the watch was created on one
+(`message_id`), and are `null` for a watch on a thread. Any 2xx answer counts as delivered. Timeouts (10 s),
 network errors, 408, 429 and 5xx are retried after 10 s, 1 min, 5 min, 30 min and 2 h (6 attempts in all); any other
 status fails at once. Undelivered events stay available to the agent through `list_watch_events`. Use `event_id` to
 drop duplicates. Verify the signature on the raw body before parsing it, for example in Python:
@@ -845,7 +848,7 @@ profile's watches (outgoing HTTPS only, every 60 s by default) and runs a fixed 
 at a time:
 
 ```sh
-dove watch create --profile ops --account info --from billing@partner.example     # or --reply-in, --where-file, --no-reply-in
+dove watch create --profile ops --account info --from billing@partner.example     # or --reply-in, --where-file, --no-reply-in, --no-reply-to
 dove watch listen --profile ops -- \
   claude -p --resume <session-id> --fork-session --allowedTools "Bash(dove search:*)" "Bash(dove message get:*)" -- \
   "A Dove watch fired. Read the new message with dove message get --account \$DOVE_ACCOUNT --id \$DOVE_MESSAGE_ID ..."

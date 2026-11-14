@@ -77,7 +77,10 @@ pub struct CreateArgs {
     /// No message from others in this thread before --deadline (fires once, at the deadline).
     #[arg(long, value_name = "THREAD_ID", group = "kind", requires = "deadline")]
     pub no_reply_in: Option<String>,
-    /// RFC 3339 instant, with --no-reply-in.
+    /// No answer from others to this message before --deadline (fires once, at the deadline).
+    #[arg(long, value_name = "MESSAGE_ID", group = "kind", requires = "deadline")]
+    pub no_reply_to: Option<String>,
+    /// RFC 3339 instant, with --no-reply-in or --no-reply-to.
     #[arg(long)]
     pub deadline: Option<String>,
     /// When the watch ends (RFC 3339). Default 30 days, at most 180.
@@ -146,6 +149,12 @@ async fn call(p: &ProfileOpts, name: &str, args: Value) -> anyhow::Result<()> {
 }
 
 async fn create(a: CreateArgs) -> anyhow::Result<()> {
+    let p = a.p.clone();
+    call(&p, "create_watch", create_args(a)?).await
+}
+
+/// The `create_watch` arguments for `dove watch create`.
+fn create_args(a: CreateArgs) -> anyhow::Result<Value> {
     let mut args = json!({ "account": a.account });
     if let Some(f) = a.from {
         args["kind"] = json!("from");
@@ -162,8 +171,12 @@ async fn create(a: CreateArgs) -> anyhow::Result<()> {
         args["kind"] = json!("no_reply_by");
         args["thread_id"] = json!(t);
         args["deadline"] = json!(a.deadline);
+    } else if let Some(m) = a.no_reply_to {
+        args["kind"] = json!("no_reply_by");
+        args["message_id"] = json!(m);
+        args["deadline"] = json!(a.deadline);
     } else {
-        bail!("choose what to watch: --from, --reply-in, --where-file or --no-reply-in");
+        bail!("choose what to watch: --from, --reply-in, --where-file, --no-reply-in or --no-reply-to");
     }
     if let Some(e) = a.expires {
         args["expires_at"] = json!(e);
@@ -171,7 +184,7 @@ async fn create(a: CreateArgs) -> anyhow::Result<()> {
     if let Some(s) = a.sink {
         args["sink"] = json!(s);
     }
-    call(&a.p, "create_watch", args).await
+    Ok(args)
 }
 
 /// Listener state per profile (and watch filter): the cursor after the last handled event and the failed attempts
@@ -397,6 +410,29 @@ async fn run_command(command: &[String], env: &[(&'static str, String)], timeout
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Cli {
+        #[command(flatten)]
+        create: CreateArgs,
+    }
+
+    #[test]
+    fn create_maps_no_reply_to_a_message() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["dove", "--account", "info"];
+            argv.extend_from_slice(extra);
+            Cli::try_parse_from(argv).map(|c| create_args(c.create).unwrap())
+        };
+        let v = parse(&["--no-reply-to", "f3-1-42", "--deadline", "2026-11-20T09:00:00Z"]).unwrap();
+        assert_eq!(
+            v,
+            json!({ "account": "info", "kind": "no_reply_by", "message_id": "f3-1-42", "deadline": "2026-11-20T09:00:00Z" })
+        );
+        assert!(parse(&["--no-reply-to", "f3-1-42"]).is_err(), "--deadline is required");
+        assert!(parse(&["--no-reply-to", "f3-1-42", "--no-reply-in", "t", "--deadline", "x"]).is_err(), "one kind");
+    }
 
     #[test]
     fn event_env_passes_ids_only() {

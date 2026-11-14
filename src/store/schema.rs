@@ -1,7 +1,7 @@
 //! Versioned schema migrations for the durable state store. Never edit a released migration; append a new one.
 
 pub const MIGRATIONS: &[&str] =
-    &[V1, V2, V3, V_SEND_IDENTITIES, V_WATCHES, V_GMAIL_IMAP, V_SINK_PROJECTS, V_REDACT_SECRETS];
+    &[V1, V2, V3, V_SEND_IDENTITIES, V_WATCHES, V_GMAIL_IMAP, V_SINK_PROJECTS, V_REDACT_SECRETS, V_WATCH_TARGETS];
 
 const V1: &str = r#"
 CREATE TABLE accounts (
@@ -341,4 +341,17 @@ CREATE INDEX sinks_project ON sinks(project_id);
 const V_REDACT_SECRETS: &str = r#"
 ALTER TABLE clients ADD COLUMN redact_secrets INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE invitations ADD COLUMN redact_secrets INTEGER NOT NULL DEFAULT 0;
+"#;
+
+/// `no_reply_by` on one message and same-second replies (PLAN A70).
+///
+/// - `watches.message_id`: the agent message id a `no_reply_by` watch was created on (NULL when it names a thread). The
+///   watch's `thread_id` is that message's thread and `baseline_ms` its `received_at`.
+/// - `watches.baseline_ids`: JSON array of the agent message ids that were already there at `baseline_ms` when the
+///   watch was created (the named message, or the thread's newest messages). They never count as a reply, so later
+///   messages can be compared with `>=` (IMAP dates have second precision). NULL on rows from before this migration,
+///   which keep the strict `>` comparison.
+const V_WATCH_TARGETS: &str = r#"
+ALTER TABLE watches ADD COLUMN message_id TEXT;
+ALTER TABLE watches ADD COLUMN baseline_ids TEXT;
 "#;

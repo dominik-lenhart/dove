@@ -432,3 +432,9 @@ cargo fmt
   (prompt after `--`, since `--allowedTools` is variadic). Tests run the real binary in
   `tests/client_e2e.rs::watch_listen_runs_the_command_once_per_event_with_ids_only`; generate events there with
   `index::sync::sync_account` after `IndexEnable`. Never build the prompt from mail content.
+- 2026-11-14: `no_reply_by` (PLAN A70) decides replies through `watch::first_reply` and `watch::Baseline`: `>=` the
+  baseline instant minus the stored `baseline_ids`, own mail by `watch::is_own` (owner addresses or the `SENT` label).
+  To test the deadline path on its own, let the sync hook end the watch, set the row back to `active`
+  (`reopen` in `tests/watch_no_reply_e2e.rs`) and `tick` past `deadline + NO_REPLY_GRACE_SECS`. IMAP same-second
+  cases put both messages at the same `add_message_at` second. Gmail mailboxes have no Dove aliases
+  (`AccountsAliasAdd` refuses them); fake a send-as follow-up with any address plus the `SENT` label.

@@ -569,3 +569,29 @@ hosts or reference hardware.
   The notice and `--check` print `brew upgrade dove` for it. Only the formula named `dove` counts. The check is on
   the path, not on `brew --prefix`, so it needs no `brew` binary and works with `/opt/homebrew`, `/usr/local` and
   Linuxbrew alike.
+- A70. "No reply" follow-up on one message (agent feedback: "awaiting reply" had no wake-up, 2026-11-14). Built on the
+  existing `no_reply_by` kind (A54) instead of a new kind or tool, so `dove watch listen` and sinks need nothing new.
+  (a) Target: exactly one of `thread_id` (as before) or `message_id`. A message target resolves to its thread in the
+  mailbox's serving generation; its `received_at` is the baseline. A draft is `invalid_argument` (nobody can answer
+  it). Unknown ids, ids of other mailboxes and messages not indexed yet are the same `not_found` (the lookup is
+  scoped to the mailbox's generation; a just-sent message is found after the next sync, the description says so).
+  (b) A reply is a message in that thread, not a draft, not in spam or trash, with `received_at >= baseline` and not
+  one of `baseline_ids`, the agent ids already there at the baseline instant (the named message, or the thread's
+  newest messages). `>=` because IMAP INTERNALDATE has second precision; the id set keeps the baseline's own
+  messages (for example an inbound question that is the thread's newest message) from answering themselves. Rows from
+  before this entry have no `baseline_ids` and keep the strict `>` (A54) at the deadline. The sync hook keeps its `>=`
+  on new rows only. (c) Own mail never counts: a From address that is the mailbox address or an alias, or the `SENT`
+  label (`watch::is_own`, the rule of `from_self`, A61 (b)), so a follow-up from a Gmail send-as address does not end
+  the watch. This applies to every watch kind, which already ignored owner mail. Gap: an auto-reply (out of office)
+  from the recipient counts as a reply; Dove does not index `Auto-Submitted`. (d) Outcomes: silence fires one event
+  at the deadline (as A54: once the index synced past it, or `NO_REPLY_GRACE_SECS` later); for a message target the
+  event's `message_id`/`received_at` name that message, a thread target keeps them `null`. A reply ends the watch
+  with `end_reason: replied` and no event (an agent that wants the reply itself watches `thread_reply`). A message
+  already answered when the watch is created is stored as ended (`replied`) and returned that way, not refused, so
+  the agent learns the outcome in one call. (e) Bounds and limits unchanged: deadline in the future and at most 180
+  days (as `expires_at`; a tighter 90-day cap would break existing callers for no gain), the 50 active watches per
+  connection, `read` on the mailbox, index enabled. Indexing disabled, mailbox removed or access lost end the watch
+  through `watch::end_reason` as before. (f) Restart safety: everything lives in the `watches` row (`thread_id`,
+  `message_id`, `baseline_ms`, `baseline_ids`, `deadline`; store migration 9 adds the two new columns) and `tick`
+  decides from it, so no in-memory timer exists to lose. (g) The state store gains message ids only (as events
+  already hold), no addresses or subjects; audit rows are unchanged.
