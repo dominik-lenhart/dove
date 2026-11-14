@@ -535,3 +535,9 @@ hosts or reference hardware.
   `move_messages`, already gated. Gmail over IMAP: `update_messages` sets no keywords (labels go through
   `X-GM-LABELS` on existing user-label folders; `[Gmail]/Spam` is a system folder and refused), so there is no
   equivalent path. A Gmail user label named `Junk` is just a label; Gmail does not train on it.
+- A65. Sink URLs off the command line (follow-up to A59 (d), 2026-11-14). Slack, Discord and ntfy webhook URLs are
+  credentials, and `dove sinks add --url` put them in shell history and `ps`. `--url-file <path>` reads the URL with
+  the secret-file rules (`secrets::read_secret_string`: regular file, no group or other access, DPAPI on Windows,
+  trimmed); `-` reads standard input (at most 8 KiB, trimmed). `--url` stays for compatibility and scripts, with a
+  warning on stderr, rather than being removed in a minor release. clap enforces exactly one of the two. Errors name
+  the file, never its content. The admin request is unchanged (`SinksAdd.url`), so nothing changes on the service side.

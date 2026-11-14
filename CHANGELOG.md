@@ -5,6 +5,11 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 
 ## [Unreleased]
 
+### Added
+
+- `dove sinks add --url-file <path>` reads the webhook URL from a file (owner-only mode, trimmed) or from standard
+  input with `-`. `--url` still works but warns that the URL lands in shell history and the process list.
+
 ### Security
 
 - Setting or removing IMAP junk keywords (`$Junk`, `$NotJunk`, `NonJunk` and any keyword containing `junk` or `spam`,

@@ -758,7 +758,8 @@ secret:
 
 ```sh
 umask 077; openssl rand -hex 32 > ~/dove-hook.secret
-dove sinks add n8n --project acme --url https://hooks.example.com/dove --secret-file ~/dove-hook.secret
+umask 077; cat > ~/dove-hook.url    # paste the URL, then Ctrl-D (keeps it out of shell history)
+dove sinks add n8n --project acme --url-file ~/dove-hook.url --secret-file ~/dove-hook.secret
 dove sinks list        # project, URL origin, active watches, pending/delivered/failed deliveries (never the secret)
 dove sinks set-project n8n --project other   # move it; the old project's watches keep working without push
 dove sinks remove n8n  # watches that used it keep working without push
@@ -768,7 +769,10 @@ A sink belongs to one project: only clients of that project see its name and can
 of other projects it does not exist (`not_found`, like an unknown name). The URL is stored sealed with the KEK like the
 secret, because Slack, Discord or ntfy URLs carry credentials, and `dove sinks list` shows only its origin. The CLI
 reads the secret file (no group or other access: 0400 or 0600) and the service stores it sealed with the KEK
-(`dove keys rotate` re-wraps URL and secret); the file is not needed afterwards.
+(`dove keys rotate` re-wraps URL and secret); the file is not needed afterwards. `--url-file` is read the same way
+(same mode rule, surrounding whitespace trimmed); `--url-file -` reads the URL from standard input, for example from
+a password manager's CLI. `--url <URL>` still works but prints a warning: a URL on the command line ends up in shell
+history and is visible to other users in the process list. The CLI never prints the URL.
 
 Upgrading from 0.5 or earlier: existing sinks have their URL sealed at the first start and belong to no project, so
 no client can use them and their watches push nothing (events stay pullable) until you assign one with

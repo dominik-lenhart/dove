@@ -320,6 +320,48 @@ pub enum SignatureCmd {
     },
 }
 
+/// Longest sink URL read from `--url-file -`.
+const MAX_SINK_URL_BYTES: u64 = 8 * 1024;
+
+/// The sink URL from `--url` or `--url-file` (clap allows exactly one). A file is read like a secret file (owner-only
+/// mode), `-` reads standard input; both are trimmed. `--url` still works but warns on `warn` that the URL lands in
+/// shell history and the process list. Neither the warning nor any error ever contains the URL.
+fn sink_url(
+    url: Option<String>,
+    url_file: Option<PathBuf>,
+    stdin: &mut dyn std::io::Read,
+    warn: &mut dyn std::io::Write,
+) -> anyhow::Result<String> {
+    use std::io::Read;
+    let url = match (url, url_file) {
+        (Some(url), None) => {
+            writeln!(
+                warn,
+                "warning: --url puts the sink URL in your shell history and the process list; use --url-file <path> \
+                 or --url-file - (standard input) instead"
+            )?;
+            return Ok(url);
+        }
+        (None, Some(path)) if path == std::path::Path::new("-") => {
+            let mut buf = Vec::new();
+            stdin.take(MAX_SINK_URL_BYTES + 1).read_to_end(&mut buf)?;
+            if buf.len() as u64 > MAX_SINK_URL_BYTES {
+                anyhow::bail!("the sink URL on standard input is longer than {MAX_SINK_URL_BYTES} bytes");
+            }
+            String::from_utf8(buf).map_err(|_| anyhow::anyhow!("the sink URL on standard input is not UTF-8"))?
+        }
+        (None, Some(path)) => crate::secrets::read_secret_string(&path)
+            .map_err(|e| anyhow::anyhow!("cannot read the sink URL file: {e:#}"))?
+            .to_string(),
+        _ => anyhow::bail!("pass exactly one of --url and --url-file"),
+    };
+    let url = url.trim();
+    if url.is_empty() {
+        anyhow::bail!("no sink URL given");
+    }
+    Ok(url.to_string())
+}
+
 /// Reads a signature file (`-`: stdin), refusing anything larger than the cap before it is sent.
 fn read_signature(path: &std::path::Path) -> anyhow::Result<String> {
     use std::io::Read;
@@ -671,9 +713,14 @@ pub enum SinksCmd {
         /// Project whose clients may use the sink (other projects never see it).
         #[arg(long)]
         project: String,
-        /// HTTPS URL (no query or fragment). Only this exact URL is ever contacted.
+        /// HTTPS URL (no query or fragment). Only this exact URL is ever contacted. Prefer `--url-file`: a URL on the
+        /// command line lands in shell history and the process list, and webhook URLs often carry credentials.
+        #[arg(long, required_unless_present = "url_file", conflicts_with = "url_file")]
+        url: Option<String>,
+        /// File holding the URL (surrounding whitespace trimmed; no group or other access, like `--secret-file`), or
+        /// `-` to read it from standard input.
         #[arg(long)]
-        url: String,
+        url_file: Option<PathBuf>,
         /// File with the HMAC signing secret (at least 32 characters, mode 0600 or stricter), e.g. from
         /// `openssl rand -hex 32`. The service keeps it sealed; the receiver needs the same secret.
         #[arg(long)]
@@ -839,7 +886,8 @@ fn admin_request(cmd: Command) -> anyhow::Result<(AdminOpts, AdminRequest)> {
             }
         },
         Command::Sinks(c) => match c {
-            SinksCmd::Add { name, project, url, secret_file, admin } => {
+            SinksCmd::Add { name, project, url, url_file, secret_file, admin } => {
+                let url = sink_url(url, url_file, &mut std::io::stdin().lock(), &mut std::io::stderr())?;
                 let secret = crate::secrets::read_secret_string(&secret_file)?;
                 (admin, R::SinksAdd { name, project, url, secret: crate::admin::Password(secret) })
             }
@@ -1034,6 +1082,49 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(std::iter::once("dove").chain(args.iter().copied()))
+    }
+
+    /// `--url-file` (a file or `-` for stdin) and `--url` are alternatives; `--url` warns about shell history, and
+    /// neither the warning nor an error repeats the URL.
+    #[test]
+    fn sinks_add_reads_the_url_from_a_file_or_stdin() {
+        let url = "https://hooks.example.com/x/T0K3N";
+        let base = ["sinks", "add", "n8n", "--project", "acme", "--secret-file", "/tmp/s"];
+        let with = |extra: &[&str]| parse(&base.iter().copied().chain(extra.iter().copied()).collect::<Vec<_>>());
+        assert!(with(&[]).is_err(), "one of --url and --url-file is required");
+        assert!(with(&["--url", url, "--url-file", "-"]).is_err(), "not both");
+        let Command::Sinks(SinksCmd::Add { url: u, url_file: f, .. }) = with(&["--url-file", "-"]).unwrap().command
+        else {
+            panic!()
+        };
+        assert_eq!((u, f), (None, Some(PathBuf::from("-"))));
+
+        let (mut none, mut warn) = (std::io::empty(), Vec::new());
+        // stdin, trimmed, no warning.
+        let got = sink_url(None, Some("-".into()), &mut format!("  {url}\n").as_bytes(), &mut warn).unwrap();
+        assert_eq!((got.as_str(), warn.is_empty()), (url, true));
+        assert!(sink_url(None, Some("-".into()), &mut &b" \n"[..], &mut warn).is_err(), "empty");
+        let long = vec![b'a'; MAX_SINK_URL_BYTES as usize + 1];
+        assert!(sink_url(None, Some("-".into()), &mut long.as_slice(), &mut warn).is_err(), "too long");
+        // --url keeps working, with a warning that names the alternative but not the URL.
+        assert_eq!(sink_url(Some(url.into()), None, &mut none, &mut warn).unwrap(), url);
+        let w = String::from_utf8(warn).unwrap();
+        assert!(w.contains("shell history") && w.contains("--url-file") && !w.contains("T0K3N"), "{w}");
+        // A file: owner-only mode like a secret file, trimmed.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("url");
+        std::fs::write(&path, format!("{url}\n")).unwrap();
+        crate::platform::restrict_file(&path).unwrap();
+        let mut warn = Vec::new();
+        assert_eq!(sink_url(None, Some(path.clone()), &mut none, &mut warn).unwrap(), url);
+        assert!(warn.is_empty());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let e = format!("{:#}", sink_url(None, Some(path), &mut none, &mut warn).unwrap_err());
+            assert!(!e.contains("T0K3N"), "{e}");
+        }
     }
 
     #[test]
