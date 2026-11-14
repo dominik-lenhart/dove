@@ -1440,13 +1440,14 @@ impl ImapSession {
         if present.is_empty() {
             return Ok(Vec::new());
         }
+        let mut ops = Vec::new();
         if !add.is_empty() {
-            self.simple(ImapOp::UidStoreFlags { uids: &present, add: true, flags: add }, SMALL_LITERAL).await?;
+            ops.push(ImapOp::UidStoreFlags { uids: &present, add: true, flags: add });
         }
         if !remove.is_empty() {
-            self.simple(ImapOp::UidStoreFlags { uids: &present, add: false, flags: remove }, SMALL_LITERAL).await?;
+            ops.push(ImapOp::UidStoreFlags { uids: &present, add: false, flags: remove });
         }
-        self.fetch_meta(&present).await
+        self.stores_then_fetch(ops, &present).await
     }
 
     /// Adds and removes Gmail labels (`X-GM-LABELS`) on `uids` of `folder` (Gmail mode) and returns the current
@@ -1467,13 +1468,50 @@ impl ImapSession {
         if present.is_empty() {
             return Ok(Vec::new());
         }
+        let mut ops = Vec::new();
         if !add.is_empty() {
-            self.simple(ImapOp::UidStoreGmLabels { uids: &present, add: true, labels: add }, SMALL_LITERAL).await?;
+            ops.push(ImapOp::UidStoreGmLabels { uids: &present, add: true, labels: add });
         }
         if !remove.is_empty() {
-            self.simple(ImapOp::UidStoreGmLabels { uids: &present, add: false, labels: remove }, SMALL_LITERAL).await?;
+            ops.push(ImapOp::UidStoreGmLabels { uids: &present, add: false, labels: remove });
         }
-        self.fetch_meta(&present).await
+        self.stores_then_fetch(ops, &present).await
+    }
+
+    /// Runs organize STOREs in order, then reads the UIDs' metadata back. A STORE fully sent whose reply is lost is
+    /// [`ImapError::OutcomeUnknown`]; so is any failure after a STORE went through, because part of the change is in
+    /// place. Only a failure before the first STORE reached the server is definitive (organize refunds those).
+    async fn stores_then_fetch(
+        &mut self,
+        ops: Vec<ImapOp<'_>>,
+        present: &[u32],
+    ) -> Result<Vec<FetchedMeta>, ImapError> {
+        let mut written = false;
+        for op in ops {
+            if let Err(e) = self.write_simple(op).await {
+                return Err(if written { ImapError::OutcomeUnknown } else { e });
+            }
+            written = true;
+        }
+        let metas = self.fetch_meta(present).await;
+        if written { metas.map_err(|_| ImapError::OutcomeUnknown) } else { metas }
+    }
+
+    /// [`Self::simple`] for a write: a command that was fully sent but got no answer may have been applied
+    /// ([`ImapError::OutcomeUnknown`]); one that never left completely is [`ImapError::NotDispatched`].
+    async fn write_simple(&mut self, op: ImapOp<'_>) -> Result<Done, ImapError> {
+        let d = match self.exec(op, SMALL_LITERAL).await {
+            Ok(d) => d,
+            Err(ExecError { sent_all: true, .. }) => return Err(ImapError::OutcomeUnknown),
+            Err(ExecError { err, sent_all: false }) => {
+                return Err(if err == ImapError::Network { ImapError::NotDispatched } else { err });
+            }
+        };
+        match d.status {
+            Status::Ok => Ok(d),
+            Status::No => Err(ImapError::Missing),
+            Status::Bad => Err(ImapError::Protocol("command rejected as malformed")),
+        }
     }
 
     /// Moves `uids` of `src` to `dest`: `UID MOVE` (RFC 6851) when offered, else `UID COPY`, then `\Deleted` and

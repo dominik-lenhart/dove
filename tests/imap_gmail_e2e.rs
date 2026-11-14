@@ -12,7 +12,7 @@ use dove::admin::AdminRequest;
 use dove::imap::{TlsMode, presets};
 use dove::index::imap_sync::{quick_inbox, sync_steps};
 use serde_json::{Value, json};
-use support::fake_imap::{FakeImap, Opts, verb_of};
+use support::fake_imap::{FakeImap, Fault, Opts, verb_of};
 use support::harness::{FakeImapUser, Harness, g};
 
 const PW: &str = "app-password-abcd";
@@ -502,6 +502,50 @@ async fn organize_uses_labels_and_move_only() {
     let rows = fx.rows().await;
     assert_eq!(rows.len(), 4, "{rows:?}");
     assert_eq!(fx.subjects("INBOX").await, sorted(&["four", "one", "two"]));
+}
+
+/// Flags first, then labels: a label STORE refused after the flag STORE went through leaves part of the change in
+/// place, so the id is `outcome_unknown` (and spends its organize budget unit), not a refundable `not_found`.
+#[tokio::test]
+async fn label_failure_after_flags_is_outcome_unknown() {
+    let fx = setup().await;
+    let m = fx.add(&["INBOX"], "x", &[]);
+    fx.sync().await;
+    let id = fx.id(ALL, m).await;
+    fx.h.imap.fail_next_containing("UID STORE", "X-GM-LABELS", Fault::No);
+    let v =
+        fx.h.ok(
+            &fx.token,
+            "update_messages",
+            json!({"account": "me", "ids": [id], "add_flags": ["STARRED"], "add_labels": ["Work"]}),
+        )
+        .await;
+    assert_eq!(result(&v)["error"]["code"], "outcome_unknown", "{v}");
+    assert!(fx.h.imap.gm_flags(&fx.u.user, m).contains(&"\\Flagged".to_string()));
+    assert_eq!(places(&fx, m), sorted(&[ALL, "INBOX"]));
+}
+
+/// A move refused for the whole call is refused before its first write: with INBOX unknown, moving an All Mail and a
+/// Trash message to the inbox changes neither (the All Mail label change would otherwise run first).
+#[tokio::test]
+async fn whole_call_refusals_come_before_any_write() {
+    let fx = setup().await;
+    let a = fx.add(&["Work"], "a", &[]);
+    let t = fx.add(&[TRASH], "t", &[]);
+    fx.sync().await;
+    let (ia, it) = (fx.id(ALL, a).await, fx.id(TRASH, t).await);
+    let aid = fx.u.account_id.clone();
+    fx.h.app()
+        .store
+        .call(move |c| Ok(c.execute("DELETE FROM imap_folders WHERE account_id = ?1 AND name = 'INBOX'", [aid])?))
+        .await
+        .unwrap();
+    fx.h.imap.clear_commands();
+    let e = fx.h.err(&fx.token, "move_messages", json!({"account": "me", "ids": [ia, it], "to": "inbox"})).await;
+    assert_eq!(e, "invalid_argument");
+    let cmds = fx.h.imap.commands();
+    assert!(!cmds.iter().any(|c| matches!(verb_of(c).as_str(), "UID STORE" | "UID MOVE")), "{cmds:?}");
+    assert_eq!(places(&fx, a), sorted(&[ALL, "Work"]));
 }
 
 /// Without MOVE, Trash and Spam are refused: never the COPY + `\Deleted` + EXPUNGE fallback. Label changes still work.

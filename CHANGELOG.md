@@ -5,6 +5,14 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 
 ## [Unreleased]
 
+### Fixed
+
+- The hourly organize budget gives back only failures that certainly changed nothing. A Gmail move out of Trash whose
+  second write failed, a Gmail write answered with a server error, a lost IMAP STORE or MOVE reply and a copy that kept
+  its original now count as spent.
+- IMAP `update_messages`: a STORE whose reply was lost, or a failure after part of the change was stored, is reported
+  as `outcome_unknown` instead of `upstream_error` or `not_found`.
+
 ## [0.7.0] - 2026-11-13
 
 Agent feedback: answering "whom have I not replied to?" took many calls, broad searches were dominated by the

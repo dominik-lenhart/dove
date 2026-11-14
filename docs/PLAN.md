@@ -509,3 +509,19 @@ hosts or reference hardware.
   extra words ("Ihr Passwort für das Portal lautet …", "lautet jetzt"), passwords containing spaces (only the first
   word is hidden), "Benutzername / Passwort: a / b" (hides `a`, not `b`), alphanumeric codes without a colon, 4-digit
   codes that look like years, and over-redaction of a plain word after `Passwort:` in a subject.
+- A63. Organize budget refunds only definitive failures (follow-up to A59 (a), 2026-11-14). A refund gives back a
+  message change that certainly did not happen; anything that may have reached the mailbox stays spent. (a) Per id:
+  `Outcome::Failed` is refunded unless its code is `outcome_unknown`; `Outcome::Spent` (failed, but a write for that
+  id took effect) never is. The classification is the error code set where the write was classified
+  (`Google::write`: not dispatched or 4xx definitive, 5xx/lost response `outcome_unknown`; the IMAP session), never
+  error text. (b) Gmail moves out of Trash are two writes (untrash, then modify): once the untrash went through, a
+  failed modify is `Spent`. (c) IMAP organize STOREs now classify like `APPEND` and `MOVE`: a STORE fully sent whose
+  reply is lost is `outcome_unknown` (was `upstream_error`, so the agent was told nothing happened), one that never
+  left completely is `not_dispatched`. Any failure after a STORE went through (the second STORE of add+remove, the
+  `X-GM-LABELS` STORE after a flag STORE, the metadata read-back) is `outcome_unknown` too: part of the change is in
+  place. The error covers the whole folder group, including ids the server did not have, so those are spent as well
+  (conservative). (d) A copy that kept its original (server without `MOVE`) is `Spent`: a copy now exists. (e) A call
+  that fails as a whole after `cx.commit()` refunds nothing (which writes happened is unknown); before the commit it
+  refunds everything. Gmail-over-IMAP moves now check "INBOX exists" before the first write, so no organize path
+  returns a whole-call error after a write any more; the branch stays as the safe default and is pinned by a unit test
+  of `organize::unused`.
