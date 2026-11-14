@@ -44,10 +44,12 @@ fn attachments_schema() -> Value {
         "Files to attach. Either a reference {ref | account + message_id, attachment_id} to an attachment of a message ",
         "you can read, or inline {filename, mime_type, content_base64}."
     ), "items": { "type": "object", "properties": {
-        "ref": { "type": "string" }, "account": { "type": "string" }, "message_id": { "type": "string" },
+        "ref": { "type": "string", "description": "Reference: opaque ref from search_messages of the message holding the attachment." },
+        "account": { "type": "string", "description": "Reference: mailbox alias of that message (with message_id)." },
+        "message_id": { "type": "string", "description": "Reference: message id (with account)." },
         "attachment_id": { "type": "string", "description": "From get_message attachments[].attachment_id." },
-        "filename": { "type": "string" }, "mime_type": { "type": "string", "description": "type/subtype, e.g. application/pdf" },
-        "content_base64": { "type": "string" }
+        "filename": { "type": "string", "description": "Inline: file name." }, "mime_type": { "type": "string", "description": "Inline: type/subtype, e.g. application/pdf" },
+        "content_base64": { "type": "string", "description": "Inline: the file content, base64 encoded." }
     }, "additionalProperties": false } })
 }
 
@@ -71,14 +73,16 @@ pub fn defs() -> Vec<ToolDef> {
             destructive: false,
             mail_content: false,
             input_schema: || {
-                let r = json!({ "type": "array", "items": { "type": "string" }, "maxItems": 50 });
+                let r = |d: &str| json!({ "type": "array", "items": { "type": "string" }, "maxItems": 50, "description": d });
                 json!({ "type": "object", "properties": {
                     "account": account_schema(),
                     "request_key": { "type": "string", "description": "Client-generated UUID for idempotent retries." },
-                    "to": r, "cc": r, "bcc": r,
-                    "subject": { "type": "string" },
-                    "body_text": { "type": "string" },
-                    "reply_to_message_id": { "type": "string" },
+                    "to": r("To recipients (email addresses, at most 50)."),
+                    "cc": r("Cc recipients (email addresses, at most 50)."),
+                    "bcc": r("Bcc recipients (email addresses, at most 50)."),
+                    "subject": { "type": "string", "description": "Subject line." },
+                    "body_text": { "type": "string", "description": "Plain-text body (at most 500 KB)." },
+                    "reply_to_message_id": { "type": "string", "description": "Make a threaded reply to this message of `account`." },
                     "quote_original": { "type": "boolean", "description": "Replies: quote the original's text below body_text (default true when you have read on this mailbox)." },
                     "forward_message_id": { "type": "string", "description": "Forward this message of `account` (needs read)." },
                     "forward_ref": { "type": "string", "description": "Forward the message of this ref from search_messages (any mailbox you can read)." },
@@ -108,13 +112,17 @@ pub fn defs() -> Vec<ToolDef> {
             destructive: true,
             mail_content: false,
             input_schema: || {
-                let r = json!({ "type": "array", "items": { "type": "string" }, "maxItems": 50 });
+                let r = |d: &str| json!({ "type": "array", "items": { "type": "string" }, "maxItems": 50, "description": d });
                 json!({ "type": "object", "properties": {
                     "account": account_schema(),
-                    "draft_id": { "type": "string" },
-                    "expected_revision": { "type": "string" },
-                    "changes": { "type": "object", "properties": {
-                        "to": r, "cc": r, "bcc": r, "subject": { "type": "string" }, "body_text": { "type": "string" },
+                    "draft_id": { "type": "string", "description": "Draft id from create_draft or list_drafts." },
+                    "expected_revision": { "type": "string", "description": "Revision from create_draft, get_draft or the last update_draft; a mismatch fails with draft_conflict." },
+                    "changes": { "type": "object", "description": "Fields to change; omitted fields keep their value.", "properties": {
+                        "to": r("New To list (email addresses, at most 50)."),
+                        "cc": r("New Cc list (email addresses, at most 50)."),
+                        "bcc": r("New Bcc list (email addresses, at most 50)."),
+                        "subject": { "type": "string", "description": "New subject line." },
+                        "body_text": { "type": "string", "description": "New plain-text body (at most 500 KB)." },
                         "attachments": attachments_schema()
                     }, "additionalProperties": false }
                 }, "required": ["account", "draft_id", "expected_revision", "changes"], "additionalProperties": false })
@@ -135,7 +143,9 @@ pub fn defs() -> Vec<ToolDef> {
             mail_content: false,
             input_schema: || {
                 json!({ "type": "object", "properties": {
-                    "account": account_schema(), "draft_id": { "type": "string" }, "expected_revision": { "type": "string" }
+                    "account": account_schema(),
+                    "draft_id": { "type": "string", "description": "Draft id from create_draft or list_drafts." },
+                    "expected_revision": { "type": "string", "description": "Revision of the draft as the owner reviewed it; a mismatch fails with draft_conflict." }
                 }, "required": ["account", "draft_id", "expected_revision"], "additionalProperties": false })
             },
             output_schema: || {
@@ -159,7 +169,9 @@ pub fn defs() -> Vec<ToolDef> {
             mail_content: false,
             input_schema: || {
                 json!({ "type": "object", "properties": {
-                    "account": account_schema(), "draft_id": { "type": "string" }, "expected_revision": { "type": "string" }
+                    "account": account_schema(),
+                    "draft_id": { "type": "string", "description": "Draft id from create_draft or list_drafts." },
+                    "expected_revision": { "type": "string", "description": "Delete only if the draft is still at this revision." }
                 }, "required": ["account", "draft_id"], "additionalProperties": false })
             },
             output_schema: || object_schema(json!({ "draft_id": {"type":"string"}, "deleted": {"type":"boolean"} })),

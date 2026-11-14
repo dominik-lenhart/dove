@@ -101,7 +101,7 @@ fn input_schema() -> Value {
         "type": "object",
         "properties": {
             "accounts": {"type": "array", "items": {"type": "string"}, "description": "Mailbox aliases from list_accounts; default all readable."},
-            "source": {"type": "string", "enum": ["index", "gmail"], "default": "index"},
+            "source": {"type": "string", "enum": ["index", "gmail"], "default": "index", "description": "index: the local search index; gmail: a live Gmail search with gmail_query."},
             "where": {"type": "object", "description": "A condition {field, op, value} or {all:[...]}, {any:[...]}, {not:{...}}. Ops: eq/in for addresses, label, ids, category; terms/phrase/prefix for subject, body_text, text, attachment_text (no substring match); lt/lte/gt/gte for received_at (RFC 3339 with offset, or YYYY-MM-DD = that UTC day) and size_bytes. Max depth 4, 32 conditions.", "examples": [pred]},
             "select": {"type": "array", "items": {"type": "string", "enum": query::thread_selectable()},
                 "description": "Columns. message_count, matched_count, last_sender_is_self, last_inbound_at, last_outbound_at and awaiting_reply need group_by=thread."},
@@ -110,14 +110,14 @@ fn input_schema() -> Value {
             "awaiting_reply": {"type": "boolean",
                 "description": "Only with group_by=thread: true keeps threads whose latest non-draft message is not from self, false those where it is."},
             "order_by": {"type": "array", "maxItems": 2, "items": {"type": "object", "properties": {
-                "field": {"type": "string", "enum": ["received_at", "size_bytes", "subject"]},
-                "dir": {"type": "string", "enum": ["asc", "desc"]}}}},
-            "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LIMIT, "default": DEFAULT_LIMIT},
+                "field": {"type": "string", "enum": ["received_at", "size_bytes", "subject"], "description": "Column to sort by."},
+                "dir": {"type": "string", "enum": ["asc", "desc"], "description": "Sort direction."}}}, "description": "Sort keys, at most 2; default newest first."},
+            "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LIMIT, "default": DEFAULT_LIMIT, "description": "Most rows per page."},
             "cursor": {"type": "string", "description": "next_cursor of a previous result; pass alone."},
-            "count_only": {"type": "boolean"},
-            "coverage_policy": {"type": "string", "enum": ["allow_partial", "require_complete"]},
-            "max_lag_seconds": {"type": "integer", "minimum": 0},
-            "include_spam_trash": {"type": "boolean", "default": false},
+            "count_only": {"type": "boolean", "description": "Return only the number of matches; excludes select, order_by, limit and cursor."},
+            "coverage_policy": {"type": "string", "enum": ["allow_partial", "require_complete"], "description": "require_complete fails with index_incomplete when the index does not cover every mailbox; default allow_partial (count_only implies require_complete)."},
+            "max_lag_seconds": {"type": "integer", "minimum": 0, "description": "Longest accepted age of the index checkpoint; with require_complete the default is 60."},
+            "include_spam_trash": {"type": "boolean", "default": false, "description": "Also search Spam and Trash."},
             "gmail_query": {"type": "string", "description": "Gmail search syntax, e.g. from:alice newer_than:7d; only with source=gmail."}
         },
         "additionalProperties": false

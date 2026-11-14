@@ -40,9 +40,9 @@ pub fn defs() -> Vec<ToolDef> {
             json!({ "type": "object", "properties": {
                 "since": { "type": "string", "description": "RFC 3339 instant with offset, UTC date YYYY-MM-DD, or span back from now (7d, 36h); threads with mail since then." },
                 "accounts": { "type": "array", "items": { "type": "string" }, "description": "Mailbox aliases; default all readable." },
-                "folders": { "type": "array", "maxItems": intel::MAX_FOLDERS, "items": { "type": "string" }, "default": ["INBOX"] },
-                "category": { "type": "string", "enum": ["personal", "newsletter", "notification", "calendar"] },
-                "limit": { "type": "integer", "minimum": 1, "maximum": intel::MAX_LIMIT, "default": intel::DEFAULT_LIMIT },
+                "folders": { "type": "array", "maxItems": intel::MAX_FOLDERS, "items": { "type": "string" }, "default": ["INBOX"], "description": "Label ids or folder names as in list_labels." },
+                "category": { "type": "string", "enum": ["personal", "newsletter", "notification", "calendar"], "description": "Only threads of this category." },
+                "limit": { "type": "integer", "minimum": 1, "maximum": intel::MAX_LIMIT, "default": intel::DEFAULT_LIMIT, "description": "Most threads returned." },
                 "cursor": { "type": "string", "description": "Resume a previous result; pass alone." }
             }, "additionalProperties": false })
         },

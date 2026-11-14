@@ -41,7 +41,7 @@ pub fn defs() -> Vec<ToolDef> {
             json!({ "type": "object", "properties": {
                 "ref": { "type": "string", "description": "Opaque ref from search_messages; replaces account + message_id." },
                 "account": account_schema(),
-                "message_id": { "type": "string" },
+                "message_id": { "type": "string", "description": "Message id from search_messages; used with account instead of ref." },
                 "attachment_id": { "type": "string", "description": "From get_message attachments[].attachment_id." },
                 "as_text": { "type": "boolean", "default": false, "description": "Return extracted text (PDF, DOCX, ODT, text, CSV) instead of the bytes." },
                 "max_chars": { "type": "integer", "minimum": 1, "maximum": MAX_TEXT_CHARS, "default": DEFAULT_TEXT_CHARS, "description": "With as_text: longest text returned." }
