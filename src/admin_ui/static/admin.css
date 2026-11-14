@@ -1,0 +1,778 @@
+/* Dove admin UI. One stylesheet, no external assets. Drafts are shown as letters on airmail paper; everything around
+   them stays quiet. Light and dark follow prefers-color-scheme. */
+
+:root {
+  --paper: #eef1f4;
+  --sheet: #ffffff;
+  --ink: #1c2733;
+  --muted: #5b6875;
+  --line: #d5dbe1;
+  --blue: #2f5d8a;
+  --blue-ink: #ffffff;
+  --blue-soft: #e3ecf5;
+  --red: #b3392f;
+  --red-soft: #f8e6e4;
+  --amber: #8a5a12;
+  --amber-soft: #f6ecd9;
+  --green: #2e6b45;
+  --green-soft: #e1f0e6;
+  --focus: #2f5d8a;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --serif: "Iowan Old Style", Charter, "Bitstream Charter", "Palatino Linotype", Palatino, "Book Antiqua", Georgia,
+    serif;
+  --radius: 10px;
+  color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --paper: #121820;
+    --sheet: #1a222c;
+    --ink: #e3e8ed;
+    --muted: #9aa6b2;
+    --line: #2c3743;
+    --blue: #86aed8;
+    --blue-ink: #0e1620;
+    --blue-soft: #1e2d3d;
+    --red: #e6837a;
+    --red-soft: #3a2020;
+    --amber: #e1b46a;
+    --amber-soft: #352b1a;
+    --green: #8cc7a1;
+    --green-soft: #1b3024;
+    --focus: #86aed8;
+  }
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font: 16px/1.5 var(--sans);
+  font-variant-numeric: tabular-nums;
+}
+
+a {
+  color: var(--blue);
+  text-underline-offset: 2px;
+}
+
+:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+h1 {
+  font-size: 1.6rem;
+  line-height: 1.2;
+  letter-spacing: -0.015em;
+  font-weight: 650;
+  margin: 1.5rem 0 0.75rem;
+}
+
+h1 strong {
+  font-weight: 750;
+}
+
+h2 {
+  font-size: 1.05rem;
+  font-weight: 650;
+  margin: 0 0 0.6rem;
+}
+
+code {
+  font-size: 0.9em;
+  background: var(--blue-soft);
+  padding: 0.1em 0.35em;
+  border-radius: 4px;
+  overflow-wrap: anywhere;
+}
+
+/* ---------------------------------------------------------------- top bar */
+
+.top {
+  background: var(--sheet);
+  border-bottom: 1px solid var(--line);
+  position: sticky;
+  top: 0;
+  z-index: 5;
+}
+
+.top-inner {
+  max-width: 46rem;
+  margin: 0 auto;
+  padding: 0 1rem;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  column-gap: 1rem;
+  min-height: 3.5rem;
+}
+
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  color: var(--ink);
+  text-decoration: none;
+  font-weight: 750;
+  letter-spacing: -0.01em;
+  font-size: 1.1rem;
+}
+
+.brand svg {
+  width: 1.5rem;
+  height: 1.5rem;
+  fill: var(--blue);
+}
+
+/* Phones: brand and sign-out on the first row, the four sections as equal tabs on the second. */
+.top nav {
+  order: 3;
+  flex: 1 0 100%;
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 0.25rem;
+  padding-bottom: 0.4rem;
+}
+
+.top nav a {
+  text-align: center;
+  padding-inline: 0.2rem;
+  font-size: 0.95rem;
+}
+
+.signout {
+  margin-left: auto;
+}
+
+.top nav a,
+.tabs a {
+  color: var(--muted);
+  text-decoration: none;
+  padding: 0.6rem 0.7rem;
+  border-radius: 8px;
+  white-space: nowrap;
+  font-weight: 550;
+}
+
+.top nav a[aria-current="page"],
+.tabs a[aria-current="page"] {
+  color: var(--ink);
+  background: var(--blue-soft);
+}
+
+.signout button {
+  background: none;
+  border: 0;
+  color: var(--muted);
+  font: inherit;
+  font-size: 0.9rem;
+  padding: 0.6rem 0.25rem;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+main {
+  max-width: 46rem;
+  margin: 0 auto;
+  padding: 0 1rem 6rem;
+}
+
+main.narrow {
+  max-width: 28rem;
+  padding-top: 12vh;
+}
+
+body.bare .brand {
+  font-size: 1.4rem;
+  margin-bottom: 1.25rem;
+}
+
+/* ---------------------------------------------------------------- blocks, rows, chips */
+
+.block {
+  margin: 1.75rem 0;
+}
+
+.card {
+  background: var(--sheet);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 1.25rem;
+}
+
+.card h1 {
+  margin-top: 0;
+}
+
+.rows {
+  background: var(--sheet);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.rows:empty {
+  display: none;
+}
+
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.35rem 1rem;
+  padding: 0.85rem 1rem;
+  min-height: 3.25rem;
+  color: inherit;
+  text-decoration: none;
+  border-top: 1px solid var(--line);
+}
+
+.row:first-child {
+  border-top: 0;
+}
+
+a.row:hover {
+  background: var(--blue-soft);
+}
+
+.row-main {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.row-meta {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.detail {
+  display: block;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.muted,
+.meta,
+.hint {
+  color: var(--muted);
+}
+
+.meta {
+  font-size: 0.95rem;
+}
+
+.hint {
+  font-size: 0.9rem;
+}
+
+.empty {
+  color: var(--muted);
+  padding: 1rem;
+  margin: 0;
+  background: var(--sheet);
+  border: 1px dashed var(--line);
+  border-radius: var(--radius);
+}
+
+.chip {
+  display: inline-block;
+  font-size: 0.8rem;
+  font-weight: 600;
+  line-height: 1;
+  padding: 0.35em 0.6em;
+  border-radius: 999px;
+  white-space: nowrap;
+  background: var(--blue-soft);
+  color: var(--blue);
+}
+
+.chip.wait {
+  background: var(--amber-soft);
+  color: var(--amber);
+}
+
+.chip.done {
+  background: var(--green-soft);
+  color: var(--green);
+}
+
+.chip.bad {
+  background: var(--red-soft);
+  color: var(--red);
+}
+
+.chip.quiet {
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--line);
+}
+
+.notice {
+  padding: 0.75rem 1rem;
+  border-radius: var(--radius);
+  margin: 1rem 0;
+}
+
+.notice.ok {
+  background: var(--green-soft);
+  color: var(--green);
+}
+
+.notice.error {
+  background: var(--red-soft);
+  color: var(--red);
+}
+
+.status {
+  min-height: 1.5em;
+  margin: 0.5rem 0;
+  font-size: 0.95rem;
+}
+
+.status.error {
+  color: var(--red);
+}
+
+.status.ok {
+  color: var(--green);
+}
+
+/* ---------------------------------------------------------------- buttons */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 3rem;
+  padding: 0 1.25rem;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: var(--sheet);
+  color: var(--ink);
+  font: inherit;
+  font-weight: 600;
+  text-decoration: none;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.btn.small {
+  min-height: 2.75rem;
+  padding: 0 0.9rem;
+  font-size: 0.95rem;
+}
+
+.btn.primary {
+  background: var(--blue);
+  border-color: var(--blue);
+  color: var(--blue-ink);
+}
+
+.btn.danger {
+  color: var(--red);
+  border-color: var(--red);
+  background: transparent;
+}
+
+.btn.wide {
+  width: 100%;
+}
+
+.btn:disabled {
+  opacity: 0.55;
+  cursor: progress;
+}
+
+/* ---------------------------------------------------------------- sign-in */
+
+.signin p {
+  margin: 0.5rem 0 1rem;
+}
+
+.signin .hint {
+  margin-top: 1.25rem;
+}
+
+/* ---------------------------------------------------------------- requests */
+
+.tabs {
+  display: flex;
+  gap: 0.25rem;
+  margin: 0 0 1rem;
+  overflow-x: auto;
+}
+
+.req-head .crumb {
+  margin: 1.25rem 0 0;
+  font-size: 0.95rem;
+}
+
+.req-head h1 {
+  font-weight: 500;
+}
+
+.note {
+  margin: 1.25rem 0;
+}
+
+.note figcaption {
+  font-size: 0.9rem;
+  color: var(--muted);
+  margin-bottom: 0.35rem;
+}
+
+.note blockquote {
+  margin: 0;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--line);
+  background: var(--sheet);
+  border-radius: var(--radius);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* An access request: one plain card per mailbox (no airmail edge, nothing leaves). */
+.grant {
+  background: var(--sheet);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  margin: 1rem 0;
+  padding: 1rem 1.25rem;
+}
+
+.field label {
+  display: block;
+  font-size: 0.9rem;
+  color: var(--muted);
+  margin-bottom: 0.25rem;
+}
+
+.field input {
+  width: 100%;
+  max-width: 12rem;
+  min-height: 2.75rem;
+  padding: 0 0.6rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--sheet);
+  color: var(--ink);
+  font: inherit;
+}
+
+/* The letter: the one decorated element. An airmail edge marks mail that is about to leave. */
+.letter {
+  position: relative;
+  background: var(--sheet);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  margin: 1.25rem 0;
+  padding: 1.35rem 1.25rem 1.25rem;
+  overflow: hidden;
+}
+
+.letter::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  height: 6px;
+  background: repeating-linear-gradient(
+    -45deg,
+    var(--red) 0 12px,
+    var(--sheet) 12px 18px,
+    var(--blue) 18px 30px,
+    var(--sheet) 30px 36px
+  );
+}
+
+.letter.compact,
+.letter.unreadable {
+  padding-bottom: 0.5rem;
+}
+
+.letter.compact::before,
+.letter.unreadable::before {
+  background: var(--line);
+}
+
+.letter-top {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.5rem 1rem;
+}
+
+.when {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem 0.6rem;
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+.pick {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-height: 2.75rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.pick input,
+.late input {
+  width: 1.35rem;
+  height: 1.35rem;
+  accent-color: var(--blue);
+}
+
+.envelope {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.15rem 0.85rem;
+  margin: 1rem 0 0;
+  padding-bottom: 0.85rem;
+  border-bottom: 1px solid var(--line);
+  font-size: 0.95rem;
+}
+
+.envelope dt {
+  color: var(--muted);
+}
+
+.envelope dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.subject {
+  font-family: var(--serif);
+  font-size: 1.3rem;
+  font-weight: 600;
+  line-height: 1.3;
+  margin: 1rem 0 0.75rem;
+  overflow-wrap: anywhere;
+}
+
+.letter-body {
+  font-family: var(--serif);
+  font-size: 1.06rem;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  margin: 0;
+  max-width: 66ch;
+}
+
+.attachments {
+  list-style: none;
+  margin: 1rem 0 0;
+  padding: 0.75rem 0 0;
+  border-top: 1px solid var(--line);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.attachments li {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.35rem 0.6rem;
+  font-size: 0.9rem;
+  overflow-wrap: anywhere;
+}
+
+.late {
+  border: 1px solid var(--amber);
+  background: var(--amber-soft);
+  border-radius: var(--radius);
+  padding: 0.75rem 1rem;
+  margin: 1.25rem 0;
+}
+
+.late legend {
+  font-weight: 650;
+  padding: 0 0.25rem;
+}
+
+.late label {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  min-height: 2.75rem;
+  cursor: pointer;
+}
+
+.stop {
+  margin: -0.5rem 0 1.25rem;
+}
+
+/* Decisions stay at thumb's reach on a phone. */
+.actionbar {
+  position: sticky;
+  bottom: 0;
+  margin: 1.5rem -1rem 0;
+  padding: 0.75rem 1rem calc(0.75rem + env(safe-area-inset-bottom));
+  background: var(--sheet);
+  border-top: 1px solid var(--line);
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.6rem;
+}
+
+.actionbar .status {
+  grid-column: 1 / -1;
+  margin: 0;
+}
+
+.actionbar .status:empty {
+  display: none;
+}
+
+.actionbar .btn {
+  min-height: 3.25rem;
+}
+
+/* ---------------------------------------------------------------- audit */
+
+.filters {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));
+  gap: 0.75rem;
+  background: var(--sheet);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 1rem;
+  margin-bottom: 1rem;
+}
+
+.filters label span {
+  display: block;
+  font-size: 0.9rem;
+  color: var(--muted);
+  margin-bottom: 0.25rem;
+}
+
+.filters input,
+.filters select {
+  width: 100%;
+  min-height: 2.75rem;
+  padding: 0 0.6rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--paper);
+  color: var(--ink);
+  font: inherit;
+}
+
+.filter-actions {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+}
+
+.audit {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  background: var(--sheet);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+
+.audit-row {
+  padding: 0.7rem 1rem;
+  border-top: 1px solid var(--line);
+}
+
+.audit-row:first-child {
+  border-top: 0;
+}
+
+.audit-main {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.5rem;
+  overflow-wrap: anywhere;
+}
+
+.audit-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.15rem 1rem;
+  color: var(--muted);
+  font-size: 0.88rem;
+  overflow-wrap: anywhere;
+}
+
+.audit-meta span:empty {
+  display: none;
+}
+
+@media (min-width: 40rem) {
+  .top nav {
+    order: 0;
+    flex: 1 1 auto;
+    display: flex;
+    padding-bottom: 0;
+  }
+
+  .top nav a {
+    padding-inline: 0.7rem;
+    font-size: 1rem;
+  }
+
+  .signout {
+    margin-left: 0;
+  }
+
+  h1 {
+    font-size: 1.85rem;
+  }
+
+  .actionbar {
+    margin: 1.5rem 0 0;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    grid-template-columns: auto auto 1fr;
+  }
+
+  .actionbar .status {
+    grid-column: 3;
+    grid-row: 1;
+    align-self: center;
+  }
+
+  .letter {
+    padding: 1.6rem 1.75rem 1.5rem;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    scroll-behavior: auto !important;
+  }
+}

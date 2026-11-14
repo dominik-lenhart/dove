@@ -19,12 +19,16 @@ use crate::app::App;
 use crate::gmail::connect::{self, CallbackOutcome, CallbackQuery};
 
 pub fn router(app: Arc<App>) -> Router {
-    Router::new()
+    let mut r = Router::new()
         .route("/healthz", get(healthz))
         .route("/oauth/google/callback", get(google_callback))
         .merge(crate::mcp::routes())
-        .merge(crate::oauth::routes())
-        .layer(middleware::from_fn_with_state(app.clone(), guard))
+        .merge(crate::oauth::routes());
+    // The admin UI exists only when enabled, and never in local mode (the guard refuses `/admin` there anyway).
+    if app.cfg.admin_ui.enabled && !app.cfg.is_local() {
+        r = r.merge(crate::admin_ui::routes(app.clone()));
+    }
+    r.layer(middleware::from_fn_with_state(app.clone(), guard))
         .layer(DefaultBodyLimit::max(app.cfg.limits.body_bytes))
         .with_state(app)
 }
@@ -91,6 +95,10 @@ async fn guard(State(app): State<Arc<App>>, mut req: Request, next: Next) -> Res
     req.headers_mut().remove(PROXY_AUTH_HEADER);
     req.extensions_mut().insert(ClientIp(ip));
     let path = req.uri().path().to_string();
+    // `/admin` has its own host, origin, credential and rate rules (design 2026-11-14 section 5.1).
+    if crate::admin_ui::is_admin_path(&path) {
+        return crate::admin_ui::guard(app, req, next).await;
+    }
     let host = req.headers().get(header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("");
     if path != "/healthz" && !host.eq_ignore_ascii_case(&app.cfg.public_host()) {
         return (StatusCode::MISDIRECTED_REQUEST, "wrong host").into_response();

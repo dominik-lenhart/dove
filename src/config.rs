@@ -51,6 +51,82 @@ pub struct Config {
     /// Agent requests: scheduled sends the operator approves (design 2026-11-14 section 4).
     #[serde(default)]
     pub requests: RequestsConfig,
+    /// The admin web UI under `/admin` (design 2026-11-14 section 5, PLAN A74). Off by default.
+    #[serde(default)]
+    pub admin_ui: AdminUiConfig,
+}
+
+/// `[admin_ui]`: the owner's web UI on the same listener, reached over the tailnet only and signed in with a passkey.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AdminUiConfig {
+    /// Serve `/admin`. Off: every `/admin` request is 404 and `dove admin passkey add` refuses.
+    pub enabled: bool,
+    /// The exact browser origin of the UI, `https://<name>` or `https://<name>:<port>`, for example the node's
+    /// tailnet name. Requests to `/admin` with another `Host` are 404; the host is the passkeys' RP ID, so changing
+    /// it means enrolling the passkeys again.
+    pub origin: Option<String>,
+    /// Requests per minute per client address under `/admin`.
+    pub requests_per_minute: u32,
+    /// Failed passkey sign-ins and enrolments per hour per client address; after that, failures answer 429. A valid
+    /// passkey always signs in (PLAN A74 (i)).
+    pub login_failures_per_hour: u32,
+}
+
+impl Default for AdminUiConfig {
+    fn default() -> Self {
+        Self { enabled: false, origin: None, requests_per_minute: 120, login_failures_per_hour: 10 }
+    }
+}
+
+impl AdminUiConfig {
+    /// The validated origin (`None` when the UI is off).
+    pub fn origin(&self) -> Option<&str> {
+        if self.enabled { self.origin.as_deref() } else { None }
+    }
+
+    /// `host[:port]` that `/admin` requests must carry.
+    pub fn host(&self) -> Option<String> {
+        let url = url::Url::parse(self.origin()?).ok()?;
+        let host = url.host_str()?;
+        Some(match url.port() {
+            Some(p) => format!("{host}:{p}"),
+            None => host.to_string(),
+        })
+    }
+
+    /// The WebAuthn RP ID: the origin's host without the port.
+    pub fn rp_id(&self) -> Option<String> {
+        Some(url::Url::parse(self.origin()?).ok()?.host_str()?.to_string())
+    }
+
+    fn validate(&self, local: bool) -> anyhow::Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if local {
+            bail!("admin_ui is not available in local mode (use the dove CLI; design 2026-11-14 section 2)");
+        }
+        let Some(origin) = &self.origin else {
+            bail!(
+                "admin_ui.origin is required when admin_ui.enabled = true (for example https://dove-host.tail1234.ts.net)"
+            );
+        };
+        let url = url::Url::parse(origin).context("admin_ui.origin is not a URL")?;
+        if url.scheme() != "https" || url.origin().ascii_serialization() != *origin {
+            bail!(
+                "admin_ui.origin must be a bare https origin like https://dove-host.tail1234.ts.net (no path, no slash)"
+            );
+        }
+        // WebAuthn needs a registrable domain name as RP ID; an IP literal cannot hold passkeys.
+        if !matches!(url.host(), Some(url::Host::Domain(_))) {
+            bail!("admin_ui.origin must use a DNS name, not an IP address (passkeys are bound to a name)");
+        }
+        if self.requests_per_minute == 0 || self.login_failures_per_hour == 0 {
+            bail!("admin_ui.requests_per_minute and admin_ui.login_failures_per_hour must be at least 1");
+        }
+        Ok(())
+    }
 }
 
 /// `[requests]`: agents ask, the operator approves (`dove requests approve`), Dove sends the approved revision.
@@ -398,6 +474,7 @@ impl Config {
         if !(1..=1440).contains(&self.requests.late_grace_minutes) || !(1..=30).contains(&self.requests.pending_days) {
             bail!("requests.late_grace_minutes must be between 1 and 1440 and requests.pending_days between 1 and 30");
         }
+        self.admin_ui.validate(self.is_local())?;
         if !(1..=3650).contains(&self.requests.retention_days) {
             bail!("requests.retention_days must be between 1 and 3650");
         }
@@ -540,6 +617,14 @@ redact_secrets_default = false
 # late_grace_minutes = 60
 # pending_days = 7
 # retention_days = 90
+
+[admin_ui]
+# The owner's web UI under /admin (passkey sign-in). Reach it over the tailnet only, never through the public proxy
+# (docs/deployment.md). Enrol a passkey with `sudo dove admin passkey add --name <label>`.
+# enabled = false
+# origin = "https://dove-host.tail1234.ts.net"
+# requests_per_minute = 120
+# login_failures_per_hour = 10
 
 [oauth]
 # Downstream OAuth for MCP hosts (ChatGPT, Claude). Defaults shown.

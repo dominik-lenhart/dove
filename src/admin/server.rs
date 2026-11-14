@@ -361,6 +361,19 @@ async fn execute(call: &mut AdminCall<'_>, req: AdminRequest) -> anyhow::Result<
         }
         RequestsDeny { id } => crate::requests::admin::deny(call, id).await,
         RequestsCancel { id, items } => crate::requests::admin::cancel(call, id, items).await,
+        PasskeysAdd { name } => {
+            let Some(origin) = app.cfg.admin_ui.origin().map(str::to_string) else {
+                bail!(
+                    "the admin UI is off: set [admin_ui] enabled = true and origin in the config file, restart Dove, \
+                     then try again"
+                );
+            };
+            call.tx(move |tx| crate::admin_ui::store::enrol_link(tx, &name, &origin)).await
+        }
+        PasskeysList => call.read(crate::admin_ui::store::passkey_list).await,
+        PasskeysRemove { name } => call.tx(move |tx| crate::admin_ui::store::passkey_remove(tx, &name)).await,
+        SessionsList => call.read(crate::admin_ui::store::sessions_list).await,
+        SessionsRevoke { id } => call.tx(move |tx| crate::admin_ui::store::sessions_revoke(tx, id.as_deref())).await,
         other => Err(anyhow!("'{}' is not available in this build yet", other.audit_fields().0)),
     }
 }

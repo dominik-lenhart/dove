@@ -155,6 +155,9 @@ pub enum Command {
     /// Agent requests: review and approve scheduled sends (admin).
     #[command(subcommand)]
     Requests(RequestsCmd),
+    /// The admin web UI: passkeys and signed-in sessions (admin).
+    #[command(subcommand)]
+    Admin(AdminCmd),
     /// Check configuration, permissions and reachability (admin). With --profile: check a remote profile instead.
     Doctor {
         /// Check this remote client profile (config, credential, network, grants). Never uses the admin socket.
@@ -689,8 +692,12 @@ pub enum TailscaleCmd {
         #[arg(long, default_value_t = 443)]
         port: u16,
         /// ALSO make Dove reachable from the internet (Tailscale Funnel). Off unless you ask for it.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "admin")]
         funnel: bool,
+        /// Also mount the admin web UI (/admin) on this port, tailnet-only, and enable it in the config file
+        /// ([admin_ui] enabled and origin). Refused while Funnel is on for the port.
+        #[arg(long)]
+        admin: bool,
         /// Print the commands and the config change without running anything.
         #[arg(long)]
         dry_run: bool,
@@ -808,6 +815,56 @@ pub enum RequestsCmd {
         /// Only these items (comma-separated indexes).
         #[arg(long, value_delimiter = ',')]
         items: Option<Vec<u32>>,
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum AdminCmd {
+    /// Passkeys that sign in to the admin web UI.
+    #[command(subcommand)]
+    Passkey(PasskeyCmd),
+    /// Signed-in admin web UI sessions.
+    #[command(subcommand)]
+    Sessions(SessionsCmd),
+}
+
+#[derive(Subcommand)]
+pub enum PasskeyCmd {
+    /// Print a one-time link (valid 5 minutes) that enrols a new passkey. Open it on the device that holds the
+    /// passkey; the admin UI must be enabled ([admin_ui] in the config file).
+    Add {
+        /// Name of the passkey (a-z, 0-9, '-', '_'); it appears in the audit log as web:<name>.
+        #[arg(long)]
+        name: String,
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+    /// Enrolled passkeys.
+    List {
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+    /// Remove a passkey; its sessions end at once.
+    Remove {
+        name: String,
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SessionsCmd {
+    /// Signed-in sessions.
+    List {
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+    /// End every session (or only the one given with --id); browsers must sign in again.
+    Revoke {
+        #[arg(long)]
+        id: Option<String>,
         #[command(flatten)]
         admin: AdminOpts,
     },
@@ -1276,6 +1333,13 @@ fn admin_request(cmd: Command) -> anyhow::Result<(AdminOpts, AdminRequest)> {
             RequestsCmd::Cancel { id, items, admin } => (admin, R::RequestsCancel { id, items }),
             RequestsCmd::Approve { .. } => unreachable!("handled in run_command"),
         },
+        Command::Admin(c) => match c {
+            AdminCmd::Passkey(PasskeyCmd::Add { name, admin }) => (admin, R::PasskeysAdd { name }),
+            AdminCmd::Passkey(PasskeyCmd::List { admin }) => (admin, R::PasskeysList),
+            AdminCmd::Passkey(PasskeyCmd::Remove { name, admin }) => (admin, R::PasskeysRemove { name }),
+            AdminCmd::Sessions(SessionsCmd::List { admin }) => (admin, R::SessionsList),
+            AdminCmd::Sessions(SessionsCmd::Revoke { id, admin }) => (admin, R::SessionsRevoke { id }),
+        },
         Command::Doctor { .. } | Command::Tailscale(_) => unreachable!("handled in run_command"),
         Command::Export { admin } => (admin, R::Export),
         Command::Serve { .. }
@@ -1397,8 +1461,8 @@ async fn run_command(command: Command) -> anyhow::Result<()> {
         Command::Remote(cmd) => crate::client::run(*cmd).await,
         Command::Local(cmd) => crate::local::run(cmd).await,
         Command::Doctor { profile: Some(p), admin } => crate::client::doctor(Some(&p), admin.json).await,
-        Command::Tailscale(TailscaleCmd::Setup { config, port, funnel, dry_run }) => {
-            let opts = crate::tailscale::SetupOpts { config, port, funnel, dry_run };
+        Command::Tailscale(TailscaleCmd::Setup { config, port, funnel, admin, dry_run }) => {
+            let opts = crate::tailscale::SetupOpts { config, port, funnel, admin, dry_run };
             crate::tailscale::setup(&opts, &crate::tailscale::Tailscale::from_path(), &mut std::io::stdout()).await
         }
         Command::Doctor { profile: None, admin } => {

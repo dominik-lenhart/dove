@@ -57,6 +57,12 @@ hosts or reference hardware.
      rotating refresh with reuse detection, DCR (bounded, rate-limited, no authority), RFC 7009 revocation,
      pre-registered clients in config (`tests/oauth_e2e.rs`). Unverified: real ChatGPT and Claude hosts (AC23);
      host versions/settings are not recorded because no real host was available.
+   - [~] Admin web UI, part 1 (design 2026-11-14 §5, A74): `/admin` guard and gate, passkey enrolment and sign-in on
+     Dove's own WebAuthn verifier, sessions, CSRF/Origin, step-up bound to the action, pages Overview, Requests,
+     Audit, Settings, `dove admin passkey|sessions`, `dove tailscale setup --admin` (`tests/admin_ui_e2e.rs`,
+     `tests/admin_ui_logs.rs`, `tests/tailscale_e2e.rs`, unit tests with the W3C vectors). Part 2: Connections,
+     Mailboxes, Projects, Watches and sinks. Unverified: a real browser and a real authenticator (platform passkey,
+     security key, synced passkey), and Tailscale Serve in front of it.
 5. Hardening
    - [x] Fake Google server integration suite covering the automatable parts of AC1-AC21 (AC1, AC2, AC4, AC6, AC7,
      AC10, AC12, AC13, AC16, AC18 in `tests/mcp_e2e.rs`, `tests/connect_e2e.rs`; AC14, AC17, AC20 in
@@ -741,3 +747,54 @@ hosts or reference hardware.
   `actions`. Left as is: `Actions::parse_grant` echoes up to 32 characters of the agent's own input back to the agent
   (never to audit); the project check of `resolve_grants` at approval is shadowed by cancel-on-removal and has no test
   of its own.
+- A74. Admin web UI, part 1 (2026-11-14; design 2026-11-14 §5). Fail-closed decisions where the design is silent:
+  (a) No `webauthn-rs`: webauthn-rs-core 0.6 brings x509-parser, der-parser, nom 7, serde_cbor_2, base64 0.21,
+  thiserror 1, serde_with and an MPL attestation-CA crate for attestation formats Dove never verifies. Dove has its own
+  verifier (`admin_ui::webauthn`, ES256 and EdDSA on aws-lc-rs, already in the tree through rustls) and a bounded CBOR
+  decoder (`admin_ui::cbor`: depth 8, lengths checked against the input, duplicate map keys and trailing bytes
+  refused), tested with the W3C WebAuthn L3 vectors and a software authenticator. (b) Attestation `none` is requested;
+  any `fmt` is accepted and its statement ignored, since Dove trusts the enrolment link, not the authenticator model.
+  (c) Sign-in uses discoverable credentials (no `allowCredentials`), each passkey gets a random 16-byte user handle,
+  and a presented user handle must match. Step-up allows only the session's own passkey. (d) Sign counter: refused
+  when either counter is non-zero and the new one is not larger; a change of the backup-eligible flag is refused;
+  backup state is stored. (e) The CSRF token is derived from the session token (`SHA-256("dove-admin-csrf\0" ||
+  token)`), so nothing extra is stored; every POST needs it plus exactly one `Origin` equal to the admin origin and
+  `Sec-Fetch-Site` absent or `same-origin`. A POST without `Origin` is refused. Only GET, HEAD and POST exist.
+  (f) Sessions last 12 hours from sign-in, without sliding renewal; at most 32 passkeys and 32 sessions; only the
+  SHA-256 of the session and enrolment tokens is stored. The enrolment token travels in the URL fragment (never sent
+  to the server or logged in a proxy) and enrolment signs the browser in. (g) Step-up challenges are
+  `SHA-256(random || canonical action)` and the pending action is stored under them in memory (64 entries, 120 s,
+  at most 4 per session, single use, taken out before it is checked). The confirmation runs exactly the stored
+  `AdminRequest`. Beyond the design's list, adding and removing passkeys and `clients invite` also need a step-up.
+  (h) Untrusted text is HTML-escaped and loses control and bidi characters (shown as U+FFFD), as in the CLI.
+  (i) The per-address limits are shared by every caller behind Tailscale Serve (all `127.0.0.1`), and a process on
+  the host can spend them. So the sign-in failure limit never refuses a valid assertion: options are always issued,
+  the assertion is verified, and only failures are charged; once the bucket is empty, failures answer 429 instead of
+  401 (the same rule as `/mcp` bearer failures). Over the request budget (120 per minute) a browser whose session the
+  gate has already found valid (an in-memory list of at most 64 token hashes) draws from a per-session budget of the
+  same size instead; that path never touches the state store, and the gate still checks the session itself. Every
+  loopback address (`127.0.0.0/8`, `::1`) is one rate-limit key, since a local process can pick its source address.
+  Sign-in challenges keep no server state a stranger could fill or push out: the ceremony id is the challenge and
+  its expiry (120 s) under an HMAC with a per-process key, and a challenge is recorded as spent once an assertion
+  over it verified (at most 256 entries, refused when full; only a passkey holder adds one). What a flooding local
+  process can still do is delay a new sign-in by using up the anonymous budget. Before sign-in the owner cannot be
+  told apart from it behind Serve. That is a nuisance, not a bypass; existing sessions and the CLI are unaffected.
+  (j) Unknown paths under `/admin` answer 404 before the session check (the plan said after): the route list is
+  public in the source anyway. (k) The Overview shows the last doctor result (cached in memory); "Run checks" runs it.
+  (l) The UI is refused in local mode and `dove tailscale setup --admin` refuses while Funnel is on for the port.
+  (m) Access requests (A73, merged while this was built) are shown per mailbox with what is asked and what the
+  connection has now; approval (with an optional shorter time in minutes) goes through the same passkey confirmation
+  as a send, and "End access now" is `requests cancel`. The send path refuses a duration and the access path takes
+  no revisions, so a forged `kind` field fails in the verb.
+  Review follow-ups (independent security review of PR #19): (n) The session gate is a `route_layer`. As a `layer`
+  it also wrapped the router's fallback, which after the merge answered every unknown path of the public listener
+  with a redirect to the sign-in page (visible through a Funnel prefix mount); unknown paths now answer 404 on both
+  hosts, as (j) says. (o) `/admin` answers 404 to a request that carries `Tailscale-Funnel-Request` (Tailscale sets
+  it on Funnel traffic), so Funnel switched on after setup does not publish the UI, and to a request with more than
+  one `Host`. (p) Starting with the UI off deletes every admin session, so a session never comes back when the UI
+  is switched on again. (q) CBOR arrays and maps hold at most 64 elements (the duplicate-key check is quadratic).
+  (r) Known and accepted: the `__Host-` cookie is not bound to a port, so another HTTPS service on the same tailnet
+  name could overwrite it (the owner is signed out; `Origin` checks keep writes and reads closed); an enrolment
+  link is full admin for whoever opens it first within five minutes, so `passkey add` tells the operator to remove
+  the passkey if the link was used by someone else; without a proxy secret a loopback caller chooses its
+  `X-Forwarded-For` (older behaviour, A30), which with (i) no longer buys a second budget on loopback.

@@ -38,6 +38,8 @@ pub struct App {
     pub oauth: crate::oauth::OAuthState,
     /// Watch event worker state (`crate::watch`).
     pub watch: crate::watch::Runtime,
+    /// Admin web UI challenge pools and the last health check (`crate::admin_ui`).
+    pub admin_ui: crate::admin_ui::Runtime,
     /// Graceful stop requested over the admin channel (local mode's `Shutdown`).
     pub shutdown: tokio::sync::Notify,
 }
@@ -67,6 +69,11 @@ impl App {
             None => None,
         };
         let store = Store::open(&cfg.state_db_path())?;
+        // Switching the admin UI off signs every browser out: a session from before must not work again when the
+        // UI is switched back on.
+        if !cfg.admin_ui.enabled {
+            store.call_blocking(|c| Ok(c.execute("DELETE FROM admin_sessions", [])?))?;
+        }
         let notifier = Notifier::new(cfg.notifier.webhook_url.clone(), store.clone());
         let vault = Vault::new(kek);
         let gateway = Arc::new(Gateway::new(upstream, &cfg.limits));
@@ -94,6 +101,7 @@ impl App {
             draft_locks: Default::default(),
             oauth: crate::oauth::OAuthState::load(&cfg.oauth)?,
             watch: Default::default(),
+            admin_ui: Default::default(),
             shutdown: Default::default(),
             vault,
             pepper: Pepper::new(pepper),

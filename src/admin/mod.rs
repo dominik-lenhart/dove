@@ -252,6 +252,23 @@ pub enum AdminRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         items: Option<Vec<u32>>,
     },
+
+    /// Admin UI (design 2026-11-14 section 5.2): a one-time link (5 minutes) that enrols a passkey named `name`.
+    PasskeysAdd {
+        name: String,
+    },
+    PasskeysList,
+    /// Removes a passkey and ends its sessions.
+    PasskeysRemove {
+        name: String,
+    },
+    /// Signed-in admin UI sessions.
+    SessionsList,
+    /// Ends one admin UI session (`id`) or all of them.
+    SessionsRevoke {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
 }
 
 /// The revision of one item's draft as `requests show` printed it; approval is refused when it changed since.
@@ -345,6 +362,12 @@ impl AdminRequest {
             RequestsApprove { id, .. } => ("requests.approve", None, None, vec![id.clone()]),
             RequestsDeny { id } => ("requests.deny", None, None, vec![id.clone()]),
             RequestsCancel { id, .. } => ("requests.cancel", None, None, vec![id.clone()]),
+            // Passkey names are operator-chosen labels; session ids are opaque. Enrolment tokens never appear here.
+            PasskeysAdd { name } => ("passkeys.add", None, None, vec![name.clone()]),
+            PasskeysList => ("passkeys.list", None, None, vec![]),
+            PasskeysRemove { name } => ("passkeys.remove", None, None, vec![name.clone()]),
+            SessionsList => ("sessions.list", None, None, vec![]),
+            SessionsRevoke { id } => ("sessions.revoke", None, None, id.iter().cloned().collect()),
         }
     }
 }

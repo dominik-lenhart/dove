@@ -8,7 +8,8 @@
 # service. There is deliberately no route for:
 #   /healthz  It reveals whether any mailbox needs re-authorization ("degraded"). Monitor it on the loopback
 #             address instead: curl -fsS http://127.0.0.1:8787/healthz
-#   admin     The admin interface is a Unix socket, not HTTP. Nothing here can reach it.
+#   admin     The admin socket is not HTTP, and the admin web UI is tailnet-only (docs/deployment.md). Never add a
+#             route for it here.
 #   GET/DELETE /mcp  The service answers 405 to them anyway; stateless Streamable HTTP needs only POST.
 
 {

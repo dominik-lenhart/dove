@@ -389,6 +389,73 @@ fn tailscale_that_is_off_or_missing_is_a_clear_error() {
 
 // ------------------------------------------------------------------ doctor
 
+fn admin_ui_of(path: &Path) -> (Option<bool>, Option<String>) {
+    let v: toml::Value = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let t = v.get("admin_ui");
+    (
+        t.and_then(|t| t.get("enabled")).and_then(toml::Value::as_bool),
+        t.and_then(|t| t.get("origin")).and_then(|o| o.as_str()).map(String::from),
+    )
+}
+
+#[test]
+fn admin_flag_mounts_the_admin_ui_on_the_tailnet_only() {
+    let fake = Fake::new();
+    let original = config_text();
+    let (_d, cfg) = config_file(&original);
+    let r = dove(&fake, &cfg, &["--admin"]);
+    assert_eq!(r.code, 0, "{}\n{}", r.stdout, r.stderr);
+    let mut want: Vec<String> = PUBLIC_PATHS.iter().map(|s| (*s).to_string()).collect();
+    want.push(dove::admin_ui::ADMIN_PREFIX.to_string());
+    want.sort();
+    assert_eq!(fake.mounted(), want);
+    assert!(fake.file("serve.txt").contains("443 /admin http://127.0.0.1:8787/admin"));
+    assert!(fake.file("funnel.txt").is_empty());
+    assert_eq!(admin_ui_of(&cfg), (Some(true), Some(format!("https://{HOST}"))));
+    assert!(std::fs::read_to_string(&cfg).unwrap().contains("# trailing comment that must survive"));
+    assert!(r.stdout.contains("/admin (tailnet only") && r.stdout.contains("dove admin passkey add"), "{}", r.stdout);
+    // Idempotent.
+    let before = fake.changes();
+    let text = std::fs::read_to_string(&cfg).unwrap();
+    assert_eq!(dove(&fake, &cfg, &["--admin"]).code, 0);
+    assert_eq!(fake.changes(), before);
+    assert_eq!(std::fs::read_to_string(&cfg).unwrap(), text);
+    // A later setup without --admin takes the mount down.
+    let r = dove(&fake, &cfg, &[]);
+    assert_eq!(r.code, 0, "{}\n{}", r.stdout, r.stderr);
+    assert!(!fake.file("serve.txt").contains("/admin"));
+}
+
+#[test]
+fn admin_flag_is_refused_whenever_funnel_could_expose_it() {
+    // Together with --funnel: refused by the command line, nothing is touched.
+    let fake = Fake::new();
+    let original = config_text();
+    let (_d, cfg) = config_file(&original);
+    let r = dove(&fake, &cfg, &["--admin", "--funnel"]);
+    assert_ne!(r.code, 0);
+    assert!(fake.changes().is_empty());
+    assert_eq!(std::fs::read_to_string(&cfg).unwrap(), original);
+
+    // Funnel already on for the port: refused before anything changes; another port works.
+    let fake = Fake::new();
+    let (_d, cfg) = config_file(&original);
+    assert_eq!(dove(&fake, &cfg, &["--funnel"]).code, 0);
+    let before = fake.changes();
+    let text = std::fs::read_to_string(&cfg).unwrap();
+    let r = dove(&fake, &cfg, &["--admin"]);
+    assert_ne!(r.code, 0);
+    assert!(r.stderr.contains("tailnet-only") && r.stderr.contains("Funnel is on"), "{}", r.stderr);
+    assert_eq!(fake.changes(), before);
+    assert!(!fake.file("serve.txt").contains("/admin"));
+    assert_eq!(std::fs::read_to_string(&cfg).unwrap(), text);
+    assert_eq!(admin_ui_of(&cfg), (None, None));
+    let r = dove(&fake, &cfg, &["--admin", "--port", "8443"]);
+    assert_eq!(r.code, 0, "{}\n{}", r.stdout, r.stderr);
+    assert!(fake.file("serve.txt").contains("8443 /admin "));
+    assert!(!fake.file("funnel.txt").contains("8443"));
+}
+
 const LISTEN: &str = "127.0.0.1:8787";
 
 async fn check(fake: &Fake, url: &str) -> Option<Value> {
@@ -468,4 +535,20 @@ async fn the_service_doctor_reports_what_the_cli_needs_for_the_tailscale_check()
     let fake = Fake::new();
     dove::tailscale::add_doctor_check(&mut v, &fake.ts()).await;
     assert_eq!(v.as_array().unwrap().last().unwrap()["check"], "tailscale_serve");
+}
+
+#[tokio::test]
+async fn doctor_reports_the_admin_ui_and_fails_when_funnel_exposes_it() {
+    let fake = Fake::new();
+    let (_d, cfg) = config_file(&config_text());
+    assert_eq!(dove(&fake, &cfg, &["--admin"]).code, 0);
+    let url = format!("https://{HOST}");
+    let ok = check(&fake, &url).await.unwrap();
+    assert_eq!(ok["ok"], true, "{ok}");
+    assert!(ok["detail"].as_str().unwrap().contains("admin UI (tailnet only)"), "{ok}");
+    // Someone turned Funnel on by hand: the admin UI would be on the internet.
+    std::fs::write(fake.state.path().join("funnel.txt"), "443\n").unwrap();
+    let bad = check(&fake, &url).await.unwrap();
+    assert_eq!(bad["ok"], false, "{bad}");
+    assert!(bad["detail"].as_str().unwrap().contains("tailnet-only"), "{bad}");
 }
