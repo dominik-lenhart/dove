@@ -460,3 +460,11 @@ cargo fmt
   `send_at = now + 60`, not hours ahead. `IndexDisable` purges the index at once, which shadows the `index_enabled`
   checks; test the flag alone with `UPDATE accounts SET index_enabled = 0`. The note is sealed with the request id as
   vault scope and is the only free text in the tables; keep ids, times and codes everywhere else.
+- 2026-11-14: A sync that ends `ready` can still leave messages in the index's `pending` retry queue (a failed fetch;
+  thread unknown) while `last_success_at` advances, so "the index shows no reply" needs `pending` empty for the serving
+  generation (`requests::worker::reply_condition`). Make a fetch fail with `fail_next("GET", "/messages/<id>", ..)` or
+  IMAP `fail_next_containing("UID FETCH", "UID FETCH <uid> (UID BODY.PEEK[])", Fault::Bad)`, and make the retry due with
+  `UPDATE pending SET next_attempt_at = 0`. `create_draft` does not derive reply recipients and the fake Google sends a
+  draft without any, but SMTP refuses it: IMAP reply fixtures need an explicit `to`. A test of the request worker's claim
+  guard must keep the request `approved` (another item still open), or `close_if_finished` plus the claim's
+  request-status check hide the mutation.

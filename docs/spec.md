@@ -274,8 +274,8 @@ human message and, where useful, `retry_after_seconds`. An `invalid_argument` na
 - FR-C2. Commands as listed in 5.1 and 5.2, plus `audit tail|search`, `keys rotate` (section 6.4), `doctor` (checks
   configuration, permissions of secret files, reachability of Google, TLS of the public URL) and `export` (projects,
   clients and accounts without secrets, for review).
-- FR-C3. `requests list|show|approve|deny|cancel` (§6.3a): `show` reads every draft of a request fresh and prints it as
-  text to the operator's terminal; `approve` binds the revisions that were shown.
+- FR-C3. `requests list|show|approve|deny|cancel` (§6.3a): `show` reads every draft of a request fresh and prints its
+  whole text to the operator's terminal; `approve` binds the revisions that were shown and refuses text that was cut.
 
 ### 5.6 Client experience and OAuth (v1)
 
@@ -359,10 +359,12 @@ code (`draft_changed`, `not_found`, `access_lost`, `client_revoked`, `account_di
 `upstream_error` after three refusals five minutes apart); `send_unknown` for a lost reply or a restart while
 `sending`, never retried; `missed` when the item could not be sent within `late_grace_minutes` after its time;
 `skipped` (`replied`, `condition_unknown`) for `unless_reply`. Writes that were not dispatched (rate limit, mailbox
-needs re-authorization) are tried again inside the grace. `unless_reply` uses the `no_reply_by` reply rule (A70) on an
-index synced within the last 10 minutes; otherwise the worker asks for a sync and waits, and on doubt never sends.
+needs re-authorization) are tried again inside the grace. `unless_reply` uses the `no_reply_by` reply rule (A70),
+except that replies in Trash or Spam count, on an index synced within the last 10 minutes with no message waiting for
+a retry; otherwise the worker asks for a sync and waits, and on doubt never sends.
 Limits: 20 open requests per client, 50 items per request, and a server-wide 200 scheduled sends per UTC day checked
-at approval. The agent's note is untrusted, sealed with the vault and shown only by `requests show`.
+at approval. Approval also needs an unexpired request and `draft` on the mailbox. Closed requests are deleted after
+`[requests] retention_days` (90), and a client keeps at most 500. The agent's note is untrusted, sealed with the vault and shown only by `requests show`.
 
 ### 6.4 Secrets and encryption at rest
 
