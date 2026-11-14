@@ -17,6 +17,11 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
   never forwarded by the shipped Caddy and nginx templates; `dove tailscale setup --admin` mounts it on the tailnet name
   and refuses while Funnel is on.
 
+### Changed
+
+- Every tool parameter now has a description in `tools/list` (origin, format and enforced limits), so agents and
+  registries no longer have to guess what an id or cursor refers to.
+
 ## [0.11.0] - 2026-11-14
 
 ### Added

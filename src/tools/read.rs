@@ -126,7 +126,8 @@ pub fn defs() -> Vec<ToolDef> {
             input_schema: || {
                 let mut s = detail_schema();
                 s["properties"].as_object_mut().expect("object").remove("ref");
-                s["properties"]["thread_id"] = json!({ "type": "string" });
+                s["properties"]["thread_id"] =
+                    json!({ "type": "string", "description": "Thread id from search_messages or get_message." });
                 s["properties"]["message_id"] =
                     json!({ "type": "string", "description": "Instead of thread_id: the thread of this message." });
                 s["required"] = json!(["account"]);
@@ -153,9 +154,9 @@ pub fn defs() -> Vec<ToolDef> {
             input_schema: || {
                 json!({ "type": "object", "properties": {
                     "account": account_schema(),
-                    "own_only": { "type": "boolean", "default": true },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 50, "default": 20 },
-                    "page_token": { "type": "string" }
+                    "own_only": { "type": "boolean", "default": true, "description": "List only drafts this project created." },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 50, "default": 20, "description": "Most drafts per page." },
+                    "page_token": { "type": "string", "description": "next_page_token of the previous page." }
                 }, "required": ["account"], "additionalProperties": false })
             },
             output_schema: || {
@@ -176,8 +177,9 @@ pub fn defs() -> Vec<ToolDef> {
             mail_content: true,
             input_schema: || {
                 json!({ "type": "object", "properties": {
-                    "account": account_schema(), "draft_id": { "type": "string" },
-                    "max_body_chars": { "type": "integer", "minimum": 1, "maximum": MAX_BODY_CHARS }
+                    "account": account_schema(),
+                    "draft_id": { "type": "string", "description": "Draft id from create_draft or list_drafts." },
+                    "max_body_chars": { "type": "integer", "minimum": 1, "maximum": MAX_BODY_CHARS, "description": "Longest body returned, in characters (default 20000)." }
                 }, "required": ["account", "draft_id"], "additionalProperties": false })
             },
             output_schema: || {
@@ -196,10 +198,10 @@ fn detail_schema() -> Value {
         "properties": {
             "ref": { "type": "string", "description": "Opaque ref from search_messages; replaces account + message_id." },
             "account": account_schema(),
-            "message_id": { "type": "string" },
-            "max_body_chars": { "type": "integer", "minimum": 1, "maximum": MAX_BODY_CHARS, "default": DEFAULT_BODY_CHARS },
-            "include_headers": { "type": "array", "items": { "type": "string", "enum": EXTRA_HEADERS } },
-            "select": { "type": "array", "items": { "type": "string", "enum": DETAIL_FIELDS } }
+            "message_id": { "type": "string", "description": "Message id from search_messages; used with account instead of ref." },
+            "max_body_chars": { "type": "integer", "minimum": 1, "maximum": MAX_BODY_CHARS, "default": DEFAULT_BODY_CHARS, "description": "Longest body returned, in characters." },
+            "include_headers": { "type": "array", "items": { "type": "string", "enum": EXTRA_HEADERS }, "description": "Extra headers to return in addition to the standard fields." },
+            "select": { "type": "array", "items": { "type": "string", "enum": DETAIL_FIELDS }, "description": "Fields to return; omit for all fields." }
         },
         "additionalProperties": false
     })

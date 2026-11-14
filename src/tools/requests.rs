@@ -48,13 +48,14 @@ pub fn defs() -> Vec<ToolDef> {
             input_schema: || {
                 json!({ "type": "object", "properties": {
                     "account": account_schema(),
-                    "items": { "type": "array", "minItems": 1, "items": { "type": "object", "properties": {
-                        "draft_id": { "type": "string" },
+                    "items": { "type": "array", "minItems": 1, "description": "Drafts to send, in the order they are scheduled.", "items": { "type": "object", "properties": {
+                        "draft_id": { "type": "string", "description": "Draft id from create_draft or list_drafts." },
                         "expected_revision": { "type": "string", "description": "The draft's current revision (from create_draft, update_draft or get_draft)." },
                         "send_at": { "type": "string", "description": "RFC 3339 instant with offset, e.g. 2026-11-17T09:00:00+01:00. Omit when using window." }
                     }, "required": ["draft_id", "expected_revision"], "additionalProperties": false } },
                     "window": { "type": "object", "properties": {
-                        "from": { "type": "string" }, "to": { "type": "string" }
+                        "from": { "type": "string", "description": "RFC 3339 instant with offset: the first send time." },
+                        "to": { "type": "string", "description": "RFC 3339 instant with offset: the last send time." }
                     }, "required": ["from", "to"], "additionalProperties": false,
                     "description": "Spread the items evenly from `from` to `to` (both included) instead of send_at." },
                     "unless_reply": { "type": "boolean", "description": "Skip an item when its thread got a reply from someone else after this request." },
@@ -85,7 +86,7 @@ pub fn defs() -> Vec<ToolDef> {
             mail_content: false,
             input_schema: || {
                 json!({ "type": "object", "properties": {
-                    "grants": { "type": "array", "minItems": 1, "items": { "type": "object", "properties": {
+                    "grants": { "type": "array", "minItems": 1, "description": "Mailboxes and the rights asked for on each.", "items": { "type": "object", "properties": {
                         "account": { "type": "string", "description": "Mailbox alias or address, as the owner named it." },
                         "actions": { "type": "string", "description": "Comma list of actions or presets, e.g. read,draft or assistant." }
                     }, "required": ["account", "actions"], "additionalProperties": false } },
@@ -117,7 +118,7 @@ pub fn defs() -> Vec<ToolDef> {
             mail_content: false,
             input_schema: || {
                 json!({ "type": "object", "properties": {
-                    "status": { "type": "string", "enum": requests::STATUSES }
+                    "status": { "type": "string", "enum": requests::STATUSES, "description": "Only requests with this status." }
                 }, "additionalProperties": false })
             },
             output_schema: || object_schema(json!({ "requests": {"type":"array"} })),
@@ -132,7 +133,7 @@ pub fn defs() -> Vec<ToolDef> {
             destructive: true,
             mail_content: false,
             input_schema: || {
-                json!({ "type": "object", "properties": { "request_id": { "type": "string" } },
+                json!({ "type": "object", "properties": { "request_id": { "type": "string", "description": "Request id from request_send, request_access or list_requests." } },
                         "required": ["request_id"], "additionalProperties": false })
             },
             output_schema: || {

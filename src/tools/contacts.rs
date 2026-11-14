@@ -36,7 +36,7 @@ pub fn defs() -> Vec<ToolDef> {
                 "query": { "type": "string", "minLength": intel::MIN_QUERY_CHARS, "maxLength": intel::MAX_QUERY_CHARS,
                            "description": "Part of an address or display name (case-insensitive)." },
                 "account": super::account_schema(),
-                "limit": { "type": "integer", "minimum": 1, "maximum": intel::MAX_LIMIT, "default": intel::DEFAULT_LIMIT },
+                "limit": { "type": "integer", "minimum": 1, "maximum": intel::MAX_LIMIT, "default": intel::DEFAULT_LIMIT, "description": "Most contacts returned." },
                 "include_automated": { "type": "boolean", "default": false,
                                        "description": "Also list no-reply, mailer-daemon and similar addresses." }
             }, "additionalProperties": false })

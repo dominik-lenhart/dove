@@ -41,12 +41,13 @@ pub fn defs() -> Vec<ToolDef> {
                 "properties": {
                     "items": {
                         "type": "array", "minItems": 1, "maxItems": MAX_ITEMS,
+                        "description": "The reads to run, at most 20, independent of each other.",
                         "items": {
                             "type": "object",
                             "properties": {
-                                "id": { "type": "string", "maxLength": 64 },
-                                "op": { "type": "string", "enum": OPS },
-                                "args": { "type": "object" }
+                                "id": { "type": "string", "maxLength": 64, "description": "Your label for this item, unique in the call; echoed in its result." },
+                                "op": { "type": "string", "enum": OPS, "description": "The read to run." },
+                                "args": { "type": "object", "description": "Arguments exactly as for that tool." }
                             },
                             "required": ["id", "op", "args"],
                             "additionalProperties": false

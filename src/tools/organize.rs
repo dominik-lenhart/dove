@@ -53,8 +53,8 @@ fn results_schema() -> Value {
     }))
 }
 
-fn labels_schema() -> Value {
-    json!({ "type": "array", "items": { "type": "string" }, "maxItems": MAX_LABELS })
+fn labels_schema(d: &str) -> Value {
+    json!({ "type": "array", "items": { "type": "string" }, "maxItems": MAX_LABELS, "description": d })
 }
 
 pub fn defs() -> Vec<ToolDef> {
@@ -73,11 +73,13 @@ pub fn defs() -> Vec<ToolDef> {
             destructive: false,
             mail_content: false,
             input_schema: || {
-                let flags = json!({ "type": "array", "items": { "type": "string", "enum": ["UNREAD", "STARRED"] }, "maxItems": 2 });
+                let flags = |d: &str| json!({ "type": "array", "items": { "type": "string", "enum": ["UNREAD", "STARRED"] }, "maxItems": 2, "description": d });
                 json!({ "type": "object", "properties": {
                     "account": account_schema(), "ids": ids_schema(),
-                    "add_flags": flags, "remove_flags": flags,
-                    "add_labels": labels_schema(), "remove_labels": labels_schema()
+                    "add_flags": flags("Flags to set (UNREAD marks unread, STARRED stars)."),
+                    "remove_flags": flags("Flags to clear (removing UNREAD marks read)."),
+                    "add_labels": labels_schema("Labels (Gmail) or keywords (IMAP) to add, at most 20."),
+                    "remove_labels": labels_schema("Labels (Gmail) or keywords (IMAP) to remove, at most 20.")
                 }, "required": ["account", "ids"], "additionalProperties": false })
             },
             output_schema: results_schema,

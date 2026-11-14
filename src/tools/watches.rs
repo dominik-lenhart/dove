@@ -44,7 +44,7 @@ pub fn defs() -> Vec<ToolDef> {
                     "type": "object",
                     "properties": {
                         "account": account_schema(),
-                        "kind": { "type": "string", "enum": Kind::ALL },
+                        "kind": { "type": "string", "enum": Kind::ALL, "description": "What to watch for; each kind uses the fields named below." },
                         "thread_id": { "type": "string", "description": "thread_reply, no_reply_by: thread id from search_messages or get_message." },
                         "message_id": { "type": "string", "description": "no_reply_by, instead of thread_id: the message that should get an answer." },
                         "from": { "type": "string", "description": "from: an address (ann@example.com) or a domain (example.com)." },
@@ -89,7 +89,7 @@ pub fn defs() -> Vec<ToolDef> {
             input_schema: || {
                 json!({
                     "type": "object",
-                    "properties": { "watch_id": { "type": "string" } },
+                    "properties": { "watch_id": { "type": "string", "description": "Watch id from create_watch or list_watches." } },
                     "required": ["watch_id"],
                     "additionalProperties": false
                 })
@@ -116,9 +116,9 @@ pub fn defs() -> Vec<ToolDef> {
                 json!({
                     "type": "object",
                     "properties": {
-                        "cursor": { "type": "string" },
-                        "watch_id": { "type": "string" },
-                        "limit": { "type": "integer", "minimum": 1, "maximum": MAX_EVENTS, "default": DEFAULT_EVENTS }
+                        "cursor": { "type": "string", "description": "next_cursor of the previous call; omit for the oldest kept events." },
+                        "watch_id": { "type": "string", "description": "Only events of this watch (from create_watch or list_watches)." },
+                        "limit": { "type": "integer", "minimum": 1, "maximum": MAX_EVENTS, "default": DEFAULT_EVENTS, "description": "Most events returned." }
                     },
                     "additionalProperties": false
                 })

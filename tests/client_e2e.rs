@@ -828,6 +828,26 @@ async fn mcp_catalog_lists_every_tool_without_a_server() {
         assert!(t["inputSchema"].is_object() && t["outputSchema"].is_object(), "{t}");
         assert!(t["annotations"]["readOnlyHint"].is_boolean(), "{t}");
     }
+    // Registries score tools by parameter documentation: every input property, nested ones included, has a description.
+    fn undocumented(path: &str, schema: &Value, out: &mut Vec<String>) {
+        if let Some(props) = schema["properties"].as_object() {
+            for (k, v) in props {
+                let here = format!("{path}.{k}");
+                if v["description"].as_str().is_none_or(|d| d.trim().is_empty()) {
+                    out.push(here.clone());
+                }
+                undocumented(&here, v, out);
+            }
+        }
+        if schema["items"].is_object() {
+            undocumented(&format!("{path}[]"), &schema["items"], out);
+        }
+    }
+    let mut missing = Vec::new();
+    for t in replies[2]["result"]["tools"].as_array().unwrap() {
+        undocumented(t["name"].as_str().unwrap(), &t["inputSchema"], &mut missing);
+    }
+    assert!(missing.is_empty(), "input properties without a description: {missing:?}");
 
     assert_eq!(replies[3]["id"], 4);
     assert_eq!(replies[3]["result"]["isError"], true);
