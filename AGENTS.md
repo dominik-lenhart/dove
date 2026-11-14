@@ -432,3 +432,9 @@ cargo fmt
   (prompt after `--`, since `--allowedTools` is variadic). Tests run the real binary in
   `tests/client_e2e.rs::watch_listen_runs_the_command_once_per_event_with_ids_only`; generate events there with
   `index::sync::sync_account` after `IndexEnable`. Never build the prompt from mail content.
+- 2026-11-14: Several messages of one mailbox are read with `mail::fetch_many` (IMAP: one session, one `EXAMINE` and
+  one metadata `UID FETCH` per folder, then `fetch_raw_sized` per message; Gmail: `upstream_per_mailbox` concurrency).
+  Do not loop over `fetch_message` for a list: on IMAP each call is its own pool checkout, credential load and four
+  commands. `get_message` with `refs`/`message_ids` runs through `batch::run`; never add a second response budget.
+  Read-path tests count commands in `h.imap.commands()` (`EXAMINE`, `BODY.PEEK[]`, `(UID RFC822.SIZE)`) and requests
+  in `h.google.requests()`.

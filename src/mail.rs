@@ -64,30 +64,111 @@ pub async fn fetch_message(cx: &ToolCx, mb: &Mailbox, id: &str, prio: Priority) 
     }
 }
 
-async fn folder(cx: &ToolCx, account_id: &str, folder_id: i64) -> Result<Folder, ToolError> {
-    let aid = account_id.to_string();
-    let folders = cx.app.store.call(move |c| account::load_folders(c, &aid)).await.map_err(ToolError::from)?;
-    folders.into_iter().find(|f| f.folder_id == folder_id).ok_or_else(ToolError::not_found)
+async fn fetch_imap(cx: &ToolCx, mb: &Mailbox, id: &str) -> Result<Fetched, ToolError> {
+    fetch_imap_many(cx, mb, &[id.to_string()]).await?.pop().unwrap_or_else(|| Err(ToolError::internal()))
 }
 
-async fn fetch_imap(cx: &ToolCx, mb: &Mailbox, id: &str) -> Result<Fetched, ToolError> {
+/// Several messages of one mailbox, in input order, each with its own result. Gmail messages are read with bounded
+/// concurrency; IMAP messages share one session: each folder is selected once and its metadata (with sizes) comes in
+/// one `UID FETCH`, then one body fetch per message. A message that is gone is `not_found` in its slot; a failure of
+/// the connection itself fails the whole call.
+pub async fn fetch_many(
+    cx: &ToolCx,
+    mb: &Mailbox,
+    ids: &[String],
+    prio: Priority,
+) -> Result<Vec<Result<Fetched, ToolError>>, ToolError> {
+    use futures::stream::{self, StreamExt};
+    match mb.provider {
+        Provider::Gmail => Ok(stream::iter((0..ids.len()).map(|i| fetch_message(cx, mb, &ids[i], prio)))
+            .buffered(cx.app.cfg.limits.upstream_per_mailbox.max(1))
+            .collect()
+            .await),
+        Provider::Imap => fetch_imap_many(cx, mb, ids).await,
+    }
+}
+
+struct Group {
+    name: String,
+    uidvalidity: u32,
+    /// (result slot, UID)
+    items: Vec<(usize, u32)>,
+}
+
+async fn fetch_imap_many(
+    cx: &ToolCx,
+    mb: &Mailbox,
+    ids: &[String],
+) -> Result<Vec<Result<Fetched, ToolError>>, ToolError> {
     // Unknown, malformed and stale (UIDVALIDITY changed) ids are all the same `not_found`.
-    let mid = ImapMsgId::parse(id).ok_or_else(ToolError::not_found)?;
-    let f = folder(cx, &mb.account_id, mid.folder_id).await?;
-    let name = f.name.clone();
-    let max = mime::Limits::default().max_raw_bytes;
-    let (meta, raw, gmail) = account::with_session(&cx.app, &mb.account_id, move |s| {
-        Box::pin(async move {
-            let st = s.select(&name, true).await?;
-            if st.uidvalidity != mid.uidvalidity {
-                return Err(ImapError::Missing);
+    let parsed_ids: Vec<Option<ImapMsgId>> = ids.iter().map(|id| ImapMsgId::parse(id)).collect();
+    let aid = mb.account_id.clone();
+    let folders = cx.app.store.call(move |c| account::load_folders(c, &aid)).await.map_err(ToolError::from)?;
+    // Wanted (slot, uid) pairs per folder and UIDVALIDITY, in first-appearance order.
+    let mut groups: Vec<Group> = Vec::new();
+    for (i, mid) in parsed_ids.iter().enumerate() {
+        let Some(mid) = mid else { continue };
+        let Some(f) = folders.iter().find(|f| f.folder_id == mid.folder_id) else { continue };
+        match groups.iter_mut().find(|g| g.name == f.name && g.uidvalidity == mid.uidvalidity) {
+            Some(g) => g.items.push((i, mid.uid)),
+            None => {
+                groups.push(Group { name: f.name.clone(), uidvalidity: mid.uidvalidity, items: vec![(i, mid.uid)] })
             }
-            let meta = s.fetch_meta(&[mid.uid]).await?.into_iter().next().ok_or(ImapError::Missing)?;
-            let raw = s.fetch_raw(mid.uid, max).await?;
-            Ok((meta, raw, s.is_gmail()))
+        }
+    }
+    let max = mime::Limits::default().max_raw_bytes;
+    type Got = (usize, FetchedMeta, Option<Vec<u8>>);
+    let (got, gmail): (Vec<Got>, bool) = if groups.is_empty() {
+        (Vec::new(), false)
+    } else {
+        account::with_session(&cx.app, &mb.account_id, move |s| {
+            Box::pin(async move {
+                let mut got = Vec::new();
+                for Group { name, uidvalidity, items } in groups {
+                    let st = match s.select(&name, true).await {
+                        Ok(st) => st,
+                        Err(ImapError::Missing) => continue,
+                        Err(e) => return Err(e),
+                    };
+                    if st.uidvalidity != uidvalidity {
+                        continue;
+                    }
+                    let mut uids: Vec<u32> = items.iter().map(|(_, u)| *u).collect();
+                    uids.sort_unstable();
+                    uids.dedup();
+                    let metas = s.fetch_meta(&uids).await?;
+                    for (slot, uid) in items {
+                        let Some(m) = metas.iter().find(|m| m.uid == uid) else { continue };
+                        let raw = match s.fetch_raw_sized(uid, m.size, max).await {
+                            Ok(r) => r,
+                            Err(ImapError::Missing) => continue,
+                            Err(e) => return Err(e),
+                        };
+                        got.push((slot, m.clone(), raw));
+                    }
+                }
+                Ok((got, s.is_gmail()))
+            })
         })
-    })
-    .await?;
+        .await?
+    };
+    let mut out: Vec<Result<Fetched, ToolError>> = (0..ids.len()).map(|_| Err(ToolError::not_found())).collect();
+    for (slot, meta, raw) in got {
+        let Some(f) = parsed_ids[slot].and_then(|mid| folders.iter().find(|f| f.folder_id == mid.folder_id)) else {
+            continue;
+        };
+        out[slot] = shape_imap(&ids[slot], f, &meta, raw, gmail);
+    }
+    Ok(out)
+}
+
+fn shape_imap(
+    id: &str,
+    f: &Folder,
+    meta: &FetchedMeta,
+    raw: Option<Vec<u8>>,
+    gmail: bool,
+) -> Result<Fetched, ToolError> {
     let raw = raw.ok_or_else(|| {
         ToolError::new(ErrorCode::TooLarge, "the message exceeds the size limit")
             .with_details(json!({ "size_bytes": meta.size }))
@@ -98,7 +179,7 @@ async fn fetch_imap(cx: &ToolCx, mb: &Mailbox, id: &str) -> Result<Fetched, Tool
     let meta = MessageMeta {
         id: id.to_string(),
         thread_id: imap_thread_id(&parsed, id),
-        labels: message_labels(&f, &meta, gmail),
+        labels: message_labels(f, meta, gmail),
         internal_date_ms: meta.internal_date_s.saturating_mul(1000),
         size_estimate: meta.size as i64,
         snippet,

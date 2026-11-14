@@ -13,6 +13,16 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
   skipped on the first start, failing commands are retried up to `--max-attempts`, and a lock file keeps a second
   listener on the same profile from running the command twice. Pin it to an agent session with
   `claude -p --resume <session-id> --fork-session`.
+- `get_message` reads several messages in one call: pass `refs` from search_messages (or `account` +
+  `message_ids`), up to 20. Each id gets its own result or error under batch_read's 64 KiB response budget; a single
+  id answers as before.
+
+### Changed
+
+- `get_thread` is faster. On IMAP all members are read over one connection, with each folder opened once and one
+  metadata fetch per folder (a one-folder thread of N messages needs N + 2 commands instead of 4N). On Gmail, a thread
+  asked for by `message_id` needs one request less. Long threads stop fetching once the body budget is spent. IMAP
+  reads and index sync no longer send a separate size probe per message.
 
 ## [0.8.1] - 2026-11-14
 

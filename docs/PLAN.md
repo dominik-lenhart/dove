@@ -569,3 +569,26 @@ hosts or reference hardware.
   The notice and `--check` print `brew upgrade dove` for it. Only the formula named `dove` counts. The check is on
   the path, not on `brew --prefix`, so it needs no `brew` binary and works with `/opt/homebrew`, `/usr/local` and
   Linuxbrew alike.
+- A69. Fewer round trips for reads (production audit 2026-11-14: `batch_read` was never called; agents ran
+  search_messages and then one get_message per hit; get_thread averaged 866 ms, max 3.3 s). (a) `get_message` takes
+  `refs` or `account` + `message_ids` (1 to 20) instead of one id. It is not a second batch: each id becomes a
+  `get_message` item for `batch::run`, so the 64 KiB response budget, coalescing, the per-read rate charge, per-item
+  status and the single audit record are batch_read's. The answer is `{messages: [{id, ok, message | error}],
+  ok_count, error_count}`; a single id keeps `{message}`. Targeted reads stay unredacted, the untrusted notice is
+  added by `mcp::call_tool` as for every `mail_content` tool. batch_read items may not use the list arguments (no
+  nested batches). search_messages' description points to it. (b) get_thread reads members in rounds of 8 through
+  `mail::fetch_many`, shaping each round before the next, and stops fetching once the 150,000-character body budget is
+  spent (before, Gmail fetched every member and IMAP went one by one). On IMAP one round is one pooled session: each
+  folder is examined once, its metadata (with `RFC822.SIZE`) comes in one `UID FETCH`, then one body fetch per
+  message. Before, each member cost its own session checkout, credential load and folder lookup plus `EXAMINE`,
+  metadata, size probe and body, so a one-folder thread of N messages drops from 4N commands to N + 2. The size probe
+  is also gone from single reads and index hydration (`ImapSession::fetch_raw_sized`): the metadata fetch already
+  carries the size. On Gmail, get_thread with `message_id` reads that message in full first and takes the thread id
+  from it, instead of a `format=minimal` lookup followed by a second fetch of the same message (N + 2 requests become
+  N + 1). Gmail's `threads.get` cannot return raw messages (formats full, metadata, minimal), and parsing its `full`
+  payload would be a second MIME path, so members stay `messages.get?format=raw` at the per-mailbox concurrency. No new
+  upstream endpoint or IMAP command. (c) update_draft has no redundant read: Gmail does one `drafts.get?format=raw`
+  (ownership and revision check) and one `drafts.update`, which dominates; IMAP does the fresh read, `APPEND`, a read
+  back of the server's bytes (the ownership hash) and the expunge of the previous UID, each on its own pool checkout.
+  The fresh read lost its size probe with (b); the rest is required by the IMAP draft ownership rules (hash of the
+  bytes the server stores).
