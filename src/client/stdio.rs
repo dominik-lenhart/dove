@@ -125,14 +125,14 @@ pub async fn run(server: &str, token: zeroize::Zeroizing<String>) -> anyhow::Res
     Ok(())
 }
 
-enum LineRead {
+pub(super) enum LineRead {
     Line,
     TooLong,
     Eof,
 }
 
 /// Reads one `\n`-terminated line into `buf` without buffering more than `MAX_LINE_BYTES` of it.
-async fn read_line_bounded<R: tokio::io::AsyncBufRead + Unpin>(
+pub(super) async fn read_line_bounded<R: tokio::io::AsyncBufRead + Unpin>(
     r: &mut R,
     buf: &mut Vec<u8>,
 ) -> anyhow::Result<LineRead> {

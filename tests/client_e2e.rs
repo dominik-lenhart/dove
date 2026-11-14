@@ -764,3 +764,77 @@ async fn watch_listen_runs_the_command_once_per_event_with_ids_only() {
     assert_ne!(o.code, 0);
     assert!(o.stderr.contains("already runs"), "{}", o.stderr);
 }
+
+/// `dove mcp catalog` (what Glama builds from the root Dockerfile): lists every tool with schemas and annotations,
+/// refuses tool calls, needs no profile or server, writes nothing and exits when stdin closes.
+#[tokio::test]
+async fn mcp_catalog_lists_every_tool_without_a_server() {
+    let home = tempfile::tempdir().unwrap();
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_dove"))
+        .env_clear()
+        .env("HOME", home.path())
+        .env("PATH", "/usr/bin:/bin")
+        .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent/dove-test-bus")
+        .current_dir(home.path())
+        .args(["mcp", "catalog"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let input = [
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}).to_string(),
+        json!({"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2025-06-18",
+            "capabilities":{},"clientInfo":{"name":"t","version":"0"}}})
+        .to_string(),
+        json!({"jsonrpc":"2.0","method":"notifications/initialized"}).to_string(),
+        json!({"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}}).to_string(),
+        json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"search_messages","arguments":{}}})
+            .to_string(),
+        "{ not json".to_string(),
+        json!({"jsonrpc":"2.0","id":5,"method":"nope"}).to_string(),
+    ]
+    .join("\n");
+    let mut sin = child.stdin.take().unwrap();
+    sin.write_all(format!("{input}\n").as_bytes()).await.unwrap();
+    drop(sin);
+    let out = tokio::time::timeout(Duration::from_secs(30), child.wait_with_output()).await.unwrap().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let replies: Vec<Value> =
+        String::from_utf8(out.stdout).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!(replies.len(), 6, "{replies:?}");
+
+    let all: Vec<String> = dove::tools::registry().iter().map(|t| t.name.to_string()).collect();
+    let names = |r: &Value| -> Vec<String> {
+        r["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect()
+    };
+    // Before initialize: the legacy shape, without output schemas.
+    assert_eq!(replies[0]["id"], 1);
+    assert_eq!(names(&replies[0]), all);
+    assert!(replies[0]["result"]["tools"].as_array().unwrap().iter().all(|t| t.get("outputSchema").is_none()));
+
+    assert_eq!(replies[1]["id"], 2);
+    assert_eq!(replies[1]["result"]["protocolVersion"], "2025-06-18");
+    assert_eq!(replies[1]["result"]["serverInfo"]["name"], "dove");
+
+    // After negotiating 2025-06-18: every tool, including send and the requests tools that are off by default.
+    assert_eq!(replies[2]["id"], 3);
+    assert_eq!(names(&replies[2]), all);
+    for n in ["send_draft", "search_messages", "move_messages", "request_send"] {
+        assert!(all.iter().any(|a| a == n), "{n} missing");
+    }
+    for t in replies[2]["result"]["tools"].as_array().unwrap() {
+        assert!(t["inputSchema"].is_object() && t["outputSchema"].is_object(), "{t}");
+        assert!(t["annotations"]["readOnlyHint"].is_boolean(), "{t}");
+    }
+
+    assert_eq!(replies[3]["id"], 4);
+    assert_eq!(replies[3]["result"]["isError"], true);
+    assert!(replies[3]["result"]["content"][0]["text"].as_str().unwrap().contains("catalog mode"));
+    assert_eq!(replies[4]["error"]["code"], -32700);
+    assert_eq!(replies[5]["error"]["code"], -32601);
+
+    // Nothing written: no config, no credential store, no cache.
+    assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
+}

@@ -11,3 +11,5 @@
 docs
 tests
 deploy
+# The binary embeds the release signing key (src/update); keep that one file in the build context.
+!deploy/release/minisign.pub

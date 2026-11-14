@@ -1,5 +1,5 @@
 # The toolchain used for development, CI and release builds. Bump it deliberately (and `rust-version` in Cargo.toml,
-# the toolchain in .github/workflows/*.yml and the rust image in deploy/Containerfile) in one commit.
+# the toolchain in .github/workflows/*.yml and the rust image in deploy/Containerfile and Dockerfile) in one commit.
 [toolchain]
 channel = "1.100.0"
 components = ["rustfmt", "clippy"]

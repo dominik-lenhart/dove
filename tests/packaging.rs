@@ -412,3 +412,26 @@ fn install_ps1_compares_the_whole_trusted_comment_line() {
     assert!(ps1.contains(r#"-ccontains "Trusted comment: dove $tag""#), "exact line check missing");
     assert!(!ps1.contains(r#".Contains("dove $tag")"#), "substring check is back");
 }
+
+/// The root Dockerfile (registry catalog image) builds with the same pinned images as the server image, the rust
+/// image matches rust-toolchain.toml, and it runs the catalog, never the service.
+#[test]
+fn catalog_dockerfile_matches_the_server_image() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let read = |p: &str| std::fs::read_to_string(format!("{root}/{p}")).unwrap();
+    let froms = |s: &str| -> Vec<String> {
+        s.lines().filter_map(|l| l.strip_prefix("FROM ")).map(|l| l.split(' ').next().unwrap().to_string()).collect()
+    };
+    let catalog = read("Dockerfile");
+    let server = froms(&read("deploy/Containerfile"));
+    for image in froms(&catalog) {
+        assert!(server.contains(&image), "Dockerfile uses {image}, deploy/Containerfile does not");
+    }
+    let channel = read("rust-toolchain.toml")
+        .lines()
+        .find_map(|l| l.strip_prefix("channel = ").map(|v| v.trim_matches('"').to_string()))
+        .unwrap();
+    assert!(catalog.contains(&format!("FROM rust:{channel}-")), "rust image does not match toolchain {channel}");
+    assert!(catalog.contains(r#"ENTRYPOINT ["/usr/local/bin/dove", "mcp", "catalog"]"#));
+    assert!(!catalog.lines().any(|l| l.starts_with("CMD")), "a CMD would replace the catalog arguments");
+}

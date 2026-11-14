@@ -205,6 +205,8 @@ Agents that live in a terminal can use the same tools through the CLI (`dove log
 `dove watch listen` wakes a CLI agent when mail arrives: it pulls watch events over outgoing HTTPS and runs a fixed
 command once per event (for example `claude -p --resume <session-id>`), passing only ids, never mail content, so the
 agent's machine needs no open port. See [Waking an agent on new mail](docs/deployment.md#waking-an-agent-on-new-mail-dove-watch-listen).
+`dove mcp catalog` only lists the tools, with no server or mailbox behind it; the root `Dockerfile` runs it for MCP
+registries such as Glama.
 
 ## Permissions
 

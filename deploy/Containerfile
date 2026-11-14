@@ -13,6 +13,8 @@ FROM rust:1.100.0-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rustfmt.toml ./
 COPY src ./src
+# Embedded by src/update (the release signing key `dove upgrade` trusts).
+COPY deploy/release/minisign.pub ./deploy/release/minisign.pub
 # Cargo needs the [dev-dependencies] self reference to resolve; the tests directory is not part of a release build.
 RUN cargo build --release --locked --bin dove \
  && install -D -m 0755 target/release/dove /out/usr/local/bin/dove \

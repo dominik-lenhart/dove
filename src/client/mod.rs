@@ -5,6 +5,7 @@
 //! path to the admin socket or admin verbs (checked by a test), and no flag selects another transport, so a remote
 //! command can never exceed the rights of its connection.
 
+pub mod catalog;
 pub mod install;
 pub mod loopback;
 pub mod profile;
@@ -324,6 +325,9 @@ pub enum McpCmd {
         #[arg(long)]
         profile: Option<String>,
     },
+    /// Describe Dove's tools over stdio without a server or mailboxes (for MCP registries such as Glama). Every
+    /// tool call is refused.
+    Catalog,
 }
 
 /// Runs a remote command. Never touches the admin socket.
@@ -378,6 +382,7 @@ pub async fn run(cmd: RemoteCmd) -> anyhow::Result<()> {
             let (_, p, token) = load(profile.as_deref())?;
             stdio::run(&p.server, token).await
         }
+        RemoteCmd::Mcp(McpCmd::Catalog) => catalog::run().await,
         RemoteCmd::ConnectInfo { profile, server } => connect_info(profile.as_deref(), server.as_deref()).await,
     }
 }
@@ -1053,6 +1058,7 @@ mod tests {
             ("profile.rs", include_str!("profile.rs")),
             ("remote.rs", include_str!("remote.rs")),
             ("stdio.rs", include_str!("stdio.rs")),
+            ("catalog.rs", include_str!("catalog.rs")),
             ("install.rs", include_str!("install.rs")),
         ] {
             let code = src.split("#[cfg(test)]").next().unwrap();

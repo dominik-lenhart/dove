@@ -476,4 +476,9 @@ cargo fmt
   A change to `query.rs` or the index schema should be checked with `DOVE_BENCH_FAST=1 DOVE_BENCH_EXPLAIN=1
   DOVE_BENCH_MESSAGES=50000 heavy cargo test --release --test bench_index -- --ignored --nocapture bench_index`
   (about 3 min); latency of large result sets grows with the match count because the plans materialize and sort them.
-
+- 2026-11-14: The root `Dockerfile` is for MCP registries only (Glama builds it on every commit and calls `tools/list`
+  over stdio): it runs `dove mcp catalog` (`src/client/catalog.rs`, all tools through `tools::catalog`, every call
+  refused, nothing opened). The server image is `deploy/Containerfile`; `tests/packaging.rs` keeps both on the same
+  pinned images. `.dockerignore` excludes `deploy/`, so a file under it that the binary embeds (`include_str!`, such
+  as `deploy/release/minisign.pub`) needs a `!` exception and a `COPY` in both files, or the image build fails. Check
+  with `heavy docker build -t dove-t-catalog:local .` and pipe an `initialize` + `tools/list` into `docker run -i`.

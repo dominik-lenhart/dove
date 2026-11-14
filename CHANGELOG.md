@@ -5,6 +5,17 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 
 ## [Unreleased]
 
+### Added
+
+- `dove mcp catalog` describes every tool over stdio without a server, mailboxes, keys or network, and refuses every
+  tool call. The new root `Dockerfile` runs it, so MCP registries such as Glama can build Dove, list its tools and
+  score them.
+
+### Fixed
+
+- `deploy/Containerfile` failed to build from source: `.dockerignore` left out `deploy/release/minisign.pub`, which the
+  binary embeds.
+
 ## [0.10.0] - 2026-11-14
 
 ### Added

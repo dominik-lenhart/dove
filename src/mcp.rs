@@ -167,11 +167,24 @@ impl DenialTracker {
     }
 }
 
-fn rpc_error(id: Value, code: i64, message: &str) -> Value {
+/// The `initialize` result for the requested protocol version, and the version it negotiated.
+pub fn initialize_result(params: &Value) -> (Value, &'static str) {
+    let requested = params["protocolVersion"].as_str().unwrap_or("");
+    let negotiated = SUPPORTED_VERSIONS.iter().copied().find(|v| *v == requested).unwrap_or(SUPPORTED_VERSIONS[0]);
+    let result = json!({
+        "protocolVersion": negotiated,
+        "capabilities": { "tools": { "listChanged": false } },
+        "serverInfo": { "name": "dove", "title": "Dove mail", "version": env!("CARGO_PKG_VERSION") },
+        "instructions": INSTRUCTIONS,
+    });
+    (result, negotiated)
+}
+
+pub fn rpc_error(id: Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
 
-fn rpc_result(id: Value, result: Value) -> Value {
+pub fn rpc_result(id: Value, result: Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "result": result })
 }
 
@@ -314,19 +327,7 @@ async fn dispatch(app: &Arc<App>, ctx: &ClientCtx, version: &str, msg: Value) ->
     let id = msg.get("id").cloned()?; // notifications get no response
     let params = msg.get("params").cloned().unwrap_or(json!({}));
     Some(match method {
-        "initialize" => {
-            let requested = params["protocolVersion"].as_str().unwrap_or("");
-            let negotiated = if SUPPORTED_VERSIONS.contains(&requested) { requested } else { SUPPORTED_VERSIONS[0] };
-            rpc_result(
-                id,
-                json!({
-                    "protocolVersion": negotiated,
-                    "capabilities": { "tools": { "listChanged": false } },
-                    "serverInfo": { "name": "dove", "title": "Dove mail", "version": env!("CARGO_PKG_VERSION") },
-                    "instructions": INSTRUCTIONS,
-                }),
-            )
-        }
+        "initialize" => rpc_result(id, initialize_result(&params).0),
         "ping" => rpc_result(id, json!({})),
         "tools/list" => rpc_result(id, json!({ "tools": tools::list(&app.cfg, ctx, version >= STRUCTURED_SINCE) })),
         "tools/call" => {
