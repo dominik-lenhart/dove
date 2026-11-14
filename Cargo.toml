@@ -48,6 +48,8 @@ getrandom = "0.4"
 zeroize = { version = "1.9", features = ["zeroize_derive"] }
 base64 = "0.23"
 jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
+# Admin UI passkeys (WebAuthn ES256/EdDSA verification, PLAN A73). Already in the tree through rustls; same version.
+aws-lc-rs = { version = "1.19", default-features = false, features = ["aws-lc-sys"] }
 
 # Mail
 mail-builder = "2"

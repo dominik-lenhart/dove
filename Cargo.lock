@@ -834,6 +834,7 @@ name = "dove-mcp"
 version = "0.11.0"
 dependencies = [
  "anyhow",
+ "aws-lc-rs",
  "axum",
  "base64 0.23.1",
  "chacha20poly1305",

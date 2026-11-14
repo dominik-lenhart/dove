@@ -1,6 +1,7 @@
 //! Dove: a self-hosted mail MCP server for AI agents. See `docs/spec.md`.
 
 pub mod admin;
+pub mod admin_ui;
 pub mod app;
 pub mod attachment_text;
 pub mod audit;
