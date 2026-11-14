@@ -829,12 +829,27 @@ impl From<LateArg> for crate::admin::Late {
 /// screen the operator approves from.
 pub fn terminal_safe(s: &str) -> String {
     s.chars()
-        .map(|c| {
-            let bidi =
-                matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}' | '\u{061C}');
-            if (c.is_control() && c != '\n' && c != '\t') || bidi { '\u{FFFD}' } else { c }
-        })
+        .map(|c| if (c.is_control() && c != '\n' && c != '\t') || is_bidi_control(c) { '\u{FFFD}' } else { c })
         .collect()
+}
+
+/// Bidirectional embeddings, overrides, isolates and marks.
+fn is_bidi_control(c: char) -> bool {
+    matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}' | '\u{061C}')
+}
+
+/// JSON output for a terminal: serde escapes C0 controls but writes DEL, C1 controls (U+0080 to U+009F) and bidi
+/// controls raw. Those can only sit inside JSON strings, so they become `\uXXXX` escapes: the value is unchanged.
+fn json_text(value: &Value) -> String {
+    let mut out = String::new();
+    for c in serde_json::to_string_pretty(value).unwrap_or_default().chars() {
+        if (c.is_control() && c != '\n') || is_bidi_control(c) {
+            out.push_str(&format!("\\u{:04X}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Renders `requests show` for the operator's terminal.
@@ -1161,7 +1176,7 @@ fn admin_request(cmd: Command) -> anyhow::Result<(AdminOpts, AdminRequest)> {
 
 fn print(value: &Value, json: bool) {
     if json {
-        println!("{}", serde_json::to_string_pretty(value).unwrap_or_default());
+        println!("{}", json_text(value));
         return;
     }
     // Human output: YAML-like rendering of the JSON value, keeping secrets shown once where returned.
@@ -1467,6 +1482,16 @@ mod tests {
         assert_eq!((id.as_str(), items), ("r_3", Some(vec![1])));
         let (_, req) = admin_request(parse(&["requests", "cancel", "r_3"]).unwrap().command).unwrap();
         assert!(matches!(req, AdminRequest::RequestsCancel { items: None, .. }));
+    }
+
+    /// `--json` output keeps the value but never writes DEL, C1 or bidi controls raw.
+    #[test]
+    fn json_output_escapes_terminal_controls() {
+        let v = serde_json::json!({ "body_text": "a\u{7f}b\u{85}c\u{9b}31m\u{202E}d\u{2067}e\x1b[0m\n", "k\u{9d}": 1 });
+        let out = json_text(&v);
+        assert!(!out.chars().any(|c| (c.is_control() && c != '\n') || is_bidi_control(c)), "{out:?}");
+        assert!(out.contains("\\u009B") && out.contains("\\u202E"), "{out}");
+        assert_eq!(serde_json::from_str::<Value>(&out).unwrap(), v);
     }
 
     /// Draft text is untrusted: escape sequences and bidi overrides never reach the operator's terminal raw.

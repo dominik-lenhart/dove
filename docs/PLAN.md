@@ -681,4 +681,8 @@ hosts or reference hardware.
   body is truncated (or reports no truncation flag), with no override (`admin::approvable`). (m) Inside the
   approval transaction Dove also refuses a request past `expires_at` that the tick has not marked yet, and a
   connection that no longer holds `draft` on the mailbox (revoked or expired connections included), instead of
-  approving items that could only end as `access_lost`.
+  approving items that could only end as `access_lost`. (n) `--json` output of every admin command escapes DEL, C1
+  controls and bidi controls as `\uXXXX` (`cli::json_text`; serde writes them raw), so it is as safe in a terminal
+  as the text mode. Thread matching of `unless_reply` fails open in three cases, listed in docs/deployment.md: a
+  thread the provider split, an IMAP reply with only `In-Reply-To` whose original was itself a reply, and a reply
+  whose server arrival date predates the request.

@@ -801,9 +801,14 @@ At its time an approved item is sent through the same path as `send_draft`, afte
 approved, the client is not revoked and still has `draft` on the mailbox, the mailbox is active, and the draft has
 exactly the approved revision and is still Dove's own. A changed or deleted draft ends as `failed` (`draft_changed`,
 `not_found`) and nothing is sent. A reply-guarded item (`unless_reply`) is skipped when someone other than the owner
-answered in the thread since the request; it needs an index synced within the last 10 minutes, otherwise Dove asks
-for a sync and waits, and skips the item (`condition_unknown`) when the grace runs out. An item that could not be
-sent within `late_grace_minutes` ends as `missed`. A send whose outcome is unknown (lost reply, restart while sending)
+answered in the thread since the request, also when that answer is already in Trash or Spam; it needs an index synced
+within the last 10 minutes with no message waiting for a retry (a message whose download failed could be the reply),
+otherwise Dove asks for a sync and waits, and skips the item (`condition_unknown`) when the grace runs out. The
+reply check matches by thread, so it misses a reply (and sends) in a thread the provider split, an IMAP reply that
+carries only `In-Reply-To` when the original was itself a reply, and a reply whose arrival date on the server is
+older than the request. An item that could not be sent within `late_grace_minutes` ends as `missed`; a send that
+started at the end of the grace can take up to the tool-call budget, so mail goes out at most
+`late_grace_minutes` plus `limits.tool_call_timeout_secs` after its time. A send whose outcome is unknown (lost reply, restart while sending)
 ends as `send_unknown` and is never retried: check the Sent folder. Revoking the client, disabling or removing the
 mailbox cancels its open items. The agent sees each item's state with `list_requests`; every decision and every
 item outcome writes one audit record without mail content (`request.*`, actor `scheduler` for the worker).
