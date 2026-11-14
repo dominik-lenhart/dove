@@ -431,7 +431,8 @@ mod tests {
 
     /// Variant names of `AdminRequest`, read from its source (4-space indented CamelCase lines inside the enum).
     fn variants() -> BTreeSet<String> {
-        let src = include_str!("../admin/mod.rs");
+        // Windows checkouts have CRLF line endings.
+        let src = include_str!("../admin/mod.rs").replace("\r\n", "\n");
         let body = src.split("pub enum AdminRequest {").nth(1).unwrap().split("\n}\n").next().unwrap();
         body.lines()
             .filter(|l| l.starts_with("    ") && !l.starts_with("     "))
