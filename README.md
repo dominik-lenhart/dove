@@ -89,22 +89,40 @@ You need a Linux server you control and an HTTPS name for it (or Tailscale). Abo
 
 **1. Install**
 
+On the server that runs the service, install as root so the binary is root-owned:
+
 ```sh
 curl -fsSL https://github.com/dominik-lenhart/dove/releases/latest/download/install.sh | sudo sh
 ```
 
-The installer picks the build for your OS and CPU (a static musl build on Alpine and other musl systems) and checks
-its SHA-256 and, when `minisign` is installed, its signature. Other ways to get the same binary:
+The service binary stays root-owned on purpose: the operator account may run agents, and an agent must not be able to
+replace the program that holds the vault keys. The installer picks the build for your OS and CPU (a static musl
+build on Alpine and other musl systems) and checks its SHA-256 and, when `minisign` is installed, its signature.
 
-- Debian and Ubuntu: download `dove_<version>_amd64.deb` or `_arm64.deb` from the
+On your own computer (the `dove` CLI, local mode, `dove mcp install`) install without sudo. This puts the binary in
+`~/.local/bin`, owned by you, so `dove upgrade` later needs no root either:
+
+```sh
+curl -fsSL https://github.com/dominik-lenhart/dove/releases/latest/download/install.sh | sh
+```
+
+If `~/.local/bin` is not in your `PATH`, the installer prints the line to add to your shell file; it never edits
+one. Other ways to get the same binary:
+
+- Debian and Ubuntu (server): download `dove_<version>_amd64.deb` or `_arm64.deb` from the
   [latest release](https://github.com/dominik-lenhart/dove/releases/latest) and run `sudo apt install ./dove_*.deb`.
   It installs the binary, the systemd unit and the `dove` service account, and creates `/etc/dove`; it generates no
   secrets and starts nothing.
-- Homebrew (macOS and Linux): `brew install dominik-lenhart/tap/dove`. This installs the binary only, no service.
+- Homebrew (macOS and Linux, your own computer): `brew install dominik-lenhart/tap/dove`, update with
+  `brew upgrade dove`. This installs the binary only, no service. `dove upgrade` leaves a Homebrew install alone and
+  points you to `brew upgrade dove`.
 - Windows: `irm https://github.com/dominik-lenhart/dove/releases/latest/download/install.ps1 | iex`. It installs
-  `dove.exe` for the current user, no administrator rights needed. Windows builds are not part of the releases until
-  the Windows port is released, see the [changelog](CHANGELOG.md).
+  `dove.exe` for the current user, no administrator rights needed, and `dove upgrade` updates it without them. Windows
+  builds are not part of the releases until the Windows port is released, see the [changelog](CHANGELOG.md).
 - Container: `ghcr.io/dominik-lenhart/dove` (amd64, arm64) with the Compose file in [`deploy/`](deploy/).
+
+Already installed with `sudo`, and `dove upgrade` says the directory is not writable? Remove the root-owned binary
+(`sudo rm /usr/local/bin/dove`) and rerun the installer without sudo.
 
 **2. Configure and start**
 
@@ -224,7 +242,9 @@ front of it. Report vulnerabilities privately as described in [`SECURITY.md`](SE
 ## Updates
 
 ```sh
-sudo dove upgrade && sudo systemctl restart dove
+sudo dove upgrade && sudo systemctl restart dove    # server: the binary is root-owned
+dove upgrade                                        # your own computer, installed without sudo
+brew upgrade dove                                   # installed with Homebrew
 ```
 
 Releases are signed with minisign, and `dove upgrade` verifies the signature against the key built into the binary

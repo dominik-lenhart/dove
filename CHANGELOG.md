@@ -5,6 +5,20 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 
 ## [Unreleased]
 
+### Changed
+
+- Installing and updating the client no longer needs root. The README and the deployment guide now separate the
+  server install (`| sudo sh`, root-owned binary, `sudo dove upgrade`) from the client install (`| sh`, `~/.local/bin`,
+  `dove upgrade` without sudo, or Homebrew). `install.sh` prints the `PATH` line for your shell (zsh, bash, fish,
+  others) when its target directory is not in `PATH`, still without touching shell files, and its closing hint
+  says `dove upgrade` without sudo after a user install.
+- `dove upgrade` on a binary in a directory you cannot write now names both ways out: `sudo dove upgrade` on a server,
+  and for your own computer how to switch to a user install (remove the root-owned binary, rerun `install.sh`
+  without sudo, keep `~/.local/bin` in `PATH`).
+- `dove upgrade` refuses to replace a binary installed by Homebrew (inside a `Cellar/dove/` directory, also when
+  reached through the `bin` symlink) and points to `brew upgrade dove`; the daily new-version notice and
+  `dove upgrade --check` say that command for Homebrew installs.
+
 ## [0.8.0] - 2026-11-14
 
 ### Added
