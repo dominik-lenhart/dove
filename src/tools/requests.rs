@@ -33,7 +33,8 @@ pub fn defs() -> Vec<ToolDef> {
             name: "request_send",
             title: "Ask to send drafts on a schedule",
             description: concat!(
-                "Ask the owner to send drafts this project created, at given times. Nothing is sent until the owner ",
+                "Ask the owner to send drafts this project created, at given times. Use it when you lack send rights ",
+                "(send_draft needs them) or want a send scheduled. Nothing is sent until the owner ",
                 "approves; the owner sees each draft as it is then, and only that exact revision is ever sent (changing ",
                 "a draft afterwards makes its item fail with draft_changed). Needs draft rights on the mailbox, not send ",
                 "rights. Give send_at (RFC 3339 with offset, in the future, at most 30 days out) on every item, or one ",
@@ -73,7 +74,8 @@ pub fn defs() -> Vec<ToolDef> {
             name: "request_access",
             title: "Ask for more access",
             description: concat!(
-                "Ask the owner for rights on mailboxes of this project: read, draft, organize, delete, send or a preset ",
+                "Ask the owner for lasting or temporary rights on mailboxes of this project (to have one draft sent, use ",
+                "request_send instead): read, draft, organize, delete, send or a preset ",
                 "(reader, drafter, assistant, full), e.g. actions \"read,draft\". With duration_minutes (1 to 43200, ",
                 "30 days) the rights end on their own; without it the request is for a permanent grant. Nothing changes ",
                 "until the owner approves; the owner may shorten the time or leave out mailboxes. The owner tells you ",

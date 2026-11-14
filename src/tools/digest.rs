@@ -24,7 +24,8 @@ pub fn defs() -> Vec<ToolDef> {
         title: "Mail digest",
         description: concat!(
             "Recent mail grouped by thread, newest first: thread id, subject, senders, message count, newest ",
-            "received_at, unread, category and a short snippet. `since` (RFC 3339 instant, a date like 2026-11-01 or a span like 7d; at most a year back) is required; ",
+            "received_at, unread, category and a short snippet. Use it for an overview of what arrived in a period; ",
+            "to find mail by sender, subject, text or label use search_messages. `since` (RFC 3339 instant, a date like 2026-11-01 or a span like 7d; at most a year back) is required; ",
             "`folders` defaults to INBOX (label ids or folder names as in list_labels); `category` filters to personal, ",
             "newsletter, notification or calendar mail. Resume with `cursor` only. If this connection hides secrets, ",
             "passwords, keys and one-time codes in subjects and snippets read [redacted] and the thread has ",

@@ -10,6 +10,9 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 - Clearer descriptions for `list_accounts`, `list_labels`, `get_thread`, `get_draft`, `list_drafts`, `list_watches`,
   `delete_watch`, `list_requests` and `cancel_request`: each says when to use it instead of a neighbouring tool, what
   it returns when an id is unknown, and (for `get_thread`) how a result cut by the size budget is marked.
+- The other tool descriptions now name the neighbouring tool to use instead (for example `move_messages` vs
+  `update_messages`, `send_draft` vs `request_send`, `digest` vs `search_messages`), and the draft tools say where a
+  revision comes from and what to do after `draft_conflict`.
 
 ## [0.12.0] - 2026-11-14
 

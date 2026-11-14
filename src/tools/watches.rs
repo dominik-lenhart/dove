@@ -107,7 +107,8 @@ pub fn defs() -> Vec<ToolDef> {
             name: "list_watch_events",
             title: "List watch events",
             description: concat!(
-                "Events of this connection's watches, oldest first, kept 14 days. Pass the returned `next_cursor` on ",
+                "Events of this connection's watches (what they matched; list_watches shows the watches themselves), ",
+                "oldest first, kept 14 days. The first call without a cursor returns the oldest kept events. Pass the returned `next_cursor` on ",
                 "the next call to get only newer events (it is returned even when there are none). Optional watch_id ",
                 "narrows to one watch. Each event: event_id, watch_id, kind, account, message_id, thread_id, ",
                 "received_at; read the message with get_message(account, message_id)."

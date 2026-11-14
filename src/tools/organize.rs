@@ -66,7 +66,8 @@ pub fn defs() -> Vec<ToolDef> {
                 "Mark messages read or unread, star or unstar them, and add or remove labels (Gmail user labels; IMAP ",
                 "keywords). Flags: UNREAD, STARRED. At most 100 ids per call; each id gets its own result. ",
                 "Labels must already exist on Gmail. IMAP keywords with junk or spam in the name ($Junk, $NotJunk) ",
-                "train spam filters and need the delete permission. To move, archive or trash, use move_messages."
+                "train spam filters and need the delete permission. Changes can be undone with the opposite call (spam-filter ",
+                "training cannot). To move, archive or trash, use move_messages."
             ),
             capability: Capability::Organize,
             read_only: false,
@@ -92,7 +93,7 @@ pub fn defs() -> Vec<ToolDef> {
                 "Move messages to a folder (IMAP) or label (Gmail), or to one of: archive, inbox, trash, spam. Moving ",
                 "into Trash or Spam, or out of Spam, needs the delete permission; out of Trash only organize. Trash is ",
                 "recoverable; Dove never deletes permanently. IMAP message ids change on a move: use new_id. At most ",
-                "100 ids per call."
+                "100 ids per call. To mark read, star or label without moving, use update_messages."
             ),
             capability: Capability::Organize,
             read_only: false,

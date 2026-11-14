@@ -66,7 +66,8 @@ pub fn defs() -> Vec<ToolDef> {
                 "inferred. If the operator set a signature for the sender it is appended after body_text (before a ",
                 "quote or forward block) unless you pass signature: false; update_draft never adds it again. ",
                 "Generate a fresh UUID request_key per intent and reuse it only to retry the same request. ",
-                "The owner reviews and sends it in Apple Mail unless send rights exist."
+                "The owner reviews and sends it in their mail app unless send rights exist. Change it with update_draft; ",
+                "send it with send_draft when you have send rights, otherwise ask the owner with request_send."
             ),
             capability: Capability::Draft,
             read_only: false,
@@ -105,7 +106,9 @@ pub fn defs() -> Vec<ToolDef> {
             description: concat!(
                 "Patch a draft this project created, conditional on expected_revision. Omitted fields are kept, ",
                 "including attachments; changes.attachments replaces the whole list ([] removes all). ",
-                "Fails with draft_conflict if the draft changed elsewhere (for example saved in Apple Mail)."
+                "Fails with draft_conflict if the draft changed elsewhere (for example saved in a mail app) or the ",
+                "revision is stale; re-read it with get_draft before trying again. Only drafts created by create_draft ",
+                "can be patched; for any other draft create a new one."
             ),
             capability: Capability::Draft,
             read_only: false,
@@ -134,8 +137,11 @@ pub fn defs() -> Vec<ToolDef> {
             name: "send_draft",
             title: "Send draft",
             description: concat!(
-                "Send one existing draft this project created, unchanged since expected_revision. Only available when ",
-                "the operator enabled sending and granted send on this mailbox. Accepts no recipients or content."
+                "Send one existing draft this project created, unchanged since expected_revision (from get_draft or the ",
+                "last update_draft); a mismatch fails with draft_conflict. Only listed when the operator enabled ",
+                "sending and granted send on this mailbox; otherwise ask the owner with request_send, which also ",
+                "schedules. Accepts no recipients or content. outcome_unknown means the mail may have gone out: never ",
+                "retry it, check Sent."
             ),
             capability: Capability::Send,
             read_only: false,
@@ -161,7 +167,8 @@ pub fn defs() -> Vec<ToolDef> {
             description: concat!(
                 "Delete a draft this project created and nobody changed since (optionally conditional on ",
                 "expected_revision). Gmail moves it to Trash; IMAP removes it from Drafts. Drafts written or changed ",
-                "by a person are never deleted (draft_conflict)."
+                "by a person are never deleted (draft_conflict), and a stale expected_revision fails the same way; leave ",
+                "such drafts to the owner. Unknown draft ids return not_found."
             ),
             capability: Capability::Draft,
             read_only: false,
