@@ -925,7 +925,57 @@ async fn send_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
     let mb = account_arg(cx, &args, Capability::Send)?.clone();
     let draft_id = gmail_id_arg(&args, "draft_id")?.to_string();
     let expected = arg_str(&args, "expected_revision")?.to_string();
-    let own = own_row(cx, &mb, &draft_id).await?;
+    let Sent { sent_message_id: sent_id, thread_id } =
+        send_core(cx, &mb, &draft_id, &expected, SendAuth::Grant).await?;
+    let mut ids = vec![draft_id.clone()];
+    ids.extend(sent_id.clone());
+    Ok(ToolOutput {
+        extra: Vec::new(),
+        text: match &sent_id {
+            Some(s) => format!("Sent draft {draft_id} as message {s}."),
+            None => format!("Sent draft {draft_id}."),
+        },
+        structured: json!({ "account": mb.alias, "draft_id": draft_id, "sent_message_id": sent_id, "thread_id": thread_id }),
+        audit: AuditInfo {
+            account: Some(mb.alias.clone()),
+            object_ids: ids,
+            result_count: Some(1),
+            ..Default::default()
+        },
+    })
+}
+
+/// What authorizes a send in [`send_core`].
+#[allow(dead_code)] // `Approved` is used by `requests::worker` (next commit).
+pub(crate) enum SendAuth {
+    /// `send_draft`: the instance gate `allow_send` and the `send` action on the mailbox, re-read before dispatch,
+    /// and the per-client `client_sends_per_hour` budget.
+    Grant,
+    /// A scheduled send the operator approved (`requests::worker`): the client is still live and still has `draft`
+    /// on the active mailbox. Neither `allow_send` nor `send` is needed, and the hourly budget is not charged (the
+    /// approval and `limits.scheduled_sends_per_day` bound it).
+    Approved,
+}
+
+/// A completed send.
+pub(crate) struct Sent {
+    pub sent_message_id: Option<String>,
+    pub thread_id: Value,
+}
+
+/// Sends one draft of `cx.client`'s project on `mb`, unchanged since `expected`: ownership and revision checks on a
+/// fresh read, the authorization re-check of `auth` right before dispatch, the send claim recorded before the
+/// upstream write, outcome classification (spec 6.3) and, for IMAP, the Sent copy. Takes no part in
+/// `policy::authorize`: the caller has authorized the call (tool) or the item (worker).
+pub(crate) async fn send_core(
+    cx: &ToolCx,
+    mb: &Mailbox,
+    draft_id: &str,
+    expected: &str,
+    auth: SendAuth,
+) -> Result<Sent, ToolError> {
+    let draft_id = draft_id.to_string();
+    let own = own_row(cx, mb, &draft_id).await?;
     match own.state.as_str() {
         "active" => {}
         "sent" => return Err(ToolError::not_found()),
@@ -938,7 +988,7 @@ async fn send_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
     }
     let lock = cx.app.draft_locks.get(&mb.account_id, &draft_id);
     let _guard = lock.lock().await;
-    let own = own_row(cx, &mb, &draft_id).await?;
+    let own = own_row(cx, mb, &draft_id).await?;
     if own.state != "active" {
         return Err(ToolError::new(
             ErrorCode::OutcomeUnknown,
@@ -948,24 +998,26 @@ async fn send_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
     // IMAP: fresh check, envelope and credentials are prepared before the send is claimed.
     let imap = match mb.provider {
         Provider::Gmail => {
-            fresh_checked(cx, &mb, &draft_id, &own, &expected).await?;
+            fresh_checked(cx, mb, &draft_id, &own, expected).await?;
             None
         }
-        Provider::Imap => Some(super::drafts_imap::prepare_send(cx, &mb, &own, &expected).await?),
+        Provider::Imap => Some(super::drafts_imap::prepare_send(cx, mb, &own, expected).await?),
     };
 
     // Recheck policy immediately before dispatch from the durable store (spec 6.3).
     let (cid, aid) = (cx.client.client_id.clone(), mb.account_id.clone());
     let allow_send = cx.app.cfg.allow_send;
+    let approved = matches!(auth, SendAuth::Approved);
     let still_allowed = cx
         .app
         .store
         .call(move |c| {
             let mbs = crate::policy::load_mailboxes(c, &cid)?;
             let epoch_ok = crate::policy::current_epoch(c, &cid)?.is_some();
-            Ok(epoch_ok
-                && allow_send
-                && mbs.iter().any(|m| m.account_id == aid && m.actions.send && m.status == "active"))
+            let granted = |m: &Mailbox| {
+                if approved { m.actions.draft } else { allow_send && m.actions.send }
+            };
+            Ok(epoch_ok && mbs.iter().any(|m| m.account_id == aid && granted(m) && m.status == "active"))
         })
         .await?;
     if !still_allowed {
@@ -975,11 +1027,13 @@ async fn send_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
     // means nothing is charged or claimed.
     cx.commit()?;
     // Separate budget from reads (spec 6.3), charged only for submissions: `client_sends_per_hour`, bursts ≤5.
-    let per_hour = cx.app.cfg.limits.client_sends_per_hour;
-    if let Some(wait) =
-        cx.app.rate_limiter.check_hourly(&format!("send:{}", cx.client.client_id), per_hour, per_hour.clamp(1, 5))
-    {
-        return Err(ToolError::rate_limited(Some(wait)));
+    if !approved {
+        let per_hour = cx.app.cfg.limits.client_sends_per_hour;
+        if let Some(wait) =
+            cx.app.rate_limiter.check_hourly(&format!("send:{}", cx.client.client_id), per_hour, per_hour.clamp(1, 5))
+        {
+            return Err(ToolError::rate_limited(Some(wait)));
+        }
     }
     // Persist the in-flight state atomically before dispatch: at most one submission (spec 6.3).
     let (aid, did, rev) = (mb.account_id.clone(), draft_id.clone(), own.message_id.clone());
@@ -1006,7 +1060,7 @@ async fn send_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
                 .map(|v| (v["id"].as_str().map(str::to_string), v["threadId"].clone()))
                 .map_err(|WriteError { error, .. }| error)
         }
-        Some(p) => super::drafts_imap::submit(cx, &mb, p).await.map(|()| (None, json!(p.thread_id))),
+        Some(p) => super::drafts_imap::submit(cx, mb, p).await.map(|()| (None, json!(p.thread_id))),
     };
     let (aid, did) = (mb.account_id.clone(), draft_id.clone());
     match res {
@@ -1024,26 +1078,11 @@ async fn send_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
                 .await;
             // IMAP: the Sent copy and the draft's removal happen only after the send is recorded.
             let sent_id = match imap {
-                Some(p) => super::drafts_imap::after_send(cx, &mb, &draft_id, p).await,
+                Some(p) => super::drafts_imap::after_send(cx, mb, &draft_id, p).await,
                 None => sent_id,
             };
             crate::index::wake(&cx.app, &mb.account_id);
-            let mut ids = vec![draft_id.clone()];
-            ids.extend(sent_id.clone());
-            Ok(ToolOutput {
-                extra: Vec::new(),
-                text: match &sent_id {
-                    Some(s) => format!("Sent draft {draft_id} as message {s}."),
-                    None => format!("Sent draft {draft_id}."),
-                },
-                structured: json!({ "account": mb.alias, "draft_id": draft_id, "sent_message_id": sent_id, "thread_id": thread_id }),
-                audit: AuditInfo {
-                    account: Some(mb.alias.clone()),
-                    object_ids: ids,
-                    result_count: Some(1),
-                    ..Default::default()
-                },
-            })
+            Ok(Sent { sent_message_id: sent_id, thread_id })
         }
         Err(e) => {
             // Not dispatched or definitively rejected: safe to retry. Anything uncertain blocks resubmission.
