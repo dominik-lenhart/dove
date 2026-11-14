@@ -91,6 +91,34 @@ pub fn parse_rfc3339_ms(s: &str) -> Option<i64> {
     Some((t.unix_timestamp_nanos() / 1_000_000) as i64)
 }
 
+/// Parses a calendar date `YYYY-MM-DD` (exactly that form) as the start of that UTC day, in unix milliseconds.
+pub fn parse_date_ms(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
+        return None;
+    }
+    let num = |r: std::ops::Range<usize>| -> Option<i32> {
+        let t = &s[r];
+        t.bytes().all(|c| c.is_ascii_digit()).then(|| t.parse().ok())?
+    };
+    let month = time::Month::try_from(u8::try_from(num(5..7)?).ok()?).ok()?;
+    let date = time::Date::from_calendar_date(num(0..4)?, month, u8::try_from(num(8..10)?).ok()?).ok()?;
+    Some(date.midnight().assume_utc().unix_timestamp() * 1000)
+}
+
+/// True for a date and time without a zone (`2026-11-01T10:00:00`, also with a space): ambiguous, so it is refused
+/// with a hint instead of being read as UTC.
+pub fn looks_like_local_datetime(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() >= 16
+        && parse_date_ms(&s[..10]).is_some()
+        && (b[10] == b'T' || b[10] == b' ')
+        && b[11..13].iter().all(u8::is_ascii_digit)
+        && b[13] == b':'
+        && !s.ends_with(['Z', 'z'])
+        && !s[11..].contains(['+', '-'])
+}
+
 /// Parses durations like `90d`, `12h`, `30m`, `45s`.
 pub fn parse_duration_secs(s: &str) -> Option<i64> {
     let s = s.trim();
@@ -141,5 +169,18 @@ mod tests {
         let ms = parse_rfc3339_ms("2026-10-01T00:00:00+02:00").unwrap();
         assert_eq!(rfc3339_ms(ms), "2026-09-30T22:00:00Z");
         assert!(parse_rfc3339_ms("2026-10-01T00:00:00").is_none());
+    }
+
+    #[test]
+    fn dates_are_strict_utc_days() {
+        assert_eq!(parse_date_ms("2026-10-01"), parse_rfc3339_ms("2026-10-01T00:00:00Z"));
+        for bad in ["2026-1-01", "2026-13-01", "2026-02-30", "20261001", "2026-10-01 ", "+026-10-01", "2026-10-0a"] {
+            assert!(parse_date_ms(bad).is_none(), "{bad}");
+        }
+        assert!(looks_like_local_datetime("2026-10-01T10:00:00"));
+        assert!(looks_like_local_datetime("2026-10-01 10:00"));
+        assert!(!looks_like_local_datetime("2026-10-01T10:00:00Z"));
+        assert!(!looks_like_local_datetime("2026-10-01T10:00:00+02:00"));
+        assert!(!looks_like_local_datetime("2026-10-01"));
     }
 }

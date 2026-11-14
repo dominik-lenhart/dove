@@ -72,6 +72,13 @@ impl ToolError {
     pub fn invalid(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::InvalidArgument, message)
     }
+    /// `invalid_argument` that names the offending argument. `field` is a path built from the tool's own structure
+    /// (`where.all[1].op`, `limit`), never from caller-supplied text, so it is safe to keep in the audit record. The
+    /// message starts with the path and says how to fix the call.
+    pub fn invalid_at(field: impl Into<String>, message: impl AsRef<str>) -> Self {
+        let field = field.into();
+        Self::invalid(format!("{field}: {}", message.as_ref())).with_details(json!({ "field": field }))
+    }
     pub fn internal() -> Self {
         Self::new(ErrorCode::Internal, "internal error")
     }
@@ -87,6 +94,48 @@ impl ToolError {
     pub fn with_details(mut self, details: Value) -> Self {
         self.details = Some(details);
         self
+    }
+
+    /// Adds one key to `details` (creating it).
+    pub fn with_detail(mut self, key: &str, value: Value) -> Self {
+        let d = self.details.get_or_insert_with(|| json!({}));
+        if let Some(o) = d.as_object_mut() {
+            o.insert(key.to_string(), value);
+        }
+        self
+    }
+
+    /// A valid example of the argument (`details.example`), for `invalid_argument` errors.
+    pub fn with_example(self, example: Value) -> Self {
+        self.with_detail("example", example)
+    }
+
+    /// The coarse, content-free kind of an `invalid_argument` error for the audit record: the argument path with
+    /// list indices removed (`where.all[].op`). `None` for other codes, errors without a path and anything that does
+    /// not look like a path built by [`ToolError::invalid_at`].
+    pub fn audit_field(&self) -> Option<String> {
+        if self.code != ErrorCode::InvalidArgument {
+            return None;
+        }
+        let f = self.details.as_ref()?.get("field")?.as_str()?;
+        let mut out = String::new();
+        let mut in_index = false;
+        for c in f.chars() {
+            match c {
+                '[' => {
+                    in_index = true;
+                    out.push('[');
+                }
+                ']' => {
+                    in_index = false;
+                    out.push(']');
+                }
+                _ if in_index => {}
+                'a'..='z' | '_' | '.' => out.push(c),
+                _ => return None,
+            }
+        }
+        (!out.is_empty() && out.len() <= 48).then_some(out)
     }
 
     pub fn to_json(&self) -> Value {
@@ -113,5 +162,27 @@ impl From<anyhow::Error> for ToolError {
             return te.clone();
         }
         internal_from(err)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audit_field_keeps_only_a_path_of_argument_names() {
+        let f = |field: &str| ToolError::invalid_at(field, "x").audit_field();
+        assert_eq!(f("where.all[12].op").as_deref(), Some("where.all[].op"));
+        assert_eq!(f("limit").as_deref(), Some("limit"));
+        // Anything that is not a plain path (caller text, digits, spaces, quotes) is dropped, never recorded.
+        for bad in ["Where", "where field", "where.\"x\"", "select2", "a@b.test", "", &"a".repeat(49)] {
+            assert_eq!(f(bad), None, "{bad}");
+        }
+        // Only invalid_argument carries a kind, and only when the error names a field.
+        assert_eq!(
+            ToolError::new(ErrorCode::NotFound, "x").with_details(json!({"field": "limit"})).audit_field(),
+            None
+        );
+        assert_eq!(ToolError::invalid("x").audit_field(), None);
     }
 }
