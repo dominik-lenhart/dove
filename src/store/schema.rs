@@ -12,6 +12,7 @@ pub const MIGRATIONS: &[&str] = &[
     V_WATCH_TARGETS,
     V_REQUESTS,
     V_ACCESS_GRANTS,
+    V_ADMIN_UI,
 ];
 
 const V1: &str = r#"
@@ -431,4 +432,42 @@ CREATE TABLE client_grant_extras (
 );
 CREATE INDEX client_grant_extras_expiry ON client_grant_extras(expires_at);
 CREATE INDEX client_grant_extras_request ON client_grant_extras(request_id);
+"#;
+
+/// Admin web UI (design 2026-11-14 section 5.2, PLAN A74).
+///
+/// - `admin_passkeys`: WebAuthn credentials of the owner. `label` is the audit actor (`web:<label>`), `credential_id`
+///   is unique, `public_key` is the SEC1 point (ES256) or the Ed25519 key, `user_handle` is random per passkey.
+/// - `admin_enrolments`: one-time enrolment links; only the SHA-256 of the token is stored.
+/// - `admin_sessions`: signed-in browsers; only the SHA-256 of the cookie token is stored. Removing a passkey ends its
+///   sessions.
+const V_ADMIN_UI: &str = r#"
+CREATE TABLE admin_passkeys (
+    id               TEXT PRIMARY KEY,
+    label            TEXT NOT NULL UNIQUE,
+    credential_id    BLOB NOT NULL UNIQUE,
+    user_handle      BLOB NOT NULL,
+    alg              INTEGER NOT NULL CHECK (alg IN (-7, -8)),
+    public_key       BLOB NOT NULL,
+    sign_count       INTEGER NOT NULL DEFAULT 0,
+    backup_eligible  INTEGER NOT NULL,
+    backup_state     INTEGER NOT NULL,
+    created_at       INTEGER NOT NULL,
+    last_used_at     INTEGER
+);
+CREATE TABLE admin_enrolments (
+    token_hash  BLOB PRIMARY KEY,
+    label       TEXT NOT NULL,
+    created_at  INTEGER NOT NULL,
+    expires_at  INTEGER NOT NULL,
+    used_at     INTEGER
+);
+CREATE TABLE admin_sessions (
+    id            TEXT PRIMARY KEY,
+    token_hash    BLOB NOT NULL UNIQUE,
+    passkey_id    TEXT NOT NULL REFERENCES admin_passkeys(id) ON DELETE CASCADE,
+    created_at    INTEGER NOT NULL,
+    expires_at    INTEGER NOT NULL,
+    last_seen_at  INTEGER NOT NULL
+);
 "#;

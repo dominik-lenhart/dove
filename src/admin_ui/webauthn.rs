@@ -405,12 +405,8 @@ mod tests {
         let v = vector("none-es256");
         assert_eq!(v.register(RP, true), Err(Error::UserVerified));
         let cred = v.register(RP, false).unwrap();
-        let stored = StoredCredential {
-            alg: cred.alg,
-            public_key: &cred.public_key,
-            sign_count: 0,
-            backup_eligible: true,
-        };
+        let stored =
+            StoredCredential { alg: cred.alg, public_key: &cred.public_key, sign_count: 0, backup_eligible: true };
         assert_eq!(
             verify_assertion(
                 RP,
@@ -492,11 +488,16 @@ mod tests {
         let ok = format!(r#"{{"type":"webauthn.get","challenge":"{c}","origin":"https://example.org"}}"#);
         assert_eq!(check_client_data(ok.as_bytes(), "webauthn.get", &ch, "https://example.org"), Ok(()));
         let cases = [
-            (format!(r#"{{"type":"webauthn.get","challenge":"{c}=","origin":"https://example.org"}}"#), Error::Challenge),
+            (
+                format!(r#"{{"type":"webauthn.get","challenge":"{c}=","origin":"https://example.org"}}"#),
+                Error::Challenge,
+            ),
             (format!(r#"{{"type":"webauthn.get","challenge":"{c}","origin":"https://example.org/"}}"#), Error::Origin),
             (format!(r#"{{"type":"webauthn.get","challenge":"{c}","origin":"http://example.org"}}"#), Error::Origin),
             (
-                format!(r#"{{"type":"webauthn.get","challenge":"{c}","origin":"https://example.org","crossOrigin":"no"}}"#),
+                format!(
+                    r#"{{"type":"webauthn.get","challenge":"{c}","origin":"https://example.org","crossOrigin":"no"}}"#
+                ),
                 Error::CrossOrigin,
             ),
             (
@@ -509,7 +510,11 @@ mod tests {
             ("{".to_string(), Error::ClientData),
         ];
         for (json, want) in cases {
-            assert_eq!(check_client_data(json.as_bytes(), "webauthn.get", &ch, "https://example.org"), Err(want), "{json}");
+            assert_eq!(
+                check_client_data(json.as_bytes(), "webauthn.get", &ch, "https://example.org"),
+                Err(want),
+                "{json}"
+            );
         }
     }
 
@@ -520,7 +525,13 @@ mod tests {
         let cred = v.register(RP, false).unwrap();
         let (x, y) = (cred.public_key[1..33].to_vec(), cred.public_key[33..].to_vec());
         let ec = |alg: i128, crv: i128, x: Vec<u8>, y: Vec<u8>| {
-            Map(vec![(Int(1), Int(2)), (Int(3), Int(alg)), (Int(-1), Int(crv)), (Int(-2), Bytes(x)), (Int(-3), Bytes(y))])
+            Map(vec![
+                (Int(1), Int(2)),
+                (Int(3), Int(alg)),
+                (Int(-1), Int(crv)),
+                (Int(-2), Bytes(x)),
+                (Int(-3), Bytes(y)),
+            ])
         };
         assert_eq!(parse_cose_key(&ec(-7, 1, x.clone(), y.clone())).unwrap(), (ALG_ES256, cred.public_key.clone()));
         assert_eq!(parse_cose_key(&ec(-35, 2, x.clone(), y.clone())), Err(Error::Algorithm), "ES384");

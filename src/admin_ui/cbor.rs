@@ -271,7 +271,8 @@ mod tests {
     #[test]
     fn unsupported_items_are_refused() {
         // Floats (half, single, double), undefined, simple(16), simple(255), tags, indefinite lengths.
-        for h in ["f90000", "fa47c35000", "fb3ff199999999999a", "f7", "f0", "f8ff", "c11a514b67b0", "5f42010243030405ff"]
+        for h in
+            ["f90000", "fa47c35000", "fb3ff199999999999a", "f7", "f0", "f8ff", "c11a514b67b0", "5f42010243030405ff"]
         {
             assert_eq!(d(h), Err(Error::Unsupported), "{h}");
         }

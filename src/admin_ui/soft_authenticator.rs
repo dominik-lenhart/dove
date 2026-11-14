@@ -279,9 +279,8 @@ mod tests {
                     sign_count: count,
                     backup_eligible: cred.backup_eligible,
                 };
-                let r =
-                    verify_assertion(rp(), &ch, stored, &s.client_data_json, &s.authenticator_data, &s.signature)
-                        .unwrap();
+                let r = verify_assertion(rp(), &ch, stored, &s.client_data_json, &s.authenticator_data, &s.signature)
+                    .unwrap();
                 assert!(r.sign_count > count);
                 count = r.sign_count;
             }

@@ -15,6 +15,8 @@
 //! - Nothing here runs unless the operator started it: the service itself never calls `tailscale`.
 //! - [`PUBLIC_PATHS`] is the one list; tests compare it with `deploy/Caddyfile`, `deploy/nginx/dove.conf` and the
 //!   routes the HTTP layer registers, so a new route cannot be added to one and forgotten in the others.
+//! - `--admin` also mounts the admin UI prefix ([`crate::admin_ui::ADMIN_PREFIX`]) on the same port and is refused
+//!   whenever Funnel is on for that port: the admin UI is tailnet-only (design 2026-11-14 section 5.1).
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -192,6 +194,8 @@ pub struct Desired {
     /// Dove's loopback origin, `http://127.0.0.1:8787`.
     pub upstream: String,
     pub funnel: bool,
+    /// Also serve the admin UI prefix (tailnet only).
+    pub admin: bool,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -212,6 +216,15 @@ impl Plan {
 }
 
 impl Desired {
+    /// The paths this port should serve: the public ones, plus the admin prefix with `--admin`.
+    pub fn paths(&self) -> Vec<&'static str> {
+        let mut p = PUBLIC_PATHS.to_vec();
+        if self.admin {
+            p.push(crate::admin_ui::ADMIN_PREFIX);
+        }
+        p
+    }
+
     pub fn target(&self, path: &str) -> String {
         format!("{}{path}", self.upstream.trim_end_matches('/'))
     }
@@ -226,13 +239,20 @@ impl Desired {
 /// something that is not Dove's, so nothing foreign is ever removed.
 pub fn plan(d: &Desired, cur: &Current) -> anyhow::Result<Plan> {
     let https = format!("--https={}", d.port);
+    if d.admin && (d.funnel || cur.funnel) {
+        bail!(
+            "Funnel is on for port {port} of {host}: the admin UI must stay tailnet-only. Turn Funnel off \
+             (tailscale funnel --https={port} off) or mount the admin UI on another port with --port",
+            port = d.port,
+            host = d.host
+        );
+    }
+    let wanted = d.paths();
     let mut p = Plan::default();
     let foreign: Vec<&String> = cur
         .handlers
         .iter()
-        .filter(|(path, h)| {
-            !PUBLIC_PATHS.contains(&path.as_str()) && !matches!(h, Handler::Proxy(t) if d.is_dove_target(t))
-        })
+        .filter(|(path, h)| !wanted.contains(&path.as_str()) && !matches!(h, Handler::Proxy(t) if d.is_dove_target(t)))
         .map(|(path, _)| path)
         .collect();
     if !foreign.is_empty() {
@@ -243,7 +263,7 @@ pub fn plan(d: &Desired, cur: &Current) -> anyhow::Result<Plan> {
             foreign.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
         );
     }
-    for path in PUBLIC_PATHS {
+    for path in &wanted {
         let want = Handler::Proxy(d.target(path));
         match cur.handlers.get(*path) {
             Some(h) if *h == want => {}
@@ -265,8 +285,8 @@ pub fn plan(d: &Desired, cur: &Current) -> anyhow::Result<Plan> {
             }
         }
     }
-    // Mounts of an older Dove release that are no longer public.
-    for path in cur.handlers.keys().filter(|p| !PUBLIC_PATHS.contains(&p.as_str())) {
+    // Mounts of an older Dove release that are no longer public (and `/admin` when setup runs without `--admin`).
+    for path in cur.handlers.keys().filter(|p| !wanted.contains(&p.as_str())) {
         p.removed.push(path.clone());
         p.steps.push(vec!["serve".into(), https.clone(), "--set-path".into(), path.clone(), "off".into()]);
     }
@@ -333,6 +353,54 @@ pub fn set_public_url(text: &str, url: &str) -> anyhow::Result<Option<String>> {
     Ok(Some(out))
 }
 
+/// `text` with `[admin_ui] enabled = true` and `origin = url`, every comment and the layout kept. `None` when both
+/// already are.
+pub fn set_admin_ui(text: &str, url: &str) -> anyhow::Result<Option<String>> {
+    use toml_edit::{DocumentMut, Item, Table, Value, value};
+    let mut doc: DocumentMut =
+        text.parse().map_err(|e| anyhow!("the config file is not valid TOML ({e}); not modified"))?;
+    if doc.get("admin_ui").is_none() {
+        doc.insert("admin_ui", Item::Table(Table::new()));
+    }
+    let Some(table) = doc.get_mut("admin_ui").and_then(Item::as_table_like_mut) else {
+        bail!("`admin_ui` in the config file is not a table; not modified");
+    };
+    let same = |v: &Value, want: &Value| match (v, want) {
+        (Value::Boolean(a), Value::Boolean(b)) => a.value() == b.value(),
+        (Value::String(a), Value::String(b)) => a.value() == b.value(),
+        _ => false,
+    };
+    let mut changed = false;
+    for (key, want) in [("enabled", Value::from(true)), ("origin", Value::from(url))] {
+        match table.get_mut(key).and_then(Item::as_value_mut) {
+            Some(v) if same(v, &want) => {}
+            Some(v) => {
+                let decor = v.decor().clone();
+                *v = want;
+                *v.decor_mut() = decor;
+                changed = true;
+            }
+            None => {
+                table.insert(key, value(want));
+                changed = true;
+            }
+        }
+    }
+    if !changed {
+        return Ok(None);
+    }
+    let out = doc.to_string();
+    let back: toml::Value = toml::from_str(&out).context("internal: generated invalid TOML")?;
+    let ok = back.get("admin_ui").is_some_and(|t| {
+        t.get("enabled").and_then(|v| v.as_bool()) == Some(true)
+            && t.get("origin").and_then(|v| v.as_str()) == Some(url)
+    });
+    if !ok {
+        bail!("internal: could not set [admin_ui]; not modified");
+    }
+    Ok(Some(out))
+}
+
 /// Writes `text` over `path` atomically (temp file in the same directory, same mode and owner, then rename).
 fn write_config(path: &Path, text: &str) -> anyhow::Result<()> {
     let meta = std::fs::metadata(path).with_context(|| format!("cannot read {}", path.display()))?;
@@ -388,7 +456,22 @@ pub struct SetupOpts {
     pub config: PathBuf,
     pub port: u16,
     pub funnel: bool,
+    /// Also mount `/admin` and enable `[admin_ui]` with this origin.
+    pub admin: bool,
     pub dry_run: bool,
+}
+
+impl SetupOpts {
+    fn flags(&self) -> String {
+        let mut f = String::new();
+        if self.funnel {
+            f.push_str(" --funnel");
+        }
+        if self.admin {
+            f.push_str(" --admin");
+        }
+        f
+    }
 }
 
 fn guidance_for_denied(out: &mut dyn Write, opts: &SetupOpts, why: &str) -> std::io::Result<()> {
@@ -399,7 +482,7 @@ fn guidance_for_denied(out: &mut dyn Write, opts: &SetupOpts, why: &str) -> std:
         "  sudo dove tailscale setup --config {} --port {}{}",
         opts.config.display(),
         opts.port,
-        if opts.funnel { " --funnel" } else { "" }
+        opts.flags()
     )?;
     writeln!(out, "or let your user manage Tailscale once, then run it again:")?;
     writeln!(out, "  sudo tailscale set --operator=$USER")
@@ -431,6 +514,9 @@ pub async fn setup(opts: &SetupOpts, ts: &Tailscale, out: &mut dyn Write) -> any
             "HTTPS certificates are not enabled for this tailnet; turn on HTTPS in the Tailscale admin console (DNS page)"
         );
     }
+    if opts.funnel && opts.admin {
+        bail!("--admin and --funnel cannot be combined: the admin UI is tailnet-only");
+    }
     if opts.funnel {
         if !FUNNEL_PORTS.contains(&opts.port) {
             bail!("Funnel only works on ports 443, 8443 and 10000, not {}", opts.port);
@@ -444,12 +530,19 @@ pub async fn setup(opts: &SetupOpts, ts: &Tailscale, out: &mut dyn Write) -> any
         port: opts.port,
         upstream: format!("http://{}", cfg.listen),
         funnel: opts.funnel,
+        admin: opts.admin,
     };
     let serve = ts.json(&["serve", "status", "--json"]).await.map_err(|e| tailscale_failure(out, opts, e))?;
     let current = read_current(&serve, &desired.host, desired.port);
     let plan = plan(&desired, &current)?;
     let url = public_url(&desired.host, desired.port);
-    let new_text = set_public_url(&text, &url)?;
+    let mut new_text = set_public_url(&text, &url)?;
+    if opts.admin {
+        let base = new_text.clone().unwrap_or_else(|| text.clone());
+        if let Some(t) = set_admin_ui(&base, &url)? {
+            new_text = Some(t);
+        }
+    }
 
     writeln!(out, "Node:       {}", desired.host)?;
     writeln!(out, "Public URL: {url}")?;
@@ -463,6 +556,9 @@ pub async fn setup(opts: &SetupOpts, ts: &Tailscale, out: &mut dyn Write) -> any
         writeln!(out, "WARNING: --funnel makes Dove reachable from the entire internet, not just your tailnet.")?;
         writeln!(out, "Only the public paths below are forwarded, and every MCP call still needs a connection token,")?;
         writeln!(out, "but anyone can now reach the sign-in and OAuth endpoints. Tailscale ACLs no longer apply.")?;
+    }
+    if opts.admin {
+        writeln!(out, "Admin UI:   {url}/admin (tailnet only; sign in with a passkey)")?;
     }
     if plan.funnel_left_on {
         writeln!(out)?;
@@ -488,8 +584,17 @@ pub async fn setup(opts: &SetupOpts, ts: &Tailscale, out: &mut dyn Write) -> any
         }
     }
     match &new_text {
+        Some(_) if opts.admin => writeln!(
+            out,
+            "Config:     set public_url = \"{url}\" and [admin_ui] enabled = true, origin = \"{url}\" in {}",
+            opts.config.display()
+        )?,
         Some(_) => writeln!(out, "Config:     set public_url = \"{url}\" in {}", opts.config.display())?,
-        None => writeln!(out, "Config:     public_url is already {url}")?,
+        None => writeln!(
+            out,
+            "Config:     public_url{} already {url}",
+            if opts.admin { " and admin_ui.origin are" } else { " is" }
+        )?,
     }
     if opts.dry_run {
         return Ok(());
@@ -509,7 +614,7 @@ pub async fn setup(opts: &SetupOpts, ts: &Tailscale, out: &mut dyn Write) -> any
                     "  sudo dove tailscale setup --config {} --port {}{}",
                     opts.config.display(),
                     opts.port,
-                    if opts.funnel { " --funnel" } else { "" }
+                    opts.flags()
                 )?;
                 bail!("config file not writable");
             }
@@ -525,6 +630,9 @@ pub async fn setup(opts: &SetupOpts, ts: &Tailscale, out: &mut dyn Write) -> any
     writeln!(out)?;
     writeln!(out, "Done. Restart Dove so it uses the new public_url:  sudo systemctl restart dove")?;
     writeln!(out, "Then check it with:  dove doctor")?;
+    if opts.admin {
+        writeln!(out, "Enrol a passkey for the admin UI:  sudo dove admin passkey add --name <device>")?;
+    }
     writeln!(out)?;
     writeln!(out, "Notes:")?;
     writeln!(
@@ -574,15 +682,18 @@ pub async fn doctor_check(public_url: &str, listen: &str, ts: &Tailscale) -> Opt
         Err(e) => return row(false, format!("cannot read the serve configuration: {e}")),
     };
     let cur = read_current(&serve, &host, port);
-    // Funnel is the operator's choice: compare as if it stays as it is.
-    let d = Desired { host, port, upstream: format!("http://{listen}"), funnel: cur.funnel };
+    // Funnel is the operator's choice: compare as if it stays as it is. A mounted admin UI is wanted, unless Funnel
+    // exposes it (then `plan` refuses, and the row says why).
+    let admin = cur.handlers.contains_key(crate::admin_ui::ADMIN_PREFIX);
+    let d = Desired { host, port, upstream: format!("http://{listen}"), funnel: cur.funnel, admin };
     let p = match plan(&d, &cur) {
         Ok(p) => p,
         Err(e) => return row(false, e.to_string()),
     };
     let funnel = if cur.funnel { "; Funnel is ON (reachable from the internet)" } else { "" };
     if p.is_empty() {
-        return row(true, format!("{} paths served on port {port}{funnel}", PUBLIC_PATHS.len()));
+        let admin = if admin { " and the admin UI (tailnet only)" } else { "" };
+        return row(true, format!("{} paths{admin} served on port {port}{funnel}", PUBLIC_PATHS.len()));
     }
     let mut parts = Vec::new();
     for (label, list) in [("missing", &p.added), ("different target", &p.changed), ("no longer public", &p.removed)] {
@@ -608,7 +719,13 @@ mod tests {
     use super::*;
 
     fn desired(funnel: bool) -> Desired {
-        Desired { host: "dove.tail1234.ts.net".into(), port: 443, upstream: "http://127.0.0.1:8787".into(), funnel }
+        Desired {
+            host: "dove.tail1234.ts.net".into(),
+            port: 443,
+            upstream: "http://127.0.0.1:8787".into(),
+            funnel,
+            admin: false,
+        }
     }
 
     fn serve_json(paths: &[(&str, &str)], funnel: bool) -> Value {
@@ -774,5 +891,86 @@ mod tests {
         }
         routes.remove("/healthz");
         assert_eq!(routes, want, "routes registered in src/http.rs, src/mcp.rs and src/oauth.rs");
+
+        // The admin UI: its own list, every route under the prefix, nothing shared with the public list.
+        use crate::admin_ui::{ADMIN_PATHS, ADMIN_PREFIX};
+        let admin: BTreeSet<String> = ADMIN_PATHS.iter().map(|s| (*s).to_string()).collect();
+        assert_eq!(admin.len(), ADMIN_PATHS.len(), "no duplicate admin paths");
+        let under = |p: &str| p == ADMIN_PREFIX || p.starts_with(&format!("{ADMIN_PREFIX}/"));
+        assert!(admin.iter().all(|p| under(p)), "every admin path is under {ADMIN_PREFIX}");
+        assert!(!want.iter().any(|p| under(p) || p.to_lowercase().starts_with(ADMIN_PREFIX)), "no public admin path");
+        let mut admin_routes = BTreeSet::new();
+        for part in include_str!("admin_ui/mod.rs").split(".route(").skip(1) {
+            let arg = part.split(',').next().unwrap_or_default().trim();
+            assert!(arg.starts_with('"'), "admin route registered with an expression: {arg}");
+            admin_routes.insert(arg.trim_matches('"').to_string());
+        }
+        assert_eq!(admin_routes, admin, "routes registered in src/admin_ui/mod.rs");
+
+        // No deploy file forwards the admin UI: proxy templates never name its path (their allowlists equal
+        // PUBLIC_PATHS above), and anything else in deploy/ may name only the admin socket.
+        for (name, text) in [
+            ("deploy/Caddyfile", caddy),
+            ("deploy/nginx/dove.conf", include_str!("../deploy/nginx/dove.conf")),
+            ("deploy/nginx/dove-restricted.conf", include_str!("../deploy/nginx/dove-restricted.conf")),
+        ] {
+            assert!(!text.to_lowercase().contains(ADMIN_PREFIX), "{name} names {ADMIN_PREFIX}");
+        }
+        let mut stack = vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("deploy")];
+        let mut seen = 0;
+        while let Some(dir) = stack.pop() {
+            for e in std::fs::read_dir(&dir).unwrap() {
+                let path = e.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                seen += 1;
+                let text = String::from_utf8_lossy(&std::fs::read(&path).unwrap()).to_lowercase();
+                for (i, _) in text.match_indices(ADMIN_PREFIX) {
+                    assert!(text[i..].starts_with("/admin.sock"), "{} names {ADMIN_PREFIX}", path.display());
+                }
+            }
+        }
+        assert!(seen >= 5, "deploy/ was walked");
+    }
+
+    #[test]
+    fn admin_mount_is_tailnet_only() {
+        let mut d = desired(false);
+        d.admin = true;
+        let p = plan(&d, &Current::default()).unwrap();
+        let mounted: Vec<&str> = p.steps.iter().map(|s| s[5].as_str()).collect();
+        assert_eq!(mounted.len(), PUBLIC_PATHS.len() + 1);
+        assert_eq!(mounted.last(), Some(&"/admin"));
+        assert!(!p.steps.iter().any(|s| s[0] == "funnel"));
+        // Funnel already on for the port, or asked for: refused before anything is planned.
+        assert!(plan(&d, &current(&[], &[], true)).unwrap_err().to_string().contains("tailnet-only"));
+        d.funnel = true;
+        assert!(plan(&d, &Current::default()).is_err());
+        // Mounted and Funnel off: nothing to do. Setup without --admin takes the mount away.
+        let mut with_admin = all_mounted();
+        with_admin.push(("/admin".into(), "http://127.0.0.1:8787/admin".into()));
+        let refs: Vec<(&str, &str)> = with_admin.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        let cur = read_current(&serve_json(&refs, false), "dove.tail1234.ts.net", 443);
+        d.funnel = false;
+        assert!(plan(&d, &cur).unwrap().is_empty());
+        let without = plan(&desired(false), &cur).unwrap();
+        assert_eq!(without.removed, vec!["/admin".to_string()]);
+    }
+
+    #[test]
+    fn admin_ui_edit_keeps_comments_and_is_idempotent() {
+        let text = "public_url = \"https://d.ts.net\"\n\n[admin_ui]\n# the owner's UI\nenabled = false # off for now\n";
+        let out = set_admin_ui(text, "https://d.ts.net").unwrap().unwrap();
+        assert!(out.contains("# the owner's UI") && out.contains("# off for now"), "{out}");
+        let v: toml::Value = toml::from_str(&out).unwrap();
+        assert_eq!(v["admin_ui"]["enabled"].as_bool(), Some(true));
+        assert_eq!(v["admin_ui"]["origin"].as_str(), Some("https://d.ts.net"));
+        assert!(set_admin_ui(&out, "https://d.ts.net").unwrap().is_none(), "idempotent");
+        let added = set_admin_ui("public_url = \"https://d.ts.net\"\n", "https://d.ts.net").unwrap().unwrap();
+        let v: toml::Value = toml::from_str(&added).unwrap();
+        assert_eq!(v["admin_ui"]["origin"].as_str(), Some("https://d.ts.net"));
+        assert!(set_admin_ui("admin_ui = 5\n", "https://d.ts.net").is_err());
     }
 }
