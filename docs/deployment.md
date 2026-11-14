@@ -700,7 +700,7 @@ secret store, not in a project file. Grants are explicit per mailbox. Actions:
 | `read` | search, read, attachments, list folders and drafts | - |
 | `draft` | create, update and delete its own drafts | `read` |
 | `organize` | mark read/unread, star, add/remove labels (IMAP keywords), archive, move between folders, move out of Trash | `read` |
-| `delete` | move to Trash or Spam/Junk (also any folder below them), and move out of Spam/Junk; never a permanent delete | `organize` |
+| `delete` | move to Trash or Spam/Junk (also any folder below them), move out of Spam/Junk, and set or remove junk/not-junk keywords on IMAP (`$Junk`, `$NotJunk`, ...); never a permanent delete | `organize` |
 | `send` | `send_draft`, only with `allow_send = true` | `draft` |
 
 Presets are shorthands: `reader` = `read`, `drafter` = `read,draft`, `assistant` = `read,draft,organize`, `full` =
@@ -712,7 +712,11 @@ mailbox to a project gives existing tokens no new access. Other commands:
 `clients revoke <name>`, `clients show <name>`, `clients list`, `projects list|show|remove-account`,
 `clients set-redaction <name> on|off` (hide passwords, keys and one-time codes in the subjects and snippets of
 search, digest and draft lists; full reads stay intact; also `--redact-secrets` on `create` and `invite`, spec 6.5a).
-Changes take effect on the next request, without a restart. `--expires` takes `90d`, `12h`, `30m`, `45s` or `2w`.
+Changes take effect on the next request, without a restart. To make redaction the default for new connections, set
+`redact_secrets_default = true` under `[clients]` in the service config (see `dove config-example`) and restart:
+`clients create` and `clients invite` then turn it on unless you pass `--no-redact-secrets`, and connections made
+from an invitation (`dove login`, the OAuth approval page for ChatGPT or Claude) get the invitation's setting.
+Existing connections and invitations keep theirs; change them with `clients set-redaction`. `--expires` takes `90d`, `12h`, `30m`, `45s` or `2w`.
 
 Connect an MCP host with the bearer token, for example:
 
@@ -758,7 +762,8 @@ secret:
 
 ```sh
 umask 077; openssl rand -hex 32 > ~/dove-hook.secret
-dove sinks add n8n --project acme --url https://hooks.example.com/dove --secret-file ~/dove-hook.secret
+umask 077; cat > ~/dove-hook.url    # paste the URL, then Ctrl-D (keeps it out of shell history)
+dove sinks add n8n --project acme --url-file ~/dove-hook.url --secret-file ~/dove-hook.secret
 dove sinks list        # project, URL origin, active watches, pending/delivered/failed deliveries (never the secret)
 dove sinks set-project n8n --project other   # move it; the old project's watches keep working without push
 dove sinks remove n8n  # watches that used it keep working without push
@@ -768,7 +773,10 @@ A sink belongs to one project: only clients of that project see its name and can
 of other projects it does not exist (`not_found`, like an unknown name). The URL is stored sealed with the KEK like the
 secret, because Slack, Discord or ntfy URLs carry credentials, and `dove sinks list` shows only its origin. The CLI
 reads the secret file (no group or other access: 0400 or 0600) and the service stores it sealed with the KEK
-(`dove keys rotate` re-wraps URL and secret); the file is not needed afterwards.
+(`dove keys rotate` re-wraps URL and secret); the file is not needed afterwards. `--url-file` is read the same way
+(same mode rule, surrounding whitespace trimmed); `--url-file -` reads the URL from standard input, for example from
+a password manager's CLI. `--url <URL>` still works but prints a warning: a URL on the command line ends up in shell
+history and is visible to other users in the process list. The CLI never prints the URL.
 
 Upgrading from 0.5 or earlier: existing sinks have their URL sealed at the first start and belong to no project, so
 no client can use them and their watches push nothing (events stay pullable) until you assign one with

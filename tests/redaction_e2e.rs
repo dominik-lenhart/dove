@@ -31,7 +31,11 @@ struct Fx {
 }
 
 async fn setup() -> Fx {
-    let h = Harness::start().await;
+    setup_with(|_| {}).await
+}
+
+async fn setup_with(customize: impl FnOnce(&mut dove::config::Config)) -> Fx {
+    let h = Harness::start_with(customize).await;
     h.mailbox("info", MB);
     h.project("acme", &["info"]).await;
     let now = dove::util::now_unix_ms();
@@ -223,7 +227,7 @@ async fn the_switch_is_operator_owned_visible_and_immediate() {
             grants: vec![g("info", "read")],
             expires: None,
             allow_ip: vec![],
-            redact_secrets: true,
+            redact_secrets: Some(true),
         })
         .await
         .unwrap();
@@ -250,7 +254,7 @@ async fn redeem(h: &Harness, inv: &str) -> String {
 async fn invitations_carry_the_switch() {
     let fx = setup().await;
     let h = &fx.h;
-    let invite = |name: &str, redact_secrets: bool| AdminRequest::ClientsInvite {
+    let invite = |name: &str, redact_secrets: Option<bool>| AdminRequest::ClientsInvite {
         name: name.into(),
         project: "acme".into(),
         accounts: vec!["info".into()],
@@ -262,22 +266,63 @@ async fn invitations_carry_the_switch() {
     let args = json!({ "select": ["subject"] });
 
     // Set at invitation time.
-    let v = h.admin(invite("laptop", true)).await.unwrap();
+    let v = h.admin(invite("laptop", Some(true))).await.unwrap();
     assert_eq!(v["redact_secrets"], true);
     let t = redeem(h, v["invitation"].as_str().unwrap()).await;
     assert!(!leaks(&h.ok(&t, "search_messages", args.clone()).await.to_string()));
 
     // Set on an open invitation before it is redeemed.
-    let v = h.admin(invite("tablet", false)).await.unwrap();
+    let v = h.admin(invite("tablet", Some(false))).await.unwrap();
     let r = h.admin(AdminRequest::ClientsSetRedaction { name: "tablet".into(), enabled: true }).await.unwrap();
     assert_eq!(r["invitation"], "tablet");
     let t = redeem(h, v["invitation"].as_str().unwrap()).await;
     assert!(!leaks(&h.ok(&t, "search_messages", args.clone()).await.to_string()));
 
-    // Default invitation: off.
-    let v = h.admin(invite("phone", false)).await.unwrap();
+    // Default invitation (no choice, `clients.redact_secrets_default` unset): off.
+    let v = h.admin(invite("phone", None)).await.unwrap();
+    assert_eq!(v["redact_secrets"], false);
     let t = redeem(h, v["invitation"].as_str().unwrap()).await;
     assert!(leaks(&h.ok(&t, "search_messages", args).await.to_string()));
+}
+
+/// `clients.redact_secrets_default = true` turns redaction on for connections created without an explicit choice, by
+/// `clients create` and through invitations (the redeemed or OAuth-approved connection copies the invitation's
+/// setting); an explicit opt-out still wins.
+#[tokio::test]
+async fn server_default_applies_unless_the_operator_opts_out() {
+    let fx = setup_with(|c| c.clients.redact_secrets_default = true).await;
+    let h = &fx.h;
+    let args = json!({ "select": ["subject"] });
+    let create = |name: &str, redact_secrets: Option<bool>| AdminRequest::ClientsCreate {
+        name: name.into(),
+        project: "acme".into(),
+        grants: vec![g("info", "read")],
+        expires: None,
+        allow_ip: vec![],
+        redact_secrets,
+    };
+    let invite = |name: &str, redact_secrets: Option<bool>| AdminRequest::ClientsInvite {
+        name: name.into(),
+        project: "acme".into(),
+        accounts: vec!["info".into()],
+        capabilities: "read".into(),
+        expires: None,
+        allow_ip: vec![],
+        redact_secrets,
+    };
+    for (name, choice, redacted) in [("dflt", None, true), ("optout", Some(false), false), ("optin", Some(true), true)]
+    {
+        let v = h.admin(create(name, choice)).await.unwrap();
+        assert_eq!(v["redact_secrets"], redacted, "{name}");
+        let out = h.ok(v["token"].as_str().unwrap(), "search_messages", args.clone()).await.to_string();
+        assert_eq!(leaks(&out), !redacted, "{name}");
+    }
+    for (name, choice, redacted) in [("inv-dflt", None, true), ("inv-optout", Some(false), false)] {
+        let v = h.admin(invite(name, choice)).await.unwrap();
+        assert_eq!(v["redact_secrets"], redacted, "{name}");
+        let t = redeem(h, v["invitation"].as_str().unwrap()).await;
+        assert_eq!(leaks(&h.ok(&t, "search_messages", args.clone()).await.to_string()), !redacted, "{name}");
+    }
 }
 
 #[tokio::test]

@@ -6,7 +6,7 @@
 mod support;
 
 use serde_json::{Value, json};
-use support::fake_imap::{FakeImap, Opts, encode_utf7, verb_of};
+use support::fake_imap::{FakeImap, Fault, Opts, encode_utf7, verb_of};
 use support::harness::{FakeImapUser, Harness, g};
 
 const MB: &str = "info@example.org";
@@ -30,6 +30,26 @@ async fn setup_with(opts: Opts) -> Setup {
 
 async fn setup() -> Setup {
     setup_with(Opts::default()).await
+}
+
+/// [`setup_with`] with an hourly organize budget of `per_hour` messages.
+async fn budget_setup(opts: Opts, per_hour: u32) -> Setup {
+    let mut h = Harness::start_with(|c| c.limits.client_organize_per_hour = per_hour).await;
+    h.imap = FakeImap::start_with(opts).await;
+    let u = h.imap_mailbox("info", MB).await;
+    h.project("p", &["info"]).await;
+    let assistant = h.token("p", "assistant", vec![g("info", "assistant")]).await;
+    let full = h.token("p", "full", vec![g("info", "full")]).await;
+    Setup { h, u, assistant, full }
+}
+
+/// Checks that exactly `n` units of the organize budget are left: `n + 1` unknown ids are refused as rate limited,
+/// `n` fit (and, all being `not_found` before any write, are given back).
+async fn assert_budget_left(s: &Setup, token: &str, n: usize) {
+    let ids = |k: usize| (0..k).map(|i| format!("f999-1-{i}")).collect::<Vec<_>>();
+    let star = |k: usize| json!({ "account": "info", "ids": ids(k), "add_flags": ["STARRED"] });
+    assert_eq!(s.h.err(token, "update_messages", star(n + 1)).await, "rate_limited", "more than {n} left");
+    s.h.ok(token, "update_messages", star(n)).await;
 }
 
 fn raw(subject: &str) -> Vec<u8> {
@@ -161,6 +181,34 @@ async fn flags_and_keywords_round_trip() {
     h.imap.assert_only_allowlisted();
 }
 
+/// Junk and not-junk keywords train spam filters in mail clients and servers: setting or removing one needs `delete`
+/// (like leaving Junk), in any case, refused before any IMAP command. Other keywords stay `organize`.
+#[tokio::test]
+async fn junk_keywords_need_delete() {
+    let s = setup().await;
+    let (h, u) = (&s.h, &s.u);
+    let a = h.imap.add_message(&u.user, "INBOX", &raw("a"), &["$Junk"]);
+    let ia = imap_id(h, u, "INBOX", a).await;
+    h.imap.clear_commands();
+    for kw in ["$Junk", "$NotJunk", "Junk", "NotJunk", "NonJunk", "$junk", "$NOTJUNK", "$Spam", "NotSpam"] {
+        for key in ["add_labels", "remove_labels"] {
+            let args = json!({ "account": "info", "ids": [ia], key: [kw], "add_flags": ["STARRED"] });
+            assert_eq!(h.err(&s.assistant, "update_messages", args).await, "forbidden", "{key} {kw}");
+        }
+    }
+    assert!(h.imap.commands().is_empty(), "{:?}", h.imap.commands());
+    // Other keywords need only organize; delete allows junk keywords.
+    h.ok(&s.assistant, "update_messages", json!({ "account": "info", "ids": [ia], "add_labels": ["$Follow"] })).await;
+    h.ok(
+        &s.full,
+        "update_messages",
+        json!({ "account": "info", "ids": [ia], "remove_labels": ["$Junk"], "add_labels": ["$NotJunk"] }),
+    )
+    .await;
+    let flags = h.imap.flags(&u.user, "INBOX", a).unwrap();
+    assert!(flags.contains(&"$NotJunk".to_string()) && !flags.contains(&"$Junk".to_string()), "{flags:?}");
+}
+
 #[tokio::test]
 async fn move_with_move_capability() {
     let s = setup().await;
@@ -201,6 +249,81 @@ async fn move_with_move_capability() {
     h.ok(&s.assistant, "move_messages", json!({ "account": "info", "ids": [new_a], "to": "archive" })).await;
     assert_eq!(h.imap.uids(&u.user, "Archiv").len(), 1);
     h.imap.assert_only_allowlisted();
+}
+
+/// Failed ids are given back only when nothing reached the server: a refused STORE or MOVE (`NO`) is refunded, a
+/// STORE or MOVE whose reply was lost (`outcome_unknown`), a second STORE failing after the first went through, and a
+/// failed read-back after a STORE are spent.
+#[tokio::test]
+async fn organize_budget_refunds_only_definitive_failures() {
+    let s = budget_setup(Opts::default(), 10).await;
+    let (h, u) = (&s.h, &s.u);
+    add_folder(&s, "Projekte", None).await;
+    let a = h.imap.add_message(&u.user, "INBOX", &raw("a"), &[]);
+    let b = h.imap.add_message(&u.user, "INBOX", &raw("b"), &[]);
+    let c = h.imap.add_message(&u.user, "Sent", &raw("c"), &["\\Seen"]);
+    let (ia, ib, ic) =
+        (imap_id(h, u, "INBOX", a).await, imap_id(h, u, "INBOX", b).await, imap_id(h, u, "Sent", c).await);
+    let star = |ids: &[&String]| json!({ "account": "info", "ids": ids, "add_flags": ["STARRED"] });
+
+    // The INBOX group's STORE is refused: both its ids are given back, Sent's change is spent. 10 - 1 = 9.
+    h.imap.fail_next("UID STORE", Fault::No);
+    let r = h.ok(&s.assistant, "update_messages", star(&[&ia, &ib, &ic])).await;
+    assert_eq!(ok_ids(&r), vec![false, false, true], "{r}");
+    assert!(!h.imap.flags(&u.user, "INBOX", a).unwrap().contains(&"\\Flagged".to_string()));
+    // The reply to the STORE is lost after the server applied it: outcome_unknown, spent. 9 - 2 = 7.
+    h.imap.fail_next("UID STORE", Fault::DropAfterApply);
+    let r = h.ok(&s.assistant, "update_messages", star(&[&ia, &ib])).await;
+    assert_eq!(ok_ids(&r), vec![false, false], "{r}");
+    assert_eq!(r["results"][0]["error"]["code"], "outcome_unknown", "{r}");
+    assert!(h.imap.flags(&u.user, "INBOX", a).unwrap().contains(&"\\Flagged".to_string()));
+    // Two STOREs (+\Flagged, then -\Seen): the second is refused after the first went through. 7 - 1 = 6.
+    h.imap.fail_next_containing("UID STORE", "-FLAGS", Fault::No);
+    let r = h
+        .ok(
+            &s.assistant,
+            "update_messages",
+            json!({ "account": "info", "ids": [ic], "add_flags": ["UNREAD", "STARRED"] }),
+        )
+        .await;
+    assert_eq!(r["results"][0]["error"]["code"], "outcome_unknown", "{r}");
+    let mut flags = h.imap.flags(&u.user, "Sent", c).unwrap();
+    flags.sort();
+    assert_eq!(flags, vec!["\\Flagged".to_string(), "\\Seen".to_string()]);
+    // A refused MOVE is given back; a MOVE whose reply is lost is spent. 6 - 1 = 5.
+    h.imap.fail_next("UID MOVE", Fault::No);
+    let r = h.ok(&s.assistant, "move_messages", json!({ "account": "info", "ids": [ia], "to": "Projekte" })).await;
+    assert_eq!(ok_ids(&r), vec![false], "{r}");
+    h.imap.fail_next("UID MOVE", Fault::DropAfterApply);
+    let r = h.ok(&s.assistant, "move_messages", json!({ "account": "info", "ids": [ib], "to": "Projekte" })).await;
+    assert_eq!(r["results"][0]["error"]["code"], "outcome_unknown", "{r}");
+    // The STORE went through but reading the result back fails: spent, also for the id the server did not have
+    // (its group's outcome is unknown). 5 - 2 = 3.
+    let gone = format!("f{}-{}-999", folder_id(h, &u.account_id, "INBOX").await, h.imap.uidvalidity(&u.user, "INBOX"));
+    h.imap.fail_next_containing("UID FETCH", &format!("UID FETCH {a} ("), Fault::Drop);
+    let r = h
+        .ok(&s.assistant, "update_messages", json!({ "account": "info", "ids": [ia, gone], "add_labels": ["Kunde"] }))
+        .await;
+    assert_eq!(r["results"][0]["error"]["code"], "outcome_unknown", "{r}");
+    assert!(h.imap.flags(&u.user, "INBOX", a).unwrap().contains(&"Kunde".to_string()));
+    assert_budget_left(&s, &s.assistant, 3).await;
+    h.imap.assert_only_allowlisted();
+}
+
+/// Without MOVE, a copy whose original could not be flagged `\Deleted` is a failed id that still changed the mailbox
+/// (a copy exists): it is not given back.
+#[tokio::test]
+async fn organize_budget_spends_copies_that_kept_their_original() {
+    let s = budget_setup(Opts { move_cap: false, ..Opts::default() }, 4).await;
+    let (h, u) = (&s.h, &s.u);
+    add_folder(&s, "Archive", None).await;
+    let a = h.imap.add_message(&u.user, "INBOX", &raw("a"), &[]);
+    let ia = imap_id(h, u, "INBOX", a).await;
+    h.imap.fail_next_containing("UID STORE", "\\Deleted", Fault::No);
+    let r = h.ok(&s.assistant, "move_messages", json!({ "account": "info", "ids": [ia], "to": "archive" })).await;
+    assert_eq!(r["results"][0]["error"]["code"], "upstream_error", "{r}");
+    assert_eq!((h.imap.uids(&u.user, "INBOX"), h.imap.uids(&u.user, "Archive").len()), (vec![a], 1));
+    assert_budget_left(&s, &s.assistant, 3).await;
 }
 
 #[tokio::test]

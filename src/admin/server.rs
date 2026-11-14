@@ -235,6 +235,7 @@ async fn execute(call: &mut AdminCall<'_>, req: AdminRequest) -> anyhow::Result<
         AccountsEnable { alias } => call.tx(move |tx| ops::account_set_enabled(tx, &alias, true)).await,
         ClientsCreate { name, project, grants, expires, allow_ip, redact_secrets } => {
             let expires_in = parse_expiry(expires.as_deref())?;
+            let redact_secrets = redact_secrets.unwrap_or(app.cfg.clients.redact_secrets_default);
             let pepper = app.pepper.clone();
             call.tx(move |tx| {
                 let nc = ops::NewClient {
@@ -268,6 +269,7 @@ async fn execute(call: &mut AdminCall<'_>, req: AdminRequest) -> anyhow::Result<
         ClientsRevoke { name } => call.tx(move |tx| ops::client_revoke(tx, &name)).await,
         ClientsInvite { name, project, accounts, capabilities, expires, allow_ip, redact_secrets } => {
             let expires_in = parse_expiry(expires.as_deref())?;
+            let redact_secrets = redact_secrets.unwrap_or(app.cfg.clients.redact_secrets_default);
             let pepper = app.pepper.clone();
             call.tx(move |tx| {
                 let ni = crate::invite::NewInvite {

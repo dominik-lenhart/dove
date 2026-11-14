@@ -320,6 +320,48 @@ pub enum SignatureCmd {
     },
 }
 
+/// Longest sink URL read from `--url-file -`.
+const MAX_SINK_URL_BYTES: u64 = 8 * 1024;
+
+/// The sink URL from `--url` or `--url-file` (clap allows exactly one). A file is read like a secret file (owner-only
+/// mode), `-` reads standard input; both are trimmed. `--url` still works but warns on `warn` that the URL lands in
+/// shell history and the process list. Neither the warning nor any error ever contains the URL.
+fn sink_url(
+    url: Option<String>,
+    url_file: Option<PathBuf>,
+    stdin: &mut dyn std::io::Read,
+    warn: &mut dyn std::io::Write,
+) -> anyhow::Result<String> {
+    use std::io::Read;
+    let url = match (url, url_file) {
+        (Some(url), None) => {
+            writeln!(
+                warn,
+                "warning: --url puts the sink URL in your shell history and the process list; use --url-file <path> \
+                 or --url-file - (standard input) instead"
+            )?;
+            return Ok(url);
+        }
+        (None, Some(path)) if path == std::path::Path::new("-") => {
+            let mut buf = Vec::new();
+            stdin.take(MAX_SINK_URL_BYTES + 1).read_to_end(&mut buf)?;
+            if buf.len() as u64 > MAX_SINK_URL_BYTES {
+                anyhow::bail!("the sink URL on standard input is longer than {MAX_SINK_URL_BYTES} bytes");
+            }
+            String::from_utf8(buf).map_err(|_| anyhow::anyhow!("the sink URL on standard input is not UTF-8"))?
+        }
+        (None, Some(path)) => crate::secrets::read_secret_string(&path)
+            .map_err(|e| anyhow::anyhow!("cannot read the sink URL file: {e:#}"))?
+            .to_string(),
+        _ => anyhow::bail!("pass exactly one of --url and --url-file"),
+    };
+    let url = url.trim();
+    if url.is_empty() {
+        anyhow::bail!("no sink URL given");
+    }
+    Ok(url.to_string())
+}
+
 /// Reads a signature file (`-`: stdin), refusing anything larger than the cap before it is sent.
 fn read_signature(path: &std::path::Path) -> anyhow::Result<String> {
     use std::io::Read;
@@ -489,8 +531,12 @@ pub enum ClientsCmd {
         #[arg(long = "allow-ip")]
         allow_ip: Vec<String>,
         /// Hide passwords, keys and one-time codes in overview results (snippets, subjects); full reads stay intact.
-        #[arg(long)]
+        /// Without this flag or `--no-redact-secrets`, the server's `clients.redact_secrets_default` decides.
+        #[arg(long, conflicts_with = "no_redact_secrets")]
         redact_secrets: bool,
+        /// Do not hide secrets, even when the server's `clients.redact_secrets_default` is on.
+        #[arg(long)]
+        no_redact_secrets: bool,
         #[command(flatten)]
         admin: AdminOpts,
     },
@@ -546,9 +592,13 @@ pub enum ClientsCmd {
         expires: Option<String>,
         #[arg(long = "allow-ip")]
         allow_ip: Vec<String>,
-        /// The connection hides passwords, keys and one-time codes in overview results.
-        #[arg(long)]
+        /// The connection hides passwords, keys and one-time codes in overview results. Without this flag or
+        /// `--no-redact-secrets`, the server's `clients.redact_secrets_default` decides.
+        #[arg(long, conflicts_with = "no_redact_secrets")]
         redact_secrets: bool,
+        /// The connection shows secrets, even when the server's `clients.redact_secrets_default` is on.
+        #[arg(long)]
+        no_redact_secrets: bool,
         #[command(flatten)]
         admin: AdminOpts,
     },
@@ -671,9 +721,14 @@ pub enum SinksCmd {
         /// Project whose clients may use the sink (other projects never see it).
         #[arg(long)]
         project: String,
-        /// HTTPS URL (no query or fragment). Only this exact URL is ever contacted.
+        /// HTTPS URL (no query or fragment). Only this exact URL is ever contacted. Prefer `--url-file`: a URL on the
+        /// command line lands in shell history and the process list, and webhook URLs often carry credentials.
+        #[arg(long, required_unless_present = "url_file", conflicts_with = "url_file")]
+        url: Option<String>,
+        /// File holding the URL (surrounding whitespace trimmed; no group or other access, like `--secret-file`), or
+        /// `-` to read it from standard input.
         #[arg(long)]
-        url: String,
+        url_file: Option<PathBuf>,
         /// File with the HMAC signing secret (at least 32 characters, mode 0600 or stricter), e.g. from
         /// `openssl rand -hex 32`. The service keeps it sealed; the receiver needs the same secret.
         #[arg(long)]
@@ -700,6 +755,15 @@ pub enum SinksCmd {
         #[command(flatten)]
         admin: AdminOpts,
     },
+}
+
+/// `--redact-secrets` / `--no-redact-secrets` (clap refuses both); neither leaves it to the server's default.
+fn redaction(on: bool, off: bool) -> Option<bool> {
+    match (on, off) {
+        (true, _) => Some(true),
+        (_, true) => Some(false),
+        _ => None,
+    }
 }
 
 fn split_list(s: &str) -> Vec<String> {
@@ -780,7 +844,16 @@ fn admin_request(cmd: Command) -> anyhow::Result<(AdminOpts, AdminRequest)> {
             ProjectsCmd::Show { name, admin } => (admin, R::ProjectsShow { name }),
         },
         Command::Clients(c) => match c {
-            ClientsCmd::Create { name, project, grants, expires, allow_ip, redact_secrets, admin } => (
+            ClientsCmd::Create {
+                name,
+                project,
+                grants,
+                expires,
+                allow_ip,
+                redact_secrets,
+                no_redact_secrets,
+                admin,
+            } => (
                 admin,
                 R::ClientsCreate {
                     name,
@@ -788,7 +861,7 @@ fn admin_request(cmd: Command) -> anyhow::Result<(AdminOpts, AdminRequest)> {
                     grants: parse_grant_args(&grants)?,
                     expires,
                     allow_ip,
-                    redact_secrets,
+                    redact_secrets: redaction(redact_secrets, no_redact_secrets),
                 },
             ),
             ClientsCmd::SetGrants { name, grants, admin } => {
@@ -801,7 +874,17 @@ fn admin_request(cmd: Command) -> anyhow::Result<(AdminOpts, AdminRequest)> {
                 (admin, R::ClientsSetRedaction { name, enabled: mode == "on" })
             }
             ClientsCmd::List { admin } => (admin, R::ClientsList),
-            ClientsCmd::Invite { name, project, accounts, capabilities, expires, allow_ip, redact_secrets, admin } => (
+            ClientsCmd::Invite {
+                name,
+                project,
+                accounts,
+                capabilities,
+                expires,
+                allow_ip,
+                redact_secrets,
+                no_redact_secrets,
+                admin,
+            } => (
                 admin,
                 R::ClientsInvite {
                     name,
@@ -810,7 +893,7 @@ fn admin_request(cmd: Command) -> anyhow::Result<(AdminOpts, AdminRequest)> {
                     capabilities,
                     expires,
                     allow_ip,
-                    redact_secrets,
+                    redact_secrets: redaction(redact_secrets, no_redact_secrets),
                 },
             ),
         },
@@ -839,7 +922,8 @@ fn admin_request(cmd: Command) -> anyhow::Result<(AdminOpts, AdminRequest)> {
             }
         },
         Command::Sinks(c) => match c {
-            SinksCmd::Add { name, project, url, secret_file, admin } => {
+            SinksCmd::Add { name, project, url, url_file, secret_file, admin } => {
+                let url = sink_url(url, url_file, &mut std::io::stdin().lock(), &mut std::io::stderr())?;
                 let secret = crate::secrets::read_secret_string(&secret_file)?;
                 (admin, R::SinksAdd { name, project, url, secret: crate::admin::Password(secret) })
             }
@@ -1034,6 +1118,74 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(std::iter::once("dove").chain(args.iter().copied()))
+    }
+
+    /// `--url-file` (a file or `-` for stdin) and `--url` are alternatives; `--url` warns about shell history, and
+    /// neither the warning nor an error repeats the URL.
+    #[test]
+    fn sinks_add_reads_the_url_from_a_file_or_stdin() {
+        let url = "https://hooks.example.com/x/T0K3N";
+        let base = ["sinks", "add", "n8n", "--project", "acme", "--secret-file", "/tmp/s"];
+        let with = |extra: &[&str]| parse(&base.iter().copied().chain(extra.iter().copied()).collect::<Vec<_>>());
+        assert!(with(&[]).is_err(), "one of --url and --url-file is required");
+        assert!(with(&["--url", url, "--url-file", "-"]).is_err(), "not both");
+        let Command::Sinks(SinksCmd::Add { url: u, url_file: f, .. }) = with(&["--url-file", "-"]).unwrap().command
+        else {
+            panic!()
+        };
+        assert_eq!((u, f), (None, Some(PathBuf::from("-"))));
+
+        let (mut none, mut warn) = (std::io::empty(), Vec::new());
+        // stdin, trimmed, no warning.
+        let got = sink_url(None, Some("-".into()), &mut format!("  {url}\n").as_bytes(), &mut warn).unwrap();
+        assert_eq!((got.as_str(), warn.is_empty()), (url, true));
+        assert!(sink_url(None, Some("-".into()), &mut &b" \n"[..], &mut warn).is_err(), "empty");
+        let long = vec![b'a'; MAX_SINK_URL_BYTES as usize + 1];
+        assert!(sink_url(None, Some("-".into()), &mut long.as_slice(), &mut warn).is_err(), "too long");
+        // --url keeps working, with a warning that names the alternative but not the URL.
+        assert_eq!(sink_url(Some(url.into()), None, &mut none, &mut warn).unwrap(), url);
+        let w = String::from_utf8(warn).unwrap();
+        assert!(w.contains("shell history") && w.contains("--url-file") && !w.contains("T0K3N"), "{w}");
+        // A file: owner-only mode like a secret file, trimmed.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("url");
+        std::fs::write(&path, format!("{url}\n")).unwrap();
+        crate::platform::restrict_file(&path).unwrap();
+        let mut warn = Vec::new();
+        assert_eq!(sink_url(None, Some(path.clone()), &mut none, &mut warn).unwrap(), url);
+        assert!(warn.is_empty());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let e = format!("{:#}", sink_url(None, Some(path), &mut none, &mut warn).unwrap_err());
+            assert!(!e.contains("T0K3N"), "{e}");
+        }
+    }
+
+    /// No flag leaves redaction to the server's `clients.redact_secrets_default` (`None`, not sent at all, so an older
+    /// service still parses the request); `--no-redact-secrets` is an explicit opt-out; both flags are refused.
+    #[test]
+    fn redaction_flags_are_tri_state() {
+        let create = ["clients", "create", "bot", "--project", "acme", "--grant", "info=read"];
+        let invite = ["clients", "invite", "bot", "--project", "acme"];
+        for base in [&create[..], &invite[..]] {
+            let req = |extra: &[&str]| {
+                let cli = parse(&base.iter().copied().chain(extra.iter().copied()).collect::<Vec<_>>())?;
+                Ok::<_, clap::Error>(admin_request(cli.command).unwrap().1)
+            };
+            let flag = |r: &AdminRequest| match r {
+                AdminRequest::ClientsCreate { redact_secrets, .. }
+                | AdminRequest::ClientsInvite { redact_secrets, .. } => *redact_secrets,
+                _ => panic!(),
+            };
+            assert_eq!(flag(&req(&[]).unwrap()), None);
+            assert_eq!(flag(&req(&["--redact-secrets"]).unwrap()), Some(true));
+            assert_eq!(flag(&req(&["--no-redact-secrets"]).unwrap()), Some(false));
+            assert!(req(&["--redact-secrets", "--no-redact-secrets"]).is_err());
+            let wire = serde_json::to_value(req(&[]).unwrap()).unwrap();
+            assert!(wire.get("redact_secrets").is_none(), "{wire}");
+        }
     }
 
     #[test]

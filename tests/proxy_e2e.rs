@@ -24,7 +24,7 @@ async fn allow_ip_token(h: &Harness) -> String {
             grants: vec![g("info", "read")],
             expires: None,
             allow_ip: vec!["203.0.113.0/24".into()],
-            redact_secrets: false,
+            redact_secrets: None,
         })
         .await
         .unwrap();

@@ -509,3 +509,47 @@ hosts or reference hardware.
   extra words ("Ihr Passwort für das Portal lautet …", "lautet jetzt"), passwords containing spaces (only the first
   word is hidden), "Benutzername / Passwort: a / b" (hides `a`, not `b`), alphanumeric codes without a colon, 4-digit
   codes that look like years, and over-redaction of a plain word after `Passwort:` in a subject.
+- A63. Organize budget refunds only definitive failures (follow-up to A59 (a), 2026-11-14). A refund gives back a
+  message change that certainly did not happen; anything that may have reached the mailbox stays spent. (a) Per id:
+  `Outcome::Failed` is refunded unless its code is `outcome_unknown`; `Outcome::Spent` (failed, but a write for that
+  id took effect) never is. The classification is the error code set where the write was classified
+  (`Google::write`: not dispatched or 4xx definitive, 5xx/lost response `outcome_unknown`; the IMAP session), never
+  error text. (b) Gmail moves out of Trash are two writes (untrash, then modify): once the untrash went through, a
+  failed modify is `Spent`. (c) IMAP organize STOREs now classify like `APPEND` and `MOVE`: a STORE fully sent whose
+  reply is lost is `outcome_unknown` (was `upstream_error`, so the agent was told nothing happened), one that never
+  left completely is `not_dispatched`. Any failure after a STORE went through (the second STORE of add+remove, the
+  `X-GM-LABELS` STORE after a flag STORE, the metadata read-back) is `outcome_unknown` too: part of the change is in
+  place. The error covers the whole folder group, including ids the server did not have, so those are spent as well
+  (conservative). (d) A copy that kept its original (server without `MOVE`) is `Spent`: a copy now exists. (e) A call
+  that fails as a whole after `cx.commit()` refunds nothing (which writes happened is unknown); before the commit it
+  refunds everything. Gmail-over-IMAP moves now check "INBOX exists" before the first write, so no organize path
+  returns a whole-call error after a write any more; the branch stays as the safe default and is pinned by a unit test
+  of `organize::unused`.
+- A64. Junk keywords need `delete` (follow-up to A59 (b), 2026-11-14). Mail clients and servers train spam filters on
+  IMAP keywords (Thunderbird `Junk`/`NonJunk`, Apple Mail and RFC 5788 registry `$Junk`/`$NotJunk`, `NotJunk`), so an
+  `organize`-only agent could train a filter to promote spam or bury real mail. Adding or removing any keyword whose
+  name contains `junk` or `spam` (ASCII case-insensitive; keywords are ASCII by `imap::Keyword`) now needs `delete`,
+  checked for the whole call before any IMAP command. A substring match rather than a list: a false hit only asks for
+  more permission, while a missed spelling would train the filter. Gmail API: `update_messages` reaches user labels
+  only (`SPAM` is a system label and refused before any write in both directions), so Spam is reachable only through
+  `move_messages`, already gated. Gmail over IMAP: `update_messages` sets no keywords (labels go through
+  `X-GM-LABELS` on existing user-label folders; `[Gmail]/Spam` is a system folder and refused), so there is no
+  equivalent path. A Gmail user label named `Junk` is just a label; Gmail does not train on it.
+- A65. Sink URLs off the command line (follow-up to A59 (d), 2026-11-14). Slack, Discord and ntfy webhook URLs are
+  credentials, and `dove sinks add --url` put them in shell history and `ps`. `--url-file <path>` reads the URL with
+  the secret-file rules (`secrets::read_secret_string`: regular file, no group or other access, DPAPI on Windows,
+  trimmed); `-` reads standard input (at most 8 KiB, trimmed). `--url` stays for compatibility and scripts, with a
+  warning on stderr, rather than being removed in a minor release. clap enforces exactly one of the two. Errors name
+  the file, never its content. The admin request is unchanged (`SinksAdd.url`), so nothing changes on the service side.
+- A66. Redaction default for new connections (follow-up to A60, 2026-11-14). `[clients] redact_secrets_default`
+  (service config, default `false`) decides `redact_secrets` for connections created without an explicit choice. (a)
+  The shipped default stays `false`: turning redaction on for every new connection after an upgrade would change what
+  scripted `clients create` calls produce without the operator asking; the operator opts the instance in. (b) The
+  admin request's `redact_secrets` is an `Option<bool>` resolved on the service (`None` = the config default), and
+  `None` is not serialized, so a newer CLI talking to a service that was not restarted yet still sends a request the
+  old service accepts (`deny_unknown_fields`). An older CLI sends `false`, which the new service reads as an explicit
+  opt-out; the CLI and the service are one binary, so this only lasts until the restart. (c) The CLI has
+  `--redact-secrets` and `--no-redact-secrets` (mutually exclusive). (d) The default is applied when the invitation is
+  created and stored on it; `/connect/redeem` and the OAuth approval page copy the invitation's value, which covers
+  OAuth connections (every OAuth connection, dynamic or pre-registered client, comes from an invitation). Existing
+  connections and open invitations are not touched.

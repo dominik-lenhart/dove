@@ -22,7 +22,7 @@ async fn invite(h: &Harness, name: &str, accounts: &[&str], caps: &str) -> Resul
         capabilities: caps.into(),
         expires: None,
         allow_ip: vec![],
-        redact_secrets: false,
+        redact_secrets: None,
     })
     .await
 }
@@ -197,7 +197,7 @@ async fn redeem_checks_the_invitation_ip_allowlist() {
             capabilities: "read".into(),
             expires: None,
             allow_ip: vec!["192.0.2.0/24".into()],
-            redact_secrets: false,
+            redact_secrets: None,
         })
         .await
         .unwrap()["invitation"]

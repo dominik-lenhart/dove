@@ -65,7 +65,8 @@ pub fn defs() -> Vec<ToolDef> {
             description: concat!(
                 "Mark messages read or unread, star or unstar them, and add or remove labels (Gmail user labels; IMAP ",
                 "keywords). Flags: UNREAD, STARRED. At most 100 ids per call; each id gets its own result. ",
-                "Labels must already exist on Gmail. To move, archive or trash, use move_messages."
+                "Labels must already exist on Gmail. IMAP keywords with junk or spam in the name ($Junk, $NotJunk) ",
+                "train spam filters and need the delete permission. To move, archive or trash, use move_messages."
             ),
             capability: Capability::Organize,
             read_only: false,
@@ -162,8 +163,24 @@ fn flags_arg(args: &Value, key: &str) -> Result<Vec<Flag>, ToolError> {
 
 /// One id's outcome.
 enum Outcome {
-    Done { new_id: Option<String>, labels: Option<Vec<String>> },
+    Done {
+        new_id: Option<String>,
+        labels: Option<Vec<String>>,
+    },
+    /// Failed. Refunded unless the error is `outcome_unknown` (a write that may have been applied).
     Failed(ToolError),
+    /// Failed after a write for this id took effect (Gmail untrash before a failed modify, an IMAP copy whose original
+    /// stayed): reported like `Failed`, never refunded.
+    Spent(ToolError),
+}
+
+impl Outcome {
+    /// Whether this id's budget unit goes back: only failures that certainly changed nothing upstream. The
+    /// classification is the error code set where the write was classified (`Google::write`, the IMAP session),
+    /// never error text.
+    fn refundable(&self) -> bool {
+        matches!(self, Outcome::Failed(e) if e.code != ErrorCode::OutcomeUnknown)
+    }
 }
 
 fn output(mb: &Mailbox, verb: &str, ids: &[String], outcomes: Vec<Outcome>) -> ToolOutput {
@@ -180,7 +197,7 @@ fn output(mb: &Mailbox, verb: &str, ids: &[String], outcomes: Vec<Outcome>) -> T
                 }
                 v
             }
-            Outcome::Failed(e) => json!({ "id": id, "ok": false, "error": e.to_json() }),
+            Outcome::Failed(e) | Outcome::Spent(e) => json!({ "id": id, "ok": false, "error": e.to_json() }),
         })
         .collect();
     let failed = ids.len() - ok;
@@ -230,16 +247,23 @@ impl Budget {
         Ok(Self { key, reserved })
     }
 
-    /// Gives back what did not change: everything when the call failed before its first write, else the failed ids.
+    /// Gives back what certainly did not change (see [`unused`]).
     fn settle(self, cx: &ToolCx, r: Result<Vec<Outcome>, ToolError>) -> Result<Vec<Outcome>, ToolError> {
-        let unused = match &r {
-            Ok(outcomes) => outcomes.iter().filter(|o| matches!(o, Outcome::Failed(_))).count() as u32,
-            Err(_) if !cx.committed() => self.reserved,
-            Err(_) => 0,
-        };
-        cx.app.rate_limiter.refund(&self.key, unused.min(self.reserved));
+        cx.app.rate_limiter.refund(&self.key, unused(self.reserved, &r, cx.committed()));
         r
     }
+}
+
+/// Budget units to give back: everything when the call failed before its first write (`committed` false), nothing
+/// when it failed after (some writes may have happened and which ones is unknown), else one per refundable id
+/// ([`Outcome::refundable`]).
+fn unused(reserved: u32, r: &Result<Vec<Outcome>, ToolError>, committed: bool) -> u32 {
+    let n = match r {
+        Ok(outcomes) => u32::try_from(outcomes.iter().filter(|o| o.refundable()).count()).unwrap_or(u32::MAX),
+        Err(_) if !committed => reserved,
+        Err(_) => 0,
+    };
+    n.min(reserved)
 }
 
 // ------------------------------------------------------------------ Gmail helpers
@@ -442,6 +466,14 @@ fn imap_flags(flags: &[Flag], labels: &[String], adding: bool) -> Result<(Vec<St
     Ok((add, remove))
 }
 
+/// Whether an IMAP keyword is one mail clients and servers train spam filters on: `$Junk`, `$NotJunk`, `Junk`,
+/// `NotJunk`, `NonJunk`, `$Spam`, ... Any keyword containing `junk` or `spam` in any case counts (keywords are ASCII);
+/// a false hit only asks for the `delete` permission.
+fn is_junk_keyword(keyword: &str) -> bool {
+    let k = keyword.to_ascii_lowercase();
+    k.contains("junk") || k.contains("spam")
+}
+
 async fn imap_update(
     cx: &ToolCx,
     mb: &Mailbox,
@@ -458,6 +490,10 @@ async fn imap_update(
     let (a2, r2) = imap_flags(remove_flags, remove_labels, false)?;
     add.extend(a2);
     remove.extend(r2);
+    // Adding or removing a junk keyword is spam-filter training, like moving into or out of Junk (PLAN A64).
+    if add_labels.iter().chain(remove_labels).any(|l| is_junk_keyword(l)) {
+        require_delete(cx, mb, NeedsDelete::JunkKeyword)?;
+    }
     let ImapGroups { folders, groups, mut outcomes } = imap_groups(cx, mb, ids).await?;
     cx.commit()?;
     for ((folder_id, uidvalidity), members) in groups {
@@ -532,6 +568,8 @@ enum NeedsDelete {
     Into,
     /// Out of Spam/Junk: promotes mail the provider classified as spam into view (security review 2026-11-13).
     OutOfSpam,
+    /// A junk or not-junk keyword (`$Junk`, `$NotJunk`, `NonJunk`, ...): mail clients train spam filters on them.
+    JunkKeyword,
 }
 
 fn require_delete(cx: &ToolCx, mb: &Mailbox, why: NeedsDelete) -> Result<(), ToolError> {
@@ -540,6 +578,9 @@ fn require_delete(cx: &ToolCx, mb: &Mailbox, why: NeedsDelete) -> Result<(), Too
             ToolError::forbidden(match why {
                 NeedsDelete::Into => "moving to Trash or Spam needs the delete permission on this mailbox",
                 NeedsDelete::OutOfSpam => "moving messages out of Spam needs the delete permission on this mailbox",
+                NeedsDelete::JunkKeyword => {
+                    "setting or removing junk keywords trains spam filters and needs the delete permission on this mailbox"
+                }
             })
         } else {
             e
@@ -595,35 +636,39 @@ async fn gmail_move(cx: &ToolCx, mb: &Mailbox, ids: &[String], target: &Target) 
             let i = ids.iter().position(|x| x == id).unwrap_or_default();
             let Some(labels) = &current[i] else { return Outcome::Failed(ToolError::not_found()) };
             let has = |l: &str| labels.iter().any(|x| x == l);
-            let r = async {
-                match target {
-                    Target::Trash => return gmail_write(cx, mb, || GmailOp::TrashMessage(id), &json!({})).await,
-                    Target::Spam => {
-                        let body = json!({ "addLabelIds": ["SPAM"], "removeLabelIds": ["INBOX"] });
-                        return gmail_write(cx, mb, || GmailOp::ModifyMessage(id), &body).await;
-                    }
-                    Target::Archive => {
-                        let body = json!({ "removeLabelIds": ["INBOX"] });
-                        return gmail_write(cx, mb, || GmailOp::ModifyMessage(id), &body).await;
-                    }
-                    Target::Inbox | Target::Named(_) => {}
-                }
-                if has("TRASH") {
-                    gmail_write(cx, mb, || GmailOp::UntrashMessage(id), &json!({})).await?;
-                }
-                let mut remove: Vec<&str> = if has("SPAM") { vec!["SPAM"] } else { vec![] };
-                let add = match label {
-                    Some(l) => {
-                        remove.push("INBOX");
-                        l.as_str()
-                    }
-                    None => "INBOX",
-                };
-                let body = json!({ "addLabelIds": [add], "removeLabelIds": remove });
-                gmail_write(cx, mb, || GmailOp::ModifyMessage(id), &body).await
-            };
-            match r.await {
+            let done = |r: Result<Value, ToolError>| match r {
                 Ok(_) => Outcome::Done { new_id: Some(id.to_string()), labels: None },
+                Err(e) => Outcome::Failed(e),
+            };
+            match target {
+                Target::Trash => return done(gmail_write(cx, mb, || GmailOp::TrashMessage(id), &json!({})).await),
+                Target::Spam => {
+                    let body = json!({ "addLabelIds": ["SPAM"], "removeLabelIds": ["INBOX"] });
+                    return done(gmail_write(cx, mb, || GmailOp::ModifyMessage(id), &body).await);
+                }
+                Target::Archive => {
+                    let body = json!({ "removeLabelIds": ["INBOX"] });
+                    return done(gmail_write(cx, mb, || GmailOp::ModifyMessage(id), &body).await);
+                }
+                Target::Inbox | Target::Named(_) => {}
+            }
+            let untrash = has("TRASH");
+            if untrash && let Err(e) = gmail_write(cx, mb, || GmailOp::UntrashMessage(id), &json!({})).await {
+                return Outcome::Failed(e);
+            }
+            let mut remove: Vec<&str> = if has("SPAM") { vec!["SPAM"] } else { vec![] };
+            let add = match label {
+                Some(l) => {
+                    remove.push("INBOX");
+                    l.as_str()
+                }
+                None => "INBOX",
+            };
+            let body = json!({ "addLabelIds": [add], "removeLabelIds": remove });
+            match gmail_write(cx, mb, || GmailOp::ModifyMessage(id), &body).await {
+                Ok(_) => Outcome::Done { new_id: Some(id.to_string()), labels: None },
+                // The message already left Trash: the move is half done and counts as spent.
+                Err(e) if untrash => Outcome::Spent(e),
                 Err(e) => Outcome::Failed(e),
             }
         })
@@ -760,7 +805,8 @@ async fn move_group(
                 if let Some((_, d)) = m.moved.iter().find(|(s, _)| *s == uid) {
                     Outcome::Done { new_id: new_id(m.dest_uidvalidity, *d), labels: None }
                 } else if let Some((_, d)) = m.copied_kept.iter().find(|(s, _)| *s == uid) {
-                    Outcome::Failed(
+                    // A copy exists now: the write took effect.
+                    Outcome::Spent(
                         ToolError::new(
                             ErrorCode::UpstreamError,
                             "the message was copied but the original could not be removed; it is now in both folders",
@@ -874,7 +920,12 @@ async fn gmail_imap_update(
                     metas = s.store_flags(&name, uidvalidity, &uids, &add, &remove).await?;
                 }
                 if !gadd.is_empty() || !gremove.is_empty() {
-                    metas = s.store_gm_labels(&name, uidvalidity, &uids, &gadd, &gremove).await?;
+                    // Flags stored (metas of present UIDs) and then a label failure: part of the change is in place.
+                    let flagged = !metas.is_empty();
+                    metas = s
+                        .store_gm_labels(&name, uidvalidity, &uids, &gadd, &gremove)
+                        .await
+                        .map_err(|e| if flagged { crate::imap::ImapError::OutcomeUnknown } else { e })?;
                 }
                 Ok(metas)
             })
@@ -951,6 +1002,12 @@ async fn gmail_imap_move(
     let missing = |what: &str| ToolError::invalid(format!("this Gmail mailbox shows no {what} folder in IMAP"));
     let all = folders.iter().find(|f| f.special == Some(Special::All)).cloned().ok_or_else(|| missing("All Mail"))?;
     let inbox = folders.iter().find(|f| f.name.eq_ignore_ascii_case("INBOX")).cloned();
+    // Every refusal of the call comes before the first write (out of Trash/Spam into the inbox needs INBOX).
+    let out_of_bin =
+        groups.keys().any(|(id, _)| matches!(folder_of(&folders, *id).special, Some(Special::Trash | Special::Junk)));
+    if matches!(dest, GmailDest::Inbox) && inbox.is_none() && out_of_bin {
+        return Err(missing("INBOX"));
+    }
     let mut committed = false;
     for ((folder_id, uidvalidity), members) in groups {
         let f = folder_of(&folders, folder_id).clone();
@@ -1057,6 +1114,27 @@ mod tests {
         assert_eq!(imap_target(&plain, &Target::Spam).unwrap().folder_id, 3);
         assert_eq!(target_arg(&json!({"to": "Junk"})).unwrap(), Target::Spam);
         assert!(target_arg(&json!({"to": "a\nb"})).is_err());
+    }
+
+    #[test]
+    fn budget_refunds_only_what_certainly_did_not_change() {
+        let failed = |code| Outcome::Failed(ToolError::new(code, "x"));
+        let done = || Outcome::Done { new_id: None, labels: None };
+        let r = Ok(vec![
+            done(),
+            failed(ErrorCode::NotFound),
+            failed(ErrorCode::UpstreamError),
+            failed(ErrorCode::OutcomeUnknown),
+            Outcome::Spent(ToolError::new(ErrorCode::UpstreamError, "x")),
+        ]);
+        assert_eq!(unused(5, &r, true), 2);
+        // A call that failed as a whole: everything back before its first write, nothing after it (which of its
+        // writes happened is unknown).
+        let err: Result<Vec<Outcome>, ToolError> = Err(ToolError::internal());
+        assert_eq!(unused(5, &err, false), 5);
+        assert_eq!(unused(5, &err, true), 0);
+        // Never more than was reserved.
+        assert_eq!(unused(1, &r, true), 1);
     }
 
     #[test]

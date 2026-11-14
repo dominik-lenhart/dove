@@ -62,7 +62,7 @@ async fn intersected_grants_and_token_lifecycle() {
         grants: vec![g("info", "draft")],
         expires: None,
         allow_ip: vec![],
-        redact_secrets: false,
+        redact_secrets: None,
     })
     .await;
     assert!(bad.unwrap_err().to_string().contains("draft requires read"));
@@ -72,7 +72,7 @@ async fn intersected_grants_and_token_lifecycle() {
         grants: vec![g("info", "read,draft,send")],
         expires: None,
         allow_ip: vec![],
-        redact_secrets: false,
+        redact_secrets: None,
     })
     .await;
     assert!(bad.unwrap_err().to_string().contains("allow_send"));
@@ -83,7 +83,7 @@ async fn intersected_grants_and_token_lifecycle() {
         grants: vec![g("info", "read,draft"), g("billing", "read")],
         expires: Some("90d".into()),
         allow_ip: vec![],
-        redact_secrets: false,
+        redact_secrets: None,
     })
     .await
     .unwrap();
@@ -144,7 +144,7 @@ async fn expired_and_ip_bound_tokens_fail() {
             grants: vec![g("info", "read")],
             expires: None,
             allow_ip: vec!["10.0.0.0/8".into()],
-            redact_secrets: false,
+            redact_secrets: None,
         },
     )
     .await
@@ -209,7 +209,7 @@ async fn every_admin_action_writes_exactly_one_audit_record() {
             grants: vec![g("info", "read")],
             expires: None,
             allow_ip: vec![],
-            redact_secrets: false,
+            redact_secrets: None,
         },
     )
     .await

@@ -5,7 +5,7 @@
 mod support;
 
 use serde_json::{Value, json};
-use support::fake_google::MessageSpec;
+use support::fake_google::{Fault, MessageSpec};
 use support::harness::{Harness, g};
 
 const INFO: &str = "info@acme.test";
@@ -132,7 +132,7 @@ async fn presets_expand_and_tools_follow_grants() {
                 grants: vec![bad(actions)],
                 expires: None,
                 allow_ip: vec![],
-                redact_secrets: false,
+                redact_secrets: None,
             })
             .await
             .unwrap_err();
@@ -469,4 +469,60 @@ async fn organize_budget_counts_changed_messages_per_client() {
         .await
         .unwrap();
     assert_eq!(refused, 3);
+}
+
+/// Only definitive failures are given back: a 4xx from Gmail is refunded, a 5xx (`outcome_unknown`, Google may have
+/// applied it) is spent, and so is a move out of Trash whose untrash went through before its modify failed.
+#[tokio::test]
+async fn organize_budget_refunds_only_definitive_gmail_failures() {
+    let h = Harness::start_with(|c| c.limits.client_organize_per_hour = 10).await;
+    h.mailbox("info", INFO);
+    h.project("acme", &["info"]).await;
+    let t = h.token("acme", "agent", vec![g("info", "full")]).await;
+    let trashed = h.google.add_message(INFO, msg("t", &["TRASH"]));
+    let x = h.google.add_message(INFO, msg("x", &["INBOX"]));
+    let y = h.google.add_message(INFO, msg("y", &["INBOX"]));
+    let star = |id: &str| json!({ "account": "info", "ids": [id], "add_flags": ["STARRED"] });
+    let left = |n: usize| {
+        let h = &h;
+        let t = &t;
+        async move {
+            let ids = |k: usize| (0..k).map(|i| format!("nope{i}")).collect::<Vec<_>>();
+            let call = |k: usize| json!({ "account": "info", "ids": ids(k), "add_flags": ["STARRED"] });
+            assert_eq!(h.err(t, "update_messages", call(n + 1)).await, "rate_limited", "more than {n} left");
+            h.ok(t, "update_messages", call(n)).await;
+        }
+    };
+
+    // Untrash succeeds, the modify is refused: the message left Trash, so the unit is spent. 10 - 1 = 9.
+    h.google.fail_next("POST", &format!("{trashed}/modify"), Fault::Status(400, json!({})));
+    let r = h.ok(&t, "move_messages", json!({ "account": "info", "ids": [trashed], "to": "inbox" })).await;
+    assert_eq!(results(&r), vec![(trashed.clone(), false, Some("upstream_error".into()))], "{r}");
+    assert_eq!(h.google.count("POST", &format!("{trashed}/untrash")), 1);
+    // A 5xx leaves the outcome unknown: spent. 9 - 1 = 8.
+    h.google.fail_next("POST", &format!("{x}/modify"), Fault::Status(503, json!({})));
+    let r = h.ok(&t, "update_messages", star(&x)).await;
+    assert_eq!(results(&r), vec![(x.clone(), false, Some("outcome_unknown".into()))], "{r}");
+    // A 4xx is definitive: given back.
+    h.google.fail_next("POST", &format!("{y}/modify"), Fault::Status(400, json!({})));
+    let r = h.ok(&t, "update_messages", star(&y)).await;
+    assert_eq!(results(&r), vec![(y.clone(), false, Some("upstream_error".into()))], "{r}");
+    left(8).await;
+}
+
+/// Gmail has no spam-training keyword path: the `SPAM` label is a system label, which update_messages refuses before
+/// any write in both directions; only move_messages reaches Spam, behind `delete`.
+#[tokio::test]
+async fn spam_label_is_not_reachable_through_update_messages() {
+    let h = setup().await;
+    let t = h.token("acme", "agent", vec![g("info", "full")]).await;
+    let x = h.google.add_message(INFO, msg("x", &["INBOX", "SPAM"]));
+    h.google.clear_requests();
+    for key in ["add_labels", "remove_labels"] {
+        for label in ["SPAM", "Spam"] {
+            let args = json!({ "account": "info", "ids": [x], key: [label] });
+            assert_eq!(h.err(&t, "update_messages", args).await, "invalid_argument", "{key} {label}");
+        }
+    }
+    assert!(writes(&h).is_empty(), "{:?}", writes(&h));
 }
