@@ -6,6 +6,9 @@
 # Environment:
 #   DOVE_VERSION       X.Y.Z (or vX.Y.Z); default: the latest release
 #   DOVE_INSTALL_DIR   target directory; default: /usr/local/bin as root, otherwise ~/.local/bin
+#
+# On your own computer run it without sudo: a user-level install updates itself (`dove upgrade`) without root.
+# On a server that runs the Dove service use `| sudo sh`: there the binary stays root-owned on purpose.
 #   DOVE_LIBC          Linux only: gnu or musl; default: musl on musl systems (Alpine), gnu everywhere else
 #   DOVE_DOWNLOAD_BASE testing only: replaces https://github.com/dominik-lenhart/dove/releases/download
 #                      (files are fetched from <base>/<tag>/<file>; DOVE_VERSION is then required)
@@ -141,13 +144,33 @@ mv -f "$dir/.dove.new.$$" "$dir/dove"
 say "Installed $dir/dove"
 case ":${PATH:-}:" in
   *":$dir:"*) ;;
-  *) say "Note: $dir is not in your PATH. Add it, for example: export PATH=\"$dir:\$PATH\"" ;;
+  *)
+    # Print the line, never edit the user's shell files.
+    path_dir="$dir"
+    [ -z "${HOME:-}" ] || [ "$dir" != "$HOME/.local/bin" ] || path_dir='$HOME/.local/bin'
+    case "${SHELL:-}" in
+      */zsh) rc='~/.zshrc'; line="export PATH=\"$path_dir:\$PATH\"" ;;
+      */bash) rc='~/.bashrc'; line="export PATH=\"$path_dir:\$PATH\"" ;;
+      */fish) rc='~/.config/fish/config.fish'; line="fish_add_path \"$path_dir\"" ;;
+      *) rc='~/.profile'; line="export PATH=\"$path_dir:\$PATH\"" ;;
+    esac
+    say ""
+    say "Note: $dir is not in your PATH, so your shell will not find dove yet. Add this line to $rc"
+    say "and open a new terminal:"
+    say ""
+    say "  $line"
+    ;;
 esac
 
+if [ "$(id -u)" -eq 0 ]; then
+  upgrade="sudo dove upgrade   (on a server, then restart the service)"
+else
+  upgrade="dove upgrade   (no sudo needed, this install belongs to you)"
+fi
 cat <<EOF
 
 Next steps:
   dove --version
   Set up the service:  https://github.com/$REPO/blob/main/docs/deployment.md
-  Later upgrades:      sudo dove upgrade   (then restart the service)
+  Later upgrades:      $upgrade
 EOF

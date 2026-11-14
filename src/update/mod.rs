@@ -412,11 +412,53 @@ fn extract_zip_binary(archive: &[u8], tag: &str, target: &str) -> anyhow::Result
     Ok(data)
 }
 
-fn sudo_hint(dir: &Path) -> String {
+/// What to tell the user when `path`'s directory does not accept new files. On Unix that is usually a root-owned
+/// install: right for a server (the service binary stays root-owned on purpose), wrong for a client on someone's own
+/// computer, so both ways out are named.
+fn sudo_hint(path: &Path) -> String {
+    let dir = path.parent().unwrap_or(path);
     if cfg!(windows) {
         return format!("{} is not writable by this Windows user; reinstall Dove with install.ps1", dir.display());
     }
-    format!("{} is not writable by this user; run `sudo dove upgrade`", dir.display())
+    format!(
+        "{dir} is not writable by this user.\n\
+         On a server, run `sudo dove upgrade`.\n\
+         On your own computer, switch to a user install that updates without root: `sudo rm {path}`, run \
+         `curl -fsSL https://github.com/{slug}/releases/latest/download/install.sh | sh` (without sudo), and make \
+         sure ~/.local/bin is in your PATH.",
+        dir = dir.display(),
+        path = path.display(),
+        slug = repo_slug(),
+    )
+}
+
+/// True when `exe` (symlinks resolved) lives in a Homebrew Cellar, `.../Cellar/dove/<version>/bin/dove`: Homebrew
+/// owns that file and would be left with a binary that does not match its records if Dove replaced it.
+pub fn is_homebrew_install(exe: &Path) -> bool {
+    let real = std::fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());
+    let names: Vec<_> = real.components().filter_map(|c| c.as_os_str().to_str()).collect();
+    names.windows(2).any(|w| w[0] == "Cellar" && w[1] == "dove")
+}
+
+/// Why `dove upgrade` leaves a Homebrew-managed binary alone.
+pub fn homebrew_refusal(exe: &Path) -> String {
+    format!("{} is managed by Homebrew; run `{HOMEBREW_UPGRADE}` instead", exe.display())
+}
+
+/// The command that updates a Homebrew-managed binary.
+pub const HOMEBREW_UPGRADE: &str = "brew upgrade dove";
+
+/// The command that updates the running binary: `brew upgrade dove` for a Homebrew install, `dove upgrade` otherwise.
+pub fn upgrade_command() -> &'static str {
+    match std::env::current_exe() {
+        Ok(exe) => upgrade_command_for(&exe),
+        Err(_) => "dove upgrade",
+    }
+}
+
+/// [`upgrade_command`] for the binary at `exe`.
+pub fn upgrade_command_for(exe: &Path) -> &'static str {
+    if is_homebrew_install(exe) { HOMEBREW_UPGRADE } else { "dove upgrade" }
 }
 
 fn parent_dir(path: &Path) -> anyhow::Result<&Path> {
@@ -436,7 +478,7 @@ pub fn check_writable(exe: &Path) -> anyhow::Result<()> {
             let _ = std::fs::remove_file(&tmp);
             Ok(())
         }
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Err(anyhow!(sudo_hint(dir))),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Err(anyhow!(sudo_hint(exe))),
         Err(e) => Err(anyhow!("cannot write in {}: {e}", dir.display())),
     }
 }
@@ -454,7 +496,7 @@ pub fn replace_binary(path: &Path, binary: &[u8]) -> anyhow::Result<()> {
     std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o700);
     let mut f = match opts.open(&tmp) {
         Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return Err(anyhow!(sudo_hint(dir))),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return Err(anyhow!(sudo_hint(path))),
         Err(e) => return Err(anyhow!("cannot write in {}: {e}", dir.display())),
     };
     let result = (|| -> anyhow::Result<()> {
@@ -469,7 +511,7 @@ pub fn replace_binary(path: &Path, binary: &[u8]) -> anyhow::Result<()> {
         #[cfg(windows)]
         let swapped = windows::swap_in(&tmp, path);
         swapped.map_err(|e| match e.kind() {
-            std::io::ErrorKind::PermissionDenied => anyhow!(sudo_hint(dir)),
+            std::io::ErrorKind::PermissionDenied => anyhow!(sudo_hint(path)),
             _ => anyhow!("cannot replace {}: {e}", path.display()),
         })?;
         if let Ok(d) = std::fs::File::open(dir) {
@@ -485,6 +527,9 @@ pub fn replace_binary(path: &Path, binary: &[u8]) -> anyhow::Result<()> {
 
 /// Downloads, verifies and installs `version` over the binary at `exe`.
 pub async fn install(src: &Source, http: &reqwest::Client, version: &Version, exe: &Path) -> anyhow::Result<()> {
+    if is_homebrew_install(exe) {
+        bail!("{}", homebrew_refusal(exe));
+    }
     check_writable(exe)?;
     let binary = fetch_binary(src, http, version).await?;
     replace_binary(exe, &binary)
@@ -526,7 +571,7 @@ pub async fn run_upgrade(opts: UpgradeOpts) -> anyhow::Result<u8> {
     if opts.check {
         return Ok(match decision {
             Decision::Install(v) => {
-                println!("{}", notice::notice_text(&v, &src.current));
+                println!("{}", notice::notice_text(&v, &src.current, upgrade_command()));
                 EXIT_UPDATE_AVAILABLE
             }
             Decision::UpToDate { latest } => {
@@ -556,6 +601,9 @@ pub async fn run_upgrade(opts: UpgradeOpts) -> anyhow::Result<u8> {
         return Err(unsupported_target());
     }
     let exe = current_exe()?;
+    if is_homebrew_install(&exe) {
+        bail!("{}", homebrew_refusal(&exe));
+    }
     eprintln!("Downloading Dove {} (installed {installed}) ...", tag(&version));
     install(&src, &http, &version, &exe).await?;
     println!("Dove {} installed at {}.", tag(&version), exe.display());

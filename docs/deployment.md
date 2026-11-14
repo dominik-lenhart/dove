@@ -33,12 +33,36 @@ Contents: [Requirements](#requirements) · [Install](#install) · [Google Cloud]
 Signed releases are published on GitHub for Linux and macOS (x86_64 and aarch64), together with a container image
 on GHCR. See [releasing.md](releasing.md) for how they are signed and how to verify them.
 
-One-line installer (checks the SHA-256 and, when `minisign` is installed, the signature; installs to
-`~/.local/bin`, or `/usr/local/bin` as root):
+One-line installer (checks the SHA-256 and, when `minisign` is installed, the signature). Where it installs depends
+on who runs it:
 
-```sh
-curl -fsSL https://github.com/dominik-lenhart/dove/releases/latest/download/install.sh | sh
-```
+- **Server running the service: as root**, into `/usr/local/bin`. The service binary stays root-owned on purpose. The
+  operator uid may run agents, and an agent must not be able to replace the binary that holds the vault keys. That is
+  why `dove upgrade` needs root there (`sudo dove upgrade`).
+
+  ```sh
+  curl -fsSL https://github.com/dominik-lenhart/dove/releases/latest/download/install.sh | sudo sh
+  ```
+
+- **Client or your own computer** (CLI, `dove login`, `dove mcp install`, [local mode](#local-mode)): **without
+  sudo**, into `~/.local/bin`, owned by you. `dove upgrade` then updates it without root, like other user-level
+  tools. If the directory is not in your `PATH`, the installer prints the line to add (zsh: `~/.zshrc`, bash:
+  `~/.bashrc`, other shells: `~/.profile`) and does not edit your shell files. Set `DOVE_INSTALL_DIR` to choose
+  another directory.
+
+  ```sh
+  curl -fsSL https://github.com/dominik-lenhart/dove/releases/latest/download/install.sh | sh
+  ```
+
+- **Homebrew** (macOS and Linux, your own computer): `brew install dominik-lenhart/tap/dove` and
+  `brew upgrade dove`. Homebrew owns that binary, so `dove upgrade` refuses to replace a binary inside a Homebrew
+  Cellar and names `brew upgrade dove`; the daily new-version notice does the same.
+- **Windows**: `install.ps1` installs `dove.exe` for the current user (no administrator rights), and `dove upgrade`
+  updates it the same way.
+
+If you installed on your own computer with `sudo` and `dove upgrade` reports that the directory is not writable,
+switch to a user install: `sudo rm /usr/local/bin/dove`, rerun the installer without `sudo`, and make sure
+`~/.local/bin` is in your `PATH`.
 
 To build from source instead, see the first block below.
 
@@ -446,7 +470,7 @@ A short window between the check and the connection remains on every platform. O
 
 ### Set up
 
-Install the binary (`install.sh`, Homebrew, or `install.ps1` on Windows; see [Install](#install)), then:
+Install the binary without sudo (`install.sh`, Homebrew, or `install.ps1` on Windows; see [Install](#install)), then:
 
 ```sh
 dove local init                 # config, keys and data directory for your user (port 8787; --port to change)
@@ -522,8 +546,8 @@ mode only; a server-mode service refuses it.
 
 ### Upgrading
 
-`dove upgrade`, then `dove local install` to restart the service on the new binary (`dove doctor` tells you when the
-running service is older). On Windows the running `dove.exe` cannot be overwritten, so `dove upgrade` renames it aside
+`dove upgrade` (no sudo for a user install; `brew upgrade dove` for Homebrew), then `dove local install` to restart
+the service on the new binary (`dove doctor` tells you when the running service is older). On Windows the running `dove.exe` cannot be overwritten, so `dove upgrade` renames it aside
 and moves the new one in; the old file is deleted on a later start.
 
 ### Limits on Windows
@@ -881,7 +905,7 @@ Always start with a backup of the state store (previous section).
 ```sh
 # 1. back up state.db first (see "Backup and restore"), then:
 sudo dove upgrade --check            # shows the newest release without installing it
-sudo dove upgrade                    # downloads, verifies and replaces /usr/local/bin/dove
+sudo dove upgrade                    # downloads, verifies and replaces /usr/local/bin/dove (root-owned on a server)
 sudo systemctl restart dove          # migrations run now; the old process keeps running until this
 sudo journalctl -u dove -n 50        # look for migration errors
 dove doctor

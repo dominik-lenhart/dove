@@ -553,3 +553,19 @@ hosts or reference hardware.
   created and stored on it; `/connect/redeem` and the OAuth approval page copy the invitation's value, which covers
   OAuth connections (every OAuth connection, dynamic or pre-registered client, comes from an invitation). Existing
   connections and open invitations are not touched.
+- A67. Client install and update without root (owner request 2026-11-14, after `dove update` on a Mac failed with
+  "/usr/local/bin is not writable", because the README quickstart said `| sudo sh`). (a) The service binary on a server
+  stays root-owned: the operator uid may run agents, and they must not be able to replace the binary that holds the
+  vault keys. Nothing changes there, and `sudo dove upgrade` stays the server path. (b) The client path is documented
+  as its own install (`| sh` into `~/.local/bin`, Homebrew, `install.ps1`), so the self-update has the same shape as
+  other user-level tools. `install.sh` already chose `~/.local/bin` for non-root; it now prints the `PATH` line for
+  the user's shell (`$SHELL`: zsh `~/.zshrc`, bash `~/.bashrc`, fish `fish_add_path`, otherwise `~/.profile`; the
+  default directory is written as `$HOME/.local/bin`) and never edits shell files. (c) `dove upgrade` cannot know
+  whether a root-owned binary sits on a server or on a laptop, so the not-writable error names both: `sudo dove
+  upgrade`, and the switch to a user install (remove the binary, rerun `install.sh` without sudo, `PATH`). Windows
+  wording is unchanged. (d) Homebrew: a binary whose symlink-resolved path has the components `Cellar/dove` is
+  Homebrew's. `dove upgrade` refuses (no download, nothing written) and says `brew upgrade dove`, since replacing it
+  would leave Homebrew's records stale, and `brew cleanup` or the next `brew upgrade` would overwrite or remove it.
+  The notice and `--check` print `brew upgrade dove` for it. Only the formula named `dove` counts. The check is on
+  the path, not on `brew --prefix`, so it needs no `brew` binary and works with `/opt/homebrew`, `/usr/local` and
+  Linuxbrew alike.

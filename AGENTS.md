@@ -417,3 +417,11 @@ cargo fmt
   (new binary installed, service not restarted). A new optional request field must be `Option<_>` with
   `#[serde(default, skip_serializing_if = "Option::is_none")]` so the older service still parses requests that do not
   use it; tests construct `AdminRequest` literals in many files, so a new field touches all of them.
+- 2026-11-14: Client install and update (PLAN A67): the server binary stays root-owned on purpose, the client uses a
+  user-level install (`install.sh` without sudo). `update::is_homebrew_install` canonicalizes and looks for the path
+  components `Cellar/dove`; test it with a temp dir holding `Cellar/dove/<ver>/bin/dove` and a `bin/dove` symlink
+  (`brew_layout` in `tests/update_e2e.rs`). `notice_text`/`notice_line` take the upgrade command as a parameter,
+  production passes `update::upgrade_command()`. `tests/packaging.rs` runs `install.sh` through `InstallEnv`
+  (`$SHELL`, default directory, dir on `PATH`); `InstallRun` keeps its temp dir alive, because a dropped `TempDir`
+  deletes what the test wants to inspect. The user-install test skips itself as root (the default dir is then
+  `/usr/local/bin`), so the root branch of install.sh's closing hint is not covered.

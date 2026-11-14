@@ -347,6 +347,15 @@ async fn unwritable_directory_fails_before_downloading() {
     let err = update::install(&src, &http(), &Version::new(0, 2, 0), &exe).await.unwrap_err();
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
     assert!(err.to_string().contains("run `sudo dove upgrade`"), "{err:#}");
+    // A client on its own computer gets the way out of the root-owned install, with the exact binary to remove.
+    for part in [
+        format!("sudo rm {}", exe.display()),
+        "install.sh | sh".to_string(),
+        "(without sudo)".to_string(),
+        "~/.local/bin is in your PATH".to_string(),
+    ] {
+        assert!(err.to_string().contains(&part), "missing {part:?}: {err:#}");
+    }
     assert!(fake.requests().is_empty(), "checked before any download");
     assert_eq!(std::fs::read(&exe).unwrap(), OLD_BINARY);
     // The write path itself gives the same hint.
@@ -354,6 +363,49 @@ async fn unwritable_directory_fails_before_downloading() {
     let err = update::replace_binary(&exe, NEW_BINARY).unwrap_err();
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
     assert!(err.to_string().contains("sudo dove upgrade"), "{err:#}");
+}
+
+/// A fake Homebrew prefix: `<root>/Cellar/<formula>/<version>/bin/dove` with `<root>/bin/dove` linking to it, like
+/// `/opt/homebrew/bin/dove`.
+fn brew_layout(formula: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let root = tempfile::tempdir().unwrap();
+    let keg = root.path().join("Cellar").join(formula).join("0.1.0").join("bin");
+    std::fs::create_dir_all(&keg).unwrap();
+    let real = keg.join("dove");
+    std::fs::write(&real, OLD_BINARY).unwrap();
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::create_dir(root.path().join("bin")).unwrap();
+    let link = root.path().join("bin").join("dove");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    (root, link, real)
+}
+
+#[tokio::test]
+async fn homebrew_binaries_are_not_overwritten() {
+    let fake = FakeReleases::start().await;
+    fake.publish("v0.2.0");
+    let src = fake.source("0.1.0");
+    let (_root, link, real) = brew_layout("dove");
+    // Reached through the symlink in <prefix>/bin, the way `current_exe` plus canonicalize would see it.
+    for path in [&link, &real] {
+        let err = update::install(&src, &http(), &Version::new(0, 2, 0), path).await.unwrap_err();
+        assert!(err.to_string().contains("brew upgrade dove"), "{err:#}");
+        assert!(fake.requests().is_empty(), "refused before any download");
+        assert_eq!(std::fs::read(&real).unwrap(), OLD_BINARY);
+        assert_eq!(std::fs::read(&link).unwrap(), OLD_BINARY);
+    }
+    assert!(update::is_homebrew_install(&link));
+    assert_eq!(update::upgrade_command_for(&link), "brew upgrade dove");
+    // Not a Homebrew install: another formula's keg, a plain user install.
+    let (_other_root, other_link, _) = brew_layout("not-dove");
+    let (plain_dir, plain) = installed();
+    for path in [&other_link, &plain] {
+        assert!(!update::is_homebrew_install(path), "{}", path.display());
+        assert_eq!(update::upgrade_command_for(path), "dove upgrade");
+    }
+    update::install(&src, &http(), &Version::new(0, 2, 0), &plain).await.unwrap();
+    assert_eq!(std::fs::read(&plain).unwrap(), NEW_BINARY);
+    drop(plain_dir);
 }
 
 #[tokio::test]
@@ -386,8 +438,14 @@ async fn notice_cache_limits_lookups_to_one_per_day() {
     assert_eq!(lookups(), 1);
     assert_eq!(notice::read_cache(&cache), Some(CacheEntry { checked_at: t0, latest: Some("v0.2.0".into()) }));
     assert_eq!(
-        notice::notice_line(latest.as_ref(), &src.current).unwrap(),
+        notice::notice_line(latest.as_ref(), &src.current, "dove upgrade").unwrap(),
         "A new Dove version is available: v0.2.0 (installed v0.1.0). Run: dove upgrade"
+    );
+
+    // A Homebrew install is told to use brew; the cached lookup is the same.
+    assert_eq!(
+        notice::notice_line(latest.as_ref(), &src.current, update::HOMEBREW_UPGRADE).unwrap(),
+        "A new Dove version is available: v0.2.0 (installed v0.1.0). Run: brew upgrade dove"
     );
 
     // Fresh cache: no request, even though the server now knows a newer release.
