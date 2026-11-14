@@ -4,9 +4,10 @@
 
 use serde_json::{Value, json};
 
+use super::lenient::{self, Spec};
 use super::search::{Found, collect_targets, field_coverage, recheck, resolve_accounts};
 use super::{
-    AuditInfo, ToolCx, ToolDef, ToolOutput, UNTRUSTED_NOTE, arg_str, make_ref, object_schema, only_keys, opt_str,
+    AuditInfo, ToolCx, ToolDef, ToolOutput, UNTRUSTED_NOTE, make_ref, object_schema, only_keys_hint, opt_str,
     opt_str_list, opt_u64,
 };
 use crate::content;
@@ -23,7 +24,7 @@ pub fn defs() -> Vec<ToolDef> {
         title: "Mail digest",
         description: concat!(
             "Recent mail grouped by thread, newest first: thread id, subject, senders, message count, newest ",
-            "received_at, unread, category and a short snippet. `since` (RFC 3339, at most a year back) is required; ",
+            "received_at, unread, category and a short snippet. `since` (RFC 3339 instant, a date like 2026-11-01 or a span like 7d; at most a year back) is required; ",
             "`folders` defaults to INBOX (label ids or folder names as in list_labels); `category` filters to personal, ",
             "newsletter, notification or calendar mail. Resume with `cursor` only. If this connection hides secrets, ",
             "passwords, keys and one-time codes in subjects and snippets read [redacted] and the thread has ",
@@ -37,7 +38,7 @@ pub fn defs() -> Vec<ToolDef> {
         mail_content: true,
         input_schema: || {
             json!({ "type": "object", "properties": {
-                "since": { "type": "string", "description": "RFC 3339 instant with offset; threads with mail since then." },
+                "since": { "type": "string", "description": "RFC 3339 instant with offset, UTC date YYYY-MM-DD, or span back from now (7d, 36h); threads with mail since then." },
                 "accounts": { "type": "array", "items": { "type": "string" }, "description": "Mailbox aliases; default all readable." },
                 "folders": { "type": "array", "maxItems": intel::MAX_FOLDERS, "items": { "type": "string" }, "default": ["INBOX"] },
                 "category": { "type": "string", "enum": ["personal", "newsletter", "notification", "calendar"] },
@@ -66,31 +67,82 @@ pub fn defs() -> Vec<ToolDef> {
     }]
 }
 
+const DIGEST_SPEC: Spec<'static> = Spec {
+    aliases: &[("account", "accounts"), ("folder", "folders")],
+    lists: &["accounts", "folders"],
+    bools: &[],
+    ints: &["limit"],
+};
+
+const DIGEST_HINTS: &[(&str, &str)] = &[
+    ("after", "Use 'since'."),
+    ("from", "Use 'since'."),
+    ("date", "Use 'since'."),
+    ("days", "Use 'since', for example \"7d\" or a date."),
+    ("mailbox", "Use 'accounts' (aliases from list_accounts)."),
+    ("max_results", "Use 'limit'."),
+    ("page_token", "Use 'cursor': the next_cursor of the previous result, passed alone."),
+];
+
+/// `since`: an RFC 3339 instant with offset, a UTC date (`2026-11-01`, start of that day) or a span back from now
+/// (`7d`, `36h`). A time without offset is ambiguous and refused.
+fn parse_since(args: &Value) -> Result<i64, ToolError> {
+    const FORMS: &str = "an RFC 3339 instant with offset (2026-11-01T00:00:00Z), a UTC date (2026-11-01) or a span back from now (7d, 36h)";
+    let example = || json!("2026-11-01T00:00:00Z");
+    let s = match args.get("since") {
+        Some(Value::String(s)) => s.trim(),
+        None | Some(Value::Null) => {
+            return Err(ToolError::invalid_at("since", format!("is required: {FORMS}")).with_example(example()));
+        }
+        Some(_) => {
+            return Err(ToolError::invalid_at("since", format!("must be a string: {FORMS}")).with_example(example()));
+        }
+    };
+    if let Some(ms) = util::parse_rfc3339_ms(s).or_else(|| util::parse_date_ms(s)) {
+        return Ok(ms);
+    }
+    if let Some(secs) = util::parse_duration_secs(s).filter(|n| *n > 0) {
+        return Ok(util::now_unix_ms().saturating_sub(secs.saturating_mul(1000)));
+    }
+    let hint = if util::looks_like_local_datetime(s) {
+        "has no time zone offset; add Z for UTC or an offset like +01:00"
+    } else {
+        "takes"
+    };
+    Err(ToolError::invalid_at("since", format!("{hint} {FORMS}")).with_example(example()))
+}
+
 fn parse_req(args: &Value) -> Result<DigestReq, ToolError> {
-    only_keys(args, &["since", "accounts", "folders", "category", "limit"])?;
-    let since = arg_str(args, "since")?;
-    let since_ms = util::parse_rfc3339_ms(since).ok_or_else(|| {
-        ToolError::invalid("'since' takes an RFC 3339 instant with offset, e.g. 2026-11-01T00:00:00Z")
-    })?;
+    only_keys_hint(args, &["since", "accounts", "folders", "category", "limit"], DIGEST_HINTS)?;
+    let since_ms = parse_since(args)?;
     if since_ms < util::now_unix_ms() - intel::MAX_WINDOW_DAYS * 86_400_000 {
-        return Err(ToolError::invalid(format!("'since' may be at most {} days back", intel::MAX_WINDOW_DAYS)));
+        return Err(ToolError::invalid_at(
+            "since",
+            format!("may be at most {} days back; use a later date or span", intel::MAX_WINDOW_DAYS),
+        ));
     }
     let folders = match args.get("folders") {
         None | Some(Value::Null) => vec!["INBOX".to_string()],
         Some(_) => {
             let f = opt_str_list(args, "folders", intel::MAX_FOLDERS)?;
             if f.is_empty() || f.iter().any(|x| x.trim().is_empty() || x.chars().count() > 256) {
-                return Err(ToolError::invalid("'folders' takes 1 to 10 non-empty names of at most 256 characters"));
+                return Err(ToolError::invalid_at(
+                    "folders",
+                    format!(
+                        "takes 1 to {} non-empty folder names of at most 256 characters, e.g. [\"INBOX\"]",
+                        intel::MAX_FOLDERS
+                    ),
+                ));
             }
             f
         }
     };
     let category = match opt_str(args, "category")? {
         None => None,
-        Some(c) => Some(
-            Category::parse(c)
-                .ok_or_else(|| ToolError::invalid("'category' is personal, newsletter, notification or calendar"))?,
-        ),
+        Some(c) => Some(Category::parse(&c.trim().to_ascii_lowercase()).ok_or_else(|| {
+            ToolError::invalid_at("category", "is personal, newsletter, notification or calendar")
+                .with_example(json!("newsletter"))
+        })?),
     };
     Ok(DigestReq {
         accounts: super::search::accounts_arg(args)?,
@@ -106,7 +158,10 @@ async fn digest(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
         Some(c) => {
             // Resume with the cursor only: the query is bound to it.
             if args.as_object().is_some_and(|o| o.len() != 1) {
-                return Err(ToolError::invalid("'cursor' must be passed alone"));
+                return Err(ToolError::invalid_at(
+                    "cursor",
+                    "must be passed alone; it keeps the original query and page size. Drop the other arguments, or start a new digest without 'cursor'",
+                ));
             }
             let cur = cx.app.index.cursors.get(c, &cx.client.client_id, cx.client.auth_epoch)?;
             match cur.payload {
@@ -114,7 +169,7 @@ async fn digest(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
                 _ => return Err(cursor::invalid()),
             }
         }
-        None => (parse_req(&args)?, None),
+        None => (parse_req(&lenient::normalize(&args, &DIGEST_SPEC)?)?, None),
     };
     let (mut mbs, mut account_errors) = resolve_accounts(cx, req.accounts.as_deref())?;
     if let Some(p) = &resumed {

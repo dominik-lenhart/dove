@@ -8,7 +8,8 @@ use futures::stream::{self, StreamExt};
 use serde_json::{Value, json};
 
 use super::coverage::{self, PendingInfo};
-use super::{AuditInfo, ToolCx, ToolDef, ToolOutput, UNTRUSTED_NOTE, object_schema, only_keys, opt_bool, opt_str};
+use super::lenient::{self, Spec};
+use super::{AuditInfo, ToolCx, ToolDef, ToolOutput, UNTRUSTED_NOTE, object_schema, only_keys_hint, opt_bool, opt_str};
 use crate::content;
 use crate::error::{ErrorCode, ToolError};
 use crate::gmail::gateway::{GmailOp, Priority};
@@ -99,9 +100,9 @@ fn input_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "accounts": {"type": "array", "items": {"type": "string"}, "description": "Mailbox aliases; default all readable."},
+            "accounts": {"type": "array", "items": {"type": "string"}, "description": "Mailbox aliases from list_accounts; default all readable."},
             "source": {"type": "string", "enum": ["index", "gmail"], "default": "index"},
-            "where": {"type": "object", "description": "A condition or {all:[...]}, {any:[...]}, {not:{...}}. Max depth 4, 32 conditions.", "examples": [pred]},
+            "where": {"type": "object", "description": "A condition {field, op, value} or {all:[...]}, {any:[...]}, {not:{...}}. Ops: eq/in for addresses, label, ids, category; terms/phrase/prefix for subject, body_text, text, attachment_text (no substring match); lt/lte/gt/gte for received_at (RFC 3339 with offset, or YYYY-MM-DD = that UTC day) and size_bytes. Max depth 4, 32 conditions.", "examples": [pred]},
             "select": {"type": "array", "items": {"type": "string", "enum": query::thread_selectable()},
                 "description": "Columns. message_count, matched_count, last_sender_is_self, last_inbound_at, last_outbound_at and awaiting_reply need group_by=thread."},
             "group_by": {"type": "string", "enum": ["message", "thread"], "default": "message",
@@ -112,22 +113,75 @@ fn input_schema() -> Value {
                 "field": {"type": "string", "enum": ["received_at", "size_bytes", "subject"]},
                 "dir": {"type": "string", "enum": ["asc", "desc"]}}}},
             "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LIMIT, "default": DEFAULT_LIMIT},
-            "cursor": {"type": "string", "description": "Resume a previous result; pass alone."},
+            "cursor": {"type": "string", "description": "next_cursor of a previous result; pass alone."},
             "count_only": {"type": "boolean"},
             "coverage_policy": {"type": "string", "enum": ["allow_partial", "require_complete"]},
             "max_lag_seconds": {"type": "integer", "minimum": 0},
             "include_spam_trash": {"type": "boolean", "default": false},
-            "gmail_query": {"type": "string", "description": "Gmail search syntax; only with source=gmail."}
+            "gmail_query": {"type": "string", "description": "Gmail search syntax, e.g. from:alice newer_than:7d; only with source=gmail."}
         },
         "additionalProperties": false
     })
 }
 
+/// Arguments read in their one obvious meaning when written in a nearby shape (see `tools::lenient`).
+const SEARCH_SPEC: Spec<'static> = Spec {
+    aliases: &[("account", "accounts")],
+    lists: &["accounts", "select", "order_by"],
+    bools: &["count_only", "include_spam_trash", "awaiting_reply"],
+    ints: &["limit", "max_lag_seconds"],
+};
+
+/// Advice for argument names agents carry over from other search APIs.
+const WHERE_ADVICE: &str = "Filter with 'where' ({\"field\":\"text\",\"op\":\"terms\",\"value\":\"invoice\"}) or, with \
+     source=\"gmail\", 'gmail_query'.";
+const SEARCH_HINTS: &[(&str, &str)] = &[
+    ("query", WHERE_ADVICE),
+    ("q", WHERE_ADVICE),
+    ("search", WHERE_ADVICE),
+    ("keywords", WHERE_ADVICE),
+    ("text", WHERE_ADVICE),
+    ("gmail_query", "It needs source=\"gmail\"; the default index search is filtered with 'where'."),
+    ("filter", "Use 'where'."),
+    ("filters", "Use 'where'."),
+    ("conditions", "Use 'where'."),
+    ("from", "Put filters inside 'where' as {field, op, value}."),
+    ("to", "Put filters inside 'where' as {field, op, value}."),
+    ("subject", "Put filters inside 'where' as {field, op, value}."),
+    ("label", "Put filters inside 'where' as {field, op, value}."),
+    ("since", "Put time bounds inside 'where' as received_at conditions."),
+    ("after", "Put time bounds inside 'where' as received_at conditions."),
+    ("before", "Put time bounds inside 'where' as received_at conditions."),
+    ("sort", "Use 'order_by': [{\"field\":\"received_at\",\"dir\":\"desc\"}]."),
+    ("sort_by", "Use 'order_by': [{\"field\":\"received_at\",\"dir\":\"desc\"}]."),
+    ("max_results", "Use 'limit' (1 to 100)."),
+    ("page_size", "Use 'limit' (1 to 100)."),
+    ("top", "Use 'limit' (1 to 100)."),
+    ("page_token", "Use 'cursor': the next_cursor of the previous result, passed alone."),
+    ("next_cursor", "Use 'cursor', passed alone."),
+    ("page", "Use 'cursor': the next_cursor of the previous result, passed alone."),
+    ("fields", "Use 'select'."),
+    ("columns", "Use 'select'."),
+    ("mailbox", "Use 'accounts' (aliases from list_accounts)."),
+    ("mailboxes", "Use 'accounts' (aliases from list_accounts)."),
+    ("account_id", "Use 'accounts' (aliases from list_accounts)."),
+    ("include_spam", "Use 'include_spam_trash'."),
+    ("include_trash", "Use 'include_spam_trash'."),
+];
+
 async fn search(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
     if let Some(c) = opt_str(&args, "cursor")? {
         // Resume with the cursor only: the query, projection and order are bound to it.
-        if args.as_object().is_some_and(|o| o.len() != 1) {
-            return Err(ToolError::invalid("'cursor' must be passed alone"));
+        if let Some(o) = args.as_object().filter(|o| o.len() != 1) {
+            let others: Vec<&str> = o.keys().map(String::as_str).filter(|k| *k != "cursor").take(8).collect();
+            return Err(ToolError::invalid_at(
+                "cursor",
+                format!(
+                    "must be passed alone (also got: {}); the cursor keeps the original query and page size. Drop \
+                     the other arguments, or start a new search without 'cursor'",
+                    others.join(", ")
+                ),
+            ));
         }
         let cur = cx.app.index.cursors.get(c, &cx.client.client_id, cx.client.auth_epoch)?;
         return match cur.payload {
@@ -137,30 +191,47 @@ async fn search(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
             Payload::Digest(_) => Err(cursor::invalid()),
         };
     }
-    match opt_str(&args, "source")?.unwrap_or("index") {
+    let args = lenient::normalize(&args, &SEARCH_SPEC)?;
+    match lenient::opt_enum(&args, "source", &["index", "gmail"])?.unwrap_or("index") {
         "index" => {
-            only_keys(&args, INDEX_KEYS)?;
+            only_keys_hint(&args, INDEX_KEYS, SEARCH_HINTS)?;
             let req = parse_index_req(&args)?;
             index_search(cx, req, None, &args).await
         }
-        "gmail" => {
+        _ => {
             for k in
                 ["where", "order_by", "count_only", "coverage_policy", "max_lag_seconds", "group_by", "awaiting_reply"]
             {
                 if args.get(k).is_some() {
-                    return Err(ToolError::invalid(format!("'{k}' is not supported with source=gmail")));
+                    let how = if k == "where" {
+                        "put Gmail search syntax in 'gmail_query' (for example \"from:alice newer_than:7d is:unread\"), \
+                         or drop 'source' to filter the index with 'where'"
+                    } else {
+                        "the live Gmail search takes only accounts, gmail_query, select, limit, cursor and \
+                         include_spam_trash; drop 'source' to use the index"
+                    };
+                    return Err(ToolError::invalid_at(k, format!("is not supported with source=\"gmail\"; {how}")));
                 }
             }
-            only_keys(&args, GMAIL_KEYS)?;
+            only_keys_hint(&args, GMAIL_KEYS, SEARCH_HINTS)?;
             let (page, errors) = parse_live_req(cx, &args)?;
             live_search(cx, page, errors, false, &args).await
         }
-        _ => Err(ToolError::invalid("'source' is index or gmail")),
     }
 }
 
 fn opt_limit(args: &Value) -> Result<usize, ToolError> {
-    Ok(super::opt_u64(args, "limit", DEFAULT_LIMIT as u64, 1, MAX_LIMIT as u64)? as usize)
+    match args.get("limit") {
+        None | Some(Value::Null) => Ok(DEFAULT_LIMIT),
+        Some(v) => v.as_u64().filter(|n| (1..=MAX_LIMIT as u64).contains(n)).map(|n| n as usize).ok_or_else(|| {
+            ToolError::invalid_at(
+                "limit",
+                format!(
+                    "must be an integer from 1 to {MAX_LIMIT}; for more results page with the returned next_cursor"
+                ),
+            )
+        }),
+    }
 }
 
 pub(crate) fn accounts_arg(args: &Value) -> Result<Option<Vec<String>>, ToolError> {
@@ -169,7 +240,10 @@ pub(crate) fn accounts_arg(args: &Value) -> Result<Option<Vec<String>>, ToolErro
         Some(_) => {
             let v = super::opt_str_list(args, "accounts", MAX_ACCOUNTS_ARG)?;
             if v.is_empty() {
-                return Err(ToolError::invalid("'accounts' must not be empty; omit it to search all mailboxes"));
+                return Err(ToolError::invalid_at(
+                    "accounts",
+                    "must not be empty; omit it to search every readable mailbox, or name aliases from list_accounts",
+                ));
             }
             Ok(Some(v))
         }
@@ -177,41 +251,39 @@ pub(crate) fn accounts_arg(args: &Value) -> Result<Option<Vec<String>>, ToolErro
 }
 
 pub fn parse_index_req(args: &Value) -> Result<SearchReq, ToolError> {
-    if args.get("gmail_query").is_some() {
-        return Err(ToolError::invalid("'gmail_query' requires source=gmail"));
-    }
     let count_only = opt_bool(args, "count_only", false)?;
     if count_only {
         for k in ["select", "order_by", "limit", "cursor"] {
             if args.get(k).is_some_and(|v| !v.is_null()) {
-                return Err(ToolError::invalid(format!("'count_only' cannot be combined with '{k}'")));
+                return Err(ToolError::invalid_at(
+                    k,
+                    "cannot be combined with count_only, which returns only the number of matches; remove it",
+                ));
             }
         }
     }
-    let require_complete = match opt_str(args, "coverage_policy")? {
+    let require_complete = match lenient::opt_enum(args, "coverage_policy", &["allow_partial", "require_complete"])? {
         None | Some("allow_partial") => count_only,
-        Some("require_complete") => true,
-        Some(_) => return Err(ToolError::invalid("'coverage_policy' is allow_partial or require_complete")),
+        _ => true,
     };
     let max_lag_seconds = match args.get("max_lag_seconds") {
         None | Some(Value::Null) => None,
         Some(_) => Some(super::opt_u64(args, "max_lag_seconds", 0, 0, 365 * 86_400)?),
     };
-    let group_by_thread = match opt_str(args, "group_by")? {
-        None | Some("message") => false,
-        Some("thread") => true,
-        Some(_) => return Err(ToolError::invalid("'group_by' is message or thread")),
-    };
+    let group_by_thread = lenient::opt_enum(args, "group_by", &["message", "thread"])? == Some("thread");
     let awaiting_reply = match args.get("awaiting_reply") {
         None | Some(Value::Null) => None,
         Some(_) if !group_by_thread => {
-            return Err(ToolError::invalid("'awaiting_reply' requires group_by=thread"));
+            return Err(ToolError::invalid_at("awaiting_reply", "needs group_by=\"thread\" (it filters threads)"));
         }
         Some(_) => Some(opt_bool(args, "awaiting_reply", false)?),
     };
     let order = query::parse_order(args.get("order_by"))?;
     if group_by_thread && order.iter().any(|(f, _)| *f != query::OrderField::ReceivedAt) {
-        return Err(ToolError::invalid("threads are ordered by received_at only"));
+        return Err(ToolError::invalid_at(
+            "order_by",
+            "threads are ordered by received_at only; use that field or group_by=\"message\"",
+        ));
     }
     let select = if count_only {
         vec![]
@@ -642,12 +714,21 @@ fn render_text(out: &Value) -> String {
 // ------------------------------------------------------------------ live Gmail route
 
 fn parse_live_req(cx: &ToolCx, args: &Value) -> Result<(LivePage, Vec<Value>), ToolError> {
-    let q = super::arg_str(args, "gmail_query")?;
+    const EXAMPLE: &str = "for example \"from:alice newer_than:7d is:unread\"";
+    let q = args.get("gmail_query").and_then(Value::as_str).ok_or_else(|| {
+        ToolError::invalid_at(
+            "gmail_query",
+            format!("is required with source=\"gmail\" (Gmail search syntax, {EXAMPLE})"),
+        )
+    })?;
     if q.trim().is_empty() || q.chars().count() > MAX_GMAIL_QUERY {
-        return Err(ToolError::invalid(format!("'gmail_query' must have 1 to {MAX_GMAIL_QUERY} characters")));
+        return Err(ToolError::invalid_at(
+            "gmail_query",
+            format!("must have 1 to {MAX_GMAIL_QUERY} characters ({EXAMPLE})"),
+        ));
     }
     if q.chars().any(|c| c.is_control()) {
-        return Err(ToolError::invalid("'gmail_query' must not contain control characters"));
+        return Err(ToolError::invalid_at("gmail_query", "must not contain control characters or line breaks"));
     }
     let select = query::parse_select(args.get("select"), LIVE_SELECT, query::DEFAULT_SELECT)?;
     let names = accounts_arg(args)?;
@@ -657,8 +738,9 @@ fn parse_live_req(cx: &ToolCx, args: &Value) -> Result<(LivePage, Vec<Value>), T
         mbs.into_iter().partition(|m| m.provider == crate::policy::Provider::Gmail);
     if !imap.is_empty() {
         if names.is_some() {
-            return Err(ToolError::invalid(
-                "source=gmail searches Gmail mailboxes only; search IMAP mailboxes with the index (the default source)",
+            return Err(ToolError::invalid_at(
+                "source",
+                "gmail searches Gmail mailboxes only; search IMAP mailboxes with the index (the default source)",
             ));
         }
         for m in imap {

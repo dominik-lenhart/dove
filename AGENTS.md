@@ -444,3 +444,12 @@ cargo fmt
   (`reopen` in `tests/watch_no_reply_e2e.rs`) and `tick` past `deadline + NO_REPLY_GRACE_SECS`. IMAP same-second
   cases put both messages at the same `add_message_at` second. Gmail mailboxes have no Dove aliases
   (`AccountsAliasAdd` refuses them); fake a send-as follow-up with any address plus the `SENT` label.
+- 2026-11-14: Argument errors (PLAN A68): raise `ToolError::invalid_at(path, text)`, never `invalid("'x' ...")`, so the message
+  starts with the path and `details.field` feeds the audit (`~invalid=<path>` via `ToolError::audit_field`, which drops
+  anything that is not a plain lowercase path). Build the path from the tool's own structure, never from caller text, and
+  never echo a value into it. New leniency goes in `tools::lenient::normalize` (argument level) or `index::query::parse_*`
+  (value level) and only where the reading is unique; add the case to `tests/search_contract.rs`
+  (`search_accepts_arguments_that_have_one_reading`) and keep the not-found scope tests green. When mutation-checking from a
+  script, set `PATH` with explicit absolute directories (`~` is not expanded inside a joined PATH string): a missing
+  `cargo` makes every mutant look killed.
+

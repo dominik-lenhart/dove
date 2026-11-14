@@ -23,6 +23,7 @@ pub mod coverage;
 pub mod digest;
 pub mod drafts;
 pub mod drafts_imap;
+pub mod lenient;
 pub mod organize;
 pub mod read;
 pub mod search;
@@ -318,14 +319,14 @@ pub async fn call(cx: &ToolCx, name: &str, args: Value) -> Result<ToolOutput, To
 // ------------------------------------------------------------------ argument helpers
 
 pub fn arg_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, ToolError> {
-    args.get(key).and_then(Value::as_str).ok_or_else(|| ToolError::invalid(format!("'{key}' is required")))
+    args.get(key).and_then(Value::as_str).ok_or_else(|| ToolError::invalid_at(key, "is required and must be a string"))
 }
 
 pub fn opt_str<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>, ToolError> {
     match args.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(s)) => Ok(Some(s)),
-        Some(_) => Err(ToolError::invalid(format!("'{key}' must be a string"))),
+        Some(_) => Err(ToolError::invalid_at(key, "must be a string")),
     }
 }
 
@@ -334,7 +335,7 @@ pub fn opt_u64(args: &Value, key: &str, default: u64, min: u64, max: u64) -> Res
         None | Some(Value::Null) => Ok(default),
         Some(v) => match v.as_u64() {
             Some(n) if (min..=max).contains(&n) => Ok(n),
-            _ => Err(ToolError::invalid(format!("'{key}' must be an integer between {min} and {max}"))),
+            _ => Err(ToolError::invalid_at(key, format!("must be an integer between {min} and {max}"))),
         },
     }
 }
@@ -343,7 +344,7 @@ pub fn opt_bool(args: &Value, key: &str, default: bool) -> Result<bool, ToolErro
     match args.get(key) {
         None | Some(Value::Null) => Ok(default),
         Some(Value::Bool(b)) => Ok(*b),
-        Some(_) => Err(ToolError::invalid(format!("'{key}' must be a boolean"))),
+        Some(_) => Err(ToolError::invalid_at(key, "must be true or false")),
     }
 }
 
@@ -355,24 +356,42 @@ pub fn opt_str_list(args: &Value, key: &str, max: usize) -> Result<Vec<String>, 
             .map(|i| {
                 i.as_str()
                     .map(str::to_string)
-                    .ok_or_else(|| ToolError::invalid(format!("'{key}' must be a list of strings")))
+                    .ok_or_else(|| ToolError::invalid_at(key, "must be a list of strings, e.g. [\"a\", \"b\"]"))
             })
             .collect(),
-        Some(_) => Err(ToolError::invalid(format!("'{key}' must be a list of at most {max} strings"))),
+        Some(_) => Err(ToolError::invalid_at(key, format!("must be a list of at most {max} strings"))),
     }
 }
 
-/// Rejects arguments not in `allowed` so typos do not silently change semantics.
+/// Rejects arguments not in `allowed` so typos do not silently change semantics. The error lists what the tool
+/// takes, so the caller can fix the call without another round trip.
 pub fn only_keys(args: &Value, allowed: &[&str]) -> Result<(), ToolError> {
-    if let Some(obj) = args.as_object() {
-        for k in obj.keys() {
-            if !allowed.contains(&k.as_str()) {
-                return Err(ToolError::invalid(format!(
-                    "unknown argument '{}'",
-                    k.chars().take(64).collect::<String>()
-                )));
-            }
+    only_keys_hint(args, allowed, &[])
+}
+
+/// [`only_keys`] with per-argument advice (`(unknown name, what to do instead)`) for mistakes agents are known to
+/// make, such as passing `query` to a tool that filters with `where`. Names are compared case-insensitively.
+pub fn only_keys_hint(args: &Value, allowed: &[&str], hints: &[(&str, &str)]) -> Result<(), ToolError> {
+    let Some(obj) = args.as_object() else { return Ok(()) };
+    for k in obj.keys() {
+        if allowed.contains(&k.as_str()) {
+            continue;
         }
+        let lower = k.to_ascii_lowercase();
+        let shown: String = k.chars().take(64).collect();
+        let advice = if let Some((_, h)) = hints.iter().find(|(n, _)| *n == lower) {
+            format!(" {h}")
+        } else if let Some(a) = allowed.iter().find(|a| {
+            **a == lower || lower.strip_suffix('s') == Some(**a) || a.strip_suffix('s') == Some(lower.as_str())
+        }) {
+            format!(" Did you mean '{a}'?")
+        } else {
+            String::new()
+        };
+        return Err(ToolError::invalid_at(
+            "arguments",
+            format!("unknown argument '{shown}'.{advice} This tool takes: {}.", allowed.join(", ")),
+        ));
     }
     Ok(())
 }

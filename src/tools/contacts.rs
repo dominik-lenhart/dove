@@ -4,9 +4,10 @@
 
 use serde_json::{Value, json};
 
+use super::lenient::{self, Spec};
 use super::search::{Found, collect_targets, recheck, resolve_accounts};
 use super::{
-    AuditInfo, ToolCx, ToolDef, ToolOutput, UNTRUSTED_NOTE, object_schema, only_keys, opt_bool, opt_str, opt_u64,
+    AuditInfo, ToolCx, ToolDef, ToolOutput, UNTRUSTED_NOTE, object_schema, only_keys_hint, opt_bool, opt_str, opt_u64,
 };
 use crate::content;
 use crate::error::{ErrorCode, ToolError};
@@ -60,16 +61,54 @@ pub fn defs() -> Vec<ToolDef> {
     }]
 }
 
+const CONTACTS_SPEC: Spec<'static> = Spec { aliases: &[], lists: &[], bools: &["include_automated"], ints: &["limit"] };
+
+const CONTACTS_HINTS: &[(&str, &str)] = &[
+    ("accounts", "Use 'account' (one mailbox alias or address)."),
+    ("q", "Use 'query'."),
+    ("name", "Use 'query' (part of an address or display name)."),
+    ("email", "Use 'query' (part of an address or display name)."),
+    ("max_results", "Use 'limit'."),
+];
+
+/// `account` takes one mailbox; `accounts` with exactly one name (as `search_messages` and `digest` spell it) is the
+/// same thing. Several names have no single reading here and are refused.
+fn single_account(args: Value) -> Result<Value, ToolError> {
+    let mut args = lenient::normalize(&args, &CONTACTS_SPEC)?;
+    let Some(obj) = args.as_object_mut() else { return Ok(args) };
+    let Some(v) = obj.remove("accounts").filter(|v| !v.is_null()) else { return Ok(args) };
+    if obj.get("account").is_some_and(|a| !a.is_null()) {
+        return Err(ToolError::invalid_at("accounts", "use 'account' (or 'accounts' with one name), not both"));
+    }
+    let one = match &v {
+        Value::String(s) => Some(Value::String(s.clone())),
+        Value::Array(a) if a.len() == 1 && a[0].is_string() => Some(a[0].clone()),
+        _ => None,
+    };
+    match one {
+        Some(o) => {
+            obj.insert("account".into(), o);
+            Ok(args)
+        }
+        None => Err(ToolError::invalid_at(
+            "accounts",
+            "search_contacts covers one mailbox: pass 'account' with one alias, or omit it for every readable mailbox",
+        )
+        .with_example(json!("info"))),
+    }
+}
+
 async fn search_contacts(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
-    only_keys(&args, &["query", "account", "limit", "include_automated"])?;
+    let args = single_account(args)?;
+    only_keys_hint(&args, &["query", "account", "limit", "include_automated"], CONTACTS_HINTS)?;
     let query = opt_str(&args, "query")?.map(str::trim).filter(|q| !q.is_empty()).map(str::to_string);
     if let Some(q) = &query {
         let n = q.chars().count();
         if n > intel::MAX_QUERY_CHARS || q.chars().any(char::is_control) {
-            return Err(ToolError::invalid(format!(
-                "'query' is limited to {} characters without control characters",
-                intel::MAX_QUERY_CHARS
-            )));
+            return Err(ToolError::invalid_at(
+                "query",
+                format!("is limited to {} characters without control characters", intel::MAX_QUERY_CHARS),
+            ));
         }
         if n < intel::MIN_QUERY_CHARS {
             return Err(ToolError::new(

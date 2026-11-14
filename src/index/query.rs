@@ -298,17 +298,30 @@ impl SearchReq {
 }
 
 // ------------------------------------------------------------------ parsing
+//
+// Every error names the argument path (`where.all[1].op`), says what is expected and, where it helps, carries a
+// valid example in `details.example` (PLAN A68). Paths are built from this structure only, never from caller text.
+// Readings that have exactly one meaning are accepted: field, operator and enum names in any case, one value where a
+// list is expected, `"true"` for `true`, a calendar date for `received_at`. See `tools::lenient` for the argument level.
 
-fn bad(msg: impl Into<String>) -> ToolError {
-    ToolError::invalid(msg)
+fn bad(msg: impl AsRef<str>) -> ToolError {
+    ToolError::invalid(msg.as_ref())
+}
+
+fn bad_at(path: &str, msg: impl AsRef<str>) -> ToolError {
+    ToolError::invalid_at(path, msg)
 }
 
 fn short(s: &str) -> String {
     s.chars().take(40).collect()
 }
 
-fn parse_field(s: &str) -> Result<Field, ToolError> {
-    Ok(match s {
+fn norm(s: &str) -> String {
+    s.trim().to_ascii_lowercase()
+}
+
+fn parse_field(s: &str) -> Option<Field> {
+    Some(match norm(s).as_str() {
         "from" => Field::From,
         "to" => Field::To,
         "cc" => Field::Cc,
@@ -333,12 +346,38 @@ fn parse_field(s: &str) -> Result<Field, ToolError> {
         "attachment_text" => Field::AttachmentText,
         "category" => Field::Category,
         "from_self" => Field::FromSelf,
-        other => return Err(bad(format!("unknown field '{}'", short(other)))),
+        _ => return None,
     })
 }
 
-fn parse_op(s: &str) -> Result<Op, ToolError> {
-    Ok(match s {
+/// The field an unknown name most likely meant (agents carry names over from other APIs).
+fn field_suggestion(s: &str) -> Option<&'static str> {
+    Some(match norm(s).as_str() {
+        "sender" | "author" | "from_address" | "from_email" => "from",
+        "recipient" | "recipients" | "to_address" | "to_email" => "to",
+        "date" | "received" | "time" | "sent" | "sent_at" | "timestamp" | "internal_date" | "when" | "after"
+        | "before" | "since" | "until" => "received_at",
+        "body" | "body_plain" => "body_text",
+        "content" | "fulltext" | "full_text" | "query" | "q" | "search" | "keywords" => "text",
+        "title" => "subject",
+        "size" | "bytes" => "size_bytes",
+        "unread" => "is_unread",
+        "starred" | "star" => "is_starred",
+        "draft" => "is_draft",
+        "attachment" | "attachments" | "has_attachments" | "hasattachment" => "has_attachment",
+        "labels" | "folder" | "mailbox" | "tag" | "tags" => "label",
+        "domain" | "sender_domain" | "from_host" => "from_domain",
+        "to_domain" | "recipients_domain" => "recipient_domain",
+        "id" | "msg_id" | "gmail_id" | "messageid" => "message_id",
+        "thread" | "threadid" | "conversation" | "conversation_id" => "thread_id",
+        "filename" | "file_name" | "attachment_filename" => "attachment_name",
+        "mime" | "mime_type" | "attachment_type" | "content_type" => "attachment_mime",
+        _ => return None,
+    })
+}
+
+fn parse_op(s: &str) -> Option<Op> {
+    Some(match norm(s).as_str() {
         "eq" => Op::Eq,
         "in" => Op::In,
         "lt" => Op::Lt,
@@ -349,8 +388,23 @@ fn parse_op(s: &str) -> Result<Op, ToolError> {
         "phrase" => Op::Phrase,
         "prefix" => Op::Prefix,
         "ends_with" => Op::EndsWith,
-        other => return Err(bad(format!("unknown operator '{}'", short(other)))),
+        _ => return None,
     })
+}
+
+fn op_name(op: Op) -> &'static str {
+    match op {
+        Op::Eq => "eq",
+        Op::In => "in",
+        Op::Lt => "lt",
+        Op::Lte => "lte",
+        Op::Gt => "gt",
+        Op::Gte => "gte",
+        Op::Terms => "terms",
+        Op::Phrase => "phrase",
+        Op::Prefix => "prefix",
+        Op::EndsWith => "ends_with",
+    }
 }
 
 fn allowed_ops(f: Field) -> &'static [Op] {
@@ -365,128 +419,320 @@ fn allowed_ops(f: Field) -> &'static [Op] {
     }
 }
 
-fn check_str(s: &str) -> Result<(), ToolError> {
+fn is_text_field(f: Field) -> bool {
+    matches!(f, Field::Subject | Field::BodyText | Field::Text | Field::AttachmentText)
+}
+
+/// What the operators of a field do, for error messages.
+fn ops_help(f: Field) -> String {
+    if is_text_field(f) {
+        "terms (all words, any order), phrase (exact word sequence) or prefix (one word start); there is no \
+         substring match"
+            .into()
+    } else {
+        allowed_ops(f).iter().map(|o| op_name(*o)).collect::<Vec<_>>().join(", ")
+    }
+}
+
+fn sample_value(f: Field, op: Op) -> Value {
+    use Field::*;
+    let one = match f {
+        From | To | Cc | Bcc | Participant => json!("alice@example.com"),
+        FromDomain | RecipientDomain => json!("example.com"),
+        Label => json!("INBOX"),
+        ThreadId | MessageId => json!("18c2f0a1b2c3d4e5"),
+        IsUnread | IsStarred | IsDraft | HasAttachment | FromSelf => return json!(true),
+        ReceivedAt => return json!("2026-11-01T00:00:00Z"),
+        SizeBytes => return json!(1_000_000),
+        Subject | BodyText | Text | AttachmentText => {
+            return if op == Op::Prefix { json!("invoic") } else { json!("invoice october") };
+        }
+        AttachmentName => json!(if op == Op::EndsWith { ".pdf" } else { "invoice.pdf" }),
+        AttachmentMime => json!("application/pdf"),
+        Category => json!("newsletter"),
+    };
+    if op == Op::In { json!([one]) } else { one }
+}
+
+fn example_pred(f: Field, op: Op) -> Value {
+    json!({ "field": field_json(f), "op": op_name(op), "value": sample_value(f, op) })
+}
+
+fn field_json(f: Field) -> String {
+    serde_json::to_value(f).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default()
+}
+
+fn default_op(f: Field) -> Op {
+    allowed_ops(f)[0]
+}
+
+fn check_str(path: &str, s: &str, example: &Value) -> Result<(), ToolError> {
     if s.chars().count() > MAX_STRING {
-        return Err(bad(format!("filter strings are limited to {MAX_STRING} characters")));
+        return Err(bad_at(path, format!("is limited to {MAX_STRING} characters")).with_example(example.clone()));
     }
     if s.trim().is_empty() {
-        return Err(bad("filter strings must not be empty"));
+        return Err(bad_at(path, "must not be empty").with_example(example.clone()));
     }
     Ok(())
 }
 
-fn parse_value(f: Field, op: Op, v: Option<&Value>) -> Result<Val, ToolError> {
-    let v = v.ok_or_else(|| bad("predicate 'value' is required"))?;
+/// `received_at` bound: an RFC 3339 instant with offset, or a calendar date `YYYY-MM-DD` meaning that whole UTC day.
+/// `gte`/`lt` use the day's start; `gt`/`lte` its last millisecond, so "after / up to the day" includes or excludes
+/// the whole day. `eq` on a whole day has no single value and is refused.
+fn parse_received_at(path: &str, op: Op, v: &Value, example: &Value) -> Result<i64, ToolError> {
+    const FORMS: &str = "an RFC 3339 instant with offset (\"2026-11-01T00:00:00Z\") or a UTC date (\"2026-11-01\")";
+    let ex = || example.clone();
+    let s = v.as_str().ok_or_else(|| bad_at(path, format!("takes a string: {FORMS}")).with_example(ex()))?;
+    check_str(path, s, example)?;
+    let s = s.trim();
+    if let Some(ms) = util::parse_rfc3339_ms(s) {
+        return Ok(ms);
+    }
+    if let Some(day) = util::parse_date_ms(s) {
+        const DAY: i64 = 86_400_000;
+        return match op {
+            Op::Gte | Op::Lt => Ok(day),
+            Op::Gt | Op::Lte => Ok(day + DAY - 1),
+            _ => Err(bad_at(
+                path,
+                "a date is a whole day, so 'eq' has no single value; use {\"all\":[gte that date, lt the next date]}",
+            )
+            .with_example(ex())),
+        };
+    }
+    if util::looks_like_local_datetime(s) {
+        return Err(bad_at(path, format!("has no time zone offset; add Z for UTC or an offset like +01:00 ({FORMS})"))
+            .with_example(ex()));
+    }
+    Err(bad_at(path, format!("takes {FORMS}")).with_example(ex()))
+}
+
+fn parse_value(f: Field, op: Op, v: Option<&Value>, path: &str) -> Result<Val, ToolError> {
+    let example = example_pred(f, op);
+    let v = v.ok_or_else(|| bad_at(path, "is required").with_example(example.clone()))?;
     use Field::*;
     match (f, op) {
-        (IsUnread | IsStarred | IsDraft | HasAttachment | FromSelf, _) => {
-            v.as_bool().map(Val::Bool).ok_or_else(|| bad("boolean fields take true or false"))
-        }
-        (ReceivedAt, _) => {
-            let s = v.as_str().ok_or_else(|| bad("received_at takes an RFC 3339 instant with offset"))?;
-            check_str(s)?;
-            util::parse_rfc3339_ms(s)
-                .map(Val::Int)
-                .ok_or_else(|| bad("received_at takes an RFC 3339 instant with offset"))
-        }
-        (SizeBytes, _) => {
-            v.as_i64().filter(|n| *n >= 0).map(Val::Int).ok_or_else(|| bad("size_bytes takes a non-negative integer"))
-        }
+        (IsUnread | IsStarred | IsDraft | HasAttachment | FromSelf, _) => match v {
+            Value::Bool(b) => Ok(Val::Bool(*b)),
+            Value::String(s) if crate::tools::lenient::bool_text(s).is_some() => {
+                Ok(Val::Bool(crate::tools::lenient::bool_text(s).unwrap_or(false)))
+            }
+            _ => Err(bad_at(path, "takes true or false (a JSON boolean)").with_example(example)),
+        },
+        (ReceivedAt, _) => parse_received_at(path, op, v, &example).map(Val::Int),
+        (SizeBytes, _) => v
+            .as_u64()
+            .or_else(|| crate::tools::lenient::int_value(v))
+            .and_then(|n| i64::try_from(n).ok())
+            .map(Val::Int)
+            .ok_or_else(|| bad_at(path, "takes a non-negative integer number of bytes").with_example(example)),
         (_, Op::In) => {
-            let items = v.as_array().ok_or_else(|| bad("'in' takes a list of strings"))?;
+            let parsed;
+            let items: &[Value] = match v {
+                Value::Array(a) => a,
+                Value::String(s) => match crate::tools::lenient::json_text(s, '[') {
+                    Some(Value::Array(a)) => {
+                        parsed = a;
+                        &parsed
+                    }
+                    _ => std::slice::from_ref(v),
+                },
+                _ => return Err(bad_at(path, "takes a list of strings").with_example(example)),
+            };
             if items.is_empty() {
-                return Err(bad("'in' needs at least one value"));
+                return Err(bad_at(path, "needs at least one value").with_example(example));
             }
             if items.len() > MAX_LIST {
-                return Err(bad(format!("lists are limited to {MAX_LIST} values")));
+                return Err(bad_at(path, format!("is limited to {MAX_LIST} values")).with_example(example));
             }
             let mut out = Vec::with_capacity(items.len());
-            for i in items {
-                let s = i.as_str().ok_or_else(|| bad("'in' takes a list of strings"))?;
-                check_str(s)?;
+            for (i, item) in items.iter().enumerate() {
+                let s = item
+                    .as_str()
+                    .ok_or_else(|| bad_at(&format!("{path}[{i}]"), "must be a string").with_example(example.clone()))?;
+                check_str(&format!("{path}[{i}]"), s, &example)?;
                 out.push(s.to_string());
             }
             Ok(Val::List(out))
         }
         _ => {
-            let s = v.as_str().ok_or_else(|| bad("this operator takes a string"))?;
-            check_str(s)?;
+            // One string; a one-element list is read as that string, a list of words for `terms` as all of them.
+            let joined;
+            let s = match v {
+                Value::String(s) => s.as_str(),
+                Value::Array(a) if a.len() == 1 && a[0].is_string() => a[0].as_str().unwrap_or_default(),
+                Value::Array(a) if op == Op::Terms && !a.is_empty() && a.iter().all(Value::is_string) => {
+                    joined = a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" ");
+                    joined.as_str()
+                }
+                Value::Array(a) if a.len() > 1 && a.iter().all(Value::is_string) => {
+                    let hint = if allowed_ops(f).contains(&Op::In) {
+                        "takes one string; for several values use op 'in' with a list"
+                    } else {
+                        "takes one string"
+                    };
+                    return Err(bad_at(path, hint).with_example(example));
+                }
+                _ => return Err(bad_at(path, "must be a string").with_example(example)),
+            };
+            check_str(path, s, &example)?;
             Ok(Val::Str(s.to_string()))
         }
     }
-    .and_then(|val| check_category(f, val))
+    .and_then(|val| check_category(f, val, path))
 }
 
-/// `category` takes only the four known categories (a typo would silently match nothing).
-fn check_category(f: Field, val: Val) -> Result<Val, ToolError> {
-    if f == Field::Category {
-        for c in str_list(&val) {
-            if Category::parse(&c).is_none() {
-                return Err(bad("'category' is personal, newsletter, notification or calendar"));
-            }
-        }
+/// `category` takes only the four known categories (a typo would silently match nothing), in any case.
+fn check_category(f: Field, val: Val, path: &str) -> Result<Val, ToolError> {
+    if f != Field::Category {
+        return Ok(val);
     }
-    Ok(val)
+    let fix = |s: &str| {
+        let l = norm(s);
+        Category::parse(&l).map(|_| l)
+    };
+    let err = || {
+        bad_at(path, "is personal, newsletter, notification or calendar")
+            .with_example(example_pred(Field::Category, Op::Eq))
+    };
+    Ok(match val {
+        Val::Str(s) => Val::Str(fix(&s).ok_or_else(err)?),
+        Val::List(l) => Val::List(l.iter().map(|s| fix(s).ok_or_else(err)).collect::<Result<_, _>>()?),
+        other => other,
+    })
 }
 
 struct Budget {
     preds: usize,
 }
 
-fn parse_expr(v: &Value, depth: usize, b: &mut Budget) -> Result<Expr, ToolError> {
-    let obj = v.as_object().ok_or_else(|| bad("'where' nodes must be objects"))?;
-    let group = |key: &str| obj.get(key);
+const NODE_FORMS: &str =
+    "{\"field\":\"from\",\"op\":\"eq\",\"value\":\"a@b.com\"}, {\"all\":[...]}, {\"any\":[...]} or {\"not\":{...}}";
+
+fn parse_expr(v: &Value, depth: usize, b: &mut Budget, path: &str) -> Result<Expr, ToolError> {
+    // A node sent as JSON text has one reading.
+    let owned;
+    let v = match v {
+        Value::String(s) => match crate::tools::lenient::json_text(s, '{') {
+            Some(p) => {
+                owned = p;
+                &owned
+            }
+            None => v,
+        },
+        _ => v,
+    };
+    let Some(obj) = v.as_object() else {
+        let what = if v.is_array() {
+            "is a list; combine conditions with {\"all\":[...]} (and) or {\"any\":[...]} (or)".to_string()
+        } else {
+            format!("must be an object: {NODE_FORMS}")
+        };
+        return Err(bad_at(path, what).with_example(json!({"all": [example_pred(Field::From, Op::Eq)]})));
+    };
     let keys: Vec<&str> = obj.keys().map(String::as_str).collect();
     if let Some(kind) = ["all", "any", "not"].into_iter().find(|k| obj.contains_key(*k)) {
         if keys.len() != 1 {
-            return Err(bad(format!("a '{kind}' node must not have other keys")));
+            return Err(bad_at(path, format!("a '{kind}' group has no other keys; put more conditions inside it")));
         }
         if depth >= MAX_DEPTH {
-            return Err(bad(format!("'where' is limited to nesting depth {MAX_DEPTH}")));
+            return Err(bad_at(path, format!("nesting is limited to depth {MAX_DEPTH}; flatten with one all/any")));
         }
+        let at = format!("{path}.{kind}");
         return match kind {
-            "not" => Ok(Expr::Not(Box::new(parse_expr(group("not").expect("present"), depth + 1, b)?))),
+            "not" => Ok(Expr::Not(Box::new(parse_expr(&obj["not"], depth + 1, b, &at)?))),
             _ => {
-                let items = group(kind)
-                    .and_then(Value::as_array)
-                    .ok_or_else(|| bad(format!("'{kind}' takes a list of conditions")))?;
+                let items = obj[kind].as_array().ok_or_else(|| {
+                    bad_at(&at, "takes a list of conditions")
+                        .with_example(json!({kind: [example_pred(Field::From, Op::Eq)]}))
+                })?;
                 if items.is_empty() {
-                    return Err(bad(format!("empty '{kind}' groups are not allowed")));
+                    return Err(bad_at(&at, "must not be empty; omit 'where' to match everything"));
                 }
-                let parsed = items.iter().map(|i| parse_expr(i, depth + 1, b)).collect::<Result<Vec<_>, _>>()?;
+                let parsed = items
+                    .iter()
+                    .enumerate()
+                    .map(|(i, x)| parse_expr(x, depth + 1, b, &format!("{at}[{i}]")))
+                    .collect::<Result<Vec<_>, _>>()?;
                 Ok(if kind == "all" { Expr::All(parsed) } else { Expr::Any(parsed) })
             }
         };
     }
     for k in &keys {
         if !["field", "op", "value"].contains(k) {
-            return Err(bad(format!("unknown key '{}' in a condition", short(k))));
+            // A field name used as a key (`{"from": "a@b.com"}`) is a common shape: show the real one.
+            return Err(match parse_field(k) {
+                Some(f) => {
+                    let name = field_json(f);
+                    bad_at(path, format!("a condition is {{field, op, value}}, not {{\"{name}\": ...}}"))
+                        .with_example(example_pred(f, default_op(f)))
+                }
+                None => bad_at(
+                    path,
+                    format!("a condition has only 'field', 'op' and 'value'; found an unknown key. {NODE_FORMS}"),
+                )
+                .with_example(example_pred(Field::From, Op::Eq)),
+            });
         }
     }
     b.preds += 1;
     if b.preds > MAX_PREDICATES {
-        return Err(bad(format!("'where' is limited to {MAX_PREDICATES} conditions")));
+        return Err(bad_at("where", format!("is limited to {MAX_PREDICATES} conditions")));
     }
-    let field = parse_field(obj.get("field").and_then(Value::as_str).ok_or_else(|| bad("condition needs 'field'"))?)?;
-    let op = parse_op(obj.get("op").and_then(Value::as_str).ok_or_else(|| bad("condition needs 'op'"))?)?;
+    let fpath = format!("{path}.field");
+    let field_text = obj.get("field").and_then(Value::as_str);
+    let field = match field_text.and_then(parse_field) {
+        Some(f) => f,
+        None => {
+            let list = FIELDS.join(", ");
+            let msg = match field_text {
+                None => format!("is required. Fields: {list}"),
+                Some(t) => match field_suggestion(t) {
+                    Some(s) => format!("unknown field '{}'; did you mean '{s}'? Fields: {list}", short(t)),
+                    None => format!("unknown field '{}'. Fields: {list}", short(t)),
+                },
+            };
+            return Err(bad_at(&fpath, msg).with_example(example_pred(Field::From, Op::Eq)));
+        }
+    };
+    let opath = format!("{path}.op");
+    let op_text = obj.get("op").and_then(Value::as_str);
+    let op = match op_text.and_then(parse_op) {
+        Some(o) => o,
+        None => {
+            let fname = field_json(field);
+            let what = match op_text {
+                None => format!("is required for '{fname}'"),
+                Some(t) => format!("'{}' is not an operator for '{fname}'", short(t)),
+            };
+            return Err(bad_at(&opath, format!("{what}; use {}", ops_help(field)))
+                .with_example(example_pred(field, default_op(field))));
+        }
+    };
     if !allowed_ops(field).contains(&op) {
-        return Err(bad(format!("operator {op:?} is not supported for this field").to_lowercase()));
+        return Err(bad_at(
+            &opath,
+            format!("'{}' is not supported for '{}'; use {}", op_name(op), field_json(field), ops_help(field)),
+        )
+        .with_example(example_pred(field, default_op(field))));
     }
-    let value = parse_value(field, op, obj.get("value"))?;
-    if matches!(field, Field::Subject | Field::BodyText | Field::Text | Field::AttachmentText) {
+    let vpath = format!("{path}.value");
+    let value = parse_value(field, op, obj.get("value"), &vpath)?;
+    if is_text_field(field) {
         let Val::Str(s) = &value else { unreachable!("text ops take strings") };
         let toks = tokens(s);
         if toks.is_empty() {
-            return Err(bad("the search text contains no searchable words"));
+            return Err(bad_at(&vpath, "contains no searchable words").with_example(example_pred(field, op)));
         }
         if op == Op::Prefix {
             if toks.len() != 1 {
-                return Err(bad("'prefix' takes exactly one word"));
+                return Err(bad_at(&vpath, "'prefix' takes exactly one word; use terms for several words")
+                    .with_example(example_pred(field, op)));
             }
             if toks[0].chars().count() < MIN_PREFIX_CHARS {
                 return Err(ToolError::new(
                     crate::error::ErrorCode::QueryTooBroad,
-                    format!("prefixes need at least {MIN_PREFIX_CHARS} characters"),
+                    format!("{vpath}: prefixes need at least {MIN_PREFIX_CHARS} characters"),
                 ));
             }
         }
@@ -496,10 +742,36 @@ fn parse_expr(v: &Value, depth: usize, b: &mut Budget) -> Result<Expr, ToolError
 
 /// Parses a `where` object. `{}` or null means "match all visible rows".
 pub fn parse_where(v: Option<&Value>) -> Result<Option<Expr>, ToolError> {
-    match v {
+    // The whole `where` sent as JSON text has one reading.
+    let parsed = match v {
+        Some(Value::String(s)) => crate::tools::lenient::json_text(s, '{'),
+        _ => None,
+    };
+    match parsed.as_ref().or(v) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::Object(o)) if o.is_empty() => Ok(None),
-        Some(v) => Ok(Some(parse_expr(v, 0, &mut Budget { preds: 0 })?)),
+        Some(v) => Ok(Some(parse_expr(v, 0, &mut Budget { preds: 0 }, "where")?)),
+    }
+}
+
+/// Why a column name is not selectable here, with what to use instead.
+fn column_hint(s: &str, thread_view: bool) -> &'static str {
+    if THREAD_COLUMNS.contains(&s) && !thread_view {
+        " It needs group_by=\"thread\"."
+    } else if matches!(s, "body" | "body_text" | "text" | "content" | "html") {
+        " Message text is not a column: 'snippet' gives a preview, get_message the full text."
+    } else if matches!(s, "id" | "msg_id") {
+        " Use 'ref' (the handle for get_message) or 'message_id'."
+    } else if matches!(s, "date" | "received" | "sent" | "time" | "timestamp") {
+        " Use 'received_at'."
+    } else if matches!(s, "sender" | "author") {
+        " Use 'from'."
+    } else if matches!(s, "recipient" | "recipients") {
+        " Use 'to'."
+    } else if matches!(s, "size") {
+        " Use 'size_bytes'."
+    } else {
+        ""
     }
 }
 
@@ -507,20 +779,33 @@ pub fn parse_select(v: Option<&Value>, allowed: &[&str], default: &[&str]) -> Re
     let Some(v) = v.filter(|v| !v.is_null()) else {
         return Ok(default.iter().map(|s| s.to_string()).collect());
     };
-    let items = v.as_array().ok_or_else(|| bad("'select' takes a list of column names"))?;
+    let example = json!(["ref", "received_at", "from", "subject"]);
+    let items =
+        v.as_array().ok_or_else(|| bad_at("select", "takes a list of column names").with_example(example.clone()))?;
     if items.is_empty() {
-        return Err(bad("'select' must name at least one column"));
+        return Err(bad_at("select", "must name at least one column").with_example(example));
     }
+    let thread_view = allowed.contains(&"message_count");
     let mut out: Vec<String> = vec![];
-    for i in items {
-        let s = i.as_str().ok_or_else(|| bad("'select' takes a list of column names"))?;
-        if !allowed.contains(&s) {
-            return Err(bad(format!("column '{}' cannot be selected here", short(s))));
+    for (i, item) in items.iter().enumerate() {
+        let path = format!("select[{i}]");
+        let s = item.as_str().ok_or_else(|| bad_at(&path, "must be a column name").with_example(example.clone()))?;
+        let s = norm(s);
+        if !allowed.contains(&s.as_str()) {
+            return Err(bad_at(
+                &path,
+                format!(
+                    "'{}' cannot be selected.{} Columns: {}",
+                    short(&s),
+                    column_hint(&s, thread_view),
+                    allowed.join(", ")
+                ),
+            ));
         }
-        if out.iter().any(|x| x == s) {
-            return Err(bad(format!("column '{s}' is selected twice")));
+        if out.contains(&s) {
+            return Err(bad_at(&path, format!("'{s}' is selected twice; list each column once")));
         }
-        out.push(s.to_string());
+        out.push(s);
     }
     Ok(out)
 }
@@ -529,23 +814,45 @@ pub fn parse_order(v: Option<&Value>) -> Result<Vec<(OrderField, Dir)>, ToolErro
     let Some(v) = v.filter(|v| !v.is_null()) else {
         return Ok(vec![(OrderField::ReceivedAt, Dir::Desc)]);
     };
-    let items = v.as_array().ok_or_else(|| bad("'order_by' takes a list of {field, dir}"))?;
+    let example = json!([{"field": "received_at", "dir": "desc"}]);
+    let items =
+        v.as_array().ok_or_else(|| bad_at("order_by", "takes a list of {field, dir}").with_example(example.clone()))?;
     if items.is_empty() || items.len() > 2 {
-        return Err(bad("'order_by' takes one or two keys"));
+        return Err(bad_at("order_by", "takes one or two keys").with_example(example));
     }
     let mut out = vec![];
-    for i in items {
-        let o = i.as_object().ok_or_else(|| bad("'order_by' takes a list of {field, dir}"))?;
-        if o.keys().any(|k| k != "field" && k != "dir") {
-            return Err(bad("'order_by' entries take only 'field' and 'dir'"));
-        }
-        let f = match o.get("field").and_then(Value::as_str) {
+    for (i, item) in items.iter().enumerate() {
+        let path = format!("order_by[{i}]");
+        // `{field, dir}`, or text such as "received_at" or "received_at desc".
+        let (field, dir): (Option<String>, Option<String>) = match item {
+            Value::Object(o) => {
+                if o.keys().any(|k| k != "field" && k != "dir") {
+                    return Err(bad_at(&path, "takes only 'field' and 'dir'").with_example(example.clone()));
+                }
+                (
+                    o.get("field").and_then(Value::as_str).map(norm),
+                    o.get("dir").filter(|d| !d.is_null()).map(|d| d.as_str().map(norm).unwrap_or_default()),
+                )
+            }
+            Value::String(s) => {
+                let mut parts = s.split_whitespace();
+                let f = parts.next().map(norm);
+                let d = parts.next().map(norm);
+                if parts.next().is_some() { (None, None) } else { (f, d) }
+            }
+            _ => (None, None),
+        };
+        let f = match field.as_deref() {
             Some("received_at") => OrderField::ReceivedAt,
             Some("size_bytes") => OrderField::SizeBytes,
             Some("subject") => OrderField::Subject,
-            _ => return Err(bad("'order_by' fields are received_at, size_bytes or subject")),
+            _ => {
+                return Err(
+                    bad_at(&format!("{path}.field"), "is received_at, size_bytes or subject").with_example(example)
+                );
+            }
         };
-        let d = match o.get("dir").and_then(Value::as_str) {
+        let d = match dir.as_deref() {
             None => {
                 if f == OrderField::Subject {
                     Dir::Asc
@@ -553,12 +860,12 @@ pub fn parse_order(v: Option<&Value>) -> Result<Vec<(OrderField, Dir)>, ToolErro
                     Dir::Desc
                 }
             }
-            Some("asc") => Dir::Asc,
-            Some("desc") => Dir::Desc,
-            Some(_) => return Err(bad("'dir' is asc or desc")),
+            Some("asc" | "ascending") => Dir::Asc,
+            Some("desc" | "descending") => Dir::Desc,
+            Some(_) => return Err(bad_at(&format!("{path}.dir"), "is asc or desc").with_example(example)),
         };
         if out.iter().any(|(x, _)| *x == f) {
-            return Err(bad("an 'order_by' field is repeated"));
+            return Err(bad_at(&path, "repeats an earlier field; sort by each field once"));
         }
         out.push((f, d));
     }
@@ -1327,7 +1634,9 @@ mod tests {
         assert_eq!(code(json!({"all":[{"field":"from","op":"eq","value":"a@b.c"}], "x":1})), "invalid_argument");
         assert_eq!(code(json!({"field":"from","op":"eq","value":"x".repeat(257)})), "invalid_argument");
         assert_eq!(code(json!({"field":"from","op":"in","value":vec!["a@b.c"; 101]})), "invalid_argument");
-        assert_eq!(code(json!({"field":"received_at","op":"gte","value":"2026-10-01"})), "invalid_argument");
+        assert_eq!(code(json!({"field":"received_at","op":"gte","value":"2026-10-01T10:00:00"})), "invalid_argument");
+        assert_eq!(code(json!({"field":"received_at","op":"eq","value":"2026-10-01"})), "invalid_argument");
+        assert!(parse(json!({"field":"received_at","op":"gte","value":"2026-10-01"})).is_ok());
         assert_eq!(code(json!({"field":"subject","op":"prefix","value":"a"})), "query_too_broad");
         assert_eq!(code(json!({"field":"subject","op":"prefix","value":"two words"})), "invalid_argument");
         let deep = json!({"all":[{"any":[{"not":{"all":[{"not":{"field":"is_unread","op":"eq","value":true}}]}}]}]});

@@ -260,7 +260,7 @@ inside the untrusted-content envelope. Each call is one audit record; queries an
 ### 5.4 Errors returned to agents
 
 Tool failures return an MCP tool result with `isError: true` and structured content with a stable `code`, a short
-human message and, where useful, `retry_after_seconds`. Codes: `not_found`, `forbidden` (capability missing),
+human message and, where useful, `retry_after_seconds`. An `invalid_argument` names the argument in `details.field` and starts its message with it (`where.all[1].op: ...`); `details.example` and `details.allowed` show a valid value. The audit record of such a call holds `~invalid=<argument path>` in `object_ids`, never the value. Codes: `not_found`, `forbidden` (capability missing),
 `invalid_argument`, `account_unavailable` (disabled or `reauth_required`), `rate_limited`, `upstream_error`,
 `internal`, `draft_conflict`, `outcome_unknown`, `cursor_invalid`, `query_too_broad`, `index_incomplete`, `budget_exceeded`, `too_large` (an attachment above `limits.attachment_bytes`, or a draft's attachments above `limits.draft_attachment_bytes`, with the size and limit). Errors disclose no tokens, mail content, stack traces or unauthorized account data.
 

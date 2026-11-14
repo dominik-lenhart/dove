@@ -868,3 +868,331 @@ async fn grants_are_rechecked_before_release() {
     assert_eq!(v["result"]["isError"], true, "{v}");
     assert!(!v.to_string().contains("Invoice"), "{v}");
 }
+
+// ------------------------------------------------------------------ argument errors and leniency (PLAN A68)
+
+impl Fx {
+    /// The error object of a refused call.
+    async fn fail_tool(&self, tool: &str, args: Value) -> Value {
+        let (err, v) = self.h.call(&self.token, tool, args.clone()).await;
+        assert!(err, "{tool} {args} unexpectedly succeeded: {v}");
+        v["error"].clone()
+    }
+
+    /// Asserts an `invalid_argument` that names `field`, starts its message with it and mentions `says`.
+    async fn refused(&self, tool: &str, args: Value, field: &str, says: &str) -> Value {
+        let e = self.fail_tool(tool, args.clone()).await;
+        assert_eq!(e["code"], "invalid_argument", "{args}: {e}");
+        assert_eq!(e["details"]["field"], field, "{args}: {e}");
+        let msg = e["message"].as_str().unwrap();
+        assert!(msg.starts_with(&format!("{field}: ")), "{args}: {msg}");
+        assert!(msg.contains(says), "{args}: expected {says:?} in {msg:?}");
+        e
+    }
+}
+
+#[tokio::test]
+async fn search_errors_name_the_argument_and_how_to_fix_it() {
+    let fx = fixture().await;
+    let ok = pred("from", "eq", json!("anna@example.com"));
+    let s = "search_messages";
+    // Operators: the usual wrong guess has no substring match, and the message says what exists for the field.
+    let e = fx
+        .refused(s, json!({"where": pred("subject", "contains", json!("invoice"))}), "where.op", "no substring")
+        .await;
+    assert!(e["message"].as_str().unwrap().contains("terms (all words"), "{e}");
+    assert_eq!(e["details"]["example"], pred("subject", "terms", json!("invoice october")));
+    fx.refused(s, json!({"where": pred("subject", "eq", json!("x"))}), "where.op", "use terms").await;
+    fx.refused(s, json!({"where": pred("from", "terms", json!("x"))}), "where.op", "use eq, in").await;
+    fx.refused(s, json!({"where": {"field": "from", "value": "x"}}), "where.op", "is required for 'from'").await;
+    // The path points into nested conditions.
+    fx.refused(
+        s,
+        json!({"where": {"all": [ok.clone(), {"field": "from", "op": "eq"}]}}),
+        "where.all[1].value",
+        "is required",
+    )
+    .await;
+    fx.refused(
+        s,
+        json!({"where": {"any": [ok.clone(), {"not": pred("received_at", "gte", json!("last week"))}]}}),
+        "where.any[1].not.value",
+        "RFC 3339",
+    )
+    .await;
+    // Fields, with the likely intent; shorthand conditions; lists instead of groups.
+    fx.refused(s, json!({"where": pred("sender", "eq", json!("x"))}), "where.field", "did you mean 'from'").await;
+    fx.refused(
+        s,
+        json!({"where": pred("date", "gte", json!("2026-10-01"))}),
+        "where.field",
+        "did you mean 'received_at'",
+    )
+    .await;
+    let e = fx.refused(s, json!({"where": {"from": "anna@example.com"}}), "where", "not {\"from\": ...}").await;
+    assert_eq!(e["details"]["example"], pred("from", "eq", json!("alice@example.com")));
+    fx.refused(s, json!({"where": [ok.clone()]}), "where", "{\"all\":[...]}").await;
+    fx.refused(s, json!({"where": {"all": [ok.clone()], "field": "from"}}), "where", "no other keys").await;
+    // Values.
+    fx.refused(s, json!({"where": pred("text", "prefix", json!("two words"))}), "where.value", "exactly one word")
+        .await;
+    fx.refused(s, json!({"where": pred("from", "in", json!([1]))}), "where.value[0]", "must be a string").await;
+    fx.refused(s, json!({"where": pred("from", "eq", json!(["a@b.test", "c@d.test"]))}), "where.value", "use op 'in'")
+        .await;
+    fx.refused(s, json!({"where": pred("is_unread", "eq", json!("maybe"))}), "where.value", "true or false").await;
+    fx.refused(s, json!({"where": pred("size_bytes", "gt", json!("big"))}), "where.value", "number of bytes").await;
+    fx.refused(s, json!({"where": pred("category", "eq", json!("spam"))}), "where.value", "personal, newsletter").await;
+    fx.refused(
+        s,
+        json!({"where": pred("received_at", "gte", json!("2026-10-01T10:00:00"))}),
+        "where.value",
+        "no time zone offset",
+    )
+    .await;
+    fx.refused(s, json!({"where": pred("received_at", "gte", json!(1_790_000_000))}), "where.value", "takes a string")
+        .await;
+    fx.refused(s, json!({"where": pred("received_at", "eq", json!("2026-10-01"))}), "where.value", "whole day").await;
+    // Projection, order, paging, sources.
+    fx.refused(s, json!({"select": ["subject", "date"]}), "select[1]", "Use 'received_at'").await;
+    fx.refused(s, json!({"select": ["body_text"]}), "select[0]", "'snippet'").await;
+    fx.refused(s, json!({"select": ["message_count"]}), "select[0]", "group_by=\"thread\"").await;
+    fx.refused(s, json!({"select": ["subject", "subject"]}), "select[1]", "twice").await;
+    fx.refused(s, json!({"order_by": [{"field": "date"}]}), "order_by[0].field", "received_at, size_bytes or subject")
+        .await;
+    fx.refused(s, json!({"order_by": [{"field": "subject", "dir": "up"}]}), "order_by[0].dir", "asc or desc").await;
+    fx.refused(s, json!({"limit": 101}), "limit", "next_cursor").await;
+    fx.refused(s, json!({"limit": "many"}), "limit", "from 1 to 100").await;
+    fx.refused(s, json!({"count_only": true, "limit": 5}), "limit", "count_only").await;
+    fx.refused(s, json!({"awaiting_reply": true}), "awaiting_reply", "group_by=\"thread\"").await;
+    fx.refused(s, json!({"group_by": "thread", "order_by": [{"field": "size_bytes"}]}), "order_by", "received_at only")
+        .await;
+    let e =
+        fx.refused(s, json!({"coverage_policy": "strict"}), "coverage_policy", "allow_partial, require_complete").await;
+    assert_eq!(e["details"]["allowed"], json!(["allow_partial", "require_complete"]));
+    fx.refused(s, json!({"source": "web"}), "source", "index, gmail").await;
+    fx.refused(s, json!({"gmail_query": "x"}), "arguments", "needs source=\"gmail\"").await;
+    fx.refused(s, json!({"source": "gmail"}), "gmail_query", "newer_than:7d").await;
+    fx.refused(s, json!({"source": "gmail", "gmail_query": "x", "where": ok.clone()}), "where", "gmail_query").await;
+    fx.refused(s, json!({"source": "gmail", "gmail_query": "x", "group_by": "thread"}), "group_by", "drop 'source'")
+        .await;
+    // The cursor keeps its query, so other arguments are named and refused.
+    let first = fx.search(json!({"accounts": ["info"], "select": ["message_id"], "limit": 2})).await;
+    let cur = first["next_cursor"].as_str().unwrap();
+    fx.refused(s, json!({"cursor": cur, "limit": 5}), "cursor", "also got: limit").await;
+    // Unknown arguments list what the tool takes and, for known mix-ups, what to use.
+    let e = fx.refused(s, json!({"query": "invoice"}), "arguments", "unknown argument 'query'").await;
+    assert!(e["message"].as_str().unwrap().contains("'where'"), "{e}");
+    assert!(e["message"].as_str().unwrap().contains("This tool takes: accounts, source, where"), "{e}");
+    fx.refused(s, json!({"page_token": "x"}), "arguments", "'cursor'").await;
+    fx.refused(s, json!({"Limit": 5}), "arguments", "Did you mean 'limit'").await;
+    // Alias and canonical name together have no single reading.
+    fx.refused(s, json!({"account": "info", "accounts": ["billing"]}), "account", "not both").await;
+}
+
+#[tokio::test]
+async fn search_accepts_arguments_that_have_one_reading() {
+    let fx = fixture().await;
+    // One mailbox name, the singular `account`, and a list as JSON text all mean `accounts: ["info"]`.
+    let want = fx.search(json!({"accounts": ["info"], "select": ["message_id"], "limit": 100})).await["rows"].clone();
+    assert!(!want.as_array().unwrap().is_empty());
+    for accounts in [json!({"accounts": "info"}), json!({"account": "info"}), json!({"accounts": "[\"info\"]"})] {
+        let mut a = json!({"select": ["message_id"], "limit": 100});
+        a.as_object_mut().unwrap().extend(accounts.as_object().unwrap().clone());
+        assert_eq!(fx.search(a.clone()).await["rows"], want, "{a}");
+    }
+    // select as a string, order_by as one object, where and numbers as text, booleans as text.
+    let base = fx.search(json!({"accounts": ["info"], "select": ["subject"], "order_by": [{"field": "size_bytes", "dir": "desc"}], "limit": 2})).await;
+    let lenient = fx
+        .search(json!({"accounts": ["info"], "select": "subject", "order_by": {"field": "size_bytes", "dir": "desc"}, "limit": "2"}))
+        .await;
+    assert_eq!(lenient["rows"], base["rows"]);
+    assert_eq!(lenient["rows"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        fx.search(json!({"order_by": "size_bytes desc", "limit": 1})).await["rows"].as_array().unwrap().len(),
+        1
+    );
+    let from_anna = pred("from", "eq", json!("anna@example.com"));
+    let expect = fx.keys(from_anna.clone()).await;
+    assert!(expect.len() > 1);
+    let as_text = fx
+        .search(json!({"accounts": ["info", "billing"], "where": from_anna.to_string(), "select": ["message_id"], "limit": 100}))
+        .await;
+    assert_eq!(as_text["rows"].as_array().unwrap().len(), expect.len());
+    // A whole `where` as JSON text, also when empty; category names in any case.
+    assert_eq!(
+        fx.search(json!({"where": "{}", "count_only": true, "accounts": ["info", "billing"]})).await["count"],
+        fx.search(json!({"count_only": true, "accounts": ["info", "billing"]})).await["count"]
+    );
+    assert_eq!(
+        fx.keys(pred("category", "eq", json!("Newsletter"))).await,
+        fx.keys(pred("category", "eq", json!("newsletter"))).await
+    );
+    assert_eq!(
+        fx.keys(pred("category", "in", json!(["PERSONAL"]))).await,
+        fx.keys(pred("category", "in", json!(["personal"]))).await
+    );
+    let n = fx.search(json!({"count_only": "TRUE", "accounts": ["info", "billing"], "where": from_anna.clone()})).await;
+    assert_eq!(n["count"], json!(expect.len()));
+    assert_eq!(
+        n["count"],
+        fx.search(json!({"count_only": true, "accounts": ["info", "billing"], "where": from_anna})).await["count"]
+    );
+    assert_eq!(
+        fx.search(json!({"include_spam_trash": "true", "select": ["message_id"], "limit": 100})).await["rows"],
+        fx.search(json!({"include_spam_trash": true, "select": ["message_id"], "limit": 100})).await["rows"],
+    );
+    // Names in any case; values in one shape or another.
+    assert_eq!(fx.keys(json!({"field": "FROM", "op": " Eq ", "value": "anna@example.com"})).await, expect);
+    assert_eq!(fx.keys(pred("from", "eq", json!(["anna@example.com"]))).await, expect);
+    assert_eq!(fx.keys(pred("from", "in", json!("anna@example.com"))).await, expect);
+    assert_eq!(fx.keys(pred("from", "in", json!("[\"anna@example.com\"]"))).await, expect);
+    let quick_brown = fx.keys(pred("text", "terms", json!("quick brown"))).await;
+    assert_eq!(quick_brown, vec!["F"]);
+    assert_eq!(fx.keys(pred("text", "terms", json!(["quick", "brown"]))).await, quick_brown);
+    let unread = fx.keys(pred("is_unread", "eq", json!(true))).await;
+    assert_eq!(unread, vec!["F"]);
+    assert_eq!(fx.keys(pred("is_unread", "eq", json!("TRUE"))).await, unread);
+    let big = fx.keys(pred("size_bytes", "gt", json!(1))).await;
+    assert!(big.len() > 5);
+    assert_eq!(fx.keys(pred("size_bytes", "gt", json!("1"))).await, big);
+    let v = fx.search(json!({"group_by": "THREAD", "coverage_policy": "Allow_Partial", "accounts": ["info"]})).await;
+    assert!(v["columns"].as_array().unwrap().iter().any(|c| c == "message_count"));
+    // A date is that UTC day: gte/lt use its start, gt/lte its last millisecond.
+    let day = fx.keys(json!({"all": [pred("received_at", "gte", json!("2026-10-12")), pred("received_at", "lt", json!("2026-10-13"))]})).await;
+    assert_eq!(day, vec!["F", "G", "I"]);
+    assert_eq!(
+        day,
+        fx.keys(json!({"all": [
+            pred("received_at", "gte", json!("2026-10-12T00:00:00Z")),
+            pred("received_at", "lte", json!("2026-10-12T23:59:59.999Z"))]}))
+            .await
+    );
+    assert_eq!(
+        fx.keys(pred("received_at", "lte", json!("2026-10-12"))).await,
+        fx.keys(pred("received_at", "lt", json!("2026-10-13T00:00:00Z"))).await
+    );
+    assert_eq!(
+        fx.keys(pred("received_at", "gt", json!("2026-10-10"))).await,
+        fx.keys(pred("received_at", "gte", json!("2026-10-11T00:00:00Z"))).await
+    );
+    assert!(!fx.keys(pred("received_at", "gt", json!("2026-10-10"))).await.contains(&"D"));
+}
+
+#[tokio::test]
+async fn leniency_never_changes_which_mailboxes_are_reachable() {
+    let fx = fixture().await;
+    // An ungranted and an unknown mailbox stay the identical not_found in every spelling.
+    for key in ["accounts", "account"] {
+        let ungranted = fx.h.call(&fx.token, "search_messages", json!({ key: "secret" })).await;
+        let unknown = fx.h.call(&fx.token, "search_messages", json!({ key: "nonexistent" })).await;
+        assert_eq!(ungranted, unknown, "{key}");
+        assert_eq!(ungranted.1["error"]["code"], "not_found");
+        assert!(ungranted.1["error"].get("details").is_none(), "{key}: {ungranted:?}");
+    }
+    let ungranted =
+        fx.h.call(&fx.token, "search_messages", json!({"where": pred("thread_id", "eq", json!("secret:abc"))})).await;
+    let unknown =
+        fx.h.call(&fx.token, "search_messages", json!({"where": pred("thread_id", "eq", json!("nonexistent:abc"))}))
+            .await;
+    assert_eq!(ungranted, unknown);
+    // Several values for a single-value argument are not guessed at, and a time without zone is not read as UTC.
+    fx.refused(
+        "search_messages",
+        json!({"where": pred("subject", "phrase", json!(["a", "b"]))}),
+        "where.value",
+        "takes one string",
+    )
+    .await;
+    fx.refused("search_contacts", json!({"accounts": ["info", "billing"]}), "accounts", "one mailbox").await;
+    fx.refused("digest", json!({"since": "2026-11-01T00:00:00"}), "since", "no time zone offset").await;
+}
+
+#[tokio::test]
+async fn digest_and_contacts_errors_and_leniency() {
+    let fx = fixture().await;
+    let d = "digest";
+    let by_date = fx.h.ok(&fx.token, d, json!({"since": "2026-10-01", "accounts": ["info", "billing"]})).await;
+    assert!(!by_date["threads"].as_array().unwrap().is_empty());
+    for args in [
+        json!({"since": "2026-10-01T00:00:00Z", "accounts": ["info", "billing"]}),
+        json!({"since": " 2026-10-01 ", "accounts": "[\"info\", \"billing\"]"}),
+        json!({"since": "2026-10-01", "category": "Personal", "limit": "50", "accounts": ["info", "billing"]}),
+    ] {
+        let v = fx.h.ok(&fx.token, d, args.clone()).await;
+        if args.get("category").is_none() {
+            assert_eq!(v["threads"], by_date["threads"], "{args}");
+        }
+    }
+    let one = fx.h.ok(&fx.token, d, json!({"since": "2026-10-01", "account": "billing", "folder": "INBOX"})).await;
+    let list =
+        fx.h.ok(&fx.token, d, json!({"since": "2026-10-01", "accounts": ["billing"], "folders": ["INBOX"]})).await;
+    assert_eq!(one["threads"], list["threads"]);
+    // A span counts back from now.
+    fx.h.ok(&fx.token, d, json!({"since": "1d"})).await;
+    fx.refused(d, json!({"since": "400d"}), "since", "days back").await;
+    fx.refused(d, json!({}), "since", "is required").await;
+    fx.refused(d, json!({"since": "yesterday"}), "since", "RFC 3339").await;
+    fx.refused(d, json!({"since": "0d"}), "since", "span back from now").await;
+    fx.refused(d, json!({"since": 7}), "since", "must be a string").await;
+    fx.refused(d, json!({"since": "2026-10-01", "category": "spam"}), "category", "personal, newsletter").await;
+    fx.refused(d, json!({"since": "2026-10-01", "folders": []}), "folders", "non-empty folder names").await;
+    fx.refused(d, json!({"since": "2026-10-01", "limit": 0}), "limit", "between 1 and").await;
+    fx.refused(d, json!({"since": "2026-10-01", "days": 7}), "arguments", "'since', for example \"7d\"").await;
+
+    // search_contacts takes `account`; `accounts` with one name is the same.
+    let c = "search_contacts";
+    let by_account = fx.h.ok(&fx.token, c, json!({"account": "billing"})).await;
+    assert_eq!(fx.h.ok(&fx.token, c, json!({"accounts": ["billing"]})).await["contacts"], by_account["contacts"]);
+    assert_eq!(fx.h.ok(&fx.token, c, json!({"accounts": "billing"})).await["contacts"], by_account["contacts"]);
+    assert_eq!(
+        fx.h.ok(&fx.token, c, json!({"include_automated": "false", "limit": "5"})).await["contacts"],
+        fx.h.ok(&fx.token, c, json!({"include_automated": false, "limit": 5})).await["contacts"]
+    );
+    fx.refused(c, json!({"account": "billing", "accounts": ["info"]}), "accounts", "not both").await;
+    fx.refused(c, json!({"q": "anna"}), "arguments", "Use 'query'").await;
+    fx.refused(c, json!({"limit": 51}), "limit", "between 1 and").await;
+    fx.refused(c, json!({"include_automated": "sometimes"}), "include_automated", "true or false").await;
+    let e = fx.refused(c, json!({"query": "x".repeat(101)}), "query", "limited to").await;
+    assert!(!e.to_string().contains(&"x".repeat(50)), "the value is not echoed");
+}
+
+#[tokio::test]
+async fn refused_arguments_reach_the_audit_log_as_a_field_path_only() {
+    let fx = fixture().await;
+    let marker = ["hunter2", "payroll"].join("-");
+    let marker = marker.as_str();
+    for args in [
+        json!({"where": {"all": [pred("from", "eq", json!("a@b.test")), pred("subject", "contains", json!(marker))]}}),
+        json!({"where": pred(marker, "eq", json!("x"))}),
+        json!({"where": {marker: 1}}),
+        json!({marker: 1}),
+        json!({"limit": marker}),
+    ] {
+        fx.fail_tool("search_messages", args).await;
+    }
+    let rows: Vec<(String, String)> =
+        fx.h.app()
+            .store
+            .call(|c| {
+                let mut st = c.prepare(
+                    "SELECT result_code, object_ids FROM audit WHERE tool_or_action = 'search_messages' ORDER BY seq",
+                )?;
+                let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .await
+            .unwrap();
+    assert_eq!(rows.len(), 5);
+    let kinds: Vec<&str> = rows.iter().map(|r| r.1.as_str()).collect();
+    assert_eq!(
+        kinds,
+        [
+            r#"["~invalid=where.all[].op"]"#,
+            r#"["~invalid=where.field"]"#,
+            r#"["~invalid=where"]"#,
+            r#"["~invalid=arguments"]"#,
+            r#"["~invalid=limit"]"#
+        ]
+    );
+    assert!(rows.iter().all(|r| r.0 == "invalid_argument" && !r.1.contains(marker)));
+}

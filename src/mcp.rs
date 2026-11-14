@@ -421,6 +421,10 @@ pub async fn call_tool(app: &Arc<App>, ctx: &ClientCtx, version: &str, name: &st
         }
         Err(e) => {
             rec.result_code = e.code.as_str().into();
+            // Which argument was refused (PLAN A68): a path made of the tool's own argument names, never a value.
+            if let Some(field) = e.audit_field() {
+                rec.object_ids.push(format!("~invalid={field}"));
+            }
             record_denial(app, ctx, e.code);
             let ej = e.to_json();
             let mut r = json!({ "content": [{ "type": "text", "text": serde_json::to_string(&ej).unwrap_or_default() }], "isError": true });
