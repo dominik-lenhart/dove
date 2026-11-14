@@ -230,6 +230,9 @@ async fn writes_need_csrf_origin_and_same_site() {
         assert_eq!(r.status, want, "{name}: {}", r.text);
         assert_eq!(sessions().await, 2, "{name} changed nothing");
     }
+    // A page load from a foreign origin (a cross-origin fetch) is refused by the guard, before any page.
+    let r = b.raw("GET", "/admin/settings", &[("cookie", &cookie), ("origin", "https://evil.example")], "").await;
+    assert_eq!(r.status, 403);
     // A CSRF header works like the form field; then the write happens.
     let r = b
         .raw(
@@ -463,6 +466,10 @@ async fn sign_in_checks_every_part_of_the_assertion() {
     let last = bad.signature.len() - 1;
     bad.signature[last] ^= 1;
     assert_eq!(login_finish(&mut Browser::new(&h), &id, &bad).await.status, 401, "tampered signature");
+    let (id, ch) = login_options(&mut b).await;
+    let mut stranger = a.assert(&ch);
+    stranger.user_handle = vec![3; 16];
+    assert_eq!(login_finish(&mut Browser::new(&h), &id, &stranger).await.status, 401, "another user handle");
     let (id1, ch1) = login_options(&mut b).await;
     let (id2, _) = login_options(&mut b).await;
     assert_eq!(login_finish(&mut Browser::new(&h), &id2, &a.assert(&ch1)).await.status, 401, "other ceremony");
