@@ -242,12 +242,11 @@ async fn listen(a: ListenArgs) -> anyhow::Result<()> {
     crate::platform::ensure_private_dir(dir).with_context(|| format!("cannot create {}", dir.display()))?;
     // One listener per profile and watch filter: a second one would run COMMAND twice for the same event.
     let lock_path = path.with_extension("lock");
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&lock_path)
-        .with_context(|| format!("cannot open {}", lock_path.display()))?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    let lock = opts.open(&lock_path).with_context(|| format!("cannot open {}", lock_path.display()))?;
     if lock.try_lock().is_err() {
         bail!("another `dove watch listen` already runs for profile '{name}' ({})", lock_path.display());
     }

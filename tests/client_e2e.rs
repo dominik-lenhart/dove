@@ -714,6 +714,7 @@ async fn watch_listen_runs_the_command_once_per_event_with_ids_only() {
     assert!(!out.exists(), "an old event ran the command");
     let state = c.path(".config/dove/watch-listen/ops.json");
     assert_eq!(mode(&state), 0o600);
+    assert_eq!(mode(&c.path(".config/dove/watch-listen/ops.lock")), 0o600);
 
     // A new event runs the command once, with ids and times only.
     let id = h.google.add_message("info@acme.test", mail("CANARY-SUBJECT-q9"));
