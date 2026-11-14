@@ -588,6 +588,47 @@ async fn long_body_is_shown_in_full_and_approvable() {
     }
 }
 
+/// Approval refuses what could only fail later: a connection that lost `draft` on the mailbox since the request,
+/// and a request past `expires_at` that the worker has not marked yet.
+#[tokio::test]
+async fn approval_needs_draft_access_and_an_unexpired_request() {
+    let (h, token) = setup().await;
+    let t = util::now_unix() + 3600;
+    let (id, _) = requested(&h, &token, &[t]).await;
+    let v = show(&h, &id).await;
+    h.admin(AdminRequest::ClientsSetGrants { name: "agent".into(), grants: vec![g("info", "read")] }).await.unwrap();
+    let e = approve(&h, &id, shown_of(&v), None, dove::admin::Late::Skip).await.unwrap_err();
+    assert!(e.contains("no longer has draft access"), "{e}");
+    assert_eq!(states(&h, &id).await, ("pending".into(), vec![st("pending", None)]));
+    h.admin(AdminRequest::ClientsSetGrants { name: "agent".into(), grants: vec![g("info", "read,draft")] })
+        .await
+        .unwrap();
+    // Past its expiry, before any tick ran.
+    let rid = id.clone();
+    h.app()
+        .store
+        .call(move |c| {
+            Ok(c.execute(
+                "UPDATE requests SET expires_at = ?1 WHERE id = ?2",
+                rusqlite::params![util::now_unix() - 1, rid],
+            )?)
+        })
+        .await
+        .unwrap();
+    let e = approve(&h, &id, shown_of(&v), None, dove::admin::Late::Skip).await.unwrap_err();
+    assert!(e.contains("expired"), "{e}");
+    assert_eq!(states(&h, &id).await, ("pending".into(), vec![st("pending", None)]));
+    // Both fine again: the approval goes through (the checks above refused nothing else).
+    let rid = id.clone();
+    h.app()
+        .store
+        .call(move |c| Ok(c.execute("UPDATE requests SET expires_at = ?1 WHERE id = ?2", rusqlite::params![t, rid])?))
+        .await
+        .unwrap();
+    approve(&h, &id, shown_of(&v), None, dove::admin::Late::Skip).await.unwrap();
+    assert_eq!(states(&h, &id).await.0, "approved");
+}
+
 #[tokio::test]
 async fn daily_cap_refuses_the_approval() {
     let (h, token) = setup_with(|c| c.limits.scheduled_sends_per_day = 2).await;

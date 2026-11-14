@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 use super::{NOTE_KIND, close_if_finished};
 use crate::admin::server::AdminCall;
 use crate::admin::{Late, ShownItem};
+use crate::policy::Capability;
 use crate::tools::ToolCx;
 use crate::util;
 
@@ -307,11 +308,24 @@ pub async fn approve(
     let cap = i64::from(call.app.cfg.limits.scheduled_sends_per_day);
     let decided_by = call.actor.name.clone();
     let account_id = s.account_id.clone().unwrap_or_default();
+    let (client_id, allow_send) = (s.client_id.clone(), call.app.cfg.allow_send);
     call.tx(move |tx| {
         // The state may have moved while the drafts were read (cancel, expiry, an edit through Dove).
-        let status: String = tx.query_row("SELECT status FROM requests WHERE id = ?1", [&id], |r| r.get(0))?;
+        let (status, expires_at): (String, i64) =
+            tx.query_row("SELECT status, expires_at FROM requests WHERE id = ?1", [&id], |r| Ok((r.get(0)?, r.get(1)?)))?;
         if status != "pending" {
             bail!("request {id} is {status} now; nothing was approved");
+        }
+        // Expired even if the worker has not marked it yet.
+        if expires_at <= now {
+            bail!("request {id} expired at {}; nothing was approved", util::rfc3339(expires_at));
+        }
+        // The agent must still be allowed to draft on the mailbox; otherwise every item would fail as `access_lost`.
+        let may_draft = crate::policy::load_client(tx, &client_id, allow_send)?.is_some_and(|ctx| {
+            ctx.mailboxes.iter().any(|m| m.account_id == account_id && m.actions.has(Capability::Draft))
+        });
+        if !may_draft {
+            bail!("the connection no longer has draft access to this mailbox; nothing was approved");
         }
         let plan = still_as_shown(tx, &id, &account_id, &chosen, &shown)?;
         // Late items: the operator's choice, skip by default.

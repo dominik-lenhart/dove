@@ -678,4 +678,7 @@ hosts or reference hardware.
   (l) The operator's review reads drafts with `ToolCx::for_operator_review`, where `get_draft` returns up to
   `read::OPERATOR_BODY_CHARS` (the MIME parser's 2 MiB text limit) instead of the agent maximum of 100,000; a draft
   body is at most 500 KB, so it is never cut. `approve` re-reads the same revision and refuses any chosen item whose
-  body is truncated (or reports no truncation flag), with no override (`admin::approvable`).
+  body is truncated (or reports no truncation flag), with no override (`admin::approvable`). (m) Inside the
+  approval transaction Dove also refuses a request past `expires_at` that the tick has not marked yet, and a
+  connection that no longer holds `draft` on the mailbox (revoked or expired connections included), instead of
+  approving items that could only end as `access_lost`.

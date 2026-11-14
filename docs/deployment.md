@@ -793,7 +793,8 @@ dove requests cancel <request-id> [--items 1]
 item whose text could not be shown in full cannot be approved); HTML is never rendered and control characters are
 replaced, because the text comes from the agent and from mail. The agent's note is shown here only: it is stored encrypted and never logged. `approve`
 sends the revisions it printed; if a draft changed in between, the approval is refused and you run it again. Items
-whose time has passed when you approve are skipped unless you pass `--late send` (they are then sent at once). Items
+whose time has passed when you approve are skipped unless you pass `--late send` (they are then sent at once). An
+expired request, or one whose connection no longer has `draft` on the mailbox, cannot be approved. Items
 you leave out with `--items` end as `denied`.
 
 At its time an approved item is sent through the same path as `send_draft`, after these checks: the request is still
