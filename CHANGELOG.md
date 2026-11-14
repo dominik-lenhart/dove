@@ -5,6 +5,16 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 
 ## [Unreleased]
 
+### Added
+
+- Access requests. `request_access` lets an agent ask for rights on mailboxes of its project (grant syntax, presets
+  included), for up to 30 days or permanently, with a note for the owner. Nothing changes before the owner approves
+  with `dove requests approve`, where mailboxes can be left out (`--items`) and the time shortened (`--duration 2h`).
+  Temporary rights end on their own at the first call after their expiry and never touch the connection's earlier
+  grants; `clients set-grants`, revoking the connection, removing the mailbox and `dove requests cancel` end them
+  early. `list_accounts` and `clients show` show temporary rights with their end. A mailbox of another project and
+  an unknown name give the same `not_found`.
+
 ## [0.10.0] - 2026-11-14
 
 ### Added

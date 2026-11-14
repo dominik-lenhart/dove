@@ -705,3 +705,30 @@ hosts or reference hardware.
   `docs/benchmarks.md`). Until then the 8.1 latency targets stay unmet for large result sets; selective queries
   (a rare sender, label or term, a domain, a date range) take 3 to 12 ms.
 
+- A73. Requests stage 2: access requests and temporary grants (design `docs/superpowers/specs/2026-11-14-requests-and-admin-ui-design.md`
+  4.2 `request_access`, 4.5, 4.7 `--duration`; plan `docs/superpowers/plans/2026-11-14-requests-stage2-access.md`). Code in
+  `src/requests/access.rs`, `src/policy.rs` (`load_mailboxes_at`, `Actions::union`), `src/requests/admin.rs`
+  (`approve_access`) and `src/tools/requests.rs`; store migration `V_ACCESS_GRANTS` (`client_grant_extras`, additive).
+  Decisions where the design is silent, all fail-closed: (a) one extras row per (client, mailbox, request), never
+  merged, so two temporary approvals on a mailbox each end at their own time and none outlives what was approved; the
+  design's column list gained `request_id` and `granted_at`. (b) A permanent approval is `done` at once (the right now
+  belongs to the grants); a temporary one stays `approved` while it has rows, so it counts towards
+  `client_open_requests`, which also bounds the rows per client. (c) Permanent approval writes old ∪ approved through
+  `write_grants`, validating only the approved part with `resolve_grants` (an existing `send` grant from before
+  `allow_send` was switched off does not block it); an unreadable stored grant refuses the approval. (d) The
+  operator's `--duration` may only shorten; on a permanent request it makes the grant temporary; the time runs from
+  the approval. (e) `Actions::union` re-validates and yields nothing on an invalid operand; an extras row whose list
+  does not parse grants nothing. Both base and extras are intersected with project membership. (f) `auth_epoch` moves
+  on every approval and every deletion of extras (sweep, set-grants, revoke, cancel, mailbox removal), so cursors made
+  with a wider scope stop working; expiry itself needs no write, since the policy filters `expires_at > now` on every
+  request. (g) What a temporary right carried ends lazily but before any use: watches through `watch::end_reason`
+  (now evaluated at the tick's clock), scheduled sends through the worker's and `send_core`'s re-checks
+  (`access_lost`), pending send requests through the approval's `may_draft`. No proactive cancel, so the stage 1 paths
+  stay the only ones that decide sends. Drafts created during the grant stay in the mailbox. (h) Agent and operator
+  may cancel an approved temporary request (rights back at once); `--items` is refused for access requests. (i)
+  Removing a mailbox from the project or from Dove deletes the rows on it and cancels pending access requests naming
+  it; an approved request with rows left on other mailboxes stays approved. Disabling a mailbox does not touch access
+  requests (the status check already refuses use). (j) With `[requests] enabled = false` approved temporary rights stay
+  until their expiry (the sweep runs regardless). (k) No redundancy check in `request_access`; `show` lists what the
+  connection has now per mailbox. (l) Retention of a `done` access request counts from its decision, since requests
+  have no closing timestamp; a temporary request closes at most 30 days after it, inside the 90-day retention.

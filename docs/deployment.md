@@ -189,7 +189,7 @@ The file holds no secrets. Unknown keys are rejected. Settings and defaults (fro
 | `audit.retention_days` | `180` | Audit retention. Prune with `dove audit prune`. |
 | `notifier.webhook_url` | unset | HTTPS webhook (for example ntfy) for "mailbox needs re-authorization". Messages carry no mail content. |
 | `index.*` | see below | Search index tuning. |
-| `requests.enabled` | `true` | Agents may ask for scheduled sends that the owner approves (see [Scheduled sends](#scheduled-sends-approved-by-the-owner)). `false` hides `request_send`, refuses it like `send_draft` without `allow_send`, and the worker sends nothing. |
+| `requests.enabled` | `true` | Agents may ask for scheduled sends and for more access, which the owner approves (see [Scheduled sends](#scheduled-sends-approved-by-the-owner) and [Access requests](#access-requests-and-temporary-grants)). `false` hides `request_send` and `request_access`, refuses them like `send_draft` without `allow_send`, and the worker sends nothing. Temporary rights approved earlier still end at their expiry. |
 | `requests.late_grace_minutes` | `60` | An approved item that could not be sent within this time after its `send_at` ends as `missed` and is never sent (1 to 1440). |
 | `requests.pending_days` | `7` | A request nobody approved or denied expires after this many days (1 to 30). |
 | `requests.retention_days` | `90` | Closed requests (denied, cancelled, expired, done) are deleted, with their items and the agent's note, this many days after they closed (1 to 3650). Each connection also keeps at most 500 closed requests; older ones are deleted first. Audit records stay. |
@@ -812,6 +812,33 @@ started at the end of the grace can take up to the tool-call budget, so mail goe
 ends as `send_unknown` and is never retried: check the Sent folder. Revoking the client, disabling or removing the
 mailbox cancels its open items. The agent sees each item's state with `list_requests`; every decision and every
 item outcome writes one audit record without mail content (`request.*`, actor `scheduler` for the worker).
+
+## Access requests and temporary grants
+
+Instead of giving an agent every right it might need, give it little and let it ask: `request_access` asks for actions
+on mailboxes of its project, for a while (`duration_minutes`, at most 30 days) or permanently. Asking changes nothing.
+You decide on the admin socket:
+
+```sh
+dove requests show <request-id>                     # each mailbox: what is asked, what the connection has now
+dove requests approve <request-id>                  # as asked
+dove requests approve <request-id> --items 1 --duration 2h   # only the second mailbox, for two hours
+dove requests deny <request-id>
+dove requests cancel <request-id>                   # ends an approved temporary grant early
+```
+
+`--duration` takes minutes or `90m`, `8h`, `7d` and may only shorten what was asked; on a request for a permanent
+grant it makes the grant temporary. A permanent approval adds to the connection's grants (shown by `clients show`,
+changed with `clients set-grants`) and never removes anything. A temporary approval leaves the grants alone and adds
+rights that end on their own: the first call after the expiry no longer has them, and the connection keeps exactly
+what it had before. `clients show` and the agent's `list_accounts` show temporary rights with their end.
+
+Temporary rights also end when you run `clients set-grants` for the connection (what you set is all it has
+afterwards), revoke it, or remove the mailbox from its project or from Dove. When a temporary right ends, watches that
+needed it end (`access_lost`), and scheduled sends that needed `draft` from it fail as `access_lost` instead of going
+out. The agent's mailbox name is checked only inside its own project: a mailbox of another project looks exactly like
+one that does not exist. `send` can be asked for only while `allow_send = true`, and approving checks it again. An
+approved temporary request counts as open (`limits.client_open_requests`) until its rights end.
 
 ## Watches and sinks
 

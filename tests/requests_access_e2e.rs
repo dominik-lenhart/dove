@@ -252,6 +252,13 @@ async fn temporary_grant_works_then_expires_and_earlier_rights_stay() {
             .await,
         2
     );
+    let aliases = fx
+        .sql_str(
+            "SELECT group_concat(account_alias, ',') FROM (SELECT account_alias FROM audit \
+             WHERE tool_or_action = 'request.grant_expire' ORDER BY account_alias)",
+        )
+        .await;
+    assert_eq!(aliases.as_deref(), Some("billing,info"));
     // Earlier rights stay, nothing more.
     assert_eq!(fx.accounts().await, vec![pair("info", "read")]);
     assert_eq!(fx.base_grants().await, vec![pair("info", "read")]);

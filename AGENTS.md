@@ -36,7 +36,8 @@ cargo fmt
 - `src/index/`: SQLCipher FTS5 index, sync engine, query compiler
 - `src/client/`: remote client commands (login, search, mcp install, stdio bridge, `watch` incl. `watch listen`)
 - `src/update/`: `dove upgrade` (signed GitHub Releases) and the daily new-version notice; CLI only
-- `src/requests/`: agent requests (scheduled sends approved on the admin socket): store, admin verbs, send worker
+- `src/requests/`: agent requests approved on the admin socket: scheduled sends (store, admin verbs, send worker) and
+  access requests with temporary grants (`access.rs`)
 - `tests/`: integration tests against the fake Google server in `tests/support/`
 
 ## Security invariants (do not weaken)
@@ -476,4 +477,11 @@ cargo fmt
   A change to `query.rs` or the index schema should be checked with `DOVE_BENCH_FAST=1 DOVE_BENCH_EXPLAIN=1
   DOVE_BENCH_MESSAGES=50000 heavy cargo test --release --test bench_index -- --ignored --nocapture bench_index`
   (about 3 min); latency of large result sets grows with the match count because the plans materialize and sort them.
-
+- 2026-11-14: Temporary grants (PLAN A73) live in `client_grant_extras`; `policy::load_mailboxes_at` unites them with
+  `client_mailboxes` per request (`expires_at > now`), so never read `client_mailboxes` alone to decide what a client
+  may do, and never write extras outside `requests::access` (`drop_extras` moves the epoch and closes the request).
+  `close_if_finished` keeps an access request `approved` while it has rows. Tests expire a grant with
+  `UPDATE client_grant_extras SET expires_at = <now>` (the policy) or `requests::worker::tick(app, t)` (the sweep).
+  Guards that sit behind another check need a test where only they fire: the operator's 30-day bound is shadowed by
+  "shorter only" unless the request is permanent, and the revoke catch-all by `cancel_for_client` unless the request
+  is no longer open.
