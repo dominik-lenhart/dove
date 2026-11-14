@@ -111,13 +111,6 @@ impl RateLimiter {
         self.check_rate(key, f64::from(per_hour.max(1)) / 3600.0, per_hour, cost)
     }
 
-    /// Whether the bucket `key` has less than one token left, without taking one: for limits charged only on
-    /// failure (admin UI sign-in), checked before the attempt.
-    pub fn exhausted(&self, key: &str) -> bool {
-        let b = self.inner.lock().expect("lock");
-        b.map.get(key).is_some_and(|e| e.refilled(Instant::now()) < 1.0)
-    }
-
     /// Gives back `cost` tokens taken with [`RateLimiter::take_hourly`] (for work that did not happen), up to the cap.
     pub fn refund(&self, key: &str, cost: u32) {
         let mut b = self.inner.lock().expect("lock");

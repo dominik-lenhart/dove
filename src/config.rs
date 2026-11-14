@@ -68,7 +68,8 @@ pub struct AdminUiConfig {
     pub origin: Option<String>,
     /// Requests per minute per client address under `/admin`.
     pub requests_per_minute: u32,
-    /// Failed passkey sign-ins per hour per client address; after that sign-in is refused until the bucket refills.
+    /// Failed passkey sign-ins and enrolments per hour per client address; after that, failures answer 429. A valid
+    /// passkey always signs in (PLAN A73 (i)).
     pub login_failures_per_hour: u32,
 }
 

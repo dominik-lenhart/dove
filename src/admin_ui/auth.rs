@@ -242,14 +242,20 @@ fn login_fail_key(ip: Option<IpAddr>) -> String {
     format!("admin-login-fail:{}", ip.map(|i| i.to_string()).unwrap_or_else(|| "unknown".into()))
 }
 
-fn login_blocked(app: &App, ip: Option<IpAddr>) -> bool {
-    app.rate_limiter.exhausted(&login_fail_key(ip))
+/// Charges a failed sign-in or enrolment to the per-address bucket and returns the status to answer: `refused`, or
+/// 429 once the bucket is empty. Only failures are charged and nothing is refused before it is checked, so a valid
+/// passkey always signs in: behind Tailscale Serve every caller shares `127.0.0.1`, and a local process must not be
+/// able to lock the owner out (PLAN A73 (i), the same rule as bearer failures on `/mcp`).
+fn login_failed(app: &App, ip: Option<IpAddr>, refused: StatusCode) -> StatusCode {
+    let n = app.cfg.admin_ui.login_failures_per_hour;
+    match app.rate_limiter.check_hourly(&login_fail_key(ip), n, n) {
+        Some(_) => StatusCode::TOO_MANY_REQUESTS,
+        None => refused,
+    }
 }
 
-/// Spends one token of the per-address bucket of failed sign-ins and enrolments.
-fn login_failed(app: &App, ip: Option<IpAddr>) {
-    let n = app.cfg.admin_ui.login_failures_per_hour;
-    let _ = app.rate_limiter.check_hourly(&login_fail_key(ip), n, n);
+fn refused_json(status: StatusCode, msg: &'static str) -> Response {
+    json_error(status, if status == StatusCode::TOO_MANY_REQUESTS { TOO_MANY } else { msg })
 }
 
 const TOO_MANY: &str = "Too many failed attempts from this address. Try again later.";
@@ -372,9 +378,6 @@ pub async fn login_page(State(app): State<Arc<App>>, headers: HeaderMap) -> Resp
 }
 
 pub async fn login_options(State(app): State<Arc<App>>, Extension(ClientIp(ip)): Extension<ClientIp>) -> Response {
-    if login_blocked(&app, ip) {
-        return json_error(StatusCode::TOO_MANY_REQUESTS, TOO_MANY);
-    }
     let Some((rp_id, _)) = rp(&app) else { return json_error(StatusCode::NOT_FOUND, "not found") };
     let challenge = util::random_bytes::<32>();
     let id = new_ceremony_id();
@@ -394,9 +397,6 @@ pub async fn login_finish(
     Extension(ClientIp(ip)): Extension<ClientIp>,
     body: Bytes,
 ) -> Response {
-    if login_blocked(&app, ip) {
-        return json_error(StatusCode::TOO_MANY_REQUESTS, TOO_MANY);
-    }
     match login_check(&app, &body, ip).await {
         Ok(token) => {
             tracing::info!("admin UI sign-in");
@@ -405,10 +405,10 @@ pub async fn login_finish(
             r
         }
         Err(code) => {
-            login_failed(&app, ip);
+            let status = login_failed(&app, ip, StatusCode::UNAUTHORIZED);
             tracing::info!(reason = code, "admin UI sign-in refused");
             audit_web(&app, "web".into(), "admin_ui.login", "denied", ip).await;
-            json_error(StatusCode::UNAUTHORIZED, SIGN_IN_FAILED)
+            refused_json(status, SIGN_IN_FAILED)
         }
     }
 }
@@ -475,23 +475,18 @@ pub async fn enrol_options(
     Extension(ClientIp(ip)): Extension<ClientIp>,
     body: Bytes,
 ) -> Response {
-    if login_blocked(&app, ip) {
-        return json_error(StatusCode::TOO_MANY_REQUESTS, TOO_MANY);
-    }
     let Some((rp_id, _)) = rp(&app) else { return json_error(StatusCode::NOT_FOUND, "not found") };
     let token = match serde_json::from_slice::<EnrolOptions>(&body) {
         Ok(o) if plausible_token(&o.token) => o.token,
         _ => {
-            login_failed(&app, ip);
-            return json_error(StatusCode::BAD_REQUEST, LINK_INVALID);
+            return refused_json(login_failed(&app, ip, StatusCode::BAD_REQUEST), LINK_INVALID);
         }
     };
     let t = token.clone();
     let label = match app.store.call(move |c| store::enrolment_label(c, &t, util::now_unix())).await {
         Ok(Some(l)) => l,
         _ => {
-            login_failed(&app, ip);
-            return json_error(StatusCode::NOT_FOUND, LINK_INVALID);
+            return refused_json(login_failed(&app, ip, StatusCode::NOT_FOUND), LINK_INVALID);
         }
     };
     let challenge = util::random_bytes::<32>();
@@ -523,9 +518,6 @@ pub async fn enrol_finish(
     Extension(ClientIp(ip)): Extension<ClientIp>,
     body: Bytes,
 ) -> Response {
-    if login_blocked(&app, ip) {
-        return json_error(StatusCode::TOO_MANY_REQUESTS, TOO_MANY);
-    }
     match enrol_check(&app, &body, ip).await {
         Ok(token) => {
             tracing::info!("admin UI passkey enrolled");
@@ -534,7 +526,7 @@ pub async fn enrol_finish(
             r
         }
         Err(code) => {
-            login_failed(&app, ip);
+            let status = login_failed(&app, ip, StatusCode::BAD_REQUEST);
             tracing::info!(reason = code, "admin UI enrolment refused");
             audit_web(&app, "web".into(), "admin_ui.enrol", "denied", ip).await;
             let msg = match code {
@@ -542,7 +534,7 @@ pub async fn enrol_finish(
                 "duplicate" => "This passkey or name is already enrolled.",
                 _ => "The passkey could not be enrolled. Use a passkey with a PIN, fingerprint or face check.",
             };
-            json_error(StatusCode::BAD_REQUEST, msg)
+            refused_json(status, msg)
         }
     }
 }

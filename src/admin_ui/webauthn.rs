@@ -481,6 +481,35 @@ mod tests {
         assert_eq!(v.assert_with(&cred, |_, _, _, a, _| a.push(0)), Err(Error::AuthData));
     }
 
+    /// Attested credential data belongs to registration only: an assertion that carries it (properly signed) is refused.
+    #[test]
+    fn attested_data_in_an_assertion_is_refused() {
+        use crate::admin_ui::soft_authenticator::SoftAuthenticator;
+        let mut a = SoftAuthenticator::es256(RP.origin);
+        let reg_challenge = [3u8; 32];
+        let reg = a.register(&reg_challenge, &[1; 16]);
+        let cred = verify_registration(RP, &reg_challenge, &reg.client_data_json, &reg.attestation_object).unwrap();
+        let ao = crate::admin_ui::cbor::decode(&reg.attestation_object).unwrap();
+        let reg_auth_data = ao.get_text_key("authData").and_then(|v| v.as_bytes()).unwrap().to_vec();
+        assert_ne!(reg_auth_data[32] & AT, 0);
+        let ch = [7u8; 32];
+        let cdj =
+            format!(r#"{{"type":"webauthn.get","challenge":"{}","origin":"{}"}}"#, crate::util::b64url(&ch), RP.origin)
+                .into_bytes();
+        let sig = a.sign(&reg_auth_data, &cdj);
+        let stored = || StoredCredential {
+            alg: cred.alg,
+            public_key: &cred.public_key,
+            sign_count: cred.sign_count,
+            backup_eligible: cred.backup_eligible,
+        };
+        assert_eq!(verify_assertion(RP, &ch, stored(), &cdj, &reg_auth_data, &sig), Err(Error::AuthData));
+        // The same authenticator's ordinary assertion passes, so the refusal above is the attested data.
+        let ok = a.assert(&ch);
+        let r = verify_assertion(RP, &ch, stored(), &ok.client_data_json, &ok.authenticator_data, &ok.signature);
+        assert!(r.is_ok(), "{r:?}");
+    }
+
     #[test]
     fn client_data_rules() {
         let ch = [7u8; 32];

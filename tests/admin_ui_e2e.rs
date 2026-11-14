@@ -291,15 +291,22 @@ async fn rate_and_login_failure_limits_per_address() {
         let (id, ch) = login_options(&mut Browser::new(&h)).await;
         assert_eq!(login_finish(&mut Browser::new(&h), &id, &other.assert(&ch)).await.status, 401);
     }
+    // Further failures from that address answer 429, sign-in and enrolment alike.
+    let (id, ch) = login_options(&mut Browser::new(&h)).await;
+    assert_eq!(login_finish(&mut Browser::new(&h), &id, &other.assert(&ch)).await.status, 429);
+    assert_eq!(Browser::new(&h).post_json("/admin/enroll/options", json!({"token": "x"})).await.status, 429);
+    // A valid passkey is never refused by it: behind Tailscale Serve everyone shares 127.0.0.1, and a local process
+    // must not lock the owner out. A valid enrolment link still works too.
     let mut c = Browser::new(&h);
-    assert_eq!(c.post_json("/admin/login/options", json!({})).await.status, 429);
-    assert_eq!(c.post_json("/admin/enroll/options", json!({"token": "x"})).await.status, 429);
-    // Another address still signs in (proxy-authenticated X-Forwarded-For).
+    login(&mut c, &mut a).await;
+    assert_eq!(c.get("/admin").await.status, 200);
+    enrol(&h, &mut Browser::new(&h), "laptop").await;
+    // The bucket is per address: a failure from another address (proxy-authenticated X-Forwarded-For) is a plain 401.
     let secret = h.app().proxy_secret.as_ref().unwrap().to_string();
     let mut d = Browser::new(&h);
     d.extra = vec![("x-forwarded-for".into(), "203.0.113.9".into()), ("x-dove-proxy-auth".into(), secret.clone())];
-    login(&mut d, &mut a).await;
-    assert_eq!(d.get("/admin").await.status, 200);
+    let (id, ch) = login_options(&mut d).await;
+    assert_eq!(login_finish(&mut d, &id, &other.assert(&ch)).await.status, 401);
     // The request budget: 40 per minute per address.
     let mut e = Browser::new(&h);
     e.extra = vec![("x-forwarded-for".into(), "203.0.113.10".into()), ("x-dove-proxy-auth".into(), secret)];
@@ -314,7 +321,8 @@ async fn rate_and_login_failure_limits_per_address() {
 
 #[tokio::test]
 async fn enrolment_links_work_once_for_five_minutes() {
-    let h = start().await;
+    // Many refused enrolments below; the failure budget is not what this test is about.
+    let h = start_with(|c| c.admin_ui.login_failures_per_hour = 100).await;
     assert!(h.admin(AdminRequest::PasskeysAdd { name: "Phone!".into() }).await.unwrap_err().contains("invalid"));
     let v = h.admin(AdminRequest::PasskeysAdd { name: "phone".into() }).await.unwrap();
     let link = v["open_this_link"].as_str().unwrap();
@@ -361,6 +369,45 @@ async fn enrolment_links_work_once_for_five_minutes() {
         c.post_json("/admin/enroll/finish", json!({ "id": o2["id"], "credential": r2.to_json() })).await.status,
         400
     );
+    // A link stays used even when the passkey it created is removed: a second ceremony from it cannot enrol.
+    let race = enrol_link(&h, "race").await;
+    let mut c2 = Browser::new(&h);
+    let p1 = c2.post_json("/admin/enroll/options", json!({ "token": race })).await.json();
+    let p2 = c2.post_json("/admin/enroll/options", json!({ "token": race })).await.json();
+    let mut u1 = SoftAuthenticator::es256(ORIGIN);
+    let mut u2 = SoftAuthenticator::es256(ORIGIN);
+    let q1 = u1.register(&b64d(&p1["publicKey"]["challenge"]), &b64d(&p1["publicKey"]["user"]["id"]));
+    let q2 = u2.register(&b64d(&p2["publicKey"]["challenge"]), &b64d(&p2["publicKey"]["user"]["id"]));
+    assert_eq!(
+        c2.post_json("/admin/enroll/finish", json!({ "id": p1["id"], "credential": q1.to_json() })).await.status,
+        200
+    );
+    h.admin(AdminRequest::PasskeysRemove { name: "race".into() }).await.unwrap();
+    let r = c2.post_json("/admin/enroll/finish", json!({ "id": p2["id"], "credential": q2.to_json() })).await;
+    assert_eq!(r.status, 400, "a used link cannot enrol again after its passkey was removed: {}", r.text);
+    // A link that expires between the options and the finish.
+    let late = enrol_link(&h, "late").await;
+    let mut c3 = Browser::new(&h);
+    let p = c3.post_json("/admin/enroll/options", json!({ "token": late })).await.json();
+    h.app()
+        .store
+        .call(|c| Ok(c.execute("UPDATE admin_enrolments SET expires_at = 1 WHERE used_at IS NULL", [])?))
+        .await
+        .unwrap();
+    let mut u = SoftAuthenticator::es256(ORIGIN);
+    let q = u.register(&b64d(&p["publicKey"]["challenge"]), &b64d(&p["publicKey"]["user"]["id"]));
+    assert_eq!(
+        c3.post_json("/admin/enroll/finish", json!({ "id": p["id"], "credential": q.to_json() })).await.status,
+        400
+    );
+    // The id the page claims must be the credential id inside the attestation.
+    let claim = enrol_link(&h, "claim").await;
+    let mut c4 = Browser::new(&h);
+    let p = c4.post_json("/admin/enroll/options", json!({ "token": claim })).await.json();
+    let mut u = SoftAuthenticator::es256(ORIGIN);
+    let mut q = u.register(&b64d(&p["publicKey"]["challenge"]), &b64d(&p["publicKey"]["user"]["id"])).to_json();
+    q["id"] = json!(util::b64url(&[5u8; 16]));
+    assert_eq!(c4.post_json("/admin/enroll/finish", json!({ "id": p["id"], "credential": q })).await.status, 400);
     // An expired link.
     let token3 = enrol_link(&h, "watch").await;
     h.app()
@@ -445,19 +492,34 @@ async fn sign_in_checks_every_part_of_the_assertion() {
         refused("wrong origin", Box::new(|x| x.origin = "https://dove.example.com".into())),
         refused("wrong RP ID", Box::new(|x| x.rp_id = "dove.example.com".into())),
         refused("registration type", Box::new(|x| x.type_override = Some("webauthn.create".into()))),
-        refused("counter going back", Box::new(|x| x.sign_count = 0)),
+        refused(
+            "counter going back",
+            Box::new(|x| {
+                x.sign_count = 0;
+                x.counter_step = 0
+            }),
+        ),
+        refused("backup state without eligibility", Box::new(|x| x.backup_state = true)),
     ];
+    // Each case bends the enrolled authenticator (same key and credential) for one ceremony, then restores it.
     for (label, bend) in cases {
-        let mut x = SoftAuthenticator::es256(ORIGIN);
-        std::mem::swap(&mut x, &mut a);
+        let saved = (a.origin.clone(), a.rp_id.clone(), a.user_present, a.user_verified, a.type_override.clone());
+        let (count, step, backup) = (a.sign_count, a.counter_step, a.backup_state);
         bend(&mut a);
         let (id, ch) = login_options(&mut b).await;
         let assertion = a.assert(&ch);
-        std::mem::swap(&mut x, &mut a);
-        // `a` keeps the real state; `x` was the bent copy only for this ceremony... unless the counter case moved it.
-        a.sign_count = a.sign_count.max(x.sign_count);
+        (a.origin, a.rp_id, a.user_present, a.user_verified, a.type_override) = saved;
+        (a.sign_count, a.counter_step, a.backup_state) = (count.max(a.sign_count), step, backup);
         assert_eq!(login_finish(&mut Browser::new(&h), &id, &assertion).await.status, 401, "{label}");
     }
+    // The unbent authenticator still signs in, so each refusal above was the bent part.
+    let (id, ch) = login_options(&mut b).await;
+    assert_eq!(login_finish(&mut Browser::new(&h), &id, &a.assert(&ch)).await.status, 200, "unbent");
+    // Right after a sign-in the stored counter equals the authenticator's: the same value again is refused.
+    a.counter_step = 0;
+    let (id, ch) = login_options(&mut b).await;
+    assert_eq!(login_finish(&mut Browser::new(&h), &id, &a.assert(&ch)).await.status, 401, "counter repeated");
+    a.counter_step = 1;
     // Wrong challenge, tampered signature, another ceremony's id.
     let (id, _) = login_options(&mut b).await;
     assert_eq!(login_finish(&mut Browser::new(&h), &id, &a.assert(&[0u8; 32])).await.status, 401, "wrong challenge");
@@ -508,6 +570,23 @@ async fn sessions_end_on_revoke_passkey_removal_and_sign_out() {
     assert_eq!((r.status, r.header("location").as_str()), (303, "/admin/login"));
     assert!(r.header("set-cookie").contains("Max-Age=0"));
     assert_eq!(count(&h, "SELECT COUNT(*) FROM admin_sessions").await, 0);
+}
+
+#[tokio::test]
+async fn sign_counter_updates_are_compare_and_swap() {
+    use dove::admin_ui::store::{passkey_by_credential, record_use};
+    let h = start().await;
+    let a = enrol(&h, &mut Browser::new(&h), "phone").await;
+    let cid = a.credential_id.clone();
+    let p = h.app().store.call(move |c| passkey_by_credential(c, &cid)).await.unwrap().unwrap();
+    let stale = p.clone();
+    h.app().store.call(move |c| record_use(c, &p, 5, false, 1)).await.unwrap();
+    // A second update from the view read before the first (two sign-ins racing with one assertion) loses.
+    let r = h.app().store.call(move |c| record_use(c, &stale, 6, false, 2)).await;
+    assert!(r.is_err());
+    let cid = a.credential_id.clone();
+    let now = h.app().store.call(move |c| passkey_by_credential(c, &cid)).await.unwrap().unwrap();
+    assert_eq!(now.sign_count, 5);
 }
 
 // ------------------------------------------------------------------ step-up
@@ -567,7 +646,7 @@ async fn approval_needs_a_passkey_confirmation_bound_to_that_approval() {
     // Missing user verification, a wrong challenge, a tampered signature, another passkey: refused.
     let mut spare = SoftAuthenticator::es256(ORIGIN);
     enrol_with(&h, &mut Browser::new(&h), "spare", &mut spare).await;
-    for case in ["no uv", "challenge", "signature", "other passkey"] {
+    for case in ["no uv", "challenge", "signature", "other passkey", "other passkey's id"] {
         let (p, ch, _) = stepup_begin(&mut b, &format!("/admin/requests/{r1}/approve"), &form1).await;
         let assertion = match case {
             "no uv" => {
@@ -582,7 +661,14 @@ async fn approval_needs_a_passkey_confirmation_bound_to_that_approval() {
                 x.signature[8] ^= 1;
                 x
             }
-            _ => spare.assert(&ch),
+            "other passkey" => spare.assert(&ch),
+            _ => {
+                // Signed with this session's key, but claiming the other passkey's credential id.
+                let own = std::mem::replace(&mut a.credential_id, spare.credential_id.clone());
+                let x = a.assert(&ch);
+                a.credential_id = own;
+                x
+            }
         };
         assert_eq!(stepup_finish(&mut b, &p, &assertion).await.status, 403, "{case}");
         assert_eq!(request_status(&h, &r1).await["status"], "pending", "{case}");

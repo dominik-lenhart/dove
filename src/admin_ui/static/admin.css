@@ -430,9 +430,9 @@ a.row:hover {
 .note blockquote {
   margin: 0;
   padding: 0.75rem 1rem;
-  border-left: 3px solid var(--amber);
+  border: 1px solid var(--line);
   background: var(--sheet);
-  border-radius: 0 var(--radius) var(--radius) 0;
+  border-radius: var(--radius);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
