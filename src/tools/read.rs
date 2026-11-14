@@ -60,7 +60,7 @@ pub fn defs() -> Vec<ToolDef> {
         ToolDef {
             name: "list_accounts",
             title: "List mailboxes",
-            description: "Mailboxes this connection may use, with alias, address, status and allowed actions. IMAP mailboxes you can draft in also list from_addresses (the mailbox address and its send-as aliases).",
+            description: "Mailboxes this connection may use, with alias, address, status and allowed actions. Rights granted for a while list under temporary with their expires_at. IMAP mailboxes you can draft in also list from_addresses (the mailbox address and its send-as aliases).",
             capability: Capability::Read,
             read_only: true,
             destructive: false,
@@ -424,6 +424,23 @@ async fn list_accounts(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError
                 }
             }
             let mut v = json!({ "account": m.alias, "email": m.email, "status": m.status, "actions": actions, "indexed": m.index_enabled });
+            // Temporary rights (approved access requests): already part of `actions`, listed with their end.
+            if !m.temporary.is_empty() {
+                v["temporary"] = Value::Array(
+                    m.temporary
+                        .iter()
+                        .map(|t| {
+                            // `send` stays hidden while the instance does not allow sending, as in `actions` above.
+                            let acts: Vec<&str> = Capability::ALL
+                                .into_iter()
+                                .filter(|&cap| t.actions.has(cap) && (cap != Capability::Send || cx.client.allow_send))
+                                .map(Capability::as_str)
+                                .collect();
+                            json!({ "actions": acts.join(","), "expires_at": crate::util::rfc3339(t.expires_at) })
+                        })
+                        .collect(),
+                );
+            }
             if m.provider == crate::policy::Provider::Imap && m.actions.has(Capability::Draft) {
                 let mut from = vec![json!({ "address": m.email.to_lowercase(), "name": null })];
                 from.extend(
@@ -440,15 +457,28 @@ async fn list_accounts(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError
     let text = accounts
         .iter()
         .map(|a| {
+            let temporary: Vec<String> = a["temporary"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|t| {
+                    format!(
+                        " (temporary {} until {})",
+                        t["actions"].as_str().unwrap_or(""),
+                        t["expires_at"].as_str().unwrap_or("")
+                    )
+                })
+                .collect();
             format!(
-                "{} <{}> {} [{}]",
+                "{} <{}> {} [{}]{}",
                 a["account"].as_str().unwrap_or(""),
                 a["email"].as_str().unwrap_or(""),
                 a["status"].as_str().unwrap_or(""),
                 a["actions"]
                     .as_array()
                     .map(|x| x.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(","))
-                    .unwrap_or_default()
+                    .unwrap_or_default(),
+                temporary.concat()
             )
         })
         .collect::<Vec<_>>()

@@ -127,8 +127,9 @@ is always delivered in the untrusted-content envelope from section 6.5.
 | `move_messages` | organize (+ delete) | Up to 100 ids to a folder/label, `archive`, `inbox`, `trash` or `spam`. Trash, Spam/Junk and folders below them need `delete`, and so does moving out of Spam/Junk (it promotes spam); moving out of Trash is organize. IMAP folders without a special-use flag count as Trash/Junk by localized well-known names and trash/junk word stems. Per-id results with `new_id` (IMAP ids change). Never a permanent delete. |
 | `send_draft` | send | Optional. Submit one existing, owned draft under §6.3. |
 | `request_send` | draft | Ask the owner to approve sending own, unchanged drafts at fixed times (`send_at` per item, or a `window` Dove spreads them over; at most 30 days ahead), optionally `unless_reply` and a `note`. Needs neither `send` nor `allow_send`; nothing is sent before approval (§6.3a). |
-| `list_requests` | read | This token's requests with per-item state and reason codes. |
-| `cancel_request` | read | Cancel one of this token's pending requests or the unsent items of an approved one. |
+| `request_access` | read | Ask the owner for actions on mailboxes of this token's project (`grants: [{account, actions}]` in grant syntax), for `duration_minutes` (1 to 43,200) or permanently, with an optional `note`. Changes nothing before approval (§6.3b). |
+| `list_requests` | read | This token's requests with per-item state and reason codes; access requests with each asked grant's state and the expiry of temporary rights. |
+| `cancel_request` | read | Cancel one of this token's pending requests or the unsent items of an approved one; on an approved temporary access request it gives the rights back at once. |
 | `create_watch` | read | Watch an indexed mailbox: `thread_reply`, `from` (address or domain), `query` (a `where` filter, checked against newly indexed mail only) or `no_reply_by` (fires once at a deadline unless someone other than the mailbox owner answers first; on a `thread_id`, or on a `message_id` such as the agent's own sent mail, whose id the event then carries; an already answered message ends the watch at once with `replied`). Belongs to the creating token; at most 50 active, expiry 30 days by default, 180 at most; optional operator sink by name. |
 | `list_watches` | read | This token's watches (active and recently ended, with the reason) and the operator's sink names. |
 | `delete_watch` | read | Delete one of this token's watches and its events. |
@@ -274,8 +275,10 @@ human message and, where useful, `retry_after_seconds`. An `invalid_argument` na
 - FR-C2. Commands as listed in 5.1 and 5.2, plus `audit tail|search`, `keys rotate` (section 6.4), `doctor` (checks
   configuration, permissions of secret files, reachability of Google, TLS of the public URL) and `export` (projects,
   clients and accounts without secrets, for review).
-- FR-C3. `requests list|show|approve|deny|cancel` (§6.3a): `show` reads every draft of a request fresh and prints its
+- FR-C3. `requests list|show|approve|deny|cancel` (§6.3a, §6.3b): `show` reads every draft of a request fresh and prints its
   whole text to the operator's terminal; `approve` binds the revisions that were shown and refuses text that was cut.
+  For an access request `show` lists each asked grant next to what the connection has now, and `approve` takes
+  `--items` (mailboxes to grant) and `--duration` (only shorter than asked).
 
 ### 5.6 Client experience and OAuth (v1)
 
@@ -365,6 +368,35 @@ a retry; otherwise the worker asks for a sync and waits, and on doubt never send
 Limits: 20 open requests per client, 50 items per request, and a server-wide 200 scheduled sends per UTC day checked
 at approval. Approval also needs an unexpired request and `draft` on the mailbox. Closed requests are deleted after
 `[requests] retention_days` (90), and a client keeps at most 500. The agent's note is untrusted, sealed with the vault and shown only by `requests show`.
+
+### 6.3b Access requests and temporary grants
+
+Access requests (design 2026-11-14 §4.5, PLAN A73) let an agent ask for more rights instead of holding them. Asking
+changes nothing; only the owner's approval on the admin socket does. `request_access` names mailboxes of the token's
+own project by alias or address; an unknown name and a mailbox outside the project are the identical `not_found`, and
+no tool lists the mailboxes one could ask for. Actions use the grant syntax (`Actions::parse_grant`, presets
+included); `send` can be asked for only while `allow_send` is on, and the approval checks it again. Without
+`duration_minutes` the request is for a permanent grant; temporary rights last 1 minute to 30 days from the approval.
+
+- Permanent approval: the client's grants become old ∪ approved per mailbox (through the `clients set-grants` write
+  path, so the dependency rules apply); nothing is removed. The request is `done` at once.
+- Temporary approval: one row per mailbox in `client_grant_extras(client_id, account_id, request_id, actions,
+  expires_at)`; `client_mailboxes` is not touched. The request stays `approved` (and counts as open) while it has rows.
+- Policy: on every request the effective actions per mailbox are the base grant united with the unexpired temporary
+  rows, both intersected with the project's mailboxes, re-validated by the dependency rules (a stored list that
+  breaks them grants nothing). Expiry therefore takes effect on the first call after it, without a cache and
+  without the worker. A mailbox held only through a temporary right behaves like a granted one everywhere the
+  policy is consulted (tools, search scope and own addresses, watches, drafts, request approval and the scheduled-send
+  re-checks), and disappears from all of them at expiry: running watches end `access_lost` at the next watch tick or
+  event, scheduled sends that need the right fail `access_lost` at their time, a pending send request on it cannot be
+  approved.
+- The requests worker deletes expired rows (one audit record each, actor `scheduler`, action `request.grant_expire`)
+  and closes the request. `clients set-grants` and revoking the client delete all of the client's rows; removing a
+  mailbox from the project or from Dove deletes the rows on it and cancels pending access requests that name it.
+  Cancelling an approved temporary request (agent or owner) deletes its rows. Each of these moves the client's
+  `auth_epoch`, as an approval does.
+- `list_accounts` lists temporary rights under `temporary` with their `expires_at`; `clients show` lists them with the
+  request id. Audit records hold request ids, aliases and result codes, never the note.
 
 ### 6.4 Secrets and encryption at rest
 

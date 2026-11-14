@@ -11,6 +11,7 @@ pub const MIGRATIONS: &[&str] = &[
     V_REDACT_SECRETS,
     V_WATCH_TARGETS,
     V_REQUESTS,
+    V_ACCESS_GRANTS,
 ];
 
 const V1: &str = r#"
@@ -411,4 +412,23 @@ CREATE TABLE request_items (
     PRIMARY KEY (request_id, idx)
 );
 CREATE INDEX request_items_due ON request_items(state, send_at);
+"#;
+
+/// Requests stage 2: temporary grants from approved access requests (design 2026-11-14 section 4.5, PLAN A73).
+///
+/// One row per mailbox of one approved temporary access request; the policy grants the union of `client_mailboxes`
+/// and the rows with `expires_at > now`, so expiry needs no write. The requests worker deletes expired rows.
+/// `client_mailboxes` is never touched by a temporary grant, so its expiry leaves earlier rights as they were.
+const V_ACCESS_GRANTS: &str = r#"
+CREATE TABLE client_grant_extras (
+    client_id  TEXT NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
+    account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    request_id TEXT NOT NULL REFERENCES requests(id) ON DELETE CASCADE,
+    actions    TEXT NOT NULL,
+    granted_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    PRIMARY KEY (client_id, account_id, request_id)
+);
+CREATE INDEX client_grant_extras_expiry ON client_grant_extras(expires_at);
+CREATE INDEX client_grant_extras_request ON client_grant_extras(request_id);
 "#;

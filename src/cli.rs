@@ -786,6 +786,10 @@ pub enum RequestsCmd {
         /// Items whose time has already passed: skip them (default) or send them now.
         #[arg(long, value_enum, default_value = "skip")]
         late: LateArg,
+        /// Access requests: grant for this long instead of what the agent asked (only shorter; on a request for a
+        /// permanent grant it makes the grant temporary). Minutes, or with a unit: 90m, 8h, 7d (at most 30d).
+        #[arg(long, value_parser = parse_duration_minutes)]
+        duration: Option<u32>,
         /// Do not ask for confirmation (the drafts are still printed).
         #[arg(long)]
         yes: bool,
@@ -855,6 +859,9 @@ fn json_text(value: &Value) -> String {
 /// Renders `requests show` for the operator's terminal.
 fn render_request(v: &Value) -> String {
     let t = |x: &Value| terminal_safe(x.as_str().unwrap_or("-"));
+    if v["kind"] == "access" {
+        return render_access_request(v);
+    }
     let list = |x: &Value| {
         x.as_array()
             .map(|a| a.iter().filter_map(Value::as_str).map(terminal_safe).collect::<Vec<_>>().join(", "))
@@ -922,11 +929,112 @@ fn render_request(v: &Value) -> String {
     out
 }
 
+/// `--duration` of `requests approve`: minutes (`90`) or a duration with a unit (`90m`, `8h`, `7d`), whole minutes,
+/// from 1 minute to 30 days.
+fn parse_duration_minutes(s: &str) -> Result<u32, String> {
+    let s = s.trim();
+    let secs = if s.bytes().all(|b| b.is_ascii_digit()) && !s.is_empty() {
+        s.parse::<i64>().ok().and_then(|m| m.checked_mul(60))
+    } else {
+        crate::util::parse_duration_secs(s)
+    };
+    match secs {
+        Some(x) if x % 60 == 0 && (60..=crate::requests::access::MAX_DURATION_MINUTES * 60).contains(&x) => {
+            Ok((x / 60) as u32)
+        }
+        _ => Err("expected whole minutes from 1 minute to 30 days, e.g. 90, 90m, 8h or 7d".into()),
+    }
+}
+
+/// `dove requests approve` of an access request: print what is asked, confirm, then approve.
+async fn requests_approve_access(
+    id: String,
+    shown_v: &Value,
+    items: Option<Vec<u32>>,
+    duration: Option<u32>,
+    yes: bool,
+    admin: &AdminOpts,
+) -> anyhow::Result<()> {
+    let grants: Vec<&Value> = shown_v["grants"].as_array().map(|a| a.iter().collect()).unwrap_or_default();
+    let chosen = grants
+        .iter()
+        .filter(|g| items.as_ref().is_none_or(|l| g["idx"].as_u64().is_some_and(|n| l.contains(&(n as u32)))))
+        .count();
+    if !yes {
+        let how = match (duration, shown_v["duration_minutes"].as_i64()) {
+            (Some(m), _) => format!("for {m} minute(s)"),
+            (None, Some(m)) => format!("for {m} minute(s)"),
+            (None, None) => "permanently".into(),
+        };
+        let mut prompt = format!("\nGrant {chosen} mailbox right(s) {how}");
+        if chosen < grants.len() {
+            prompt.push_str(&format!(", leave out {}", grants.len() - chosen));
+        }
+        eprint!("{prompt}? [y/N] ");
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim(), "y" | "Y" | "yes") {
+            anyhow::bail!("not approved");
+        }
+    }
+    let req = AdminRequest::RequestsApprove {
+        id,
+        shown: vec![],
+        items,
+        late: crate::admin::Late::Skip,
+        duration_minutes: duration,
+    };
+    let v = admin_send(admin, &req).await?;
+    print(&v, admin.json);
+    Ok(())
+}
+
+/// `dove requests show` of an access request: what is asked per mailbox next to what the connection has now.
+fn render_access_request(v: &Value) -> String {
+    let t = |x: &Value| terminal_safe(x.as_str().unwrap_or("-"));
+    let how = match (v["duration_minutes"].as_i64(), v["granted_until"].as_str()) {
+        (_, Some(until)) => format!("temporary, until {}", terminal_safe(until)),
+        (Some(m), None) => format!("for {m} minute(s) from approval"),
+        (None, None) => "permanent".into(),
+    };
+    let mut out = format!(
+        "Request {} (access) from connection '{}' (project {}): {}\nasks {how}; created {}, expires {}\n",
+        t(&v["request_id"]),
+        t(&v["client"]),
+        t(&v["project"]),
+        t(&v["status"]),
+        t(&v["created_at"]),
+        t(&v["expires_at"]),
+    );
+    if let Some(n) = v["note"].as_str() {
+        out.push_str(&format!("Note from the agent (untrusted):\n  {}\n", terminal_safe(n).replace('\n', "\n  ")));
+    }
+    for g in v["grants"].as_array().into_iter().flatten() {
+        out.push_str(&format!(
+            "\n[{}] {} on mailbox {}: asks {}\n    has now: {}",
+            g["idx"],
+            t(&g["state"]),
+            t(&g["account"]),
+            t(&g["asked"]),
+            g["has"].as_str().map(terminal_safe).unwrap_or_else(|| "nothing".into()),
+        ));
+        for x in g["temporary"].as_array().into_iter().flatten() {
+            out.push_str(&format!("; {} until {}", t(&x["actions"]), t(&x["expires_at"])));
+        }
+        if g["in_project"] != true {
+            out.push_str("  (no longer in the project: cannot be granted)");
+        }
+        out.push('\n');
+    }
+    out
+}
+
 /// `dove requests approve`: Show, print, confirm, then Approve with the revisions that were printed.
 async fn requests_approve(
     id: String,
     items: Option<Vec<u32>>,
     late: LateArg,
+    duration: Option<u32>,
     yes: bool,
     admin: &AdminOpts,
 ) -> anyhow::Result<()> {
@@ -935,6 +1043,12 @@ async fn requests_approve(
         print(&shown_v, true);
     } else {
         print!("{}", render_request(&shown_v));
+    }
+    if shown_v["kind"] == "access" {
+        return requests_approve_access(id, &shown_v, items, duration, yes, admin).await;
+    }
+    if duration.is_some() {
+        anyhow::bail!("--duration applies to access requests only");
     }
     let all: Vec<&Value> = shown_v["items"].as_array().map(|a| a.iter().collect()).unwrap_or_default();
     let pending: Vec<&Value> = all.iter().copied().filter(|i| i["state"] == "pending").collect();
@@ -975,7 +1089,8 @@ async fn requests_approve(
             anyhow::bail!("not approved");
         }
     }
-    let v = admin_send(admin, &AdminRequest::RequestsApprove { id, shown, items, late: late.into() }).await?;
+    let req = AdminRequest::RequestsApprove { id, shown, items, late: late.into(), duration_minutes: None };
+    let v = admin_send(admin, &req).await?;
     print(&v, admin.json);
     Ok(())
 }
@@ -1295,8 +1410,8 @@ async fn run_command(command: Command) -> anyhow::Result<()> {
             print(&v, admin.json);
             Ok(())
         }
-        Command::Requests(RequestsCmd::Approve { id, items, late, yes, admin }) => {
-            requests_approve(id, items, late, yes, &admin).await
+        Command::Requests(RequestsCmd::Approve { id, items, late, duration, yes, admin }) => {
+            requests_approve(id, items, late, duration, yes, &admin).await
         }
         Command::Requests(RequestsCmd::Show { id, admin }) if !admin.json => {
             let v = admin_send(&admin, &AdminRequest::RequestsShow { id }).await?;
@@ -1468,6 +1583,18 @@ mod tests {
         };
         assert_eq!((items, late, yes), (None, LateArg::Skip, false));
         assert!(parse(&["requests", "approve", "r_1", "--late", "later"]).is_err());
+        // Access approvals: --duration in minutes or with a unit, only whole minutes up to 30 days.
+        for (arg, want) in [("90", 90), ("90m", 90), ("8h", 480), ("7d", 10_080), ("30d", 43_200)] {
+            let Command::Requests(RequestsCmd::Approve { duration, .. }) =
+                parse(&["requests", "approve", "r_1", "--duration", arg]).unwrap().command
+            else {
+                panic!()
+            };
+            assert_eq!(duration, Some(want), "{arg}");
+        }
+        for bad in ["0", "31d", "30s", "90x", "", "-5"] {
+            assert!(parse(&["requests", "approve", "r_1", "--duration", bad]).is_err(), "{bad}");
+        }
         assert!(parse(&["requests", "approve"]).is_err(), "the id is required");
         let Command::Requests(RequestsCmd::Deny { id, .. }) = parse(&["requests", "deny", "r_2"]).unwrap().command
         else {

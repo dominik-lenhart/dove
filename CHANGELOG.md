@@ -5,11 +5,20 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-11-14
+
 ### Added
 
 - `dove mcp catalog` describes every tool over stdio without a server, mailboxes, keys or network, and refuses every
   tool call. The new root `Dockerfile` runs it, so MCP registries such as Glama can build Dove, list its tools and
   score them.
+- Access requests. `request_access` lets an agent ask for rights on mailboxes of its project (grant syntax, presets
+  included), for up to 30 days or permanently, with a note for the owner. Nothing changes before the owner approves
+  with `dove requests approve`, where mailboxes can be left out (`--items`) and the time shortened (`--duration 2h`).
+  Temporary rights end on their own at the first call after their expiry and never touch the connection's earlier
+  grants; `clients set-grants`, revoking the connection, removing the mailbox and `dove requests cancel` end them
+  early. `list_accounts` and `clients show` show temporary rights with their end. A mailbox of another project and
+  an unknown name give the same `not_found`.
 
 ### Fixed
 
@@ -343,7 +352,8 @@ First release.
   release only after verifying its minisign signature. The CLI hints at a new release at most once a day
   (`DOVE_NO_UPDATE_CHECK=1` turns it off); the server never checks for updates.
 
-[Unreleased]: https://github.com/dominik-lenhart/dove/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/dominik-lenhart/dove/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/dominik-lenhart/dove/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/dominik-lenhart/dove/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/dominik-lenhart/dove/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/dominik-lenhart/dove/compare/v0.8.0...v0.8.1

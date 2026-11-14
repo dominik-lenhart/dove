@@ -110,11 +110,25 @@ pub fn project_remove_account(tx: &Transaction, project: &str, alias: &str) -> a
         "DELETE FROM client_mailboxes WHERE account_id = ?1 AND client_id IN (SELECT id FROM clients WHERE project_id = ?2)",
         params![aid, pid],
     )?;
+    // Temporary grants on the mailbox go with the grants; open access requests naming it are cancelled (PLAN A73).
+    // The requests go first: cancelling one deletes its rows and writes its `request.cancel` record, which a row
+    // already deleted could no longer be traced to.
+    let temporary: i64 = tx.query_row(
+        "SELECT count(*) FROM client_grant_extras WHERE account_id = ?1 \
+         AND client_id IN (SELECT id FROM clients WHERE project_id = ?2)",
+        params![aid, pid],
+        |r| r.get(0),
+    )?;
+    crate::requests::access::cancel_naming_account(tx, &aid, Some(&pid), "account_removed", util::now_unix())?;
+    crate::requests::access::drop_extras(
+        tx,
+        crate::requests::access::Scope::ProjectAccount { project_id: &pid, account_id: &aid },
+    )?;
     tx.execute("UPDATE clients SET auth_epoch = auth_epoch + 1 WHERE project_id = ?1", [&pid])?;
     // Outstanding invitations of the project could otherwise resurrect access after a re-add.
     let invitations = tx.execute("DELETE FROM invitations WHERE project_id = ?1 AND used_at IS NULL", [&pid])?;
     Ok(json!({ "project": project, "account": alias, "removed": removed == 1, "client_grants_deleted": grants,
-               "pending_invitations_cancelled": invitations }))
+               "temporary_grants_deleted": temporary, "pending_invitations_cancelled": invitations }))
 }
 
 pub fn project_list(conn: &Connection) -> anyhow::Result<Value> {
@@ -319,8 +333,13 @@ pub fn client_set_grants(
     let (cid, pid) = client_row(tx, name)?;
     let resolved = resolve_grants(tx, &pid, grants, allow_send)?;
     write_grants(tx, &cid, &resolved)?;
+    // Replacing the grants also ends every temporary grant (design 2026-11-14 section 4.5): what the operator sets is
+    // all the client has afterwards.
+    let temporary = crate::requests::access::drop_extras(tx, crate::requests::access::Scope::Client(&cid))?;
     tx.execute("UPDATE clients SET auth_epoch = auth_epoch + 1 WHERE id = ?1", [&cid])?;
-    client_show(tx, name)
+    let mut v = client_show(tx, name)?;
+    v["temporary_grants_deleted"] = json!(temporary);
+    Ok(v)
 }
 
 /// Sets secret redaction for a connection, or else for the open (unused, unexpired) invitation of that name, which
@@ -367,6 +386,8 @@ pub fn client_revoke(tx: &Transaction, name: &str) -> anyhow::Result<Value> {
     )?;
     // Its pending requests and not-yet-sent items go with it (design 2026-11-14 section 4.1).
     let requests = crate::requests::cancel_for_client(tx, &cid, now)?;
+    // Temporary grants end with the client, whatever request they came from.
+    crate::requests::access::drop_extras(tx, crate::requests::access::Scope::Client(&cid))?;
     Ok(json!({ "client": name, "revoked": true, "requests_cancelled": requests }))
 }
 
@@ -414,12 +435,24 @@ pub fn client_show(conn: &Connection, name: &str) -> anyhow::Result<Value> {
     let granted: Vec<Value> = stmt
         .query_map([&cid], |r| Ok(json!({ "account": r.get::<_, String>(0)?, "actions": r.get::<_, String>(1)? })))?
         .collect::<Result<_, _>>()?;
+    // Unexpired temporary grants (approved access requests), the same rows the policy unites with `grants`.
+    let mut stmt = conn.prepare(
+        "SELECT a.alias, e.actions, e.expires_at, e.request_id FROM client_grant_extras e \
+         JOIN accounts a ON a.id = e.account_id WHERE e.client_id = ?1 AND e.expires_at > ?2 \
+         ORDER BY a.alias, e.expires_at",
+    )?;
+    let temporary: Vec<Value> = stmt
+        .query_map(params![cid, util::now_unix()], |r| {
+            Ok(json!({ "account": r.get::<_, String>(0)?, "actions": r.get::<_, String>(1)?,
+                       "expires_at": util::rfc3339(r.get(2)?), "request_id": r.get::<_, String>(3)? }))
+        })?
+        .collect::<Result<_, _>>()?;
     Ok(json!({
         "client": name, "project": project, "kind": kind, "created_via": created_via,
         "allowed_cidrs": serde_json::from_str::<Value>(&cidrs).unwrap_or(json!([])),
         "created_at": util::rfc3339(created_at), "expires_at": expires_at.map(util::rfc3339),
         "revoked_at": revoked_at.map(util::rfc3339), "last_used_at": last_used_at.map(util::rfc3339), "last_ip": last_ip,
-        "grants": granted, "effective": effective, "redact_secrets": redact,
+        "grants": granted, "temporary": temporary, "effective": effective, "redact_secrets": redact,
     }))
 }
 

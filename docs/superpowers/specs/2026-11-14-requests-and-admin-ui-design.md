@@ -159,6 +159,8 @@ request can only add. The owner can shorten the duration or untick single mailbo
   expired rows and writes an audit record.
 - When the owner replaces a client's grants (`clients set-grants`), that client's extras are deleted **(call)**.
 - What can be granted is whatever `Actions::parse_grant` accepts for that mailbox today; requests add no new rule.
+- Built in stage 2 (PLAN A73). The table also holds `request_id` and `granted_at` (one row per mailbox of one
+  approved request, never merged); decisions where this section is silent are listed in A73.
 
 ### 4.6 Telling the owner
 

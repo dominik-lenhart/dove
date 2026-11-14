@@ -142,6 +142,20 @@ impl Actions {
         Actions { read, draft, organize, delete, send }
     }
 
+    /// Actions in either set (a base grant and temporary grants, design 2026-11-14 section 4.5), re-validated by the
+    /// dependency rules. Two valid sets always give a valid union; anything else yields no access at all (fail
+    /// closed), never a partial set.
+    pub fn union(&self, other: &Actions) -> Actions {
+        let u = Actions {
+            read: self.read || other.read,
+            draft: self.draft || other.draft,
+            organize: self.organize || other.organize,
+            delete: self.delete || other.delete,
+            send: self.send || other.send,
+        };
+        if u.validate().is_ok() { u } else { Actions::default() }
+    }
+
     pub fn has(&self, cap: Capability) -> bool {
         match cap {
             Capability::Read => self.read,
@@ -187,9 +201,23 @@ pub struct Mailbox {
     pub alias: String,
     pub email: String,
     pub status: String,
+    /// The effective actions: the base grant united with every unexpired temporary grant.
     pub actions: Actions,
     pub index_enabled: bool,
     pub provider: Provider,
+    /// Unexpired temporary grants on this mailbox (approved access requests), soonest expiry first. Their actions are
+    /// already part of `actions`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub temporary: Vec<TempGrant>,
+}
+
+/// One temporary grant (`client_grant_extras` row) as the policy saw it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TempGrant {
+    pub actions: Actions,
+    /// Unix seconds.
+    pub expires_at: i64,
+    pub request_id: String,
 }
 
 /// The authenticated caller, loaded fresh for each request.
@@ -262,8 +290,15 @@ impl ClientCtx {
     }
 }
 
-/// Loads effective mailboxes for a client: grants intersected with current project membership.
+/// Loads effective mailboxes for a client: grants intersected with current project membership, united with its
+/// unexpired temporary grants (also intersected with project membership).
 pub fn load_mailboxes(conn: &Connection, client_id: &str) -> anyhow::Result<Vec<Mailbox>> {
+    load_mailboxes_at(conn, client_id, util::now_unix())
+}
+
+/// [`load_mailboxes`] at `now` (unix seconds): a temporary grant counts while `expires_at > now`. Expiry therefore
+/// takes effect on the first request after it, without waiting for the worker that deletes the row.
+pub fn load_mailboxes_at(conn: &Connection, client_id: &str, now: i64) -> anyhow::Result<Vec<Mailbox>> {
     let mut stmt = conn.prepare_cached(
         "SELECT a.id, a.alias, a.email, a.status, cm.actions, a.index_enabled, a.provider \
          FROM client_mailboxes cm \
@@ -272,7 +307,7 @@ pub fn load_mailboxes(conn: &Connection, client_id: &str) -> anyhow::Result<Vec<
          JOIN project_accounts pa ON pa.project_id = c.project_id AND pa.account_id = a.id \
          WHERE cm.client_id = ?1 ORDER BY a.alias",
     )?;
-    let rows = stmt.query_map([client_id], |r| {
+    let row = |r: &rusqlite::Row<'_>| -> rusqlite::Result<Mailbox> {
         let actions: String = r.get(4)?;
         Ok(Mailbox {
             account_id: r.get(0)?,
@@ -282,9 +317,41 @@ pub fn load_mailboxes(conn: &Connection, client_id: &str) -> anyhow::Result<Vec<
             actions: Actions::parse(&actions).unwrap_or_default(),
             index_enabled: r.get::<_, i64>(5)? != 0,
             provider: Provider::parse(&r.get::<_, String>(6)?),
+            temporary: vec![],
         })
-    })?;
-    Ok(rows.collect::<Result<_, _>>()?)
+    };
+    let mut out: Vec<Mailbox> = stmt.query_map([client_id], row)?.collect::<Result<_, _>>()?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT a.id, a.alias, a.email, a.status, e.actions, a.index_enabled, a.provider, e.expires_at, e.request_id \
+         FROM client_grant_extras e \
+         JOIN clients c ON c.id = e.client_id \
+         JOIN accounts a ON a.id = e.account_id \
+         JOIN project_accounts pa ON pa.project_id = c.project_id AND pa.account_id = a.id \
+         WHERE e.client_id = ?1 AND e.expires_at > ?2 ORDER BY e.expires_at, e.request_id",
+    )?;
+    let extras: Vec<(Mailbox, TempGrant)> = stmt
+        .query_map(params![client_id, now], |r| {
+            let m = row(r)?;
+            let t = TempGrant { actions: m.actions, expires_at: r.get(7)?, request_id: r.get(8)? };
+            Ok((m, t))
+        })?
+        .collect::<Result<_, _>>()?;
+    for (m, t) in extras {
+        // A stored list that does not parse grants nothing (`parse` refused it, so its actions are empty).
+        if t.actions == Actions::default() {
+            continue;
+        }
+        match out.iter_mut().find(|b| b.account_id == m.account_id) {
+            Some(b) => {
+                b.actions = b.actions.union(&t.actions);
+                b.temporary.push(t);
+            }
+            None => out.push(Mailbox { temporary: vec![t], ..m }),
+        }
+    }
+    // A broken base row (empty actions) with no temporary grant stays as before: listed, allowing nothing.
+    out.sort_by(|a, b| a.alias.cmp(&b.alias));
+    Ok(out)
 }
 
 #[derive(Debug)]
@@ -502,6 +569,57 @@ mod tests {
     }
 
     #[test]
+    fn union_keeps_dependencies() {
+        let p = |s: &str| Actions::parse(s).unwrap();
+        assert_eq!(p("read").union(&p("read,draft")), p("read,draft"));
+        assert_eq!(p("read,draft").union(&p("read,organize")), p("read,draft,organize"));
+        assert_eq!(
+            p("read,draft,send").union(&p("read,organize,delete")).to_string(),
+            "read,draft,organize,delete,send"
+        );
+        // An invalid operand cannot produce a partial set: the union is empty then.
+        let broken = Actions { draft: true, ..Default::default() };
+        assert_eq!(Actions::default().union(&broken), Actions::default());
+        assert_eq!(broken.union(&Actions { delete: true, ..Default::default() }), Actions::default());
+    }
+
+    /// Temporary grants: united with the base grant while unexpired, intersected with the project, and a broken
+    /// stored list grants nothing.
+    #[test]
+    fn load_mailboxes_unites_unexpired_temporary_grants() {
+        let s = crate::store::Store::open_in_memory().unwrap();
+        s.call_blocking(|c| {
+            c.execute_batch(
+                "INSERT INTO projects(id, name, created_at) VALUES ('p', 'p', 0), ('q', 'q', 0);
+                 INSERT INTO clients(id, name, project_id, kind, created_at, created_via) VALUES ('c', 'c', 'p', 'token', 0, 'cli');
+                 INSERT INTO accounts(id, alias, email, status) VALUES ('a', 'a', 'a@x.test', 'active'),
+                   ('b', 'b', 'b@x.test', 'active'), ('o', 'o', 'o@x.test', 'active'), ('z', 'z', 'z@x.test', 'active');
+                 INSERT INTO project_accounts(project_id, account_id, added_at) VALUES ('p', 'a', 0), ('p', 'b', 0),
+                   ('q', 'o', 0), ('p', 'z', 0);
+                 INSERT INTO requests(id, client_id, project_id, kind, status, created_at, expires_at)
+                   VALUES ('r', 'c', 'p', 'access', 'approved', 0, 0);
+                 INSERT INTO client_mailboxes(client_id, account_id, actions) VALUES ('c', 'a', 'read');
+                 INSERT INTO client_grant_extras(client_id, account_id, request_id, actions, granted_at, expires_at) VALUES
+                   ('c', 'a', 'r', 'read,draft', 0, 100), ('c', 'b', 'r', 'read', 0, 100),
+                   ('c', 'o', 'r', 'read', 0, 100), ('c', 'z', 'r', 'draft', 0, 100);",
+            )?;
+            let view = |now| -> anyhow::Result<Vec<(String, String, usize)>> {
+                Ok(load_mailboxes_at(c, "c", now)?
+                    .into_iter()
+                    .map(|m| (m.alias, m.actions.to_string(), m.temporary.len()))
+                    .collect())
+            };
+            let s = |a: &str, b: &str, n| (a.to_string(), b.to_string(), n);
+            // `o` is outside the project, `z`'s stored list breaks the rules: neither appears.
+            assert_eq!(view(99)?, vec![s("a", "read,draft", 1), s("b", "read", 1)]);
+            // At the expiry only the base grant is left.
+            assert_eq!(view(100)?, vec![s("a", "read", 0)]);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
     fn cidr_allowlist() {
         assert!(ip_allowed("[]", None));
         assert!(ip_allowed(r#"["10.0.0.0/8"]"#, Some("10.1.2.3".parse().unwrap())));
@@ -518,6 +636,7 @@ mod tests {
             actions: Actions::parse(a).unwrap(),
             index_enabled: false,
             provider: Provider::Gmail,
+            temporary: vec![],
         };
         ClientCtx {
             client_id: "c".into(),

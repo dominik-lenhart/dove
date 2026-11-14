@@ -1,7 +1,8 @@
 //! The scheduled-send worker (design 2026-11-14 section 4.4, PLAN A71).
 //!
 //! [`tick`] takes the clock as an argument (tests drive it; the service runs it every [`TICK`]). Per pass:
-//! 1. pending requests past `expires_at` expire;
+//! 1. pending requests past `expires_at` expire; temporary grants past their expiry are deleted with one audit record
+//!    each (the policy stopped honouring them at their expiry already, PLAN A73);
 //! 2. scheduled items more than `late_grace_minutes` past their time end as `missed` (or `skipped:
 //!    condition_unknown` when they were waiting for a fresh index), before anything is sent; closed requests past
 //!    `retention_days` or beyond [`super::MAX_CLOSED_PER_CLIENT`] per client are deleted;
@@ -53,6 +54,8 @@ pub struct TickReport {
     pub unknown: usize,
     pub expired: usize,
     pub deferred: usize,
+    /// Temporary grants deleted at their expiry.
+    pub grants_expired: usize,
 }
 
 /// Startup recovery: an item found in `sending` may or may not have gone out. It ends as `send_unknown` and is never
@@ -136,7 +139,7 @@ pub async fn tick(app: &Arc<App>, now: i64) -> anyhow::Result<TickReport> {
 
     // 1 and 2: expiry and missed items, in one transaction; then old closed requests go.
     let retention = app.cfg.requests.retention_days * 86_400;
-    let (expired, ended) = app
+    let (expired, ended, grants_expired) = app
         .store
         .call(move |c| {
             let tx = c.transaction()?;
@@ -196,15 +199,17 @@ pub async fn tick(app: &Arc<App>, now: i64) -> anyhow::Result<TickReport> {
                 close_if_finished(&tx, &rid)?;
                 ended.push(state);
             }
+            let grants_expired = super::access::expire(&tx, now)?;
             let pruned = super::prune_closed(&tx, now, retention)?;
             if pruned > 0 {
                 tracing::info!(pruned, "deleted closed requests past retention");
             }
             tx.commit()?;
-            Ok((expiring.len(), ended))
+            Ok((expiring.len(), ended, grants_expired))
         })
         .await?;
     report.expired = expired;
+    report.grants_expired = grants_expired;
     report.missed = ended.iter().filter(|s| **s == "missed").count();
     report.skipped = ended.len() - report.missed;
 
