@@ -126,6 +126,9 @@ is always delivered in the untrusted-content envelope from section 6.5.
 | `update_messages` | organize (+ delete) | Up to 100 ids: add/remove flags (`UNREAD`, `STARRED`) and labels (Gmail user labels, never created; IMAP keywords). IMAP keywords containing `junk` or `spam` in any case (`$Junk`, `$NotJunk`, `NonJunk`, ...) train spam filters and need `delete`. Per-id results. |
 | `move_messages` | organize (+ delete) | Up to 100 ids to a folder/label, `archive`, `inbox`, `trash` or `spam`. Trash, Spam/Junk and folders below them need `delete`, and so does moving out of Spam/Junk (it promotes spam); moving out of Trash is organize. IMAP folders without a special-use flag count as Trash/Junk by localized well-known names and trash/junk word stems. Per-id results with `new_id` (IMAP ids change). Never a permanent delete. |
 | `send_draft` | send | Optional. Submit one existing, owned draft under §6.3. |
+| `request_send` | draft | Ask the owner to approve sending own, unchanged drafts at fixed times (`send_at` per item, or a `window` Dove spreads them over; at most 30 days ahead), optionally `unless_reply` and a `note`. Needs neither `send` nor `allow_send`; nothing is sent before approval (§6.3a). |
+| `list_requests` | read | This token's requests with per-item state and reason codes. |
+| `cancel_request` | read | Cancel one of this token's pending requests or the unsent items of an approved one. |
 | `create_watch` | read | Watch an indexed mailbox: `thread_reply`, `from` (address or domain), `query` (a `where` filter, checked against newly indexed mail only) or `no_reply_by` (fires once at a deadline unless someone other than the mailbox owner answers first; on a `thread_id`, or on a `message_id` such as the agent's own sent mail, whose id the event then carries; an already answered message ends the watch at once with `replied`). Belongs to the creating token; at most 50 active, expiry 30 days by default, 180 at most; optional operator sink by name. |
 | `list_watches` | read | This token's watches (active and recently ended, with the reason) and the operator's sink names. |
 | `delete_watch` | read | Delete one of this token's watches and its events. |
@@ -271,6 +274,8 @@ human message and, where useful, `retry_after_seconds`. An `invalid_argument` na
 - FR-C2. Commands as listed in 5.1 and 5.2, plus `audit tail|search`, `keys rotate` (section 6.4), `doctor` (checks
   configuration, permissions of secret files, reachability of Google, TLS of the public URL) and `export` (projects,
   clients and accounts without secrets, for review).
+- FR-C3. `requests list|show|approve|deny|cancel` (§6.3a): `show` reads every draft of a request fresh and prints it as
+  text to the operator's terminal; `approve` binds the revisions that were shown.
 
 ### 5.6 Client experience and OAuth (v1)
 
@@ -338,6 +343,26 @@ Only the typed Gmail operation `drafts.send` for an existing, project-owned draf
 
 Before a send, atomically persist its in-flight state on the owned draft. Concurrent requests and replay after a crash must never trigger a second submission. On confirmed success record the sent message ID. On lost response or restart with an unresolved send, mark the outcome unknown and block resubmission pending owner verification in Sent. A definitive pre-dispatch failure is safe to retry. No inference from absence in Drafts alone.
 
+
+### 6.3a Scheduled sends approved by the owner
+
+Requests (design 2026-11-14 §4, PLAN A71) let an agent with `draft` ask for its own drafts to be sent later. The
+owner approves each mail on the admin socket; an agent token never reaches an approval verb. The approval records the
+revision the owner was shown, and the approval transaction checks it again. `[requests] enabled = false` hides
+`request_send`, refuses it like `send_draft` without `allow_send`, and stops the worker.
+
+At its time an item is claimed (`scheduled` → `sending`, inside the grace, request still approved) before the upstream
+write, then sent through the `send_draft` core with these re-checks from the durable store: client live with `draft` on
+the mailbox, mailbox active, draft owned by Dove with exactly the approved revision. The worker writes one audit record
+per item (actor `scheduler`, action `request.send_item`, ids and result code only). Outcomes: `sent`; `failed` with a
+code (`draft_changed`, `not_found`, `access_lost`, `client_revoked`, `account_disabled`, the sender check's code, or
+`upstream_error` after three refusals five minutes apart); `send_unknown` for a lost reply or a restart while
+`sending`, never retried; `missed` when the item could not be sent within `late_grace_minutes` after its time;
+`skipped` (`replied`, `condition_unknown`) for `unless_reply`. Writes that were not dispatched (rate limit, mailbox
+needs re-authorization) are tried again inside the grace. `unless_reply` uses the `no_reply_by` reply rule (A70) on an
+index synced within the last 10 minutes; otherwise the worker asks for a sync and waits, and on doubt never sends.
+Limits: 20 open requests per client, 50 items per request, and a server-wide 200 scheduled sends per UTC day checked
+at approval. The agent's note is untrusted, sealed with the vault and shown only by `requests show`.
 
 ### 6.4 Secrets and encryption at rest
 

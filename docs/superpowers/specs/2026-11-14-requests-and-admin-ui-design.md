@@ -244,7 +244,7 @@ verbs. `/admin` has its own rate limit and login-attempt limit per address.
 
 Each stage is a release of its own and useful alone.
 
-1. **Requests and scheduled send, CLI approval** (4.1–4.4, 4.6, 4.7). Solves the trigger case with
+1. **Requests and scheduled send, CLI approval** (4.1–4.4, 4.7; 4.6 ships with stage 3). Solves the trigger case with
    `dove requests approve`.
 2. **Access requests and temporary grants** (4.5).
 3. **Admin UI**: passkeys and sessions first (reviewed alone), then pages, Requests page first (5).

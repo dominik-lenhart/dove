@@ -644,3 +644,18 @@ hosts or reference hardware.
   `invalid_at`, which includes the shared argument helpers (`opt_str`, `opt_u64`, `opt_bool`, `opt_str_list`,
   `only_keys`). With this the next audit review can group refusals by argument.
 
+- A71. Requests stage 1: scheduled send with CLI approval (design `docs/superpowers/specs/2026-11-14-requests-and-admin-ui-design.md`
+  4.1-4.4 and 4.7, plan `docs/superpowers/plans/2026-11-14-requests-stage1-scheduled-send.md`). Code in `src/requests/`
+  (store, `admin.rs` verbs, `worker.rs`) and `src/tools/requests.rs`; store migration `V_REQUESTS`. Decisions made while
+  building, all fail-closed: (a) the approval refuses a draft that is no longer Dove's own `active` draft with the shown
+  revision, both in its fresh read and again inside the transaction (`still_as_shown`). (b) Disabling a mailbox cancels
+  its open items (`account_disabled`), like revoking the client (`client_revoked`) and removing the mailbox
+  (`account_removed`, audited before the rows go); these cascades write one `request.cancel` record per request with
+  actor `scheduler`. (c) With `[requests] enabled = false` the worker sends nothing; approved items then end as
+  `missed` after the grace. (d) Recovery (`sending` → `send_unknown`, reason `restart`) runs before the admin socket
+  and the workers start, so no tick can claim before it. (e) A mailbox that needs re-authorization defers the item
+  inside the grace (not dispatched); a disabled one fails it. Only upstream refusals count as attempts (3, five
+  minutes apart). (f) The claim checks `send_at + grace` against the time of the claim; the write itself may still
+  dispatch up to the write deadline after a claim made at the end of the grace (bounded by
+  `upstream_request_timeout_secs`). (g) The note's vault scope is the request id, so `NewSend` carries the id.
+  (h) `notify_sink` (design 4.6) ships with stage 3.
