@@ -42,7 +42,7 @@ software authenticator in the tests.
   live 2 minutes in a pool of 64 under a per-address rate below 64 per 2 minutes, so one address cannot evict them.
 - **Fail closed where the design is silent:** POSTs without `Origin`, or with `Sec-Fetch-Site` other than
   `same-origin`, are refused; `/admin` refuses every method but GET and POST; unknown paths under `/admin` are 404
-  only after the session check (no path probing without a session).
+  (implemented before the session check; PLAN A74 (j)).
 
 ## Files
 
@@ -61,7 +61,7 @@ software authenticator in the tests.
 | `src/http.rs` | guard: `/admin` host check (404), `Authorization` refused, per-address rate limit, own Origin rule |
 | `src/tailscale.rs`, `src/cli.rs` | `dove tailscale setup --admin`, drift test with `ADMIN_PATHS`, doctor understands `/admin` |
 | `src/mcp.rs` | `RateLimiter::exhausted` (peek without spending) |
-| docs | AGENTS.md invariant, spec, deployment (setup, tailnet nginx block), CHANGELOG, PLAN A73 |
+| docs | AGENTS.md invariant, spec, deployment (setup, tailnet nginx block), CHANGELOG, PLAN A74 |
 
 ## Config
 
@@ -137,23 +137,23 @@ Audit, Settings. Responsive from 360 px, light/dark via `prefers-color-scheme`, 
 | --- | --- |
 | CBOR decoder: RFC 8949 examples, indefinite/tag/float/duplicate key/trailing bytes/depth refused | `admin_ui::cbor::tests` |
 | W3C vectors verify (ES256, EdDSA, long credential id); crossOrigin vector refused; UV is required | `admin_ui::webauthn::tests::w3c_*` |
-| wrong RP ID hash, wrong origin, wrong type, wrong challenge, missing UP, missing UV, tampered signature, tampered authData, counter regression, BE change | `webauthn::tests` + `tests/admin_ui_auth.rs` |
-| `/admin` with another Host → 404; disabled → 404; local mode → refused by config | `admin_ui_http.rs::host_and_switch` |
-| `Authorization` header on any `/admin` path refused, also with a valid session | `admin_ui_http.rs::bearer_refused` |
-| every non-public `ADMIN_PATHS` entry answers neither GET nor POST without a session | `admin_ui_http.rs::nothing_answers_without_a_session` |
-| POST without CSRF, with a wrong CSRF, without/with a foreign Origin, cross-site `Sec-Fetch-Site` → refused, nothing changed | `admin_ui_http.rs::writes_need_csrf_and_origin` |
-| security headers (CSP exactly as designed, frame-ancestors, no-store) on every page | `admin_ui_http.rs::headers` |
-| rate limit and login-failure limit per address | `admin_ui_http.rs::limits` |
-| enrolment link: one use, 5 minutes, label `valid_name`, unique credential id | `admin_ui_auth.rs::enrolment_*` |
-| login with UV; session expiry; revoke ends sessions; passkey removal ends its sessions; only the token hash stored | `admin_ui_auth.rs::login_*`, `sessions_*` |
-| step-up: approve runs exactly the stored action; replay refused; assertion for another action refused and nothing runs; other session's pending id refused; expired; a step-up verb is refused on the session-only path | `admin_ui_auth.rs::stepup_*` |
-| stored XSS: draft subject/body/headers/attachment name, agent note, client name, audit fields render escaped | `admin_ui_pages.rs::untrusted_values_are_escaped` |
-| draft view shows sender, recipients, subject, text body, attachments; HTML never rendered | `admin_ui_pages.rs::draft_view` |
-| approve/deny/stop from the UI go through `dispatch` with actor `web:<label>` | `admin_ui_pages.rs::actions_are_audited_as_web` |
+| wrong RP ID hash, wrong origin, wrong type, wrong challenge, missing UP, missing UV, tampered signature, tampered authData, counter regression, BE change | `webauthn::tests` + `admin_ui_e2e::sign_in_checks_every_part_of_the_assertion` |
+| `/admin` with another Host → 404; disabled → 404; local mode → refused by config | `admin_ui_e2e::admin_is_404_unless_enabled_and_on_its_own_host`, `admin_ui_cannot_be_enabled_in_local_mode` |
+| `Authorization` header on any `/admin` path refused, also with a valid session | `admin_ui_e2e::authorization_header_is_refused_even_with_a_session` |
+| every non-public `ADMIN_PATHS` entry answers neither GET nor POST without a session | `admin_ui_e2e::nothing_answers_without_a_session` |
+| POST without CSRF, with a wrong CSRF, without/with a foreign Origin, cross-site `Sec-Fetch-Site` → refused, nothing changed | `admin_ui_e2e::writes_need_csrf_origin_and_same_site` |
+| security headers (CSP exactly as designed, frame-ancestors, no-store) on every page | `admin_ui_e2e::security_headers_on_every_answer` |
+| rate limit and login-failure limit per address | `admin_ui_e2e::rate_and_login_failure_limits_per_address` |
+| enrolment link: one use, 5 minutes, label `valid_name`, unique credential id | `admin_ui_e2e::enrolment_links_work_once_for_five_minutes` |
+| login with UV; session expiry; revoke ends sessions; passkey removal ends its sessions; only the token hash stored | `admin_ui_e2e::sign_in_checks_every_part_of_the_assertion`, `sessions_end_on_revoke_passkey_removal_and_sign_out` |
+| step-up: approve runs exactly the stored action; replay refused; assertion for another action refused and nothing runs; other session's pending id refused; expired; a step-up verb is refused on the session-only path | `admin_ui_e2e::approval_needs_a_passkey_confirmation_bound_to_that_approval`, `removing_a_passkey_in_the_ui_needs_a_confirmation` |
+| stored XSS: draft subject/body/headers/attachment name, agent note, client name, audit fields render escaped | `admin_ui_e2e::pages_show_drafts_as_text_and_escape_untrusted_values` (client names are limited by `valid_name`) |
+| draft view shows sender, recipients, subject, text body, attachments; HTML never rendered | same test |
+| approve/deny/stop from the UI go through `dispatch` with actor `web:<label>` | `admin_ui_e2e::deny_stop_and_audit_go_through_the_admin_verbs_as_web` |
 | every `AdminRequest` variant is in the UI or excluded with a reason | `admin_ui::tests::every_verb_is_covered` |
 | `ADMIN_PATHS` = admin routes; disjoint from `PUBLIC_PATHS`; no deploy template forwards `/admin` | `tailscale::tests::allowlists_do_not_drift` |
 | `tailscale setup --admin` mounts `/admin`; refuses with `--funnel` or Funnel on; setup without `--admin` removes it | `tests/tailscale_e2e.rs` |
-| no session token, CSRF, challenge, enrolment token, mail content or note in logs/audit | `admin_ui_auth.rs::secrets_stay_out_of_logs_and_audit` |
+| no session token, CSRF, challenge, enrolment token, mail content or note in logs/audit | `tests/admin_ui_logs.rs` (also the plaintext state store) |
 
 Every guard above is mutation-checked (remove the guard, see the test fail, restore, `touch`).
 

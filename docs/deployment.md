@@ -384,7 +384,8 @@ What `setup` does, all of it safe to run again:
 1. Reads this node's name from `tailscale status --json`.
 2. Mounts exactly Dove's public paths (the table in [Reverse proxy](#reverse-proxy), nothing else) on that name with
    `tailscale serve --bg --https=<port> --set-path <path> http://127.0.0.1:8787<path>` and prints each command. There
-   is no mount for `/healthz` or anything admin. It reads the loopback address from `listen` in the config file.
+   is no mount for `/healthz`, and none for the admin UI unless you pass `--admin` (see [Admin web UI](#admin-web-ui)).
+   It reads the loopback address from `listen` in the config file.
 3. Sets `public_url` in the config file (`https://<node>`, or `https://<node>:<port>` with `--port`), keeping every
    comment and the layout.
 
@@ -394,7 +395,8 @@ an older Dove release that are no longer public are removed. The list of paths i
 `deploy/nginx/dove.conf` use; a test fails if they differ or if Dove registers a route that none of them lists.
 
 Options: `--config <file>` (default `/etc/dove/config.toml`), `--port <n>` (HTTPS port on the tailnet name, default
-443), `--funnel`, `--dry-run`.
+443), `--funnel`, `--admin` (also mount `/admin` and enable `[admin_ui]`; refused together with `--funnel` and while
+Funnel is on for the port), `--dry-run`.
 
 If Tailscale only lets root change its configuration, `setup` says so and prints what to run: either
 `sudo dove tailscale setup ...`, or `sudo tailscale set --operator=$USER` once and then run it as yourself. It checks
@@ -982,6 +984,95 @@ WantedBy=default.target
 - Container deployments: whoever can run `docker` can run admin commands via
   `docker compose exec --user <operator_uid>:65532 dove /usr/local/bin/dove ...`. Treat Docker socket access as
   operator-level.
+
+## Admin web UI
+
+Dove can serve a small web UI for the owner under `/admin`: an overview (checks, index status, waiting requests, next
+scheduled sends), the requests to review and approve, the audit log and the passkeys and sessions. It is off by default,
+runs on the same listener as the service and is meant for your own devices only, typically over your tailnet. It does
+not exist in local mode.
+
+The only way in is a passkey (a platform passkey on your phone or laptop, or a security key). Approving a request
+and removing a passkey ask for the passkey again, bound to exactly that action. Every
+action runs the same admin verb as the CLI and is audited as `web:<passkey name>`. Agent tokens are never accepted:
+a request to `/admin` with an `Authorization` header is refused.
+
+### Set up over the tailnet
+
+The simplest way is Tailscale Serve on the Dove host (see [Tailscale](#tailscale)):
+
+```sh
+dove tailscale setup --admin            # mounts /admin on the tailnet name, sets [admin_ui] enabled and origin
+sudo systemctl restart dove
+sudo dove admin passkey add --name phone
+```
+
+`passkey add` prints a link like `https://dove-host.tail1234.ts.net/admin/enroll#...`. Open it within five minutes on the
+device that should hold the passkey (it works once), create the passkey, and you are signed in. Later visits start at
+`https://<origin>/admin`. `--admin` is refused when Funnel is on for that port, because Funnel would put the admin UI on
+the internet; if you need Funnel for ChatGPT or claude.ai, mount the public paths with `--funnel` on one port and the
+admin UI on another: `dove tailscale setup --admin --port 8443`.
+
+Without the helper, set it in the config file and restart:
+
+```toml
+[admin_ui]
+enabled = true
+origin = "https://dove-host.tail1234.ts.net"   # exact browser origin; its host is the passkeys' RP ID
+# requests_per_minute = 120
+# login_failures_per_hour = 10
+```
+
+The UI answers only for the host of `origin` (every other `Host` gets 404). Passkeys are bound to that host name:
+changing `origin` means enrolling them again.
+
+### Behind nginx, bound to the tailnet
+
+The shipped `deploy/Caddyfile` and `deploy/nginx/dove.conf` never forward `/admin`, and a test keeps it that way. To serve
+the UI through nginx instead of Tailscale Serve, give it its own server block that listens only on the host's tailnet
+address, with a certificate for the admin name (for example from `tailscale cert`):
+
+```nginx
+server {
+    listen 100.101.102.103:443 ssl;            # the host's tailnet address only, never 0.0.0.0
+    server_name dove-host.tail1234.ts.net;     # the host of [admin_ui] origin
+    ssl_certificate     /etc/nginx/tls/dove-host.crt;
+    ssl_certificate_key /etc/nginx/tls/dove-host.key;
+    set_real_ip_from 192.0.2.1/32;             # ignore real_ip settings from other sites (see Reverse proxy)
+    client_max_body_size 64k;
+    access_log /var/log/nginx/dove-admin.access.log dove_noquery;   # log_format from deploy/nginx/dove.conf
+
+    location /admin {
+        proxy_pass http://127.0.0.1:8787;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Dove-Proxy-Auth "<contents of proxy_secret>";
+    }
+    location / { return 404; }
+}
+```
+
+This block is documentation, not a tested template. With `X-Dove-Proxy-Auth` Dove sees each device's tailnet address,
+so the per-address limits apply per device. Behind Tailscale Serve every request comes from `127.0.0.1` and shares
+one budget.
+
+### Sessions and passkeys
+
+```sh
+sudo dove admin passkey list           # names, algorithm, backup state, last use, open sessions
+sudo dove admin passkey remove phone   # also ends that passkey's sessions
+sudo dove admin sessions list
+sudo dove admin sessions revoke        # signs every browser out; --id <id> for one
+```
+
+A session lasts 12 hours and is not extended by use. The cookie is `__Host-dove_admin` (HttpOnly, Secure,
+SameSite=Strict), and Dove stores only a hash of it. If you lose the device that holds a passkey, remove it on the
+admin socket; the CLI keeps working without the UI.
+
+**Limits.** `requests_per_minute` (120) and `login_failures_per_hour` (10) are per client address. A valid passkey
+always signs in, but after too many failures the failures answer "too many attempts". A process on the Dove host can
+reach the loopback listener directly. It cannot sign in without your passkey, but it can use up the shared
+per-address budget behind Tailscale Serve. If the UI answers "too many requests", wait a minute or use the CLI.
 
 ## Backup and restore
 

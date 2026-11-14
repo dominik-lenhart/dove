@@ -36,13 +36,17 @@ cargo fmt
 - `src/index/`: SQLCipher FTS5 index, sync engine, query compiler
 - `src/client/`: remote client commands (login, search, mcp install, stdio bridge, `watch` incl. `watch listen`)
 - `src/update/`: `dove upgrade` (signed GitHub Releases) and the daily new-version notice; CLI only
+- `src/admin_ui/`: the admin web UI under `/admin` (passkeys, sessions, step-up, pages); `webauthn.rs` and `cbor.rs`
+  are Dove's own WebAuthn verifier
 - `src/requests/`: agent requests approved on the admin socket: scheduled sends (store, admin verbs, send worker) and
   access requests with temporary grants (`access.rs`)
 - `tests/`: integration tests against the fake Google server in `tests/support/`
 
 ## Security invariants (do not weaken)
 
-- Agent tokens never reach admin verbs. Admin happens only over the Unix socket after a peer-uid check.
+- Agent tokens never reach admin verbs. Admin happens over the Unix socket after a peer-uid check, or over `/admin`
+  after passkey authentication (session + CSRF + Origin on every write, a fresh passkey assertion for the verbs in
+  `admin_ui::needs_step_up`). `/admin` has its own host, rate limit and login-attempt limit per address.
 - Unknown and out-of-scope accounts/objects return the identical `not_found`.
 - Every tool call goes through `policy::authorize` and produces exactly one audit record.
 - No mail content, subjects, addresses, tokens or OAuth codes in logs or audit records.
@@ -491,3 +495,14 @@ cargo fmt
   Guards that sit behind another check need a test where only they fire: the operator's 30-day bound is shadowed by
   "shorter only" unless the request is permanent, and the revoke catch-all by `cancel_for_client` unless the request
   is no longer open.
+- 2026-11-14: Admin web UI (`src/admin_ui/`, PLAN A74). Routes are string literals in `admin_ui::routes` and listed in
+  `ADMIN_PATHS` (no-session pages in `ADMIN_PUBLIC_PATHS`); `allowlists_do_not_drift` compares them and fails if any
+  file under `deploy/` forwards `/admin`. A new `AdminRequest` variant must be classified in `needs_step_up`
+  (exhaustive match) and listed in `COVERAGE` (`every_verb_is_covered`). UI handlers run verbs through
+  `auth::run_action` (refuses step-up verbs) or `auth::begin_stepup`, never `dispatch` directly. Templates use `h!`
+  with positional `{}` only (a source scan enforces it); `Markup` is the only unescaped type. Tests drive the pages with
+  `tests/support/admin_ui.rs` (`Browser` sends the admin `Host`, keeps the cookie and the CSRF meta) and the
+  `SoftAuthenticator`; the default 10 failed sign-ins per hour are shared by every request of a test (all from
+  127.0.0.1), so a test with many refused assertions raises `login_failures_per_hour`. The W3C WebAuthn vectors in
+  `tests/fixtures/webauthn/` were made without user verification: only the verifier's own tests pass `require_uv =
+  false`.

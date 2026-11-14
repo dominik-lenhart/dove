@@ -275,6 +275,14 @@ human message and, where useful, `retry_after_seconds`. An `invalid_argument` na
 - FR-C2. Commands as listed in 5.1 and 5.2, plus `audit tail|search`, `keys rotate` (section 6.4), `doctor` (checks
   configuration, permissions of secret files, reachability of Google, TLS of the public URL) and `export` (projects,
   clients and accounts without secrets, for review).
+- FR-C4. Admin web UI (design 2026-11-14 §5, off by default): `/admin` on the service's listener, answered only for the
+  host of `[admin_ui] origin`, never forwarded by the public proxy templates and refused with any `Authorization`
+  header (an agent token is never an admin credential). The only credential is a passkey (WebAuthn, user verification
+  required, attestation `none`), enrolled through a one-time link from the admin socket. Sessions last 12 hours and
+  are stored as hashes; every write needs the session cookie, its CSRF token and the admin `Origin`. Approving a
+  request, widening grants, issuing or rotating tokens, connecting mailboxes, adding sinks and adding or removing
+  passkeys need a fresh assertion whose challenge is bound to that exact action. UI actions run the same admin verbs
+  as the socket and are audited as `web:<passkey label>`. Not available in local mode.
 - FR-C3. `requests list|show|approve|deny|cancel` (§6.3a, §6.3b): `show` reads every draft of a request fresh and prints its
   whole text to the operator's terminal; `approve` binds the revisions that were shown and refuses text that was cut.
   For an access request `show` lists each asked grant next to what the connection has now, and `approve` takes
@@ -472,6 +480,9 @@ redaction per connection (PLAN A60):
   the MCP, Google callback, health and downstream connection/OAuth routes explicitly listed in §5.6. Everything else returns 404 at the proxy.
 - Request body limit at the proxy and in the service (for example 1 MB; drafts with HTML stay well below).
 - `/healthz` returns only "ok" or "degraded", no account names or counts.
+- The admin web UI (FR-C4) is tailnet- or LAN-only: it answers only for its own host name, has its own per-address
+  request and sign-in failure limits, sends a strict CSP (no inline script or style) and is never part of the public
+  route list.
 - The OAuth callback only completes connect flows the CLI started (7.3). With no pending flow it returns a generic
   error page.
 - Optional: an outbound firewall rule that allows the service user to reach only Google's OAuth and Gmail API hosts.
