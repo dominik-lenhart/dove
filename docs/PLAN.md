@@ -67,10 +67,14 @@ hosts or reference hardware.
      Google account obtains a long-lived refresh token for an unverified production app).
    - [x] Restart/crash recovery tests, log canary test (AC8, AC9 in `tests/hygiene_e2e.rs`; restart cases in
      `send_e2e`, `connect_e2e`, `mcp_e2e`, `index_sync`, graceful shutdown in `shutdown_e2e`)
-   - [ ] Benchmarks (8.1) with synthetic 250k corpus, RSS measurement. Only measured so far: peak heap of the
-     parse path per message (`cargo test --release --test ingest_memory -- --ignored --nocapture`, counting
-     allocator, dev host, 2026-11-12): 22.6 MB raw -> 29.3 MiB peak, under the 32 MiB per-job budget (8.1a). This is
-     not RSS and not a service benchmark; all 8.1 latency/RSS targets remain unverified.
+   - [~] Benchmarks (8.1) with synthetic 250k corpus, RSS measurement. Done: `tests/bench_index.rs` (ignored tests,
+     release, A72) and `docs/benchmarks.md`, measured 2026-11-14 on the shared 12-core, 23 GB host with 1, 5 and 25
+     mailboxes: ingest 386-477 msg/s, index 4.5 MiB per 1000 messages (1.1 GB), peak RSS 76 MiB while ingesting and
+     125-229 MiB for sequential queries (260 MiB with 4 concurrent clients, 323 MiB with queries during ingest), zero
+     Gmail calls per indexed search. **Targets missed:** 12 of 24 queries with a 8.1 target (structured p95 <= 100 ms,
+     FTS <= 250 ms) exceed it at 250k messages, `group_by:"thread"` takes 1.5-2.6 s and `search_contacts` about 2 s.
+     Cause and options in `docs/benchmarks.md` (open, A72). Still unmeasured: live Gmail escape hatch, sync lag, cold
+     OS cache, PDF/DOCX attachment text, container memory.
    - [~] Deployment: systemd unit, container, Caddy allowlist, backup docs, SECURITY.md, README (files written:
      `deploy/` (systemd, Containerfile, compose, Caddyfile, nginx), `docs/deployment.md`, `README.md`, `SECURITY.md`,
      CI workflow with `deny.toml` and secret scan. Verified: syntax and sandbox start of the unit as a user unit,
@@ -686,3 +690,18 @@ hosts or reference hardware.
   as the text mode. Thread matching of `unless_reply` fails open in three cases, listed in docs/deployment.md: a
   thread the provider split, an IMAP reply with only `In-Reply-To` whose original was itself a reply, and a reply
   whose server arrival date predates the request.
+- A72. Benchmark method and the first 8.1 numbers (2026-11-14). (a) The 250k run does not go through a fake Google
+  server: it would hold about 2 GB of MIME in the benchmark process, distort RSS and take hours. The corpus (seeded
+  generator, no new dependencies) is parsed with `doc_from_raw_answer` and written with `ingest::upsert` in
+  transactions of 16 on the real writer, which is the sync engine's ingest minus HTTP; `bench_sync_through_fake_google`
+  runs the whole engine on 10k messages to show that difference (534 msg/s, within the range of the direct run).
+  (b) Queries are timed twice, through `mcp::call_tool` (service time) and over loopback HTTP. (c) The result is that
+  the 100 ms / 250 ms targets are missed for every query whose matching set is large: SQLite materializes and sorts the
+  complete match set of label, address and FTS predicates (cost proportional to the matches), the fixed `sqlite_stat1`
+  rows of migration V2 assume a rare value, and predicates without an index (`category`, attachment text) walk the date
+  index until 21 rows match. The thread view and `search_contacts` aggregate whole mailboxes. No fix is part of this
+  change: choosing the strategy from a bounded cardinality probe, a maintained per-generation thread table and a
+  contacts aggregate are schema and planner changes that need their own design and the contract tests (options in
+  `docs/benchmarks.md`). Until then the 8.1 latency targets stay unmet for large result sets; selective queries
+  (a rare sender, label or term, a domain, a date range) take 3 to 12 ms.
+
