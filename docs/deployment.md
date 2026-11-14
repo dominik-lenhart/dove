@@ -712,7 +712,11 @@ mailbox to a project gives existing tokens no new access. Other commands:
 `clients revoke <name>`, `clients show <name>`, `clients list`, `projects list|show|remove-account`,
 `clients set-redaction <name> on|off` (hide passwords, keys and one-time codes in the subjects and snippets of
 search, digest and draft lists; full reads stay intact; also `--redact-secrets` on `create` and `invite`, spec 6.5a).
-Changes take effect on the next request, without a restart. `--expires` takes `90d`, `12h`, `30m`, `45s` or `2w`.
+Changes take effect on the next request, without a restart. To make redaction the default for new connections, set
+`redact_secrets_default = true` under `[clients]` in the service config (see `dove config-example`) and restart:
+`clients create` and `clients invite` then turn it on unless you pass `--no-redact-secrets`, and connections made
+from an invitation (`dove login`, the OAuth approval page for ChatGPT or Claude) get the invitation's setting.
+Existing connections and invitations keep theirs; change them with `clients set-redaction`. `--expires` takes `90d`, `12h`, `30m`, `45s` or `2w`.
 
 Connect an MCP host with the bearer token, for example:
 

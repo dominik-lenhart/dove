@@ -95,7 +95,7 @@ async fn send_requires_both_gates() {
             grants: vec![g("info", "read,draft,send")],
             expires: None,
             allow_ip: vec![],
-            redact_secrets: false,
+            redact_secrets: None,
         })
         .await;
     assert!(refused.is_err(), "{refused:?}");

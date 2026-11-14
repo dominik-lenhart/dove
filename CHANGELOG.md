@@ -9,6 +9,9 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 
 - `dove sinks add --url-file <path>` reads the webhook URL from a file (owner-only mode, trimmed) or from standard
   input with `-`. `--url` still works but warns that the URL lands in shell history and the process list.
+- `[clients] redact_secrets_default` in the service config: when `true`, connections created by `clients create`,
+  `clients invite` and from invitations (`dove login`, OAuth approval) hide secrets in overview results unless created
+  with the new `--no-redact-secrets`. Off unless set; existing connections keep their setting.
 
 ### Security
 

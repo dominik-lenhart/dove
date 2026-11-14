@@ -45,6 +45,18 @@ pub struct Config {
     /// Downstream OAuth for MCP hosts and invitation redemption (spec 5.6).
     #[serde(default)]
     pub oauth: OAuthConfig,
+    /// Defaults for new connections (PLAN A66).
+    #[serde(default)]
+    pub clients: ClientsConfig,
+}
+
+/// Defaults for connections created from now on (`clients create`, `clients invite`, and through an invitation also
+/// `/connect/redeem` and the OAuth approval page). Existing connections and open invitations keep their settings.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ClientsConfig {
+    /// New connections hide secrets in overview results (PLAN A60) unless the operator passes `--no-redact-secrets`.
+    pub redact_secrets_default: bool,
 }
 
 /// Deployment mode (PLAN A58).
@@ -464,6 +476,12 @@ retention_days = 180
 
 [notifier]
 # webhook_url = "https://ntfy.example.com/dove-alerts"
+
+[clients]
+# true: new connections (clients create, clients invite, and OAuth connections made from an invitation) hide
+# passwords, keys and one-time codes in overview results unless created with --no-redact-secrets. Existing
+# connections keep their setting (dove clients set-redaction).
+redact_secrets_default = false
 
 [oauth]
 # Downstream OAuth for MCP hosts (ChatGPT, Claude). Defaults shown.

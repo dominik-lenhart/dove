@@ -51,7 +51,7 @@ async fn send_requires_instance_gate_and_grant() {
             grants: vec![g("info", "read,draft,send")],
             expires: None,
             allow_ip: vec![],
-            redact_secrets: false,
+            redact_secrets: None,
         })
         .await;
     assert!(refused.is_err(), "{refused:?}");

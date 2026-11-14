@@ -389,8 +389,9 @@ Broad searches can surface credentials that customers or services sent by mail (
 one-time codes) in snippets and subjects, although the agent never asked for them. The operator can switch on
 redaction per connection (PLAN A60):
 
-- FR-R1. `dove clients set-redaction <name> on|off`, or `--redact-secrets` on `clients create` and `clients invite`. Off
-  by default. Shown in `clients list`, `clients show` and `export`. An invitation hands the setting to the connection it
+- FR-R1. `dove clients set-redaction <name> on|off`, or `--redact-secrets` / `--no-redact-secrets` on `clients create`
+  and `clients invite`. Without either flag the service config's `[clients] redact_secrets_default` decides (off
+  unless set, PLAN A66). Shown in `clients list`, `clients show` and `export`. An invitation hands the setting to the connection it
   creates; the approval page cannot change it. A change applies from the next request.
 - FR-R2. When on, Dove replaces detected secrets with `[redacted]` in the subject and snippet of every overview row:
   `search_messages` (index and live, also inside `batch_read`), `digest` and `list_drafts`. Every row of such a

@@ -531,8 +531,12 @@ pub enum ClientsCmd {
         #[arg(long = "allow-ip")]
         allow_ip: Vec<String>,
         /// Hide passwords, keys and one-time codes in overview results (snippets, subjects); full reads stay intact.
-        #[arg(long)]
+        /// Without this flag or `--no-redact-secrets`, the server's `clients.redact_secrets_default` decides.
+        #[arg(long, conflicts_with = "no_redact_secrets")]
         redact_secrets: bool,
+        /// Do not hide secrets, even when the server's `clients.redact_secrets_default` is on.
+        #[arg(long)]
+        no_redact_secrets: bool,
         #[command(flatten)]
         admin: AdminOpts,
     },
@@ -588,9 +592,13 @@ pub enum ClientsCmd {
         expires: Option<String>,
         #[arg(long = "allow-ip")]
         allow_ip: Vec<String>,
-        /// The connection hides passwords, keys and one-time codes in overview results.
-        #[arg(long)]
+        /// The connection hides passwords, keys and one-time codes in overview results. Without this flag or
+        /// `--no-redact-secrets`, the server's `clients.redact_secrets_default` decides.
+        #[arg(long, conflicts_with = "no_redact_secrets")]
         redact_secrets: bool,
+        /// The connection shows secrets, even when the server's `clients.redact_secrets_default` is on.
+        #[arg(long)]
+        no_redact_secrets: bool,
         #[command(flatten)]
         admin: AdminOpts,
     },
@@ -749,6 +757,15 @@ pub enum SinksCmd {
     },
 }
 
+/// `--redact-secrets` / `--no-redact-secrets` (clap refuses both); neither leaves it to the server's default.
+fn redaction(on: bool, off: bool) -> Option<bool> {
+    match (on, off) {
+        (true, _) => Some(true),
+        (_, true) => Some(false),
+        _ => None,
+    }
+}
+
 fn split_list(s: &str) -> Vec<String> {
     s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()
 }
@@ -827,7 +844,16 @@ fn admin_request(cmd: Command) -> anyhow::Result<(AdminOpts, AdminRequest)> {
             ProjectsCmd::Show { name, admin } => (admin, R::ProjectsShow { name }),
         },
         Command::Clients(c) => match c {
-            ClientsCmd::Create { name, project, grants, expires, allow_ip, redact_secrets, admin } => (
+            ClientsCmd::Create {
+                name,
+                project,
+                grants,
+                expires,
+                allow_ip,
+                redact_secrets,
+                no_redact_secrets,
+                admin,
+            } => (
                 admin,
                 R::ClientsCreate {
                     name,
@@ -835,7 +861,7 @@ fn admin_request(cmd: Command) -> anyhow::Result<(AdminOpts, AdminRequest)> {
                     grants: parse_grant_args(&grants)?,
                     expires,
                     allow_ip,
-                    redact_secrets,
+                    redact_secrets: redaction(redact_secrets, no_redact_secrets),
                 },
             ),
             ClientsCmd::SetGrants { name, grants, admin } => {
@@ -848,7 +874,17 @@ fn admin_request(cmd: Command) -> anyhow::Result<(AdminOpts, AdminRequest)> {
                 (admin, R::ClientsSetRedaction { name, enabled: mode == "on" })
             }
             ClientsCmd::List { admin } => (admin, R::ClientsList),
-            ClientsCmd::Invite { name, project, accounts, capabilities, expires, allow_ip, redact_secrets, admin } => (
+            ClientsCmd::Invite {
+                name,
+                project,
+                accounts,
+                capabilities,
+                expires,
+                allow_ip,
+                redact_secrets,
+                no_redact_secrets,
+                admin,
+            } => (
                 admin,
                 R::ClientsInvite {
                     name,
@@ -857,7 +893,7 @@ fn admin_request(cmd: Command) -> anyhow::Result<(AdminOpts, AdminRequest)> {
                     capabilities,
                     expires,
                     allow_ip,
-                    redact_secrets,
+                    redact_secrets: redaction(redact_secrets, no_redact_secrets),
                 },
             ),
         },
@@ -1124,6 +1160,31 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
             let e = format!("{:#}", sink_url(None, Some(path), &mut none, &mut warn).unwrap_err());
             assert!(!e.contains("T0K3N"), "{e}");
+        }
+    }
+
+    /// No flag leaves redaction to the server's `clients.redact_secrets_default` (`None`, not sent at all, so an older
+    /// service still parses the request); `--no-redact-secrets` is an explicit opt-out; both flags are refused.
+    #[test]
+    fn redaction_flags_are_tri_state() {
+        let create = ["clients", "create", "bot", "--project", "acme", "--grant", "info=read"];
+        let invite = ["clients", "invite", "bot", "--project", "acme"];
+        for base in [&create[..], &invite[..]] {
+            let req = |extra: &[&str]| {
+                let cli = parse(&base.iter().copied().chain(extra.iter().copied()).collect::<Vec<_>>())?;
+                Ok::<_, clap::Error>(admin_request(cli.command).unwrap().1)
+            };
+            let flag = |r: &AdminRequest| match r {
+                AdminRequest::ClientsCreate { redact_secrets, .. }
+                | AdminRequest::ClientsInvite { redact_secrets, .. } => *redact_secrets,
+                _ => panic!(),
+            };
+            assert_eq!(flag(&req(&[]).unwrap()), None);
+            assert_eq!(flag(&req(&["--redact-secrets"]).unwrap()), Some(true));
+            assert_eq!(flag(&req(&["--no-redact-secrets"]).unwrap()), Some(false));
+            assert!(req(&["--redact-secrets", "--no-redact-secrets"]).is_err());
+            let wire = serde_json::to_value(req(&[]).unwrap()).unwrap();
+            assert!(wire.get("redact_secrets").is_none(), "{wire}");
         }
     }
 

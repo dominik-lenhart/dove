@@ -541,3 +541,15 @@ hosts or reference hardware.
   trimmed); `-` reads standard input (at most 8 KiB, trimmed). `--url` stays for compatibility and scripts, with a
   warning on stderr, rather than being removed in a minor release. clap enforces exactly one of the two. Errors name
   the file, never its content. The admin request is unchanged (`SinksAdd.url`), so nothing changes on the service side.
+- A66. Redaction default for new connections (follow-up to A60, 2026-11-14). `[clients] redact_secrets_default`
+  (service config, default `false`) decides `redact_secrets` for connections created without an explicit choice. (a)
+  The shipped default stays `false`: turning redaction on for every new connection after an upgrade would change what
+  scripted `clients create` calls produce without the operator asking; the operator opts the instance in. (b) The
+  admin request's `redact_secrets` is an `Option<bool>` resolved on the service (`None` = the config default), and
+  `None` is not serialized, so a newer CLI talking to a service that was not restarted yet still sends a request the
+  old service accepts (`deny_unknown_fields`). An older CLI sends `false`, which the new service reads as an explicit
+  opt-out; the CLI and the service are one binary, so this only lasts until the restart. (c) The CLI has
+  `--redact-secrets` and `--no-redact-secrets` (mutually exclusive). (d) The default is applied when the invitation is
+  created and stored on it; `/connect/redeem` and the OAuth approval page copy the invitation's value, which covers
+  OAuth connections (every OAuth connection, dynamic or pre-registered client, comes from an invitation). Existing
+  connections and open invitations are not touched.

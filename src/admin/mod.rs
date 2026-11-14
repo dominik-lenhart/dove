@@ -127,9 +127,9 @@ pub enum AdminRequest {
         expires: Option<String>,
         #[serde(default)]
         allow_ip: Vec<String>,
-        /// Hide secrets in overview results (PLAN A60).
-        #[serde(default)]
-        redact_secrets: bool,
+        /// Hide secrets in overview results (PLAN A60). `None`: the server's `clients.redact_secrets_default` (A66).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        redact_secrets: Option<bool>,
     },
     ClientsSetGrants {
         name: String,
@@ -160,9 +160,10 @@ pub enum AdminRequest {
         expires: Option<String>,
         #[serde(default)]
         allow_ip: Vec<String>,
-        /// The redeemed connection hides secrets in overview results (PLAN A60).
-        #[serde(default)]
-        redact_secrets: bool,
+        /// The redeemed connection hides secrets in overview results (PLAN A60). `None`: the server's
+        /// `clients.redact_secrets_default` (A66).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        redact_secrets: Option<bool>,
     },
 
     AuditTail {
