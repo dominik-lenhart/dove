@@ -116,8 +116,8 @@ Per item, in this order: request still approved, client not revoked, mailbox act
 condition holds, then the send claim is recorded **before** the upstream write, then the draft is sent through the
 existing send path (same outcome classification as `send_draft`, Sent copy handling and all).
 
-The send core is split out of the `send_draft` tool into a function without `policy::authorize` and without a
-`ToolCx`; the tool and the worker both call it. The tool keeps its policy check and its one audit record per call.
+The send core is split out of the `send_draft` tool into a function that takes no part in `policy::authorize`
+(it may keep `ToolCx` as the carrier of app, client and write deadline); the tool and the worker both call it. The tool keeps its policy check and its one audit record per call.
 The worker authorizes by the checks above and writes its own audit record per item (actor `scheduler`, action
 `request.send_item`, request and item ids). The sender identity is checked again at send time as today; if an alias
 was removed since approval the item ends as `failed` with that check's code, not as `draft_changed`.
@@ -125,7 +125,8 @@ A draft revision that changed for any reason, including a provider-side rewrite,
 a spurious failure is accepted and visible in the request.
 
 - An item found in `sending` after a restart, or whose write ended `outcome_unknown`, ends as `send_unknown` and is
-  never retried. A definitive refusal ends as `failed` with the code; nothing is retried automatically.
+  never retried. A write that was not dispatched (rate limit, mailbox unavailable) is tried again within the
+  grace; an upstream refusal is tried 3 times, 5 minutes apart, then ends as `failed` with the code.
 - An item that could not be sent within 60 minutes after its time (server down, upstream down) ends as `missed` and
   is not sent **(call)**. The grace is `[requests] late_grace_minutes`.
 - `unless_reply`: the item is skipped (`skipped: replied`) when the draft's thread holds a message from someone else
@@ -156,6 +157,8 @@ request can only add. The owner can shorten the duration or untick single mailbo
 - What can be granted is whatever `Actions::parse_grant` accepts for that mailbox today; requests add no new rule.
 
 ### 4.6 Telling the owner
+
+Ships with stage 3, when there is an admin URL to link.
 
 Optional `[requests] notify_sink = "<sink name>"`: a new pending request posts `{ kind, request_id, url }` to that
 existing sink (ids only, with the admin URL of the request). Without it the owner sees requests in the UI and in
