@@ -377,7 +377,7 @@ pub async fn login_page(State(app): State<Arc<App>>, headers: HeaderMap) -> Resp
     html::respond(html::login_page())
 }
 
-pub async fn login_options(State(app): State<Arc<App>>, Extension(ClientIp(ip)): Extension<ClientIp>) -> Response {
+pub async fn login_options(State(app): State<Arc<App>>) -> Response {
     let Some((rp_id, _)) = rp(&app) else { return json_error(StatusCode::NOT_FOUND, "not found") };
     let challenge = util::random_bytes::<32>();
     let id = new_ceremony_id();
