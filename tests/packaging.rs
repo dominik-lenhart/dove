@@ -238,13 +238,34 @@ fn tool_path(dir: &Path, fakes: &[&str]) -> PathBuf {
 
 struct InstallRun {
     ok: bool,
+    stdout: String,
     stderr: String,
     log: String,
     installed: Option<Vec<u8>>,
+    /// The directory it installed into (`$HOME/.local/bin` by default, `<tmp>/dest` otherwise) and `$HOME`.
+    dest: PathBuf,
+    home: PathBuf,
+    /// Keeps the directories above alive while the test inspects them.
+    _tmp: tempfile::TempDir,
+}
+
+/// How install.sh is started besides the fake release.
+#[derive(Default)]
+struct InstallEnv<'a> {
+    /// `$SHELL`, unset when `None`.
+    shell: Option<&'a str>,
+    /// Leave `DOVE_INSTALL_DIR` unset, so the script picks `~/.local/bin` (or `/usr/local/bin` as root).
+    default_dir: bool,
+    /// Put the install directory on `$PATH`.
+    dest_on_path: bool,
 }
 
 /// Runs install.sh for `version` against a fake release with the given fetcher and minisign output.
 fn run_install_sh(version: &str, fakes: &[&str], minisign_out: &str) -> InstallRun {
+    run_install_sh_in(version, fakes, minisign_out, InstallEnv::default())
+}
+
+fn run_install_sh_in(version: &str, fakes: &[&str], minisign_out: &str, env: InstallEnv) -> InstallRun {
     let dir = tempfile::tempdir().unwrap();
     let target = match std::env::consts::OS {
         "linux" => format!("{}-unknown-linux-gnu", std::env::consts::ARCH),
@@ -267,26 +288,38 @@ fn run_install_sh(version: &str, fakes: &[&str], minisign_out: &str) -> InstallR
     std::fs::write(files.join("SHA256SUMS"), format!("{hex}  {name}.tar.gz\n")).unwrap();
     std::fs::write(files.join("SHA256SUMS.minisig"), "untrusted comment: fake\n").unwrap();
     let bin = tool_path(dir.path(), fakes);
-    let (log, dest) = (dir.path().join("log"), dir.path().join("dest"));
-    let out = std::process::Command::new("/bin/sh")
-        .arg(root().join("install.sh"))
+    let (log, home) = (dir.path().join("log"), dir.path().join("home"));
+    std::fs::create_dir(&home).unwrap();
+    let dest = if env.default_dir { home.join(".local/bin") } else { dir.path().join("dest") };
+    let path =
+        if env.dest_on_path { format!("{}:{}", dest.display(), bin.display()) } else { bin.display().to_string() };
+    let mut cmd = std::process::Command::new("/bin/sh");
+    cmd.arg(root().join("install.sh"))
         .env_clear()
-        .env("PATH", &bin)
-        .env("HOME", dir.path())
+        .env("PATH", path)
+        .env("HOME", &home)
         .env("TMPDIR", dir.path())
         .env("DOVE_VERSION", version)
         .env("DOVE_LIBC", "gnu")
-        .env("DOVE_INSTALL_DIR", &dest)
         .env("FAKE_LOG", &log)
         .env("FAKE_FILES", &files)
-        .env("FAKE_MINISIGN_OUT", minisign_out)
-        .output()
-        .unwrap();
+        .env("FAKE_MINISIGN_OUT", minisign_out);
+    if !env.default_dir {
+        cmd.env("DOVE_INSTALL_DIR", &dest);
+    }
+    if let Some(shell) = env.shell {
+        cmd.env("SHELL", shell);
+    }
+    let out = cmd.output().unwrap();
     InstallRun {
         ok: out.status.success(),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         log: std::fs::read_to_string(&log).unwrap_or_default(),
         installed: std::fs::read(dest.join("dove")).ok(),
+        dest,
+        home,
+        _tmp: dir,
     }
 }
 
@@ -317,6 +350,59 @@ fn install_sh_wget_fallback_is_https_only() {
         assert!(c.contains("/wget ") && c.contains(" --https-only "), "{c}");
         assert!(c.contains(" https://github.com/dominik-lenhart/dove/releases/download/v1.2.3/"), "{c}");
     }
+}
+
+/// Outside PATH the installer prints the line to add for the user's shell, and never edits a shell file itself.
+#[test]
+fn install_sh_prints_the_path_line_for_the_users_shell() {
+    for (shell, rc, line) in [
+        (Some("/bin/zsh"), "~/.zshrc", r#"export PATH="DEST:$PATH""#),
+        (Some("/usr/bin/bash"), "~/.bashrc", r#"export PATH="DEST:$PATH""#),
+        (Some("/usr/bin/fish"), "~/.config/fish/config.fish", r#"fish_add_path "DEST""#),
+        (Some("/bin/dash"), "~/.profile", r#"export PATH="DEST:$PATH""#),
+        (None, "~/.profile", r#"export PATH="DEST:$PATH""#),
+    ] {
+        let env = InstallEnv { shell, ..InstallEnv::default() };
+        let r = run_install_sh_in("1.2.3", &["curl"], "", env);
+        assert!(r.ok, "{shell:?}: {}", r.stderr);
+        let want_line = format!("  {}", line.replace("DEST", &r.dest.display().to_string()));
+        assert!(r.stdout.contains(&want_line), "{shell:?}: no line {want_line:?} in\n{}", r.stdout);
+        assert!(
+            r.stdout.contains(&format!(
+                "is not in your PATH, so your shell will not find dove yet. Add this line to {rc}\n"
+            )),
+            "{shell:?}\n{}",
+            r.stdout
+        );
+        // Nothing in HOME was created or changed (shell files stay the user's).
+        assert_eq!(std::fs::read_dir(&r.home).unwrap().count(), 0, "{shell:?} touched HOME");
+    }
+}
+
+/// The default user-level directory is written as `$HOME/.local/bin` so the line works from any shell file; a
+/// directory already on PATH gets no note at all.
+#[test]
+fn install_sh_user_install_defaults_and_path_check() {
+    if nix::unistd::geteuid().is_root() {
+        return; // root installs to /usr/local/bin
+    }
+    let r = run_install_sh_in(
+        "1.2.3",
+        &["curl"],
+        "",
+        InstallEnv { shell: Some("/bin/zsh"), default_dir: true, ..Default::default() },
+    );
+    assert!(r.ok, "{}", r.stderr);
+    assert_eq!(r.dest, r.home.join(".local/bin"));
+    assert_eq!(r.installed.as_deref(), Some(&b"fake dove binary"[..]));
+    assert!(r.stdout.contains("  export PATH=\"$HOME/.local/bin:$PATH\"\n"), "{}", r.stdout);
+    // A user install belongs to the user: upgrades need no sudo.
+    assert!(r.stdout.contains("Later upgrades:      dove upgrade "), "{}", r.stdout);
+    assert!(!r.stdout.contains("sudo dove"), "{}", r.stdout);
+
+    let on_path = run_install_sh_in("1.2.3", &["curl"], "", InstallEnv { dest_on_path: true, ..Default::default() });
+    assert!(on_path.ok, "{}", on_path.stderr);
+    assert!(!on_path.stdout.contains("PATH"), "{}", on_path.stdout);
 }
 
 /// install.ps1 cannot run here (no PowerShell); keep its trusted-comment check an exact line comparison.
