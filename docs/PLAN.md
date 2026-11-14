@@ -656,8 +656,11 @@ hosts or reference hardware.
   and the workers start, so no tick can claim before it. (e) A mailbox that needs re-authorization defers the item
   inside the grace (not dispatched); a disabled one fails it. Only upstream refusals count as attempts (3, five
   minutes apart). (f) The claim checks `send_at + grace` against the time of the claim; the write itself may still
-  dispatch up to the write deadline after a claim made at the end of the grace (bounded by
-  `upstream_request_timeout_secs`). (g) The note's vault scope is the request id, so `NewSend` carries the id.
+  dispatch up to the write deadline after a claim made at the end of the grace, so a send can start at most
+  `grace + tool_call_timeout_secs` after its time. The claim's `state = 'scheduled'` condition is load-bearing, not a
+  formality: a pass reads up to `BATCH` due items first and then sends them one after another, each taking up to the
+  tool-call budget, so a cancel made while an earlier item is in flight reaches a later item only through that
+  condition (`cancel_while_an_earlier_item_is_sending`, by the operator and by the agent). (g) The note's vault scope is the request id, so `NewSend` carries the id.
   (h) `notify_sink` (design 4.6) ships with stage 3.
   (i) `unless_reply` treats the index as stale while the serving generation has any row in `pending`: a message whose
   fetch failed sits there with an unknown thread while `last_success_at` still advances (`sync::commit_results`, IMAP

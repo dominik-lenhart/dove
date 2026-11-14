@@ -278,7 +278,9 @@ async fn send_one(app: &Arc<App>, item: &Due, now: i64, grace: i64) -> anyhow::R
             }
         }
     }
-    // The claim is recorded before the upstream write; only one pass can make it, and never past the grace.
+    // The claim is recorded before the upstream write; only one pass can make it, and never past the grace. Its
+    // `state = 'scheduled'` is what makes a cancel effective that came in after the due list was read (while an
+    // earlier item of this pass was being sent).
     let (rid, idx) = (item.request_id.clone(), item.idx);
     let claimed = app
         .store

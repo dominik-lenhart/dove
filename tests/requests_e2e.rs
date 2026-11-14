@@ -919,6 +919,53 @@ async fn concurrent_passes_send_once() {
     assert_eq!(send_items_audit(&h).await.len(), 3);
 }
 
+/// Two items due in one pass: while the first send is in flight, a cancel of the second must win. The due list was
+/// read before the cancel and the request stays approved (item 2 is still open), so only the claim's
+/// `state = 'scheduled'` condition stops the second send.
+#[tokio::test]
+async fn cancel_while_an_earlier_item_is_sending() {
+    for by_agent in [false, true] {
+        let (h, token) = setup().await;
+        let t = util::now_unix() + 3600;
+        let (id, _) = approved(&h, &token, &[t, t, t + 600]).await;
+        if by_agent {
+            // The agent cancels the whole request, which would close it once item 0 is recorded (and the claim's
+            // request-status check would catch item 1). Item 2, held by another pass, keeps it approved.
+            let rid = id.clone();
+            h.app()
+                .store
+                .call(move |c| {
+                    Ok(c.execute(
+                        "UPDATE request_items SET state = 'sending' WHERE request_id = ?1 AND idx = 2",
+                        [rid],
+                    )?)
+                })
+                .await
+                .unwrap();
+        }
+        h.google.fail_next("POST", "drafts/send", Fault::Delay(std::time::Duration::from_millis(1500)));
+        let app = h.app().clone();
+        let pass = tokio::spawn(async move { tick(&app, t).await.unwrap() });
+        let started = std::time::Instant::now();
+        while h.google.count("POST", "drafts/send") == 0 {
+            assert!(started.elapsed() < std::time::Duration::from_secs(5), "the first send never started");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        if by_agent {
+            h.ok(&token, "cancel_request", json!({ "request_id": id })).await;
+        } else {
+            h.admin(AdminRequest::RequestsCancel { id: id.clone(), items: Some(vec![1]) }).await.unwrap();
+        }
+        assert_eq!(pass.await.unwrap(), report(1, 0, 0, 0, 0, 0), "by_agent={by_agent}");
+        let reason = if by_agent { "cancelled_by_client" } else { "cancelled_by_operator" };
+        let (_, items) = states(&h, &id).await;
+        assert_eq!(items[..2], [st("sent", None), st("cancelled", Some(reason))], "by_agent={by_agent}");
+        assert_eq!(h.google.count("POST", "drafts/send"), 1, "exactly one send");
+        let (status, items) = states(&h, &id).await;
+        assert_eq!((status.as_str(), &items[2].0[..]), ("approved", if by_agent { "sending" } else { "scheduled" }));
+    }
+}
+
 // ------------------------------------------------------------------ unless_reply
 
 use dove::index::sync::sync_account;
