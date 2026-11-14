@@ -859,6 +859,10 @@ dove watch listen --profile ops -- \
 - `claude -p --resume <session-id> --fork-session` continues a specific Claude Code session with its full context in
   a copy, so the original session (and a UI that shows it) is not written to concurrently. Without `--fork-session`
   each event continues the same session. Codex: `codex exec resume <session-id> "<prompt>"` (or `codex exec fork <session-id>` for a copy).
+- If the agent lives in a UI that has its own CLI, post into its conversation instead of starting a second agent, so
+  the run continues there with its context and shows up in the UI. T3 Code, for example:
+  `dove watch listen --profile ops -- t3 thread send <thread-id> "A Dove watch fired: ..."` (through the local T3
+  server; no remote access needed). Pass the event ids in the fixed message through a small wrapper script.
 - The cursor is saved after each handled event in `<config dir>/watch-listen/<profile>.json` (mode 0600), so a
   restart neither repeats nor skips an event. On the very first start existing events are skipped
   (`--include-existing` handles them). A command that exits non-zero or outlives `--timeout` (1800 s) is retried on
