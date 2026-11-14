@@ -5,6 +5,8 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-14
+
 ### Added
 
 - `dove watch create|list|delete|events` manage watches from the CLI, and `dove watch listen` wakes a local agent on
@@ -316,7 +318,8 @@ First release.
   release only after verifying its minisign signature. The CLI hints at a new release at most once a day
   (`DOVE_NO_UPDATE_CHECK=1` turns it off); the server never checks for updates.
 
-[Unreleased]: https://github.com/dominik-lenhart/dove/compare/v0.8.1...HEAD
+[Unreleased]: https://github.com/dominik-lenhart/dove/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/dominik-lenhart/dove/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/dominik-lenhart/dove/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/dominik-lenhart/dove/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/dominik-lenhart/dove/compare/v0.6.0...v0.7.0
