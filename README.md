@@ -11,6 +11,7 @@ with a scoped token per agent, drafts instead of silent sends, and nothing ever 
 [![CI](https://github.com/dominik-lenhart/dove/actions/workflows/ci.yml/badge.svg)](https://github.com/dominik-lenhart/dove/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/dominik-lenhart/dove?sort=semver)](https://github.com/dominik-lenhart/dove/releases)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+[![Listed on mcpservers.org](https://mcpservers.org/badge.svg)](https://mcpservers.org/servers/dominik-lenhart/dove)
 
 [Why Dove](#why-dove) · [Quickstart](#quickstart) · [What agents can do](#what-agents-can-do) · [Permissions](#permissions) ·
 [Security](#security-model) · [Deployment guide](docs/deployment.md)
