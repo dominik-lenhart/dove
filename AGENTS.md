@@ -406,3 +406,14 @@ cargo fmt
   `ToolCx::redact_table` / `redact_objects`; a new list or overview tool with subjects or snippets must call one of
   them, targeted reads must not. Test fixtures that look like keys (`ghp_…`, PEM headers, `API key: …`) trip CI's
   gitleaks: build them at run time (`format!("gh{}", "p_…")`) and check with the docker command above.
+- 2026-11-14: Organize budget refunds (PLAN A63): an id is refunded only as `Outcome::Failed` with a code other than
+  `outcome_unknown`; use `Outcome::Spent` when a write for that id took effect before the failure. IMAP writes must be
+  classified like `move_uids`/`append` (`ExecError::sent_all` true = `OutcomeUnknown`); `simple()` drops that
+  distinction and is for reads and Drafts housekeeping only (organize STOREs go through `write_simple` /
+  `stores_then_fetch`). Fake faults: IMAP `Fault::No` (refused, refunded), `Fault::DropAfterApply` (applied, reply
+  lost), `fail_next_containing("UID STORE", "-FLAGS", ..)` for the second STORE; Gmail `Fault::Status(503, ..)` is
+  `outcome_unknown`, 4xx is definitive. Budget tests probe what is left with `n + 1` then `n` unknown ids.
+- 2026-11-14: `AdminRequest` is `deny_unknown_fields`, and the CLI and the service can briefly be different versions
+  (new binary installed, service not restarted). A new optional request field must be `Option<_>` with
+  `#[serde(default, skip_serializing_if = "Option::is_none")]` so the older service still parses requests that do not
+  use it; tests construct `AdminRequest` literals in many files, so a new field touches all of them.
