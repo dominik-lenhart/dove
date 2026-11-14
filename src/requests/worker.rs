@@ -124,6 +124,10 @@ enum Outcome {
     Refused(String),
 }
 
+/// A scheduled item past its grace: request id, index, reason, project name, mailbox alias.
+type LateRow = (String, i64, Option<String>, Option<String>, Option<String>);
+
+/// One pass of the worker at `now`: expiry, late items, then at most [`BATCH`] due sends (tests drive the clock).
 pub async fn tick(app: &Arc<App>, now: i64) -> anyhow::Result<TickReport> {
     let started = Instant::now();
     let mut report = TickReport::default();
@@ -153,7 +157,7 @@ pub async fn tick(app: &Arc<App>, now: i64) -> anyhow::Result<TickReport> {
                 )?;
                 audit_event(&tx, SCHEDULER, "request.expire", project.clone(), None, vec![id.clone()], "expired")?;
             }
-            let late: Vec<(String, i64, Option<String>, Option<String>, Option<String>)> = {
+            let late: Vec<LateRow> = {
                 let mut st = tx.prepare(
                     "SELECT i.request_id, i.idx, i.reason, p.name, a.alias FROM request_items i \
                      JOIN requests r ON r.id = i.request_id LEFT JOIN projects p ON p.id = r.project_id \
