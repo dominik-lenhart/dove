@@ -837,6 +837,56 @@ def verify(secret: bytes, header: str, body: bytes, tolerance: int = 300) -> boo
 
 or in a shell: `printf '%s.%s' "$t" "$body" | openssl dgst -sha256 -hmac "$secret"`.
 
+### Waking an agent on new mail: `dove watch listen`
+
+A sink needs a receiver that is reachable from Dove. To start an agent on the machine where it runs, without opening a
+port or trusting a relay, let the client pull instead. `dove watch listen` asks the server for new events of the
+profile's watches (outgoing HTTPS only, every 60 s by default) and runs a fixed command once per event, in order, one
+at a time:
+
+```sh
+dove watch create --profile ops --account info --from billing@partner.example     # or --reply-in, --where-file, --no-reply-in
+dove watch listen --profile ops -- \
+  claude -p --resume <session-id> --fork-session --allowedTools "Bash(dove search:*)" "Bash(dove message get:*)" -- \
+  "A Dove watch fired. Read the new message with dove message get --account \$DOVE_ACCOUNT --id \$DOVE_MESSAGE_ID ..."
+```
+
+- The command runs directly (no shell; use `-- sh -c '...'` if you need one) with only ids and times in its
+  environment: `DOVE_EVENT_ID`, `DOVE_WATCH_ID`, `DOVE_EVENT_KIND`, `DOVE_ACCOUNT`, `DOVE_MESSAGE_ID`, `DOVE_THREAD_ID`,
+  `DOVE_RECEIVED_AT`, `DOVE_PROFILE`. No subject, sender or body ever reaches the prompt this way; the agent reads the
+  mail through its audited tools, inside the untrusted-content envelope. Keep the prompt fixed; never build it from
+  mail content.
+- `claude -p --resume <session-id> --fork-session` continues a specific Claude Code session with its full context in
+  a copy, so the original session (and a UI that shows it) is not written to concurrently. Without `--fork-session`
+  each event continues the same session. Codex: `codex exec resume <session-id> "<prompt>"` (or `codex exec fork <session-id>` for a copy).
+- The cursor is saved after each handled event in `<config dir>/watch-listen/<profile>.json` (mode 0600), so a
+  restart neither repeats nor skips an event. On the very first start existing events are skipped
+  (`--include-existing` handles them). A command that exits non-zero or outlives `--timeout` (1800 s) is retried on
+  the next poll, up to `--max-attempts` (3), then skipped. A lock file refuses a second listener on the same profile.
+- `--once` polls once and exits, for cron or a systemd timer; without it the listener runs until Ctrl+C, and stops at
+  once when the server rejects the connection (revoked or expired).
+- Give the listener's profile its own connection with the least it needs (often `read` on one mailbox), and give the
+  agent it starts as few tools as possible (`--allowedTools`). An event is a trigger from outside; the agent should
+  be one you would let act on a stranger's mail. Run both as an OS user that is not the Dove operator and cannot sudo
+  (see [Administration access](#administration-access)).
+
+As a systemd user service (`~/.config/systemd/user/dove-listen-ops.service`, then
+`systemctl --user enable --now dove-listen-ops`; `loginctl enable-linger $USER` keeps it running after logout):
+
+```ini
+[Unit]
+Description=Dove watch listener (ops)
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/dove watch listen --profile ops -- /home/me/bin/on-dove-event.sh
+Restart=on-failure
+RestartSec=60
+
+[Install]
+WantedBy=default.target
+```
+
 ## Administration access
 
 - The admin protocol is newline-delimited JSON over a Unix socket. The service checks `SO_PEERCRED` and accepts only

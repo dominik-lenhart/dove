@@ -34,7 +34,7 @@ cargo fmt
 - `src/imap/`: IMAP/SMTP provider; `ops.rs` is the command allowlist and the only place that builds command strings
 - `src/mcp/`: JSON-RPC / Streamable HTTP protocol layer; `src/tools/`: tool handlers
 - `src/index/`: SQLCipher FTS5 index, sync engine, query compiler
-- `src/client/`: remote client commands (login, search, mcp install, stdio bridge)
+- `src/client/`: remote client commands (login, search, mcp install, stdio bridge, `watch` incl. `watch listen`)
 - `src/update/`: `dove upgrade` (signed GitHub Releases) and the daily new-version notice; CLI only
 - `tests/`: integration tests against the fake Google server in `tests/support/`
 
@@ -425,3 +425,10 @@ cargo fmt
   (`$SHELL`, default directory, dir on `PATH`); `InstallRun` keeps its temp dir alive, because a dropped `TempDir`
   deletes what the test wants to inspect. The user-install test skips itself as root (the default dir is then
   `/usr/local/bin`), so the root branch of install.sh's closing hint is not covered.
+- 2026-11-14: To wake an agent on new mail, use `dove watch listen` (`src/client/watch.rs`), not webhooks into the agent
+  host: it pulls `list_watch_events` (one event per request, so the cursor is saved after each), runs a fixed command
+  with only `DOVE_*` ids in its environment, skips existing events on the first start, retries up to `--max-attempts`
+  and holds a `File::try_lock` lock per profile. Pin it to a session with `claude -p --resume <id> --fork-session`
+  (prompt after `--`, since `--allowedTools` is variadic). Tests run the real binary in
+  `tests/client_e2e.rs::watch_listen_runs_the_command_once_per_event_with_ids_only`; generate events there with
+  `index::sync::sync_account` after `IndexEnable`. Never build the prompt from mail content.

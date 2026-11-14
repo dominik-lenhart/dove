@@ -5,6 +5,15 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 
 ## [Unreleased]
 
+### Added
+
+- `dove watch create|list|delete|events` manage watches from the CLI, and `dove watch listen` wakes a local agent on
+  new mail: it pulls watch events over outgoing HTTPS and runs a fixed command once per event, in order, with only
+  ids and times in `DOVE_*` environment variables. The cursor is saved after each event (mode 0600), old events are
+  skipped on the first start, failing commands are retried up to `--max-attempts`, and a lock file keeps a second
+  listener on the same profile from running the command twice. Pin it to an agent session with
+  `claude -p --resume <session-id> --fork-session`.
+
 ## [0.8.1] - 2026-11-14
 
 ### Changed

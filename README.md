@@ -202,6 +202,9 @@ that created them and carry only ids and times; the agent reads content through 
 
 Agents that live in a terminal can use the same tools through the CLI (`dove login`, `dove search`,
 `dove draft create`, every command with `--json`), or wire Claude Code and Codex to Dove with `dove mcp install`.
+`dove watch listen` wakes a CLI agent when mail arrives: it pulls watch events over outgoing HTTPS and runs a fixed
+command once per event (for example `claude -p --resume <session-id>`), passing only ids, never mail content, so the
+agent's machine needs no open port. See [Waking an agent on new mail](docs/deployment.md#waking-an-agent-on-new-mail-dove-watch-listen).
 
 ## Permissions
 

@@ -512,6 +512,8 @@ async fn remote_commands_have_no_path_to_the_admin_socket() {
         vec!["connect-info", "--profile", "acme"],
         vec!["mcp", "install", "--profile", "acme", "--client", "codex"],
         vec!["message", "get", "--profile", "acme", "--account", "info", "--id", "x1"],
+        vec!["watch", "list", "--profile", "acme"],
+        vec!["watch", "listen", "--profile", "acme", "--once", "--", "true"],
     ] {
         c.run_env(&args, "", &env).await;
     }
@@ -664,4 +666,100 @@ async fn cli_draft_attach_and_forward() {
     assert_ne!(o.code, 0);
     assert!(o.stderr.contains("missing.pdf"), "{}", o.stderr);
     assert_eq!(h.google.drafts("info@acme.test").len(), before);
+}
+
+/// `dove watch listen`: skips old events on its first start, runs the command once per new event with ids only in
+/// its environment, keeps its cursor across runs, retries a failing command up to --max-attempts and then moves on,
+/// and refuses to run twice for the same profile.
+#[tokio::test]
+async fn watch_listen_runs_the_command_once_per_event_with_ids_only() {
+    let h = Harness::start_loopback_public(|c| c.oauth.redeem_per_minute = 1000).await;
+    let info = h.mailbox("info", "info@acme.test");
+    h.project("acme", &["info"]).await;
+    h.admin(AdminRequest::IndexEnable { alias: "info".into() }).await.unwrap();
+    let sync = || async { dove::index::sync::sync_account(h.app(), &info).await.unwrap() };
+    sync().await;
+    let c = Client::new(&h);
+    c.login("ops", &invite(&h, "watcher", &["info"], "read").await).await;
+    let o = c
+        .ok(&["watch", "create", "--profile", "ops", "--account", "info", "--from", "carol@example.test", "--json"], "")
+        .await;
+    let v: Value = serde_json::from_str(&o.stdout).unwrap();
+    let watch_id = v["result"]["watch_id"].as_str().unwrap().to_string();
+    let mail = |subject: &str| MessageSpec {
+        from: "carol@example.test".into(),
+        to: vec!["info@acme.test".into()],
+        subject: subject.into(),
+        text: Some("CANARY-BODY-7x2".into()),
+        labels: vec!["INBOX".into()],
+        ..Default::default()
+    };
+    // An event that exists before the listener's first start is skipped.
+    h.google.add_message("info@acme.test", mail("old one"));
+    sync().await;
+    let out = c.path("out.txt");
+    let fails = c.path("fails.txt");
+    let env = [("OUT", out.to_str().unwrap()), ("FAILS", fails.to_str().unwrap())];
+    const RECORD: [&str; 3] = ["sh", "-c", "env | grep '^DOVE_' | sort >> \"$OUT\"; echo --- >> \"$OUT\""];
+    let listen = |extra: &'static [&'static str], cmd: &'static [&'static str]| {
+        let mut a = vec!["watch", "listen", "--profile", "ops", "--once"];
+        a.extend_from_slice(extra);
+        a.push("--");
+        a.extend_from_slice(cmd);
+        a
+    };
+    let o = c.run_env(&listen(&[], &RECORD), "", &env).await;
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert!(o.stderr.contains("skipped 1 existing"), "{}", o.stderr);
+    assert!(!out.exists(), "an old event ran the command");
+    let state = c.path(".config/dove/watch-listen/ops.json");
+    assert_eq!(mode(&state), 0o600);
+
+    // A new event runs the command once, with ids and times only.
+    let id = h.google.add_message("info@acme.test", mail("CANARY-SUBJECT-q9"));
+    sync().await;
+    let o = c.run_env(&listen(&[], &RECORD), "", &env).await;
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    let text = std::fs::read_to_string(&out).unwrap();
+    assert_eq!(text.matches("---").count(), 1, "{text}");
+    for want in [
+        format!("DOVE_MESSAGE_ID={id}"),
+        "DOVE_ACCOUNT=info".to_string(),
+        "DOVE_EVENT_KIND=from".to_string(),
+        format!("DOVE_WATCH_ID={watch_id}"),
+        "DOVE_PROFILE=ops".to_string(),
+    ] {
+        assert!(text.lines().any(|l| l == want), "missing {want} in {text}");
+    }
+    assert!(text.contains("DOVE_EVENT_ID=") && text.contains("DOVE_RECEIVED_AT="), "{text}");
+    for leak in ["CANARY", "carol"] {
+        assert!(!text.contains(leak) && !o.stdout.contains(leak) && !o.stderr.contains(leak), "{leak} leaked");
+    }
+    // The cursor is kept: nothing runs again.
+    assert_eq!(c.run_env(&listen(&[], &RECORD), "", &env).await.code, 0);
+    assert_eq!(std::fs::read_to_string(&out).unwrap().matches("---").count(), 1);
+
+    // A failing command is retried until --max-attempts, then the event is skipped and the next one runs.
+    h.google.add_message("info@acme.test", mail("third"));
+    sync().await;
+    const FAIL: [&str; 3] = ["sh", "-c", "echo x >> \"$FAILS\"; exit 3"];
+    for _ in 0..3 {
+        let o = c.run_env(&listen(&["--max-attempts", "2"], &FAIL), "", &env).await;
+        assert_eq!(o.code, 0, "{}", o.stderr);
+    }
+    assert_eq!(std::fs::read_to_string(&fails).unwrap().lines().count(), 2, "retried more or less than twice");
+    let o = c.run_env(&listen(&[], &RECORD), "", &env).await;
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert_eq!(std::fs::read_to_string(&out).unwrap().matches("---").count(), 1, "the skipped event ran again");
+    h.google.add_message("info@acme.test", mail("fourth"));
+    sync().await;
+    c.run_env(&listen(&[], &RECORD), "", &env).await;
+    assert_eq!(std::fs::read_to_string(&out).unwrap().matches("---").count(), 2, "the next event did not run");
+
+    // A second listener on the same profile refuses to start.
+    let lock = std::fs::OpenOptions::new().write(true).open(c.path(".config/dove/watch-listen/ops.lock")).unwrap();
+    lock.lock().unwrap();
+    let o = c.run_env(&listen(&[], &RECORD), "", &env).await;
+    assert_ne!(o.code, 0);
+    assert!(o.stderr.contains("already runs"), "{}", o.stderr);
 }

@@ -1,5 +1,5 @@
 //! Remote client commands (spec 5.6): `login`, `logout`, `status`, `search`, `message`, `thread`, `draft`, `batch`,
-//! `mcp install|stdio`, `connect-info`, `doctor --profile`.
+//! `watch create|list|delete|events|listen`, `mcp install|stdio`, `connect-info`, `doctor --profile`.
 //!
 //! These commands talk only to the remote HTTP endpoints with the profile's connection token. This module has no
 //! path to the admin socket or admin verbs (checked by a test), and no flag selects another transport, so a remote
@@ -10,6 +10,7 @@ pub mod loopback;
 pub mod profile;
 pub mod remote;
 pub mod stdio;
+pub mod watch;
 
 use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
@@ -86,6 +87,9 @@ pub enum RemoteCmd {
         #[arg(long)]
         file: Option<PathBuf>,
     },
+    /// Watches: be told about new mail, and run a local command (an agent) once per event with `watch listen`.
+    #[command(subcommand)]
+    Watch(watch::WatchCmd),
     /// MCP host integration.
     #[command(subcommand)]
     Mcp(McpCmd),
@@ -366,6 +370,7 @@ pub async fn run(cmd: RemoteCmd) -> anyhow::Result<()> {
             let args = if v.is_array() { json!({ "items": v }) } else { v };
             tool(&p, "batch_read", args).await
         }
+        RemoteCmd::Watch(w) => watch::run(w).await,
         RemoteCmd::Mcp(McpCmd::Install { profile, client, scope, name }) => {
             mcp_install(profile.as_deref(), client, scope, name.as_deref())
         }
