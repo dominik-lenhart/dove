@@ -5,17 +5,19 @@
 //! - `from`: new mail from an address or a domain;
 //! - `query`: new mail matching a typed `where` filter (the `search_messages` schema), evaluated against newly indexed
 //!   messages only;
-//! - `no_reply_by`: thread X gets no message from others before a deadline; fires once, at the deadline.
+//! - `no_reply_by`: thread X, or the thread after message X, gets no message from others before a deadline; fires once,
+//!   at the deadline, and ends quietly (`replied`) when such a message arrives first (PLAN A70).
 //!
 //! Event production: the sync engines call [`messages_indexed`] after a fenced index transaction committed messages
 //! that are new to the account's serving generation (Gmail history sync, IMAP polling and IDLE alike; never during a
 //! backfill or rebuild). Matching reads the index, then records events in one state-store transaction: no transaction
 //! spans network I/O. `no_reply_by` is decided by [`tick`], which takes the clock as an argument.
 //!
-//! For every kind only messages count that were not sent by the mailbox owner ([`owner_addresses`]), are not drafts
-//! and not in spam or trash. Thread kinds count only messages newer than the thread's newest message when the watch
-//! was created (`baseline_ms`); `from` and `query` only messages received at most [`RECEIVED_SLACK_SECS`] before the
-//! watch was created. Either way an old message that is merely re-filed (for example moved between IMAP folders and
+//! For every kind only messages count that were not sent by the mailbox owner ([`is_own`]), are not drafts and not
+//! in spam or trash. Thread kinds count only messages not older than their baseline (the thread's newest message
+//! when the watch was created, or the named message) and not among the messages already there at that instant
+//! (`baseline_ids`); `from` and `query` only messages received at most [`RECEIVED_SLACK_SECS`] before the watch was
+//! created. Either way an old message that is merely re-filed (for example moved between IMAP folders and
 //! indexed again under a new id) does not fire.
 //!
 //! Events carry ids and timestamps only: watch id, kind, account alias, message id, thread id, received_at. No
@@ -167,8 +169,8 @@ pub fn open_filter(vault: &Vault, watch_id: &str, blob: &[u8]) -> anyhow::Result
     Ok(serde_json::from_slice(&vault.open_aux(FILTER_KIND, watch_id, blob)?)?)
 }
 
-/// Normalized addresses that count as the mailbox owner (mail from them never fires a watch). The single place to
-/// extend when a mailbox gains send-as aliases.
+/// Normalized addresses that count as the mailbox owner (mail from them never fires a watch): the mailbox address and
+/// its aliases. Together with the `SENT` label this decides [`is_own`].
 pub fn owner_addresses(conn: &Connection, account_id: &str) -> anyhow::Result<Vec<String>> {
     let email: Option<String> =
         conn.query_row("SELECT email FROM accounts WHERE id = ?1", [account_id], |r| r.get(0)).optional()?;
@@ -178,6 +180,74 @@ pub fn owner_addresses(conn: &Connection, account_id: &str) -> anyhow::Result<Ve
         out.push(norm_addr(&alias.address));
     }
     Ok(out)
+}
+
+/// Whether a message was sent by the mailbox owner: one of its From addresses is an owner address, or it carries the
+/// `SENT` label. The label covers Gmail send-as addresses, which Dove only knows live from Google, and IMAP Sent
+/// folders; it is the same rule as `from_self` in search (PLAN A61 (b)). Mail from the owner never fires a watch and is
+/// never a reply.
+pub fn is_own(senders: &[String], sent_label: bool, owners: &HashSet<String>) -> bool {
+    sent_label || senders.iter().any(|s| owners.contains(s))
+}
+
+/// Whether row `msg` of generation `gen_id` carries the `SENT` label.
+fn has_sent_label(c: &Connection, gen_id: i64, msg: i64) -> rusqlite::Result<bool> {
+    c.prepare_cached("SELECT EXISTS(SELECT 1 FROM labels WHERE label = ?1 AND gen = ?2 AND msg = ?3)")?
+        .query_row(params![query::SENT_LABEL, gen_id, msg], |r| r.get(0))
+}
+
+/// Where "later" starts in a watched thread.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Baseline {
+    /// Unix milliseconds (index `received_at`).
+    pub ms: i64,
+    /// Agent message ids already there at `ms` when the watch was created; they never count. `None` for watches
+    /// from before PLAN A70, which compare strictly (`> ms`) instead.
+    pub ids: Option<Vec<String>>,
+}
+
+impl Baseline {
+    fn from_columns(ms: Option<i64>, ids: Option<String>) -> Self {
+        Self { ms: ms.unwrap_or(0), ids: ids.and_then(|s| serde_json::from_str(&s).ok()) }
+    }
+
+    /// Whether a message at `received_at` with agent id `id` is later than the baseline. `>=`: IMAP dates have
+    /// second precision, so a quick reply can share the baseline's instant.
+    pub fn is_after(&self, id: &str, received_at: i64) -> bool {
+        match &self.ids {
+            Some(ids) => received_at >= self.ms && !ids.iter().any(|i| i == id),
+            None => received_at > self.ms,
+        }
+    }
+}
+
+/// The first message of `thread_id` in generation `gen_id` that answers after `baseline`: not a draft, not in spam or
+/// trash, not from the owner ([`is_own`]). Returns its agent message id.
+pub fn first_reply(
+    c: &Connection,
+    gen_id: i64,
+    thread_id: &str,
+    baseline: &Baseline,
+    owners: &HashSet<String>,
+) -> anyhow::Result<Option<String>> {
+    let rows: Vec<(i64, String, i64)> = c
+        .prepare_cached(
+            "SELECT id, gmail_id, received_at FROM messages WHERE gen = ?1 AND thread_id = ?2 AND received_at >= ?3 \
+             AND is_draft = 0 AND spam_trash = 0 ORDER BY received_at, id",
+        )?
+        .query_map(params![gen_id, thread_id, baseline.ms], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<Result<_, _>>()?;
+    let mut from = c.prepare_cached("SELECT addr FROM addrs WHERE msg = ?1 AND role = ?2")?;
+    for (row, id, received_at) in rows {
+        if !baseline.is_after(&id, received_at) {
+            continue;
+        }
+        let senders: Vec<String> = from.query_map(params![row, ROLE_FROM], |x| x.get(0))?.collect::<Result<_, _>>()?;
+        if !is_own(&senders, has_sent_label(c, gen_id, row)?, owners) {
+            return Ok(Some(id));
+        }
+    }
+    Ok(None)
 }
 
 /// Why a watch of `client_id` on `account_id` can no longer fire, or None while it can.
@@ -294,7 +364,7 @@ struct WatchRow {
     id: String,
     kind: Kind,
     thread_id: Option<String>,
-    baseline_ms: Option<i64>,
+    baseline: Baseline,
     filter: Option<Vec<u8>>,
     created_at: i64,
 }
@@ -307,6 +377,7 @@ struct NewMsg {
     thread_id: String,
     received_at: i64,
     senders: Vec<String>,
+    sent_label: bool,
     eligible: bool,
 }
 
@@ -328,7 +399,7 @@ async fn match_new(app: &Arc<App>, account_id: &str, gen_id: i64, ids: Vec<Strin
         .store
         .call(move |c| {
             let mut st = c.prepare_cached(
-                "SELECT id, kind, thread_id, baseline_ms, filter, created_at FROM watches \
+                "SELECT id, kind, thread_id, baseline_ms, baseline_ids, filter, created_at FROM watches \
                  WHERE account_id = ?1 AND state = 'active' AND expires_at > ?2",
             )?;
             let rows: Vec<WatchRow> = st
@@ -337,9 +408,9 @@ async fn match_new(app: &Arc<App>, account_id: &str, gen_id: i64, ids: Vec<Strin
                         id: r.get(0)?,
                         kind: Kind::parse(&r.get::<_, String>(1)?).unwrap_or(Kind::Query),
                         thread_id: r.get(2)?,
-                        baseline_ms: r.get(3)?,
-                        filter: r.get(4)?,
-                        created_at: r.get(5)?,
+                        baseline: Baseline::from_columns(r.get(3)?, r.get(4)?),
+                        filter: r.get(5)?,
+                        created_at: r.get(6)?,
                     })
                 })?
                 .collect::<Result<_, _>>()?;
@@ -408,7 +479,16 @@ async fn match_new(app: &Arc<App>, account_id: &str, gen_id: i64, ids: Vec<Strin
                     let Some((row, thread_id, received_at, draft, spam_trash)) = row else { continue };
                     let senders: Vec<String> =
                         from.query_map(params![row, ROLE_FROM], |r| r.get(0))?.collect::<Result<_, _>>()?;
-                    msgs.push(NewMsg { row, gmail_id: id.clone(), thread_id, received_at, senders, eligible: !draft && !spam_trash });
+                    let sent_label = has_sent_label(&tx, gen_id, row)?;
+                    msgs.push(NewMsg {
+                        row,
+                        gmail_id: id.clone(),
+                        thread_id,
+                        received_at,
+                        senders,
+                        sent_label,
+                        eligible: !draft && !spam_trash,
+                    });
                 }
             }
             let rows: Vec<i64> = msgs.iter().map(|m| m.row).collect();
@@ -435,16 +515,15 @@ async fn match_new(app: &Arc<App>, account_id: &str, gen_id: i64, ids: Vec<Strin
     for (i, (w, f, _)) in prepared.iter().enumerate() {
         let mut hits = Vec::new();
         for m in &msgs {
-            let from_owner = m.senders.iter().any(|s| owners_set.contains(s));
-            if !m.eligible || from_owner {
+            if !m.eligible || is_own(&m.senders, m.sent_label, &owners_set) {
                 continue;
             }
             let matched = match w.kind {
-                // Not older than the thread's newest message when the watch was created (an old message of the
-                // thread that is indexed again, for example after a move, does not count). `>=`: the message is new
-                // to the index, and IMAP dates have second precision, so a quick reply can share the instant.
+                // Not older than the baseline (an old message of the thread that is indexed again, for example after a
+                // move, does not count). `>=`: the message is new to the index, so it is not one of the baseline's own
+                // messages, and IMAP dates have second precision, so a quick reply can share the instant.
                 Kind::ThreadReply | Kind::NoReplyBy => {
-                    w.thread_id.as_deref() == Some(m.thread_id.as_str()) && m.received_at >= w.baseline_ms.unwrap_or(0)
+                    w.thread_id.as_deref() == Some(m.thread_id.as_str()) && m.received_at >= w.baseline.ms
                 }
                 _ if m.received_at < (w.created_at - RECEIVED_SLACK_SECS) * 1000 => false,
                 Kind::From => f.from.as_ref().is_some_and(|fm| fm.matches(&m.senders)),
@@ -553,48 +632,53 @@ pub async fn tick(app: &Arc<App>, now: i64) -> anyhow::Result<TickReport> {
     Ok(report)
 }
 
-/// Decides `no_reply_by` watches whose deadline passed: a message from others newer than the watch's baseline ends it
-/// quietly; otherwise it fires once the index has synced past the deadline (or [`NO_REPLY_GRACE_SECS`] after it).
+/// One due `no_reply_by` watch as [`no_reply_due`] reads it.
+struct DueRow {
+    id: String,
+    account_id: String,
+    thread_id: String,
+    message_id: Option<String>,
+    baseline: Baseline,
+    deadline: i64,
+}
+
+/// Decides `no_reply_by` watches whose deadline passed, from stored state only (a restart loses nothing): a message
+/// from others after the watch's baseline ([`first_reply`]) ends it quietly; otherwise it fires once the index has
+/// synced past the deadline (or [`NO_REPLY_GRACE_SECS`] after it).
 async fn no_reply_due(app: &Arc<App>, now: i64) -> anyhow::Result<usize> {
-    let due: Vec<(String, String, String, i64, i64)> = app
+    let due: Vec<DueRow> = app
         .store
         .call(move |c| {
             let mut st = c.prepare(
-                "SELECT id, account_id, thread_id, coalesce(baseline_ms, 0), deadline FROM watches \
+                "SELECT id, account_id, thread_id, message_id, baseline_ms, baseline_ids, deadline FROM watches \
                  WHERE state = 'active' AND kind = 'no_reply_by' AND deadline <= ?1",
             )?;
             Ok(st
-                .query_map([now], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
+                .query_map([now], |r| {
+                    Ok(DueRow {
+                        id: r.get(0)?,
+                        account_id: r.get(1)?,
+                        thread_id: r.get(2)?,
+                        message_id: r.get(3)?,
+                        baseline: Baseline::from_columns(r.get(4)?, r.get(5)?),
+                        deadline: r.get(6)?,
+                    })
+                })?
                 .collect::<Result<_, _>>()?)
         })
         .await?;
     let mut fired = 0;
-    for (wid, aid, thread_id, baseline_ms, deadline) in due {
-        let a = aid.clone();
-        let owners = app.store.call(move |c| owner_addresses(c, &a)).await?;
-        let (a, t) = (aid.clone(), thread_id.clone());
+    for w in due {
+        let a = w.account_id.clone();
+        let owners: HashSet<String> = app.store.call(move |c| owner_addresses(c, &a)).await?.into_iter().collect();
+        let (a, t, b) = (w.account_id.clone(), w.thread_id.clone(), w.baseline.clone());
         let state = app
             .index
             .read(Instant::now() + Duration::from_secs(10), move |c| {
                 let tx = c.unchecked_transaction()?;
                 let Some(s) = crate::index::sync::load_state(&tx, &a)? else { return Ok(None) };
                 let Some(g) = s.active_gen else { return Ok(None) };
-                let mut st = tx.prepare_cached(
-                    "SELECT m.id FROM messages m WHERE m.gen = ?1 AND m.thread_id = ?2 AND m.received_at > ?3 \
-                     AND m.is_draft = 0 AND m.spam_trash = 0",
-                )?;
-                let rows: Vec<i64> =
-                    st.query_map(params![g, t, baseline_ms], |r| r.get(0))?.collect::<Result<_, _>>()?;
-                let mut from = tx.prepare_cached("SELECT addr FROM addrs WHERE msg = ?1 AND role = ?2")?;
-                let mut replied = false;
-                for r in rows {
-                    let senders: Vec<String> =
-                        from.query_map(params![r, ROLE_FROM], |x| x.get(0))?.collect::<Result<_, _>>()?;
-                    if !senders.iter().any(|s| owners.contains(s)) {
-                        replied = true;
-                        break;
-                    }
-                }
+                let replied = first_reply(&tx, g, &t, &b, &owners)?.is_some();
                 Ok(Some((replied, s.last_success_at.unwrap_or(0))))
             })
             .await
@@ -603,17 +687,22 @@ async fn no_reply_due(app: &Arc<App>, now: i64) -> anyhow::Result<usize> {
             // Not indexed any more: the regular end check below ends the watch.
             None => continue,
             Some((true, _)) => "replied",
-            Some((false, synced)) if synced >= deadline || now >= deadline + NO_REPLY_GRACE_SECS => "fired",
+            Some((false, synced)) if synced >= w.deadline || now >= w.deadline + NO_REPLY_GRACE_SECS => "fired",
             Some(_) => continue,
         };
-        let tid = thread_id.clone();
+        let wid = w.id.clone();
+        // A watch on one message names it in the event, so the agent can read it and follow up.
+        let hit = Hit {
+            received_at: w.message_id.as_ref().map(|_| w.baseline.ms),
+            message_id: w.message_id.clone(),
+            thread_id: Some(w.thread_id.clone()),
+        };
         let push = app
             .store
             .call(move |c| {
                 let tx = c.transaction()?;
                 let mut push = false;
                 if decision == "fired" {
-                    let hit = Hit { message_id: None, thread_id: Some(tid), received_at: None };
                     let (n, p) = record_events(&tx, &wid, &[hit], now)?;
                     push = p;
                     if n > 0 {
@@ -733,6 +822,17 @@ mod tests {
         assert!(d.matches(&["ann@example.com".into()]));
         assert!(!d.matches(&["ann@sub.example.com".into()]));
         assert!(!d.matches(&["ann@example.com.evil.test".into()]));
+    }
+
+    #[test]
+    fn baselines_compare_inclusively_except_on_watches_from_before_a70() {
+        let b = Baseline::from_columns(Some(1_000), Some(r#"["m1"]"#.into()));
+        assert!(b.is_after("m2", 1_000), "same instant, another message");
+        assert!(!b.is_after("m1", 1_000), "the baseline's own message");
+        assert!(!b.is_after("m2", 999));
+        let legacy = Baseline::from_columns(Some(1_000), None);
+        assert!(!legacy.is_after("m2", 1_000), "rows without baseline ids keep the strict comparison");
+        assert!(legacy.is_after("m2", 1_001));
     }
 
     #[test]

@@ -28,8 +28,9 @@ pub fn defs() -> Vec<ToolDef> {
                 "Watch a mailbox for new mail and get events instead of polling search. kind: thread_reply (a new ",
                 "message in thread_id from someone other than the mailbox owner), from (new mail from an address or a ",
                 "domain), query (new mail matching a `where` filter, same schema as search_messages, checked against ",
-                "newly indexed messages only), no_reply_by (thread_id gets no message from others before `deadline`; ",
-                "fires once at the deadline). Needs the search index on the mailbox. Events carry ids only (no subject, ",
+                "newly indexed messages only), no_reply_by (no message from others in thread_id, or after message_id, ",
+                "before `deadline`: fires once at the deadline; a reply ends the watch quietly, end_reason replied; ",
+                "the mailbox owner's own follow-ups do not count). A just-sent message is found once it is indexed. Needs the search index on the mailbox. Events carry ids only (no subject, ",
                 "sender or body): read them with list_watch_events, then fetch the message with get_message. Optional ",
                 "`sink` names an operator webhook from list_watches for push delivery. Expires after 30 days by default ",
                 "(max 180); at most 50 active watches per connection."
@@ -45,6 +46,7 @@ pub fn defs() -> Vec<ToolDef> {
                         "account": account_schema(),
                         "kind": { "type": "string", "enum": Kind::ALL },
                         "thread_id": { "type": "string", "description": "thread_reply, no_reply_by: thread id from search_messages or get_message." },
+                        "message_id": { "type": "string", "description": "no_reply_by, instead of thread_id: the message that should get an answer." },
                         "from": { "type": "string", "description": "from: an address (ann@example.com) or a domain (example.com)." },
                         "where": { "type": "object", "description": "query: a search_messages `where` condition." },
                         "deadline": { "type": "string", "format": "date-time", "description": "no_reply_by: RFC 3339 instant." },
@@ -139,6 +141,7 @@ fn watch_schema() -> Value {
         "account": { "type": "string" },
         "kind": { "type": "string" },
         "thread_id": { "type": ["string", "null"] },
+        "message_id": { "type": ["string", "null"] },
         "from": { "type": ["string", "null"] },
         "where": { "type": ["object", "null"] },
         "deadline": { "type": ["string", "null"] },
@@ -176,7 +179,10 @@ fn readable(cx: &ToolCx) -> Vec<&Mailbox> {
 }
 
 async fn create_watch(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
-    only_keys(&args, &["account", "kind", "thread_id", "from", "where", "deadline", "expires_at", "sink"])?;
+    only_keys(
+        &args,
+        &["account", "kind", "thread_id", "message_id", "from", "where", "deadline", "expires_at", "sink"],
+    )?;
     let mb = super::account_arg(cx, &args, Capability::Read)?.clone();
     let kind_s = arg_str(&args, "kind")?;
     let kind = Kind::parse(kind_s)
@@ -185,9 +191,9 @@ async fn create_watch(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError>
         Kind::ThreadReply => &["thread_id"],
         Kind::From => &["from"],
         Kind::Query => &["where"],
-        Kind::NoReplyBy => &["thread_id", "deadline"],
+        Kind::NoReplyBy => &["thread_id", "message_id", "deadline"],
     };
-    for k in ["thread_id", "from", "where", "deadline"] {
+    for k in ["thread_id", "message_id", "from", "where", "deadline"] {
         if args.get(k).is_some_and(|v| !v.is_null()) && !allowed.contains(&k) {
             return Err(ToolError::invalid(format!("'{k}' does not apply to kind {}", kind.as_str())));
         }
@@ -200,15 +206,26 @@ async fn create_watch(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError>
     let now = util::now_unix();
     let mut filter = Filter::default();
     let mut audit_query = None;
-    let mut thread_id = None;
+    let mut target = None;
     let mut deadline = None;
     match kind {
         Kind::ThreadReply | Kind::NoReplyBy => {
-            let t = arg_str(&args, "thread_id")?;
-            if !crate::gmail::gateway::valid_id(t) {
-                return Err(ToolError::not_found());
-            }
-            thread_id = Some(t.to_string());
+            let id_arg = |k: &str| -> Result<Option<String>, ToolError> {
+                match opt_str(&args, k)? {
+                    Some(t) if crate::gmail::gateway::valid_id(t) => Ok(Some(t.to_string())),
+                    Some(_) => Err(ToolError::not_found()),
+                    None => Ok(None),
+                }
+            };
+            target = match (id_arg("thread_id")?, id_arg("message_id")?) {
+                (Some(t), None) => Some(Target::Thread(t)),
+                (None, Some(m)) => Some(Target::Message(m)),
+                (Some(_), Some(_)) => return Err(ToolError::invalid("give either 'thread_id' or 'message_id'")),
+                (None, None) if kind == Kind::NoReplyBy => {
+                    return Err(ToolError::invalid("'thread_id' or 'message_id' is required"));
+                }
+                (None, None) => return Err(ToolError::invalid("'thread_id' is required")),
+            };
         }
         Kind::From => {
             let raw = arg_str(&args, "from")?;
@@ -245,28 +262,38 @@ async fn create_watch(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError>
             }
         }
     };
-    // The thread must exist in the mailbox (unknown threads are not_found, like unknown messages). Its newest
-    // message is the baseline: only later messages count.
-    let mut baseline_ms = None;
-    if let Some(t) = thread_id.clone() {
+    // The thread or message must be in this mailbox's index (unknown ids, ids of other mailboxes and messages not
+    // indexed yet are the same not_found). The baseline is the thread's newest message or the named message: only
+    // later messages count, never one that is already there at that instant.
+    let mut resolved = None;
+    if let Some(target) = target.clone() {
         let aid = mb.account_id.clone();
-        baseline_ms = cx
-            .app
-            .index
-            .read(cx.deadline, move |c| {
-                let Some(g) = crate::index::sync::load_state(c, &aid)?.and_then(|s| s.serving_gen()) else {
-                    return Ok(None);
-                };
-                Ok(c.query_row(
-                    "SELECT max(received_at) FROM messages WHERE thread_id = ?1 AND gen = ?2",
-                    params![t, g],
-                    |r| r.get::<_, Option<i64>>(0),
-                )?)
-            })
-            .await?;
-        if baseline_ms.is_none() {
-            return Err(ToolError::not_found());
-        }
+        let owners: std::collections::HashSet<String> = match kind {
+            Kind::NoReplyBy => {
+                let a = aid.clone();
+                cx.app
+                    .store
+                    .call(move |c| watch::owner_addresses(c, &a))
+                    .await
+                    .map_err(crate::error::internal_from)?
+                    .into_iter()
+                    .collect()
+            }
+            _ => Default::default(),
+        };
+        let check_replies = kind == Kind::NoReplyBy;
+        resolved = Some(
+            cx.app
+                .index
+                .read(cx.deadline, move |c| {
+                    let Some(g) = crate::index::sync::load_state(c, &aid)?.and_then(|s| s.serving_gen()) else {
+                        return Ok(None);
+                    };
+                    resolve_target(c, g, &target, check_replies.then_some(&owners))
+                })
+                .await?
+                .ok_or_else(ToolError::not_found)??,
+        );
     }
     let watch_id = format!("w_{}", util::new_id());
     let sealed = match kind {
@@ -276,6 +303,15 @@ async fn create_watch(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError>
         _ => None,
     };
     let sink = opt_str(&args, "sink")?.map(str::to_string);
+    let (thread_id, message_id) = match &target {
+        Some(Target::Thread(t)) => (Some(t.clone()), None),
+        Some(Target::Message(m)) => (resolved.as_ref().map(|r| r.thread_id.clone()), Some(m.clone())),
+        None => (None, None),
+    };
+    let baseline_ms = resolved.as_ref().map(|r| r.baseline.ms);
+    let baseline_ids = resolved.as_ref().and_then(|r| r.baseline.ids.as_ref()).map(|ids| json!(ids).to_string());
+    // A message that already has an answer: the watch is recorded as ended (`replied`), so the caller sees the outcome.
+    let replied = resolved.as_ref().is_some_and(|r| r.replied);
     let (client_id, account_id, wid) = (cx.client.client_id.clone(), mb.account_id.clone(), watch_id.clone());
     let row = cx
         .app
@@ -310,15 +346,18 @@ async fn create_watch(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError>
                 ))));
             }
             tx.execute(
-                "INSERT INTO watches(id, client_id, account_id, kind, thread_id, baseline_ms, filter, deadline, sink_id, \
-                 created_at, expires_at, state) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'active')",
+                "INSERT INTO watches(id, client_id, account_id, kind, thread_id, message_id, baseline_ms, baseline_ids, \
+                 filter, deadline, sink_id, created_at, expires_at, state) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'active')",
                 params![
                     wid,
                     client_id,
                     account_id,
                     kind.as_str(),
                     thread_id,
+                    message_id,
                     baseline_ms,
+                    baseline_ids,
                     sealed,
                     deadline,
                     sink_id,
@@ -326,6 +365,9 @@ async fn create_watch(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError>
                     expires_at
                 ],
             )?;
+            if replied {
+                watch::end_watch(&tx, &wid, "replied", now)?;
+            }
             let row = load_rows(&tx, &client_id, Some(&wid))?.pop();
             tx.commit()?;
             Ok(Ok(row))
@@ -334,8 +376,13 @@ async fn create_watch(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError>
         .map_err(crate::error::internal_from)??
         .ok_or_else(ToolError::internal)?;
     let v = render(cx, &row);
+    let text = if replied {
+        format!("Watch {watch_id} created ({}) and ended at once: the message already has a reply.", kind.as_str())
+    } else {
+        format!("Watch {watch_id} created ({}).", kind.as_str())
+    };
     Ok(ToolOutput {
-        text: format!("Watch {watch_id} created ({}).", kind.as_str()),
+        text,
         structured: v,
         audit: AuditInfo {
             account: Some(mb.alias.clone()),
@@ -347,12 +394,75 @@ async fn create_watch(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError>
     })
 }
 
+/// What a thread watch names: a thread, or (`no_reply_by`) one message and the rest of its thread after it.
+#[derive(Clone)]
+enum Target {
+    Thread(String),
+    Message(String),
+}
+
+/// A target found in the index.
+struct Resolved {
+    thread_id: String,
+    baseline: watch::Baseline,
+    /// `no_reply_by` only: a message from others already answers after the baseline.
+    replied: bool,
+}
+
+/// Looks `target` up in generation `gen_id`. `Ok(None)` is `not_found`; a draft named by `message_id` is
+/// `invalid_argument` (it was never sent, so nobody can answer it). `owners` is given for `no_reply_by`, which also
+/// checks for an existing reply.
+fn resolve_target(
+    c: &rusqlite::Connection,
+    gen_id: i64,
+    target: &Target,
+    owners: Option<&std::collections::HashSet<String>>,
+) -> anyhow::Result<Option<Result<Resolved, ToolError>>> {
+    let (thread_id, baseline) = match target {
+        Target::Thread(t) => {
+            let Some(ms) = c.query_row(
+                "SELECT max(received_at) FROM messages WHERE thread_id = ?1 AND gen = ?2",
+                params![t, gen_id],
+                |r| r.get::<_, Option<i64>>(0),
+            )?
+            else {
+                return Ok(None);
+            };
+            let ids: Vec<String> = c
+                .prepare("SELECT gmail_id FROM messages WHERE thread_id = ?1 AND gen = ?2 AND received_at = ?3")?
+                .query_map(params![t, gen_id, ms], |r| r.get(0))?
+                .collect::<Result<_, _>>()?;
+            (t.clone(), watch::Baseline { ms, ids: Some(ids) })
+        }
+        Target::Message(m) => {
+            let row: Option<(String, i64, bool)> = c
+                .query_row(
+                    "SELECT thread_id, received_at, is_draft FROM messages WHERE gen = ?1 AND gmail_id = ?2",
+                    params![gen_id, m],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            let Some((t, ms, draft)) = row else { return Ok(None) };
+            if draft {
+                return Ok(Some(Err(ToolError::invalid("'message_id' names a draft; watch the sent message"))));
+            }
+            (t, watch::Baseline { ms, ids: Some(vec![m.clone()]) })
+        }
+    };
+    let replied = match owners {
+        Some(o) => watch::first_reply(c, gen_id, &thread_id, &baseline, o)?.is_some(),
+        None => false,
+    };
+    Ok(Some(Ok(Resolved { thread_id, baseline, replied })))
+}
+
 /// A stored watch as the tools render it.
 struct Row {
     id: String,
     account_id: String,
     kind: String,
     thread_id: Option<String>,
+    message_id: Option<String>,
     filter: Option<Vec<u8>>,
     deadline: Option<i64>,
     sink: Option<String>,
@@ -367,7 +477,7 @@ struct Row {
 fn load_rows(c: &rusqlite::Connection, client_id: &str, only: Option<&str>) -> anyhow::Result<Vec<Row>> {
     let mut st = c.prepare_cached(
         "SELECT w.id, w.account_id, w.kind, w.thread_id, w.filter, w.deadline, s.name, w.created_at, w.expires_at, \
-         w.state, w.end_reason, w.fired, w.last_fired_at FROM watches w LEFT JOIN sinks s ON s.id = w.sink_id \
+         w.state, w.end_reason, w.fired, w.last_fired_at, w.message_id FROM watches w LEFT JOIN sinks s ON s.id = w.sink_id \
          WHERE w.client_id = ?1 AND (?2 IS NULL OR w.id = ?2) ORDER BY w.created_at, w.id",
     )?;
     let rows = st.query_map(params![client_id, only], |r| {
@@ -385,6 +495,7 @@ fn load_rows(c: &rusqlite::Connection, client_id: &str, only: Option<&str>) -> a
             end_reason: r.get(10)?,
             fired: r.get(11)?,
             last_fired_at: r.get(12)?,
+            message_id: r.get(13)?,
         })
     })?;
     Ok(rows.collect::<Result<_, _>>()?)
@@ -398,6 +509,7 @@ fn render(cx: &ToolCx, w: &Row) -> Value {
         "account": alias,
         "kind": w.kind,
         "thread_id": w.thread_id,
+        "message_id": w.message_id,
         "from": f.from.map(|m| m.display()),
         "where": f.query,
         "deadline": w.deadline.map(util::rfc3339),

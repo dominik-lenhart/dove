@@ -16,6 +16,10 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 - `get_message` reads several messages in one call: pass `refs` from search_messages (or `account` +
   `message_ids`), up to 20. Each id gets its own result or error under batch_read's 64 KiB response budget; a single
   id answers as before.
+- `create_watch` with `kind: no_reply_by` takes a `message_id` instead of a `thread_id`: "tell me if nobody answers
+  this mail by Friday". The event names that message, so the agent can read it and follow up; a reply from someone
+  else ends the watch quietly, and a message that is already answered ends it at once (`end_reason: replied`). CLI:
+  `dove watch create --no-reply-to <message-id> --deadline <time>`.
 
 ### Changed
 
@@ -23,6 +27,13 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
   metadata fetch per folder (a one-folder thread of N messages needs N + 2 commands instead of 4N). On Gmail, a thread
   asked for by `message_id` needs one request less. Long threads stop fetching once the body budget is spent. IMAP
   reads and index sync no longer send a separate size probe per message.
+
+### Fixed
+
+- Watches no longer treat the owner's own mail from a Gmail send-as address as someone else's: mail with the `SENT`
+  label (or in the IMAP Sent folder) never fires a watch and never counts as a reply, like `from_self` in search.
+- A `no_reply_by` watch no longer fires when the reply arrived in the same second as the watched message (IMAP dates
+  have no milliseconds) and the sync hook had not seen it, for example because it was indexed during a rebuild.
 
 ## [0.8.1] - 2026-11-14
 

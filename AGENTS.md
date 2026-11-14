@@ -438,3 +438,9 @@ cargo fmt
   commands. `get_message` with `refs`/`message_ids` runs through `batch::run`; never add a second response budget.
   Read-path tests count commands in `h.imap.commands()` (`EXAMINE`, `BODY.PEEK[]`, `(UID RFC822.SIZE)`) and requests
   in `h.google.requests()`.
+- 2026-11-14: `no_reply_by` (PLAN A70) decides replies through `watch::first_reply` and `watch::Baseline`: `>=` the
+  baseline instant minus the stored `baseline_ids`, own mail by `watch::is_own` (owner addresses or the `SENT` label).
+  To test the deadline path on its own, let the sync hook end the watch, set the row back to `active`
+  (`reopen` in `tests/watch_no_reply_e2e.rs`) and `tick` past `deadline + NO_REPLY_GRACE_SECS`. IMAP same-second
+  cases put both messages at the same `add_message_at` second. Gmail mailboxes have no Dove aliases
+  (`AccountsAliasAdd` refuses them); fake a send-as follow-up with any address plus the `SENT` label.
