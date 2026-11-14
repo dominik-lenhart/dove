@@ -394,7 +394,9 @@ async fn accounts_remove(call: &mut AdminCall<'_>, alias: &str) -> anyhow::Resul
                  (SELECT 1 FROM json_each(invitations.grants) WHERE json_extract(value, '$.account_id') = ?1)",
                 [&id],
             )?;
-            // Cascades: grant + DEK, project membership, client grants, owned-draft records.
+            // Requests naming the mailbox are cancelled (and audited) first; the delete then removes their rows.
+            crate::requests::cancel_for_account(tx, &id, util::now_unix())?;
+            // Cascades: grant + DEK, project membership, client grants, owned-draft records, requests.
             tx.execute("DELETE FROM accounts WHERE id = ?1", [&id])?;
             Ok(invitations)
         })

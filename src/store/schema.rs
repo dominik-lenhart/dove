@@ -1,7 +1,17 @@
 //! Versioned schema migrations for the durable state store. Never edit a released migration; append a new one.
 
-pub const MIGRATIONS: &[&str] =
-    &[V1, V2, V3, V_SEND_IDENTITIES, V_WATCHES, V_GMAIL_IMAP, V_SINK_PROJECTS, V_REDACT_SECRETS, V_WATCH_TARGETS];
+pub const MIGRATIONS: &[&str] = &[
+    V1,
+    V2,
+    V3,
+    V_SEND_IDENTITIES,
+    V_WATCHES,
+    V_GMAIL_IMAP,
+    V_SINK_PROJECTS,
+    V_REDACT_SECRETS,
+    V_WATCH_TARGETS,
+    V_REQUESTS,
+];
 
 const V1: &str = r#"
 CREATE TABLE accounts (
@@ -354,4 +364,51 @@ ALTER TABLE invitations ADD COLUMN redact_secrets INTEGER NOT NULL DEFAULT 0;
 const V_WATCH_TARGETS: &str = r#"
 ALTER TABLE watches ADD COLUMN message_id TEXT;
 ALTER TABLE watches ADD COLUMN baseline_ids TEXT;
+"#;
+
+/// Agent requests, stage 1: scheduled sends of a client's own drafts that the operator approves (design 2026-11-14
+/// section 4, PLAN A71).
+///
+/// - `requests`: one request of one client. `note_sealed` is the agent's note sealed by the vault (kind
+///   `request_note`, scope = request id); it is shown to the operator only. `payload` holds ids and times only.
+/// - `request_items`: one draft of a send request. `requested_rev` is the revision the agent named, `approved_rev` the
+///   revision the operator was shown and approved; only that revision is ever sent. `thread_id`, `baseline_ms` and
+///   `baseline_ids` serve `unless_reply` (the `no_reply_by` reply rule, PLAN A70).
+const V_REQUESTS: &str = r#"
+CREATE TABLE requests (
+    id            TEXT PRIMARY KEY,
+    client_id     TEXT NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
+    project_id    TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    account_id    TEXT REFERENCES accounts(id) ON DELETE CASCADE,
+    kind          TEXT NOT NULL CHECK (kind IN ('send', 'access')),
+    status        TEXT NOT NULL CHECK (status IN ('pending','approved','denied','cancelled','expired','done')),
+    unless_reply  INTEGER NOT NULL DEFAULT 0,
+    note_sealed   BLOB,
+    payload       TEXT NOT NULL DEFAULT '{}',
+    created_at    INTEGER NOT NULL,
+    expires_at    INTEGER NOT NULL,
+    decided_at    INTEGER,
+    decided_by    TEXT
+);
+CREATE INDEX requests_client ON requests(client_id, status);
+CREATE TABLE request_items (
+    request_id        TEXT NOT NULL REFERENCES requests(id) ON DELETE CASCADE,
+    idx               INTEGER NOT NULL,
+    draft_id          TEXT NOT NULL,
+    requested_rev     TEXT NOT NULL,
+    approved_rev      TEXT,
+    send_at           INTEGER NOT NULL,
+    state             TEXT NOT NULL CHECK (state IN ('pending','scheduled','sending','sent','skipped','failed',
+                                                     'missed','send_unknown','cancelled','denied')),
+    reason            TEXT,
+    thread_id         TEXT,
+    baseline_ms       INTEGER,
+    baseline_ids      TEXT,
+    sent_message_id   TEXT,
+    attempts          INTEGER NOT NULL DEFAULT 0,
+    next_try_at       INTEGER,
+    updated_at        INTEGER NOT NULL,
+    PRIMARY KEY (request_id, idx)
+);
+CREATE INDEX request_items_due ON request_items(state, send_at);
 "#;

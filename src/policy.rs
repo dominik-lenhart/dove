@@ -390,6 +390,42 @@ pub fn authenticate(
     }))
 }
 
+/// Loads a live client (not revoked, not expired) by id, as [`authenticate`] does after a token lookup, for work Dove
+/// does on the client's behalf without a request (scheduled sends) and for the operator's view of its drafts. None
+/// when the client is unknown, revoked or expired.
+pub fn load_client(conn: &Connection, client_id: &str, allow_send: bool) -> anyhow::Result<Option<ClientCtx>> {
+    let now = util::now_unix();
+    let row = conn
+        .query_row(
+            "SELECT c.name, c.project_id, p.name, c.auth_epoch, c.redact_secrets FROM clients c \
+             JOIN projects p ON p.id = c.project_id \
+             WHERE c.id = ?1 AND c.revoked_at IS NULL AND (c.expires_at IS NULL OR c.expires_at > ?2)",
+            params![client_id, now],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, bool>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((client_name, project_id, project_name, auth_epoch, redact_secrets)) = row else { return Ok(None) };
+    Ok(Some(ClientCtx {
+        client_id: client_id.to_string(),
+        client_name,
+        project_id,
+        project_name,
+        auth_epoch,
+        source_ip: None,
+        mailboxes: load_mailboxes(conn, client_id)?,
+        allow_send,
+        redact_secrets,
+    }))
+}
+
 /// Re-reads whether the client is still valid and returns its current epoch (cursor resume / release checks).
 pub fn current_epoch(conn: &Connection, client_id: &str) -> anyhow::Result<Option<i64>> {
     let now = util::now_unix();

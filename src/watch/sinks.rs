@@ -261,14 +261,17 @@ fn blob_version(b: &[u8]) -> Option<u32> {
     b.get(..4).map(|v| u32::from_be_bytes(v.try_into().expect("4 bytes")))
 }
 
-/// Re-seals sink secrets, sink URLs and watch filters under the current KEK version (`dove keys rotate`). Returns how
+/// Re-seals sink secrets, sink URLs, watch filters and request notes under the current KEK version (`dove keys rotate`). Returns how
 /// many values changed.
 pub fn rewrap_sealed(tx: &Connection, vault: &Vault) -> anyhow::Result<usize> {
     let current = vault.current_kek_version();
     let mut n = 0;
-    for (table, col, kind) in
-        [("sinks", "secret", SECRET_KIND), ("sinks", "url_sealed", URL_KIND), ("watches", "filter", super::FILTER_KIND)]
-    {
+    for (table, col, kind) in [
+        ("sinks", "secret", SECRET_KIND),
+        ("sinks", "url_sealed", URL_KIND),
+        ("watches", "filter", super::FILTER_KIND),
+        ("requests", "note_sealed", crate::requests::NOTE_KIND),
+    ] {
         let rows: Vec<(String, Vec<u8>)> = {
             let mut st = tx.prepare(&format!("SELECT id, {col} FROM {table} WHERE {col} IS NOT NULL"))?;
             st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?
@@ -286,13 +289,14 @@ pub fn rewrap_sealed(tx: &Connection, vault: &Vault) -> anyhow::Result<usize> {
     Ok(n)
 }
 
-/// KEK versions still used by sink secrets, sink URLs and watch filters.
+/// KEK versions still used by sink secrets, sink URLs, watch filters and request notes.
 pub fn sealed_versions(conn: &Connection) -> anyhow::Result<Vec<u32>> {
     let mut out = Vec::new();
     for sql in [
         "SELECT secret FROM sinks",
         "SELECT url_sealed FROM sinks WHERE url_sealed IS NOT NULL",
         "SELECT filter FROM watches WHERE filter IS NOT NULL",
+        "SELECT note_sealed FROM requests WHERE note_sealed IS NOT NULL",
     ] {
         let mut st = conn.prepare(sql)?;
         for b in st.query_map([], |r| r.get::<_, Vec<u8>>(0))? {

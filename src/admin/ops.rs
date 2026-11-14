@@ -181,6 +181,11 @@ pub fn account_set_enabled(tx: &Transaction, alias: &str, enabled: bool) -> anyh
     }
     .to_string();
     tx.execute("UPDATE accounts SET status = ?1 WHERE id = ?2", params![new_status, aid])?;
+    if !enabled {
+        // Scheduled sends from a disabled mailbox are cancelled, not held until it comes back (design 4.1).
+        let requests = crate::requests::cancel_for_account(tx, &aid, util::now_unix())?;
+        return Ok(json!({ "account": alias, "status": new_status, "requests_cancelled": requests }));
+    }
     Ok(json!({ "account": alias, "status": new_status }))
 }
 
@@ -360,7 +365,9 @@ pub fn client_revoke(tx: &Transaction, name: &str) -> anyhow::Result<Value> {
         "UPDATE oauth_tokens SET revoked_at = COALESCE(revoked_at, ?1) WHERE connection_id = ?2",
         params![now, cid],
     )?;
-    Ok(json!({ "client": name, "revoked": true }))
+    // Its pending requests and not-yet-sent items go with it (design 2026-11-14 section 4.1).
+    let requests = crate::requests::cancel_for_client(tx, &cid, now)?;
+    Ok(json!({ "client": name, "revoked": true, "requests_cancelled": requests }))
 }
 
 #[allow(clippy::type_complexity)]
