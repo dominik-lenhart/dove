@@ -5,6 +5,12 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 
 ## [Unreleased]
 
+### Changed
+
+- Clearer descriptions for `list_accounts`, `list_labels`, `get_thread`, `get_draft`, `list_drafts`, `list_watches`,
+  `delete_watch`, `list_requests` and `cancel_request`: each says when to use it instead of a neighbouring tool, what
+  it returns when an id is unknown, and (for `get_thread`) how a result cut by the size budget is marked.
+
 ## [0.12.0] - 2026-11-14
 
 ### Added

@@ -63,8 +63,9 @@ pub fn defs() -> Vec<ToolDef> {
         ToolDef {
             name: "list_watches",
             title: "List watches",
-            description: "Watches of this connection (active and recently ended, with the reason) and the names of the \
-                          operator's webhook sinks a watch may use.",
+            description: "List this connection's watches (active and recently ended, with the reason they ended) and the names \
+                          of the operator's webhook sinks a watch may use. Use it to find a watch_id or a sink name for \
+                          create_watch; for what a watch has matched, use list_watch_events.",
             capability: Capability::Read,
             read_only: true,
             destructive: false,
@@ -81,7 +82,10 @@ pub fn defs() -> Vec<ToolDef> {
         ToolDef {
             name: "delete_watch",
             title: "Delete watch",
-            description: "Deletes a watch of this connection and its events.",
+            description: "Delete one watch of this connection for good, together with its stored events and any queued webhook \
+                          pushes; this cannot be undone. Use it to stop a watch early (watches also end on their own at \
+                          expires_at or when their condition is met). Unknown ids and other connections' watches return \
+                          not_found.",
             capability: Capability::Read,
             read_only: false,
             destructive: true,

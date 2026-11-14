@@ -106,7 +106,9 @@ pub fn defs() -> Vec<ToolDef> {
             name: "list_requests",
             title: "List my requests",
             description: concat!(
-                "Your requests with their status (pending, approved, denied, cancelled, expired, done) and, per item, ",
+                "List the send and access requests this connection made, newest first; status filters them. Use it ",
+                "to see whether the operator approved a request_send or request_access. Each request has its status ",
+                "(pending, approved, denied, cancelled, expired, done) and, per item, ",
                 "its state (pending, scheduled, sending, sent, skipped, failed, missed, send_unknown, cancelled, denied) ",
                 "and reason code. send_unknown means the send may have happened: never retry it, check Sent. Access ",
                 "requests list each asked grant (pending, granted, active, ended, not_approved) and when temporary ",
@@ -127,7 +129,12 @@ pub fn defs() -> Vec<ToolDef> {
         ToolDef {
             name: "cancel_request",
             title: "Cancel a request",
-            description: "Cancel a pending request, or the items of an approved request that were not sent yet. Cancelling an approved temporary access request gives its rights back at once.",
+            description: concat!(
+                "Cancel a pending request, or the items of an approved request that were not sent yet; sent items ",
+                "stay sent. Cancelling an approved temporary access request gives its rights back at once. Get ",
+                "request_id from list_requests. A request that is already finished is returned unchanged; unknown ids ",
+                "return not_found."
+            ),
             capability: Capability::Read,
             read_only: false,
             destructive: true,
