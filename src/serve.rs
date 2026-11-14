@@ -59,20 +59,26 @@ pub async fn run_with_log(config_path: &Path, log: Option<std::fs::File>) -> any
              lists and per-IP rate limits (docs/deployment.md, reverse proxy)"
         );
     }
+    // Recovery runs before anything can claim a send: a `sending` row left now is from the previous process.
+    let recovered = app.store.call(|c| crate::tools::drafts::recover_after_restart(c)).await?;
+    if recovered > 0 {
+        tracing::warn!(count = recovered, "sends interrupted by a restart are marked outcome-unknown");
+    }
+    let recovered = app.store.call(|c| crate::requests::worker::recover_after_restart(c)).await?;
+    if recovered > 0 {
+        tracing::warn!(count = recovered, "scheduled sends interrupted by a restart are marked send_unknown");
+    }
     let admin = crate::admin::server::bind(&app.cfg.admin.socket_path)?;
     tokio::spawn(crate::admin::server::serve(app.clone(), admin));
     crate::index::start(app.clone());
     crate::index::imap_idle::start(app.clone());
     crate::watch::start(app.clone());
+    crate::requests::worker::start(app.clone());
     tracing::info!(listen = %app.cfg.listen, "dove started");
     run_until_shutdown(app).await
 }
 
 async fn run_until_shutdown(app: Arc<App>) -> anyhow::Result<()> {
-    let recovered = app.store.call(|c| crate::tools::drafts::recover_after_restart(c)).await?;
-    if recovered > 0 {
-        tracing::warn!(count = recovered, "sends interrupted by a restart are marked outcome-unknown");
-    }
     let listener = tokio::net::TcpListener::bind(app.cfg.listen).await.context("cannot bind listen address")?;
     let requested = app.clone();
     let signal = async move {

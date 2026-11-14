@@ -36,6 +36,7 @@ cargo fmt
 - `src/index/`: SQLCipher FTS5 index, sync engine, query compiler
 - `src/client/`: remote client commands (login, search, mcp install, stdio bridge, `watch` incl. `watch listen`)
 - `src/update/`: `dove upgrade` (signed GitHub Releases) and the daily new-version notice; CLI only
+- `src/requests/`: agent requests (scheduled sends approved on the admin socket): store, admin verbs, send worker
 - `tests/`: integration tests against the fake Google server in `tests/support/`
 
 ## Security invariants (do not weaken)
@@ -452,4 +453,18 @@ cargo fmt
   (`search_accepts_arguments_that_have_one_reading`) and keep the not-found scope tests green. When mutation-checking from a
   script, set `PATH` with explicit absolute directories (`~` is not expanded inside a joined PATH string): a missing
   `cargo` makes every mutant look killed.
-
+- 2026-11-14: Requests (`src/requests/`, PLAN A71): the worker sends only through `drafts::send_core` with
+  `SendAuth::Approved` and an approved revision; never add a second send path. Tests drive it with
+  `dove::requests::worker::tick(h.app(), t)` (the harness starts no worker) and `Harness::restart` runs its
+  `recover_after_restart`. `unless_reply` needs an index synced within 10 minutes of the tick time, so those tests use
+  `send_at = now + 60`, not hours ahead. `IndexDisable` purges the index at once, which shadows the `index_enabled`
+  checks; test the flag alone with `UPDATE accounts SET index_enabled = 0`. The note is sealed with the request id as
+  vault scope and is the only free text in the tables; keep ids, times and codes everywhere else.
+- 2026-11-14: A sync that ends `ready` can still leave messages in the index's `pending` retry queue (a failed fetch;
+  thread unknown) while `last_success_at` advances, so "the index shows no reply" needs `pending` empty for the serving
+  generation (`requests::worker::reply_condition`). Make a fetch fail with `fail_next("GET", "/messages/<id>", ..)` or
+  IMAP `fail_next_containing("UID FETCH", "UID FETCH <uid> (UID BODY.PEEK[])", Fault::Bad)`, and make the retry due with
+  `UPDATE pending SET next_attempt_at = 0`. `create_draft` does not derive reply recipients and the fake Google sends a
+  draft without any, but SMTP refuses it: IMAP reply fixtures need an explicit `to`. A test of the request worker's claim
+  guard must keep the request `approved` (another item still open), or `close_if_finished` plus the claim's
+  request-status check hide the mutation.

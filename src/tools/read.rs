@@ -18,6 +18,9 @@ use crate::util;
 
 pub const DEFAULT_BODY_CHARS: u64 = 20_000;
 pub const MAX_BODY_CHARS: u64 = 100_000;
+/// Body text the operator's review reads (`ToolCx::for_operator_review`): the MIME parser's text limit, so a body
+/// is never cut (a draft body is at most 500 KB, a quoted reply slightly more).
+pub const OPERATOR_BODY_CHARS: usize = 2 * 1024 * 1024;
 /// Aggregate body characters across one get_thread response.
 pub const THREAD_BODY_BUDGET: usize = 150_000;
 pub const EXTRA_HEADERS: &[&str] =
@@ -929,7 +932,7 @@ async fn get_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
     }
     let did = gmail_id_arg(&args, "draft_id")?;
     let opts = ShapeOpts {
-        max_body_chars: opt_u64(&args, "max_body_chars", DEFAULT_BODY_CHARS, 1, MAX_BODY_CHARS)? as usize,
+        max_body_chars: cx.draft_body_chars(&args)?,
         include_headers: vec!["In-Reply-To".into(), "References".into()],
         select: None,
     };

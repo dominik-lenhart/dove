@@ -127,6 +127,7 @@ impl Harness {
         )
         .unwrap();
         app.store.call(|c| dove::tools::drafts::recover_after_restart(c).map(|_| ())).await.unwrap();
+        app.store.call(|c| dove::requests::worker::recover_after_restart(c).map(|_| ())).await.unwrap();
         self.env.app = app;
         let (base, server) = serve(self.env.app.clone()).await;
         self.base = base;

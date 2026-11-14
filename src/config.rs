@@ -48,6 +48,38 @@ pub struct Config {
     /// Defaults for new connections (PLAN A66).
     #[serde(default)]
     pub clients: ClientsConfig,
+    /// Agent requests: scheduled sends the operator approves (design 2026-11-14 section 4).
+    #[serde(default)]
+    pub requests: RequestsConfig,
+}
+
+/// `[requests]`: agents ask, the operator approves (`dove requests approve`), Dove sends the approved revision.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct RequestsConfig {
+    /// The request tools (`request_send`, `list_requests`, `cancel_request`) exist. Off: they are hidden and refused
+    /// like `send_draft` without `allow_send`, and approved items are not sent.
+    pub enabled: bool,
+    /// An approved item that could not be sent within this many minutes after its time ends as `missed` and is never
+    /// sent.
+    pub late_grace_minutes: i64,
+    /// A pending request expires after this many days without a decision.
+    pub pending_days: i64,
+    /// Closed requests (denied, cancelled, expired, done) are deleted this many days after they closed. Each client
+    /// also keeps at most `requests::MAX_CLOSED_PER_CLIENT` of them; older ones go first.
+    pub retention_days: i64,
+}
+
+impl Default for RequestsConfig {
+    fn default() -> Self {
+        Self { enabled: true, late_grace_minutes: 60, pending_days: 7, retention_days: 90 }
+    }
+}
+
+impl RequestsConfig {
+    pub fn grace_secs(&self) -> i64 {
+        self.late_grace_minutes * 60
+    }
 }
 
 /// Defaults for connections created from now on (`clients create`, `clients invite`, and through an invitation also
@@ -168,6 +200,12 @@ pub struct Limits {
     /// Largest total of attachments in one draft (decoded bytes, at most 16 MiB). Authenticated callers with `draft`
     /// get a request body limit large enough for this much inline base64 ([`Limits::draft_body_bytes`]).
     pub draft_attachment_bytes: usize,
+    /// Open (pending or approved) requests per client.
+    pub client_open_requests: u32,
+    /// Items (drafts) in one send request.
+    pub request_items: u32,
+    /// Server-wide cap on scheduled sends per UTC day; an approval that would exceed it on any day is refused.
+    pub scheduled_sends_per_day: u32,
 }
 
 /// Upper bound for `limits.draft_attachment_bytes`: a draft must stay below the 25 MiB MIME parse limit once
@@ -198,6 +236,9 @@ impl Default for Limits {
             tool_call_timeout_secs: 30,
             attachment_bytes: 10 * 1024 * 1024,
             draft_attachment_bytes: 10 * 1024 * 1024,
+            client_open_requests: 20,
+            request_items: 50,
+            scheduled_sends_per_day: 200,
         }
     }
 }
@@ -351,6 +392,15 @@ impl Config {
         if self.limits.client_organize_per_hour == 0 {
             bail!("limits.client_organize_per_hour must be at least 1 (remove organize from grants to turn it off)");
         }
+        if self.limits.client_open_requests == 0 || !(1..=500).contains(&self.limits.request_items) {
+            bail!("limits.client_open_requests must be at least 1 and limits.request_items between 1 and 500");
+        }
+        if !(1..=1440).contains(&self.requests.late_grace_minutes) || !(1..=30).contains(&self.requests.pending_days) {
+            bail!("requests.late_grace_minutes must be between 1 and 1440 and requests.pending_days between 1 and 30");
+        }
+        if !(1..=3650).contains(&self.requests.retention_days) {
+            bail!("requests.retention_days must be between 1 and 3650");
+        }
         if self.limits.draft_attachment_bytes > MAX_DRAFT_ATTACHMENT_BYTES {
             bail!("limits.draft_attachment_bytes must be at most {MAX_DRAFT_ATTACHMENT_BYTES}");
         }
@@ -482,6 +532,14 @@ retention_days = 180
 # passwords, keys and one-time codes in overview results unless created with --no-redact-secrets. Existing
 # connections keep their setting (dove clients set-redaction).
 redact_secrets_default = false
+
+[requests]
+# Agents may ask for a scheduled send of their own drafts (request_send); nothing is sent before the operator
+# approves it with `dove requests approve`. Defaults shown.
+# enabled = true
+# late_grace_minutes = 60
+# pending_days = 7
+# retention_days = 90
 
 [oauth]
 # Downstream OAuth for MCP hosts (ChatGPT, Claude). Defaults shown.

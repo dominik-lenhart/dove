@@ -152,6 +152,9 @@ pub enum Command {
     /// Webhook sinks for watch push delivery (admin).
     #[command(subcommand)]
     Sinks(SinksCmd),
+    /// Agent requests: review and approve scheduled sends (admin).
+    #[command(subcommand)]
+    Requests(RequestsCmd),
     /// Check configuration, permissions and reachability (admin). With --profile: check a remote profile instead.
     Doctor {
         /// Check this remote client profile (config, credential, network, grants). Never uses the admin socket.
@@ -757,6 +760,226 @@ pub enum SinksCmd {
     },
 }
 
+#[derive(Subcommand)]
+pub enum RequestsCmd {
+    /// Every connection's requests, newest first.
+    List {
+        /// Only requests with this status (pending, approved, denied, cancelled, expired, done).
+        #[arg(long)]
+        status: Option<String>,
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+    /// A request with the agent's note and each draft as it is now (sender, recipients, subject, text, attachments).
+    Show {
+        id: String,
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+    /// Show the drafts, ask, then approve exactly the revisions shown. If a draft changes in between, nothing is
+    /// approved.
+    Approve {
+        id: String,
+        /// Approve only these items (comma-separated indexes, e.g. 0,2); the others are denied. Default: all.
+        #[arg(long, value_delimiter = ',')]
+        items: Option<Vec<u32>>,
+        /// Items whose time has already passed: skip them (default) or send them now.
+        #[arg(long, value_enum, default_value = "skip")]
+        late: LateArg,
+        /// Do not ask for confirmation (the drafts are still printed).
+        #[arg(long)]
+        yes: bool,
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+    /// Deny a pending request.
+    Deny {
+        id: String,
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+    /// Stop unsent items of a request (all, or the chosen ones).
+    Cancel {
+        id: String,
+        /// Only these items (comma-separated indexes).
+        #[arg(long, value_delimiter = ',')]
+        items: Option<Vec<u32>>,
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LateArg {
+    Skip,
+    Send,
+}
+
+impl From<LateArg> for crate::admin::Late {
+    fn from(l: LateArg) -> Self {
+        match l {
+            LateArg::Skip => crate::admin::Late::Skip,
+            LateArg::Send => crate::admin::Late::Send,
+        }
+    }
+}
+
+/// Untrusted text (draft content, agent notes) made safe for a terminal: control characters other than newline and
+/// tab, and bidirectional overrides, are shown as `�`, so mail cannot move the cursor, recolour or reorder the
+/// screen the operator approves from.
+pub fn terminal_safe(s: &str) -> String {
+    s.chars()
+        .map(|c| if (c.is_control() && c != '\n' && c != '\t') || is_bidi_control(c) { '\u{FFFD}' } else { c })
+        .collect()
+}
+
+/// Bidirectional embeddings, overrides, isolates and marks.
+fn is_bidi_control(c: char) -> bool {
+    matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}' | '\u{061C}')
+}
+
+/// JSON output for a terminal: serde escapes C0 controls but writes DEL, C1 controls (U+0080 to U+009F) and bidi
+/// controls raw. Those can only sit inside JSON strings, so they become `\uXXXX` escapes: the value is unchanged.
+fn json_text(value: &Value) -> String {
+    let mut out = String::new();
+    for c in serde_json::to_string_pretty(value).unwrap_or_default().chars() {
+        if (c.is_control() && c != '\n') || is_bidi_control(c) {
+            out.push_str(&format!("\\u{:04X}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Renders `requests show` for the operator's terminal.
+fn render_request(v: &Value) -> String {
+    let t = |x: &Value| terminal_safe(x.as_str().unwrap_or("-"));
+    let list = |x: &Value| {
+        x.as_array()
+            .map(|a| a.iter().filter_map(Value::as_str).map(terminal_safe).collect::<Vec<_>>().join(", "))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "-".into())
+    };
+    let mut out = format!(
+        "Request {} ({}) from connection '{}' (project {}) on mailbox {}: {}\ncreated {}, expires {}{}\n",
+        t(&v["request_id"]),
+        t(&v["kind"]),
+        t(&v["client"]),
+        t(&v["project"]),
+        t(&v["account"]),
+        t(&v["status"]),
+        t(&v["created_at"]),
+        t(&v["expires_at"]),
+        if v["unless_reply"] == true { "; each item is skipped if someone replies in its thread first" } else { "" },
+    );
+    if let Some(n) = v["note"].as_str() {
+        out.push_str(&format!("Note from the agent (untrusted):\n  {}\n", terminal_safe(n).replace('\n', "\n  ")));
+    }
+    for it in v["items"].as_array().into_iter().flatten() {
+        out.push_str(&format!(
+            "\n[{}] {} at {}{}{}\n",
+            it["idx"],
+            t(&it["state"]),
+            t(&it["send_at"]),
+            if it["late"] == true { "  (time has passed: --late send|skip)" } else { "" },
+            it["reason"].as_str().map(|r| format!("  reason: {}", terminal_safe(r))).unwrap_or_default(),
+        ));
+        if let Some(e) = it["error"].as_str() {
+            out.push_str(&format!("    draft cannot be read: {}\n", terminal_safe(e)));
+            continue;
+        }
+        if it.get("revision").is_none() {
+            continue;
+        }
+        out.push_str(&format!("    draft {} revision {}", t(&it["draft_id"]), t(&it["revision"])));
+        if it["changed_since_request"] == true {
+            out.push_str("  (changed since the agent asked)");
+        }
+        if it["sendable"] != true {
+            out.push_str("  (changed outside Dove: cannot be sent)");
+        }
+        out.push('\n');
+        out.push_str(&format!("    From: {}\n    To: {}\n", t(&it["from"]), list(&it["to"])));
+        for k in ["cc", "bcc"] {
+            if it[k].as_array().is_some_and(|a| !a.is_empty()) {
+                out.push_str(&format!("    {}: {}\n", if k == "cc" { "Cc" } else { "Bcc" }, list(&it[k])));
+            }
+        }
+        out.push_str(&format!("    Subject: {}\n", t(&it["subject"])));
+        for a in it["attachments"].as_array().into_iter().flatten() {
+            out.push_str(&format!("    Attachment: {} ({} bytes)\n", t(&a["name"]), a["size"]));
+        }
+        out.push_str("    ----\n");
+        let body = terminal_safe(it["body_text"].as_str().unwrap_or(""));
+        for line in body.lines() {
+            out.push_str(&format!("    | {line}\n"));
+        }
+        if it["body_truncated"] == true {
+            out.push_str("    | [text truncated]\n");
+        }
+    }
+    out
+}
+
+/// `dove requests approve`: Show, print, confirm, then Approve with the revisions that were printed.
+async fn requests_approve(
+    id: String,
+    items: Option<Vec<u32>>,
+    late: LateArg,
+    yes: bool,
+    admin: &AdminOpts,
+) -> anyhow::Result<()> {
+    let shown_v = admin_send(admin, &AdminRequest::RequestsShow { id: id.clone() }).await?;
+    if admin.json {
+        print(&shown_v, true);
+    } else {
+        print!("{}", render_request(&shown_v));
+    }
+    let all: Vec<&Value> = shown_v["items"].as_array().map(|a| a.iter().collect()).unwrap_or_default();
+    let pending: Vec<&Value> = all.iter().copied().filter(|i| i["state"] == "pending").collect();
+    let chosen: Vec<&Value> = match &items {
+        Some(list) => {
+            pending.iter().copied().filter(|i| i["idx"].as_u64().is_some_and(|n| list.contains(&(n as u32)))).collect()
+        }
+        None => pending.clone(),
+    };
+    if chosen.is_empty() {
+        anyhow::bail!("no pending item to approve");
+    }
+    let mut shown = Vec::new();
+    for i in &chosen {
+        let idx = i["idx"].as_u64().unwrap_or(0) as u32;
+        let rev = i["revision"].as_str().filter(|_| i["sendable"] == true).ok_or_else(|| {
+            anyhow::anyhow!("item {idx} cannot be approved (see above); untick it with --items or deny the request")
+        })?;
+        shown.push(crate::admin::ShownItem { idx, revision: rev.to_string() });
+    }
+    let late_items = chosen.iter().filter(|i| i["late"] == true).count();
+    let sending = chosen.len() - if late == LateArg::Skip { late_items } else { 0 };
+    if !yes {
+        let mut prompt = format!("\nApprove {sending} mail(s)");
+        if late_items > 0 {
+            prompt.push_str(&format!(
+                " ({late_items} past their time: {})",
+                if late == LateArg::Skip { "skipped" } else { "sent now" }
+            ));
+        }
+        if chosen.len() < pending.len() {
+            prompt.push_str(&format!(", deny {} other(s)", pending.len() - chosen.len()));
+        }
+        eprint!("{prompt}? [y/N] ");
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim(), "y" | "Y" | "yes") {
+            anyhow::bail!("not approved");
+        }
+    }
+    let v = admin_send(admin, &AdminRequest::RequestsApprove { id, shown, items, late: late.into() }).await?;
+    print(&v, admin.json);
+    Ok(())
+}
+
 /// `--redact-secrets` / `--no-redact-secrets` (clap refuses both); neither leaves it to the server's default.
 fn redaction(on: bool, off: bool) -> Option<bool> {
     match (on, off) {
@@ -931,6 +1154,13 @@ fn admin_request(cmd: Command) -> anyhow::Result<(AdminOpts, AdminRequest)> {
             SinksCmd::List { admin } => (admin, R::SinksList),
             SinksCmd::Remove { name, admin } => (admin, R::SinksRemove { name }),
         },
+        Command::Requests(c) => match c {
+            RequestsCmd::List { status, admin } => (admin, R::RequestsList { status }),
+            RequestsCmd::Show { id, admin } => (admin, R::RequestsShow { id }),
+            RequestsCmd::Deny { id, admin } => (admin, R::RequestsDeny { id }),
+            RequestsCmd::Cancel { id, items, admin } => (admin, R::RequestsCancel { id, items }),
+            RequestsCmd::Approve { .. } => unreachable!("handled in run_command"),
+        },
         Command::Doctor { .. } | Command::Tailscale(_) => unreachable!("handled in run_command"),
         Command::Export { admin } => (admin, R::Export),
         Command::Serve { .. }
@@ -946,7 +1176,7 @@ fn admin_request(cmd: Command) -> anyhow::Result<(AdminOpts, AdminRequest)> {
 
 fn print(value: &Value, json: bool) {
     if json {
-        println!("{}", serde_json::to_string_pretty(value).unwrap_or_default());
+        println!("{}", json_text(value));
         return;
     }
     // Human output: YAML-like rendering of the JSON value, keeping secrets shown once where returned.
@@ -1063,6 +1293,14 @@ async fn run_command(command: Command) -> anyhow::Result<()> {
                 crate::tailscale::add_doctor_check(&mut v, &crate::tailscale::Tailscale::from_path()).await;
             }
             print(&v, admin.json);
+            Ok(())
+        }
+        Command::Requests(RequestsCmd::Approve { id, items, late, yes, admin }) => {
+            requests_approve(id, items, late, yes, &admin).await
+        }
+        Command::Requests(RequestsCmd::Show { id, admin }) if !admin.json => {
+            let v = admin_send(&admin, &AdminRequest::RequestsShow { id }).await?;
+            print!("{}", render_request(&v));
             Ok(())
         }
         Command::Accounts(AccountsCmd::Reconnect { alias, password_stdin, admin }) => {
@@ -1201,6 +1439,75 @@ mod tests {
             panic!()
         };
         assert_eq!((name.as_str(), project.as_str()), ("n8n", "beta"));
+    }
+
+    #[test]
+    fn requests_subcommands_parse() {
+        let Command::Requests(RequestsCmd::List { status, .. }) =
+            parse(&["requests", "list", "--status", "pending"]).unwrap().command
+        else {
+            panic!()
+        };
+        assert_eq!(status.as_deref(), Some("pending"));
+        let Command::Requests(RequestsCmd::Show { id, .. }) = parse(&["requests", "show", "r_1"]).unwrap().command
+        else {
+            panic!()
+        };
+        assert_eq!(id, "r_1");
+        let Command::Requests(RequestsCmd::Approve { id, items, late, yes, .. }) =
+            parse(&["requests", "approve", "r_1", "--items", "0,2", "--late", "send", "--yes"]).unwrap().command
+        else {
+            panic!()
+        };
+        assert_eq!((id.as_str(), items, late, yes), ("r_1", Some(vec![0, 2]), LateArg::Send, true));
+        // Defaults: every item, skip late ones, ask first.
+        let Command::Requests(RequestsCmd::Approve { items, late, yes, .. }) =
+            parse(&["requests", "approve", "r_1"]).unwrap().command
+        else {
+            panic!()
+        };
+        assert_eq!((items, late, yes), (None, LateArg::Skip, false));
+        assert!(parse(&["requests", "approve", "r_1", "--late", "later"]).is_err());
+        assert!(parse(&["requests", "approve"]).is_err(), "the id is required");
+        let Command::Requests(RequestsCmd::Deny { id, .. }) = parse(&["requests", "deny", "r_2"]).unwrap().command
+        else {
+            panic!()
+        };
+        assert_eq!(id, "r_2");
+        let Command::Requests(RequestsCmd::Cancel { id, items, .. }) =
+            parse(&["requests", "cancel", "r_3", "--items", "1"]).unwrap().command
+        else {
+            panic!()
+        };
+        assert_eq!((id.as_str(), items), ("r_3", Some(vec![1])));
+        let (_, req) = admin_request(parse(&["requests", "cancel", "r_3"]).unwrap().command).unwrap();
+        assert!(matches!(req, AdminRequest::RequestsCancel { items: None, .. }));
+    }
+
+    /// `--json` output keeps the value but never writes DEL, C1 or bidi controls raw.
+    #[test]
+    fn json_output_escapes_terminal_controls() {
+        let v = serde_json::json!({ "body_text": "a\u{7f}b\u{85}c\u{9b}31m\u{202E}d\u{2067}e\x1b[0m\n", "k\u{9d}": 1 });
+        let out = json_text(&v);
+        assert!(!out.chars().any(|c| (c.is_control() && c != '\n') || is_bidi_control(c)), "{out:?}");
+        assert!(out.contains("\\u009B") && out.contains("\\u202E"), "{out}");
+        assert_eq!(serde_json::from_str::<Value>(&out).unwrap(), v);
+    }
+
+    /// Draft text is untrusted: escape sequences and bidi overrides never reach the operator's terminal raw.
+    #[test]
+    fn untrusted_text_is_terminal_safe() {
+        let s = terminal_safe("ok\x1b[2J\x1b]0;x\x07line\n\ttab\u{202E}evil\u{2066}\r");
+        assert!(
+            !s.chars().any(|c| (c.is_control() && c != '\n' && c != '\t') || c == '\u{202E}' || c == '\u{2066}'),
+            "{s:?}"
+        );
+        assert!(s.starts_with("ok\u{FFFD}[2J") && s.contains("line\n\ttab"), "{s:?}");
+        let v = serde_json::json!({ "request_id": "r_1", "note": "a\x1b[31mred", "items": [
+            { "idx": 0, "state": "pending", "send_at": "t", "draft_id": "d", "revision": "r", "sendable": true,
+              "from": "x\x1b[0m", "to": ["y"], "subject": "s\x07", "body_text": "b\x1bc", "attachments": [] }
+        ]});
+        assert!(!render_request(&v).contains('\x1b') && !render_request(&v).contains('\x07'));
     }
 
     #[test]

@@ -26,6 +26,7 @@ pub mod drafts_imap;
 pub mod lenient;
 pub mod organize;
 pub mod read;
+pub mod requests;
 pub mod search;
 pub mod watches;
 
@@ -53,6 +54,10 @@ pub struct ToolCx {
     gate: Arc<CommitGate>,
     /// Text fields redacted during this call (batch items share it); only the count reaches the audit record.
     redactions: Arc<AtomicUsize>,
+    /// `get_draft` returns the whole body text ([`read::OPERATOR_BODY_CHARS`]) instead of at most
+    /// [`read::MAX_BODY_CHARS`]: set only for the operator's review of a send request (`dove requests show`), which
+    /// must never approve text it did not see.
+    full_draft_body: bool,
 }
 
 /// Time a write keeps after its upstream dispatch, to record the result, run the follow-up steps and answer
@@ -75,7 +80,30 @@ impl ToolCx {
         let budget = Duration::from_secs(app.cfg.limits.tool_call_timeout_secs);
         let deadline = started + budget;
         let write_deadline = deadline.checked_sub(write_reserve(budget)).unwrap_or(started);
-        Self { app, client, request_id, deadline, write_deadline, gate: Arc::default(), redactions: Arc::default() }
+        Self {
+            app,
+            client,
+            request_id,
+            deadline,
+            write_deadline,
+            gate: Arc::default(),
+            redactions: Arc::default(),
+            full_draft_body: false,
+        }
+    }
+
+    /// A context for the operator's review of drafts on the admin socket: `get_draft` returns the whole body.
+    pub fn for_operator_review(mut self) -> Self {
+        self.full_draft_body = true;
+        self
+    }
+
+    /// The `max_body_chars` a `get_draft` call uses: the caller's choice, or the whole body for the operator.
+    pub(crate) fn draft_body_chars(&self, args: &Value) -> Result<usize, ToolError> {
+        if self.full_draft_body {
+            return Ok(read::OPERATOR_BODY_CHARS);
+        }
+        Ok(opt_u64(args, "max_body_chars", read::DEFAULT_BODY_CHARS, 1, read::MAX_BODY_CHARS)? as usize)
     }
 
     /// Deadline for the upstream part of a write (SMTP submission, Gmail write): earlier than `deadline`, so a
@@ -255,18 +283,25 @@ pub fn registry() -> Vec<ToolDef> {
     v.extend(drafts::defs());
     v.extend(watches::defs());
     v.extend(organize::defs());
+    v.extend(requests::defs());
     v
+}
+
+/// Whether the tool `name` is switched off on this server: the request tools with `[requests] enabled = false`. They
+/// are then treated like `send_draft` without `allow_send`: not listed, and refused with the same error.
+pub fn switched_off(cfg: &crate::config::Config, name: &str) -> bool {
+    !cfg.requests.enabled && requests::NAMES.contains(&name)
 }
 
 pub fn exists(name: &str) -> bool {
     registry().iter().any(|t| t.name == name)
 }
 
-/// Tools usable by this client: at least one mailbox with the capability (spec 5.3).
-pub fn list(ctx: &ClientCtx, structured: bool) -> Vec<Value> {
+/// Tools usable by this client: at least one mailbox with the capability (spec 5.3), and not switched off.
+pub fn list(cfg: &crate::config::Config, ctx: &ClientCtx, structured: bool) -> Vec<Value> {
     registry()
         .into_iter()
-        .filter(|t| ctx.has_any(t.capability))
+        .filter(|t| ctx.has_any(t.capability) && !switched_off(cfg, t.name))
         .map(|t| {
             let mut d = json!({
                 "name": t.name,
@@ -307,7 +342,7 @@ pub async fn call(cx: &ToolCx, name: &str, args: Value) -> Result<ToolOutput, To
         return Err(ToolError::invalid(format!("unknown tool '{}'", name.chars().take(64).collect::<String>())));
     };
     // Discovery can be bypassed; capability is enforced again here and per mailbox in the handler (AC2).
-    if !cx.client.has_any(def.capability) {
+    if !cx.client.has_any(def.capability) || switched_off(&cx.app.cfg, def.name) {
         return Err(ToolError::forbidden("this connection may not use this tool"));
     }
     if !args.is_object() {

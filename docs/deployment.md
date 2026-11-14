@@ -189,9 +189,15 @@ The file holds no secrets. Unknown keys are rejected. Settings and defaults (fro
 | `audit.retention_days` | `180` | Audit retention. Prune with `dove audit prune`. |
 | `notifier.webhook_url` | unset | HTTPS webhook (for example ntfy) for "mailbox needs re-authorization". Messages carry no mail content. |
 | `index.*` | see below | Search index tuning. |
+| `requests.enabled` | `true` | Agents may ask for scheduled sends that the owner approves (see [Scheduled sends](#scheduled-sends-approved-by-the-owner)). `false` hides `request_send`, refuses it like `send_draft` without `allow_send`, and the worker sends nothing. |
+| `requests.late_grace_minutes` | `60` | An approved item that could not be sent within this time after its `send_at` ends as `missed` and is never sent (1 to 1440). |
+| `requests.pending_days` | `7` | A request nobody approved or denied expires after this many days (1 to 30). |
+| `requests.retention_days` | `90` | Closed requests (denied, cancelled, expired, done) are deleted, with their items and the agent's note, this many days after they closed (1 to 3650). Each connection also keeps at most 500 closed requests; older ones are deleted first. Audit records stay. |
 
 `limits` defaults: `body_bytes` 1 MiB, `client_requests_per_minute` 120, `client_burst` 40,
-`client_sends_per_hour` 20, `client_organize_per_hour` 500, `auth_failures_per_minute` 60 (failed bearer tokens on `/mcp` per client address, IPv6 by
+`client_sends_per_hour` 20, `client_organize_per_hour` 500, `client_open_requests` 20 (pending or approved requests
+per client), `request_items` 50 (drafts per request, at most 500), `scheduled_sends_per_day` 200 (server-wide: an
+approval that would schedule more sends for one UTC day is refused), `auth_failures_per_minute` 60 (failed bearer tokens on `/mcp` per client address, IPv6 by
 /64; then 429 until the bucket refills; successful requests do not count), `upstream_total_inflight` 16, `upstream_per_mailbox` 4, `upstream_search_mailboxes` 8,
 `upstream_request_timeout_secs` 10, `tool_call_timeout_secs` 30, `attachment_bytes` 10 MiB (largest attachment
 `get_attachment` returns), `draft_attachment_bytes` 10 MiB (all attachments of one draft, decoded; at most 16 MiB).
@@ -765,6 +771,47 @@ need nothing: moves use IMAP `MOVE` where the server offers it, otherwise `COPY`
 
 A `send` grant is refused unless `allow_send = true` is set in `config.toml`; that file is deployment-owner
 configuration, and neither MCP calls nor the CLI can change it. See the README before enabling it.
+
+## Scheduled sends approved by the owner
+
+An agent with `draft` on a mailbox can ask for its own drafts to be sent at fixed times with `request_send`. Nothing
+leaves before the owner approved each mail on the admin socket, and the approval binds the exact draft revision the
+owner was shown. `request_send` needs neither a `send` grant nor `allow_send`: the per-mail approval is the stronger
+gate, and `allow_send` keeps its meaning "agents may send on their own". Switch the feature off with
+`[requests] enabled = false`.
+
+```sh
+dove requests list                       # newest first; --status pending|approved|done|denied|cancelled|expired
+dove requests show <request-id>          # every draft as it is now: from, to, cc, bcc, subject, text, attachments
+dove requests approve <request-id>       # shows the drafts again, asks, then approves what it printed
+dove requests approve <request-id> --items 0,2 --late send --yes
+dove requests deny <request-id>
+dove requests cancel <request-id> [--items 1]
+```
+
+`show` prints the whole body as text (agents' own reads stop at 100,000 characters, the owner's review does not; an
+item whose text could not be shown in full cannot be approved); HTML is never rendered and control characters are
+replaced, because the text comes from the agent and from mail. The agent's note is shown here only: it is stored encrypted and never logged. `approve`
+sends the revisions it printed; if a draft changed in between, the approval is refused and you run it again. Items
+whose time has passed when you approve are skipped unless you pass `--late send` (they are then sent at once). An
+expired request, or one whose connection no longer has `draft` on the mailbox, cannot be approved. Items
+you leave out with `--items` end as `denied`.
+
+At its time an approved item is sent through the same path as `send_draft`, after these checks: the request is still
+approved, the client is not revoked and still has `draft` on the mailbox, the mailbox is active, and the draft has
+exactly the approved revision and is still Dove's own. A changed or deleted draft ends as `failed` (`draft_changed`,
+`not_found`) and nothing is sent. A reply-guarded item (`unless_reply`) is skipped when someone other than the owner
+answered in the thread since the request, also when that answer is already in Trash or Spam; it needs an index synced
+within the last 10 minutes with no message waiting for a retry (a message whose download failed could be the reply),
+otherwise Dove asks for a sync and waits, and skips the item (`condition_unknown`) when the grace runs out. The
+reply check matches by thread, so it misses a reply (and sends) in a thread the provider split, an IMAP reply that
+carries only `In-Reply-To` when the original was itself a reply, and a reply whose arrival date on the server is
+older than the request. An item that could not be sent within `late_grace_minutes` ends as `missed`; a send that
+started at the end of the grace can take up to the tool-call budget, so mail goes out at most
+`late_grace_minutes` plus `limits.tool_call_timeout_secs` after its time. A send whose outcome is unknown (lost reply, restart while sending)
+ends as `send_unknown` and is never retried: check the Sent folder. Revoking the client, disabling or removing the
+mailbox cancels its open items. The agent sees each item's state with `list_requests`; every decision and every
+item outcome writes one audit record without mail content (`request.*`, actor `scheduler` for the worker).
 
 ## Watches and sinks
 

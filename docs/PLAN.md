@@ -644,3 +644,45 @@ hosts or reference hardware.
   `invalid_at`, which includes the shared argument helpers (`opt_str`, `opt_u64`, `opt_bool`, `opt_str_list`,
   `only_keys`). With this the next audit review can group refusals by argument.
 
+- A71. Requests stage 1: scheduled send with CLI approval (design `docs/superpowers/specs/2026-11-14-requests-and-admin-ui-design.md`
+  4.1-4.4 and 4.7, plan `docs/superpowers/plans/2026-11-14-requests-stage1-scheduled-send.md`). Code in `src/requests/`
+  (store, `admin.rs` verbs, `worker.rs`) and `src/tools/requests.rs`; store migration `V_REQUESTS`. Decisions made while
+  building, all fail-closed: (a) the approval refuses a draft that is no longer Dove's own `active` draft with the shown
+  revision, both in its fresh read and again inside the transaction (`still_as_shown`). (b) Disabling a mailbox cancels
+  its open items (`account_disabled`), like revoking the client (`client_revoked`) and removing the mailbox
+  (`account_removed`, audited before the rows go); these cascades write one `request.cancel` record per request with
+  actor `scheduler`. (c) With `[requests] enabled = false` the worker sends nothing; approved items then end as
+  `missed` after the grace. (d) Recovery (`sending` → `send_unknown`, reason `restart`) runs before the admin socket
+  and the workers start, so no tick can claim before it. (e) A mailbox that needs re-authorization defers the item
+  inside the grace (not dispatched); a disabled one fails it. Only upstream refusals count as attempts (3, five
+  minutes apart). (f) The claim checks `send_at + grace` against the time of the claim; the write itself may still
+  dispatch up to the write deadline after a claim made at the end of the grace, so a send can start at most
+  `grace + tool_call_timeout_secs` after its time. The claim's `state = 'scheduled'` condition is load-bearing, not a
+  formality: a pass reads up to `BATCH` due items first and then sends them one after another, each taking up to the
+  tool-call budget, so a cancel made while an earlier item is in flight reaches a later item only through that
+  condition (`cancel_while_an_earlier_item_is_sending`, by the operator and by the agent). (g) The note's vault scope is the request id, so `NewSend` carries the id.
+  (h) `notify_sink` (design 4.6) ships with stage 3.
+  (i) `unless_reply` treats the index as stale while the serving generation has any row in `pending`: a message whose
+  fetch failed sits there with an unknown thread while `last_success_at` still advances (`sync::commit_results`, IMAP
+  `hydrate`), and it may be the reply. Checked in the same index read as the reply. The item waits and asks for a sync;
+  a retry that never succeeds ends it as `skipped: condition_unknown`, and while one is stuck no `unless_reply` item of
+  that mailbox can go out (the fail-closed side). Known limit, not changed: the `no_reply_by` watch (A70) has the same
+  gap and can fire while the reply waits for a retry. Its event only tells an agent to look, and the agent then reads
+  the thread live. (j) For `unless_reply` a reply in Trash or Spam counts (`watch::Replies::Any`); the watch keeps
+  ignoring both (`Replies::OutsideSpamTrash`). The index has one `spam_trash` flag, so spam in the thread skips the
+  send too. (k) Retention: the worker's tick deletes closed requests (denied, cancelled, expired, done) whose close
+  (decision, or the last item change for `done`) is older than `[requests] retention_days` (90), and each client's
+  oldest closed requests beyond `MAX_CLOSED_PER_CLIENT` (500), at most 1000 per tick (`requests::prune_closed`).
+  Items and the sealed note go with the request (`ON DELETE CASCADE`); audit records stay. No closing timestamp
+  column was added: the close time is derived from `decided_at` and the items' `updated_at`.
+  (l) The operator's review reads drafts with `ToolCx::for_operator_review`, where `get_draft` returns up to
+  `read::OPERATOR_BODY_CHARS` (the MIME parser's 2 MiB text limit) instead of the agent maximum of 100,000; a draft
+  body is at most 500 KB, so it is never cut. `approve` re-reads the same revision and refuses any chosen item whose
+  body is truncated (or reports no truncation flag), with no override (`admin::approvable`). (m) Inside the
+  approval transaction Dove also refuses a request past `expires_at` that the tick has not marked yet, and a
+  connection that no longer holds `draft` on the mailbox (revoked or expired connections included), instead of
+  approving items that could only end as `access_lost`. (n) `--json` output of every admin command escapes DEL, C1
+  controls and bidi controls as `\uXXXX` (`cli::json_text`; serde writes them raw), so it is as safe in a terminal
+  as the text mode. Thread matching of `unless_reply` fails open in three cases, listed in docs/deployment.md: a
+  thread the provider split, an IMAP reply with only `In-Reply-To` whose original was itself a reply, and a reply
+  whose server arrival date predates the request.

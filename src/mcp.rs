@@ -328,7 +328,7 @@ async fn dispatch(app: &Arc<App>, ctx: &ClientCtx, version: &str, msg: Value) ->
             )
         }
         "ping" => rpc_result(id, json!({})),
-        "tools/list" => rpc_result(id, json!({ "tools": tools::list(ctx, version >= STRUCTURED_SINCE) })),
+        "tools/list" => rpc_result(id, json!({ "tools": tools::list(&app.cfg, ctx, version >= STRUCTURED_SINCE) })),
         "tools/call" => {
             let name = params["name"].as_str().unwrap_or("").to_string();
             let args = params.get("arguments").cloned().unwrap_or(json!({}));

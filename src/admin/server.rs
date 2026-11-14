@@ -354,6 +354,13 @@ async fn execute(call: &mut AdminCall<'_>, req: AdminRequest) -> anyhow::Result<
         SinksSetProject { name, project } => crate::watch::sinks::set_project(call, name, project).await,
         SinksList => crate::watch::sinks::list(call).await,
         SinksRemove { name } => crate::watch::sinks::remove(call, name).await,
+        RequestsList { status } => call.read(move |c| crate::requests::admin::list(c, status.as_deref())).await,
+        RequestsShow { id } => crate::requests::admin::show(call, id).await,
+        RequestsApprove { id, shown, items, late } => {
+            crate::requests::admin::approve(call, id, shown, items, late).await
+        }
+        RequestsDeny { id } => crate::requests::admin::deny(call, id).await,
+        RequestsCancel { id, items } => crate::requests::admin::cancel(call, id, items).await,
         other => Err(anyhow!("'{}' is not available in this build yet", other.audit_fields().0)),
     }
 }
@@ -394,7 +401,9 @@ async fn accounts_remove(call: &mut AdminCall<'_>, alias: &str) -> anyhow::Resul
                  (SELECT 1 FROM json_each(invitations.grants) WHERE json_extract(value, '$.account_id') = ?1)",
                 [&id],
             )?;
-            // Cascades: grant + DEK, project membership, client grants, owned-draft records.
+            // Requests naming the mailbox are cancelled (and audited) first; the delete then removes their rows.
+            crate::requests::cancel_for_account(tx, &id, util::now_unix())?;
+            // Cascades: grant + DEK, project membership, client grants, owned-draft records, requests.
             tx.execute("DELETE FROM accounts WHERE id = ?1", [&id])?;
             Ok(invitations)
         })

@@ -131,10 +131,14 @@ a spurious failure is accepted and visible in the request.
   is not sent **(call)**. The grace is `[requests] late_grace_minutes`.
 - `unless_reply`: the item is skipped (`skipped: replied`) when the draft's thread holds a message from someone else
   that arrived after the request was created. This reuses the reply rule of the `no_reply_by` watch (PR #14:
-  own addresses, aliases and `SENT` do not count, spam and drafts do not count, `>=` with baseline ids). It needs the
+  own addresses, aliases and `SENT` do not count, drafts do not count, `>=` with baseline ids), with one difference:
+  a reply in Trash or Spam counts. The owner may have read and binned the answer; the index has one flag for both,
+  so a spam message in the thread also skips the send (the fail-closed side). It needs the
   mailbox indexed; `request_send` refuses `unless_reply` otherwise. If the index was not synced within the last
-  10 minutes at send time, the worker asks for a sync and waits for the next pass within the grace; if freshness
-  cannot be established the item ends as `skipped: condition_unknown`. Fail closed: never send on a stale check.
+  10 minutes at send time, or the mailbox's index has a message waiting in its retry queue (a fetch that failed;
+  it could be the reply, and its thread is unknown until it is fetched), the worker asks for a sync and waits for
+  the next pass within the grace; if freshness cannot be established the item ends as `skipped: condition_unknown`.
+  Fail closed: never send on a stale check.
   A draft that is not a reply (no thread yet) with `unless_reply` is `invalid_argument` at request time.
   The baseline is request creation, not approval: a reply between request and approval also skips the item. If
   indexing is switched off after approval the item ends as `skipped: condition_unknown`. If the index offers no way
@@ -244,7 +248,7 @@ verbs. `/admin` has its own rate limit and login-attempt limit per address.
 
 Each stage is a release of its own and useful alone.
 
-1. **Requests and scheduled send, CLI approval** (4.1–4.4, 4.6, 4.7). Solves the trigger case with
+1. **Requests and scheduled send, CLI approval** (4.1–4.4, 4.7; 4.6 ships with stage 3). Solves the trigger case with
    `dove requests approve`.
 2. **Access requests and temporary grants** (4.5).
 3. **Admin UI**: passkeys and sessions first (reviewed alone), then pages, Requests page first (5).
