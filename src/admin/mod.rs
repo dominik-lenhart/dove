@@ -220,6 +220,51 @@ pub enum AdminRequest {
         account: String,
         request_key: String,
     },
+
+    /// Agent requests (design 2026-11-14 section 4.7): every client's requests, optionally with one status.
+    RequestsList {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+    },
+    /// One request with its note and each draft as it is now (operator only).
+    RequestsShow {
+        id: String,
+    },
+    /// Approves the chosen pending items (`None`: all) at the revisions the operator was shown.
+    RequestsApprove {
+        id: String,
+        shown: Vec<ShownItem>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        items: Option<Vec<u32>>,
+        #[serde(default)]
+        late: Late,
+    },
+    RequestsDeny {
+        id: String,
+    },
+    /// Stops unsent items (all, or the chosen ones).
+    RequestsCancel {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        items: Option<Vec<u32>>,
+    },
+}
+
+/// The revision of one item's draft as `requests show` printed it; approval is refused when it changed since.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShownItem {
+    pub idx: u32,
+    pub revision: String,
+}
+
+/// What to do with approved items whose time has already passed: skip them (default) or send them now.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Late {
+    #[default]
+    Skip,
+    Send,
 }
 
 impl AdminRequest {
@@ -290,6 +335,12 @@ impl AdminRequest {
             OperationsRemove { client, account, request_key } => {
                 ("operations.remove", None, Some(account.clone()), vec![client.clone(), request_key.clone()])
             }
+            // Request ids only: the note and the drafts' content never reach the audit log.
+            RequestsList { .. } => ("requests.list", None, None, vec![]),
+            RequestsShow { id } => ("requests.show", None, None, vec![id.clone()]),
+            RequestsApprove { id, .. } => ("requests.approve", None, None, vec![id.clone()]),
+            RequestsDeny { id } => ("requests.deny", None, None, vec![id.clone()]),
+            RequestsCancel { id, .. } => ("requests.cancel", None, None, vec![id.clone()]),
         }
     }
 }

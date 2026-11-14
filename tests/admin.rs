@@ -192,6 +192,11 @@ async fn every_admin_action_writes_exactly_one_audit_record() {
         AdminRequest::ProjectsList,
         AdminRequest::ClientsList,
         AdminRequest::AuditVerify,
+        AdminRequest::RequestsList { status: None },
+        AdminRequest::RequestsShow { id: "r_unknown".into() }, // fails: unknown
+        AdminRequest::RequestsApprove { id: "r_unknown".into(), shown: vec![], items: None, late: Default::default() },
+        AdminRequest::RequestsDeny { id: "r_unknown".into() },
+        AdminRequest::RequestsCancel { id: "r_unknown".into(), items: None },
     ];
     for (i, r) in reqs.into_iter().enumerate() {
         let before = audit_count(&env).await;

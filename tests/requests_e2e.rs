@@ -326,3 +326,245 @@ async fn revoked_client_and_disabled_mailbox_cancel_requests() {
         vec![("cancelled".into(), "account_disabled".into()), ("cancelled".into(), "client_revoked".into())]
     );
 }
+
+// ------------------------------------------------------------------ approval (admin verbs)
+
+/// Creates `n` drafts and one request for them at `times`; returns (request id, draft ids).
+async fn requested(h: &Harness, token: &str, times: &[i64]) -> (String, Vec<String>) {
+    let mut items = Vec::new();
+    for _ in times {
+        items.push(draft(h, token, "info").await);
+    }
+    let list: Vec<(&str, &str, i64)> =
+        items.iter().zip(times).map(|((d, r), t)| (d.as_str(), r.as_str(), *t)).collect();
+    let v = h.ok(token, "request_send", send_args(&list)).await;
+    (v["request_id"].as_str().unwrap().to_string(), items.into_iter().map(|(d, _)| d).collect())
+}
+
+async fn show(h: &Harness, id: &str) -> Value {
+    h.admin(AdminRequest::RequestsShow { id: id.into() }).await.unwrap()
+}
+
+/// The revisions `show` printed, for every item.
+fn shown_of(v: &Value) -> Vec<dove::admin::ShownItem> {
+    v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["revision"].is_string())
+        .map(|i| dove::admin::ShownItem {
+            idx: i["idx"].as_u64().unwrap() as u32,
+            revision: i["revision"].as_str().unwrap().into(),
+        })
+        .collect()
+}
+
+async fn approve(
+    h: &Harness,
+    id: &str,
+    shown: Vec<dove::admin::ShownItem>,
+    items: Option<Vec<u32>>,
+    late: dove::admin::Late,
+) -> Result<Value, String> {
+    h.admin(AdminRequest::RequestsApprove { id: id.into(), shown, items, late }).await
+}
+
+/// (request status, item states with reasons) as stored.
+async fn states(h: &Harness, id: &str) -> (String, Vec<(String, Option<String>)>) {
+    let id = id.to_string();
+    h.app()
+        .store
+        .call(move |c| {
+            let status: String = c.query_row("SELECT status FROM requests WHERE id = ?1", [&id], |r| r.get(0))?;
+            let mut st = c.prepare("SELECT state, reason FROM request_items WHERE request_id = ?1 ORDER BY idx")?;
+            let items = st.query_map([&id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+            Ok((status, items))
+        })
+        .await
+        .unwrap()
+}
+
+fn st(s: &str, reason: Option<&str>) -> (String, Option<String>) {
+    (s.to_string(), reason.map(str::to_string))
+}
+
+/// Moves item `idx` of request `id` to `send_at` (as if the request had been made earlier).
+async fn set_send_at(h: &Harness, id: &str, idx: u32, send_at: i64) {
+    let id = id.to_string();
+    h.app()
+        .store
+        .call(move |c| {
+            let n = c.execute(
+                "UPDATE request_items SET send_at = ?1 WHERE request_id = ?2 AND idx = ?3",
+                rusqlite::params![send_at, id, idx],
+            )?;
+            assert_eq!(n, 1);
+            Ok(())
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn show_reads_the_drafts_fresh_and_content_stays_out_of_audit() {
+    let (h, token) = setup().await;
+    let (d, rev) = draft(&h, &token, "info").await;
+    let mut args = send_args(&[(&d, &rev, util::now_unix() + 3600)]);
+    args["note"] = json!("NOTE-CANARY-9a2c check the price");
+    let id = h.ok(&token, "request_send", args).await["request_id"].as_str().unwrap().to_string();
+    let v = show(&h, &id).await;
+    assert_eq!(v["note"], "NOTE-CANARY-9a2c check the price");
+    assert_eq!(v["client"], "agent");
+    let it = &v["items"][0];
+    assert_eq!((it["revision"].as_str(), it["sendable"].as_bool()), (Some(rev.as_str()), Some(true)));
+    assert_eq!(it["changed_since_request"], false);
+    assert_eq!(it["subject"], "Offer");
+    assert!(it["body_text"].as_str().unwrap().contains("Dear customer"));
+    assert_eq!(it["to"], json!(["c@example.org"]));
+    let audit = audit_text(&h).await;
+    for needle in ["Offer", "Dear customer", "c@example.org", "NOTE-CANARY"] {
+        assert!(!audit.contains(needle), "{needle} reached the audit log");
+    }
+    assert!(audit.contains("requests.show") && audit.contains(&id));
+    // A draft changed by a person shows as changed and not sendable.
+    let raw = String::from_utf8(h.google.draft_raw(MB, &d).unwrap()).unwrap();
+    h.google.replace_draft_externally(MB, &d, raw.replace("Dear customer", "Dear friend").as_bytes());
+    let v = show(&h, &id).await;
+    assert_eq!(
+        (v["items"][0]["changed_since_request"].as_bool(), v["items"][0]["sendable"].as_bool()),
+        (Some(true), Some(false))
+    );
+    let e = approve(&h, &id, shown_of(&v), None, dove::admin::Late::Skip).await.unwrap_err();
+    assert!(e.contains("changed outside Dove"), "{e}");
+    assert_eq!(states(&h, &id).await.0, "pending");
+}
+
+#[tokio::test]
+async fn approve_binds_what_was_shown() {
+    let (h, token) = setup().await;
+    let t = util::now_unix() + 3600;
+    let (id, drafts) = requested(&h, &token, &[t, t + 60]).await;
+    let v = show(&h, &id).await;
+    let shown = shown_of(&v);
+    // The agent edits a draft after the operator looked at it.
+    h.ok(
+        &token,
+        "update_draft",
+        json!({"account":"info","draft_id":drafts[1],"expected_revision":shown[1].revision,"changes":{"body_text":"other"}}),
+    )
+    .await;
+    let e = approve(&h, &id, shown.clone(), None, dove::admin::Late::Skip).await.unwrap_err();
+    assert!(e.contains("changed since it was shown"), "{e}");
+    assert_eq!(states(&h, &id).await, ("pending".into(), vec![st("pending", None), st("pending", None)]));
+    // An item that was not shown cannot be approved either.
+    let e = approve(&h, &id, shown[..1].to_vec(), None, dove::admin::Late::Skip).await.unwrap_err();
+    assert!(e.contains("not shown"), "{e}");
+    // Shown again, the new revision is approved and bound.
+    let v = show(&h, &id).await;
+    assert_eq!(v["items"][1]["changed_since_request"], true);
+    let r = approve(&h, &id, shown_of(&v), None, dove::admin::Late::Skip).await.unwrap();
+    assert_eq!(r["status"], "approved");
+    assert_eq!(states(&h, &id).await, ("approved".into(), vec![st("scheduled", None), st("scheduled", None)]));
+    let bound: Vec<Option<String>> = {
+        let id = id.clone();
+        h.app()
+            .store
+            .call(move |c| {
+                let mut s = c.prepare("SELECT approved_rev FROM request_items WHERE request_id = ?1 ORDER BY idx")?;
+                Ok(s.query_map([id], |r| r.get(0))?.collect::<Result<_, _>>()?)
+            })
+            .await
+            .unwrap()
+    };
+    assert_eq!(bound, shown_of(&v).into_iter().map(|s| Some(s.revision)).collect::<Vec<_>>());
+    // A person edits a draft after the operator looked at it: only the fresh read at approval sees it.
+    let (id2, drafts2) = requested(&h, &token, &[t]).await;
+    let v2 = show(&h, &id2).await;
+    let raw = String::from_utf8(h.google.draft_raw(MB, &drafts2[0]).unwrap()).unwrap();
+    h.google.replace_draft_externally(MB, &drafts2[0], raw.replace("Dear customer", "Dear friend").as_bytes());
+    let e = approve(&h, &id2, shown_of(&v2), None, dove::admin::Late::Skip).await.unwrap_err();
+    assert!(e.contains("changed since it was shown"), "{e}");
+    assert_eq!(states(&h, &id2).await.0, "pending");
+    // Decided requests cannot be approved or denied again.
+    assert!(approve(&h, &id, shown_of(&v), None, dove::admin::Late::Skip).await.is_err());
+    assert!(h.admin(AdminRequest::RequestsDeny { id: id.clone() }).await.is_err());
+    // The agent sees the decision.
+    let listed = h.ok(&token, "list_requests", json!({"status":"approved"})).await;
+    assert_eq!(listed["requests"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["requests"][0]["request_id"], id.as_str());
+    assert_eq!(listed["requests"][0]["items"][0]["state"], "scheduled");
+}
+
+#[tokio::test]
+async fn approve_selected_items_and_late_choice() {
+    let (h, token) = setup().await;
+    let now = util::now_unix();
+    let (id, _) = requested(&h, &token, &[now + 3600, now + 3600, now + 7200]).await;
+    set_send_at(&h, &id, 1, now - 60).await;
+    let v = show(&h, &id).await;
+    assert_eq!(v["items"][1]["late"], true);
+    approve(&h, &id, shown_of(&v), Some(vec![0, 1]), dove::admin::Late::Skip).await.unwrap();
+    assert_eq!(
+        states(&h, &id).await,
+        (
+            "approved".into(),
+            vec![st("scheduled", None), st("skipped", Some("late")), st("denied", Some("not_approved"))]
+        )
+    );
+    // Late::Send schedules a passed item for now.
+    let (id2, _) = requested(&h, &token, &[now + 3600]).await;
+    set_send_at(&h, &id2, 0, now - 600).await;
+    let v = show(&h, &id2).await;
+    approve(&h, &id2, shown_of(&v), None, dove::admin::Late::Send).await.unwrap();
+    assert_eq!(states(&h, &id2).await.1, vec![st("scheduled", None)]);
+    let id3 = id2.clone();
+    let send_at: i64 = h
+        .app()
+        .store
+        .call(move |c| Ok(c.query_row("SELECT send_at FROM request_items WHERE request_id = ?1", [id3], |r| r.get(0))?))
+        .await
+        .unwrap();
+    assert!(send_at >= now, "scheduled for now, not for the passed time");
+    // Only skipped items: the request is done at once.
+    let (id4, _) = requested(&h, &token, &[now + 3600]).await;
+    set_send_at(&h, &id4, 0, now - 600).await;
+    let v = show(&h, &id4).await;
+    approve(&h, &id4, shown_of(&v), None, dove::admin::Late::Skip).await.unwrap();
+    assert_eq!(states(&h, &id4).await, ("done".into(), vec![st("skipped", Some("late"))]));
+    // Deny and cancel by the operator.
+    let (id5, _) = requested(&h, &token, &[now + 3600, now + 3600]).await;
+    h.admin(AdminRequest::RequestsDeny { id: id5.clone() }).await.unwrap();
+    assert_eq!(
+        states(&h, &id5).await,
+        ("denied".into(), vec![st("denied", Some("denied")), st("denied", Some("denied"))])
+    );
+    let (id6, _) = requested(&h, &token, &[now + 3600, now + 3600]).await;
+    let v = show(&h, &id6).await;
+    approve(&h, &id6, shown_of(&v), None, dove::admin::Late::Skip).await.unwrap();
+    h.admin(AdminRequest::RequestsCancel { id: id6.clone(), items: Some(vec![1]) }).await.unwrap();
+    assert_eq!(states(&h, &id6).await.1, vec![st("scheduled", None), st("cancelled", Some("cancelled_by_operator"))]);
+    h.admin(AdminRequest::RequestsCancel { id: id6.clone(), items: None }).await.unwrap();
+    assert_eq!(states(&h, &id6).await.0, "done");
+    let list = h.admin(AdminRequest::RequestsList { status: Some("done".into()) }).await.unwrap();
+    assert_eq!(list.as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn daily_cap_refuses_the_approval() {
+    let (h, token) = setup_with(|c| c.limits.scheduled_sends_per_day = 2).await;
+    // Noon tomorrow (UTC), so all items share one UTC day.
+    let day = (util::now_unix() / DAY + 1) * DAY + 12 * 3600;
+    let (id, _) = requested(&h, &token, &[day, day + 60, day + 120]).await;
+    let v = show(&h, &id).await;
+    let e = approve(&h, &id, shown_of(&v), None, dove::admin::Late::Skip).await.unwrap_err();
+    assert!(e.contains("scheduled_sends_per_day"), "{e}");
+    assert_eq!(states(&h, &id).await.0, "pending");
+    approve(&h, &id, shown_of(&v), Some(vec![0, 1]), dove::admin::Late::Skip).await.unwrap();
+    // The day is full; another day is not.
+    let (id2, _) = requested(&h, &token, &[day + 600]).await;
+    let v = show(&h, &id2).await;
+    assert!(approve(&h, &id2, shown_of(&v), None, dove::admin::Late::Skip).await.is_err());
+    let (id3, _) = requested(&h, &token, &[day + DAY]).await;
+    let v = show(&h, &id3).await;
+    approve(&h, &id3, shown_of(&v), None, dove::admin::Late::Skip).await.unwrap();
+}

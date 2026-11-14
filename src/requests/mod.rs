@@ -13,6 +13,7 @@
 //! Nothing here carries mail content. The agent's note is sealed with the vault ([`NOTE_KIND`]) and shown to the
 //! operator only; audit records carry ids and result codes.
 
+pub mod admin;
 pub mod worker;
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};

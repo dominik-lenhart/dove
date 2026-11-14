@@ -88,7 +88,11 @@ async fn canaries_never_reach_logs_audit_or_plaintext_state() {
                    "expected_revision":u["revision"],"send_at":send_at}]}),
         )
         .await;
-    let _request_id = req["request_id"].as_str().unwrap().to_string();
+    let request_id = req["request_id"].as_str().unwrap().to_string();
+    // The operator's view carries the note and the draft's text, over the admin socket only.
+    let shown = h.admin(AdminRequest::RequestsShow { id: request_id.clone() }).await.unwrap();
+    assert_eq!(shown["note"], "CANARY-NOTE-77ab");
+    assert!(shown["items"][0]["body_text"].as_str().unwrap().contains("CANARY-DRAFT-2"));
     // Failing calls carry canaries in arguments too.
     let _ = h.call(&token, "get_message", json!({"account":"CANARY-ALIAS-ARG","message_id":"CANARYID1"})).await;
     let bogus_token = dove::tokens::generate("dove_");

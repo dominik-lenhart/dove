@@ -354,6 +354,13 @@ async fn execute(call: &mut AdminCall<'_>, req: AdminRequest) -> anyhow::Result<
         SinksSetProject { name, project } => crate::watch::sinks::set_project(call, name, project).await,
         SinksList => crate::watch::sinks::list(call).await,
         SinksRemove { name } => crate::watch::sinks::remove(call, name).await,
+        RequestsList { status } => call.read(move |c| crate::requests::admin::list(c, status.as_deref())).await,
+        RequestsShow { id } => crate::requests::admin::show(call, id).await,
+        RequestsApprove { id, shown, items, late } => {
+            crate::requests::admin::approve(call, id, shown, items, late).await
+        }
+        RequestsDeny { id } => crate::requests::admin::deny(call, id).await,
+        RequestsCancel { id, items } => crate::requests::admin::cancel(call, id, items).await,
         other => Err(anyhow!("'{}' is not available in this build yet", other.audit_fields().0)),
     }
 }
