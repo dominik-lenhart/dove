@@ -675,3 +675,7 @@ hosts or reference hardware.
   oldest closed requests beyond `MAX_CLOSED_PER_CLIENT` (500), at most 1000 per tick (`requests::prune_closed`).
   Items and the sealed note go with the request (`ON DELETE CASCADE`); audit records stay. No closing timestamp
   column was added: the close time is derived from `decided_at` and the items' `updated_at`.
+  (l) The operator's review reads drafts with `ToolCx::for_operator_review`, where `get_draft` returns up to
+  `read::OPERATOR_BODY_CHARS` (the MIME parser's 2 MiB text limit) instead of the agent maximum of 100,000; a draft
+  body is at most 500 KB, so it is never cut. `approve` re-reads the same revision and refuses any chosen item whose
+  body is truncated (or reports no truncation flag), with no override (`admin::approvable`).

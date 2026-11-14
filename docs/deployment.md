@@ -789,8 +789,9 @@ dove requests deny <request-id>
 dove requests cancel <request-id> [--items 1]
 ```
 
-`show` prints the body as text; HTML is never rendered and control characters are replaced, because the text comes
-from the agent and from mail. The agent's note is shown here only: it is stored encrypted and never logged. `approve`
+`show` prints the whole body as text (agents' own reads stop at 100,000 characters, the owner's review does not; an
+item whose text could not be shown in full cannot be approved); HTML is never rendered and control characters are
+replaced, because the text comes from the agent and from mail. The agent's note is shown here only: it is stored encrypted and never logged. `approve`
 sends the revisions it printed; if a draft changed in between, the approval is refused and you run it again. Items
 whose time has passed when you approve are skipped unless you pass `--late send` (they are then sent at once). Items
 you leave out with `--items` end as `denied`.

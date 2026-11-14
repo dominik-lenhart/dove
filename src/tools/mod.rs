@@ -54,6 +54,10 @@ pub struct ToolCx {
     gate: Arc<CommitGate>,
     /// Text fields redacted during this call (batch items share it); only the count reaches the audit record.
     redactions: Arc<AtomicUsize>,
+    /// `get_draft` returns the whole body text ([`read::OPERATOR_BODY_CHARS`]) instead of at most
+    /// [`read::MAX_BODY_CHARS`]: set only for the operator's review of a send request (`dove requests show`), which
+    /// must never approve text it did not see.
+    full_draft_body: bool,
 }
 
 /// Time a write keeps after its upstream dispatch, to record the result, run the follow-up steps and answer
@@ -76,7 +80,30 @@ impl ToolCx {
         let budget = Duration::from_secs(app.cfg.limits.tool_call_timeout_secs);
         let deadline = started + budget;
         let write_deadline = deadline.checked_sub(write_reserve(budget)).unwrap_or(started);
-        Self { app, client, request_id, deadline, write_deadline, gate: Arc::default(), redactions: Arc::default() }
+        Self {
+            app,
+            client,
+            request_id,
+            deadline,
+            write_deadline,
+            gate: Arc::default(),
+            redactions: Arc::default(),
+            full_draft_body: false,
+        }
+    }
+
+    /// A context for the operator's review of drafts on the admin socket: `get_draft` returns the whole body.
+    pub fn for_operator_review(mut self) -> Self {
+        self.full_draft_body = true;
+        self
+    }
+
+    /// The `max_body_chars` a `get_draft` call uses: the caller's choice, or the whole body for the operator.
+    pub(crate) fn draft_body_chars(&self, args: &Value) -> Result<usize, ToolError> {
+        if self.full_draft_body {
+            return Ok(read::OPERATOR_BODY_CHARS);
+        }
+        Ok(opt_u64(args, "max_body_chars", read::DEFAULT_BODY_CHARS, 1, read::MAX_BODY_CHARS)? as usize)
     }
 
     /// Deadline for the upstream part of a write (SMTP submission, Gmail write): earlier than `deadline`, so a

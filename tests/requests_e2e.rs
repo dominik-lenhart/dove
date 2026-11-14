@@ -549,6 +549,45 @@ async fn approve_selected_items_and_late_choice() {
     assert_eq!(list.as_array().unwrap().len(), 2);
 }
 
+/// A body longer than an agent's `get_draft` returns (100,000 characters) is shown to the operator in full, so it can
+/// be approved; the operator never approves text that was cut off.
+#[tokio::test]
+async fn long_body_is_shown_in_full_and_approvable() {
+    for imap in [false, true] {
+        let h = Harness::start().await;
+        if imap {
+            h.imap_mailbox("info", MB).await;
+        } else {
+            h.mailbox("info", MB);
+        }
+        h.project("acme", &["info"]).await;
+        let token = h.token("acme", "agent", vec![g("info", "read,draft")]).await;
+        let body: String = (0..150_000).map(|i| if i % 100 == 99 { '\n' } else { 'a' }).collect::<String>() + "END";
+        let c = h
+            .ok(
+                &token,
+                "create_draft",
+                json!({"account":"info","request_key":uuid::Uuid::new_v4().to_string(),"to":["c@example.org"],
+                       "subject":"Long","body_text":body}),
+            )
+            .await;
+        let (d, rev) = (c["draft_id"].as_str().unwrap(), c["revision"].as_str().unwrap());
+        // An agent reads at most 100,000 characters.
+        let agent = h.ok(&token, "get_draft", json!({"account":"info","draft_id":d,"max_body_chars":100_000})).await;
+        assert_eq!(agent["message"]["body_truncated"], true, "imap={imap}");
+        let t = util::now_unix() + 3600;
+        let id =
+            h.ok(&token, "request_send", send_args(&[(d, rev, t)])).await["request_id"].as_str().unwrap().to_string();
+        let v = show(&h, &id).await;
+        let item = &v["items"][0];
+        assert_eq!(item["body_truncated"], false, "imap={imap}");
+        let shown = item["body_text"].as_str().unwrap();
+        assert!(shown.trim_end().ends_with("END") && shown.chars().count() >= 150_003, "imap={imap}: {}", shown.len());
+        approve(&h, &id, shown_of(&v), None, dove::admin::Late::Skip).await.unwrap();
+        assert_eq!(states(&h, &id).await.0, "approved");
+    }
+}
+
 #[tokio::test]
 async fn daily_cap_refuses_the_approval() {
     let (h, token) = setup_with(|c| c.limits.scheduled_sends_per_day = 2).await;

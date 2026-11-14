@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use super::drafts::{Created, OwnRow};
-use super::read::{DEFAULT_BODY_CHARS, Fetched, MAX_BODY_CHARS, ShapeOpts, fmt_addrs, render, shape};
+use super::read::{Fetched, ShapeOpts, fmt_addrs, render, shape};
 use super::{AuditInfo, ToolCx, ToolOutput, gmail_id_arg, opt_bool, opt_str, opt_u64};
 use crate::content;
 use crate::error::{ErrorCode, ToolError};
@@ -560,7 +560,7 @@ pub(super) async fn list_drafts(cx: &ToolCx, mb: &Mailbox, args: &Value) -> Resu
 pub(super) async fn get_draft(cx: &ToolCx, mb: &Mailbox, args: &Value) -> Result<ToolOutput, ToolError> {
     let did = gmail_id_arg(args, "draft_id")?;
     let opts = ShapeOpts {
-        max_body_chars: opt_u64(args, "max_body_chars", DEFAULT_BODY_CHARS, 1, MAX_BODY_CHARS)? as usize,
+        max_body_chars: cx.draft_body_chars(args)?,
         include_headers: vec!["In-Reply-To".into(), "References".into()],
         select: None,
     };

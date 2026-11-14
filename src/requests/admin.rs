@@ -177,10 +177,10 @@ async fn read_drafts(
         return Ok(out);
     };
     let alias = s.alias.clone().unwrap_or_default();
-    let cx = ToolCx::new(app.clone(), ctx, call.actor.request_id.clone(), Instant::now());
+    // The whole body: the operator must never approve text that was cut off.
+    let cx = ToolCx::new(app.clone(), ctx, call.actor.request_id.clone(), Instant::now()).for_operator_review();
     for it in items {
-        let args =
-            json!({ "account": alias, "draft_id": it.draft_id, "max_body_chars": crate::tools::read::MAX_BODY_CHARS });
+        let args = json!({ "account": alias, "draft_id": it.draft_id });
         let r = match crate::tools::call(&cx, "get_draft", args).await {
             Ok(out) => {
                 let v = out.structured;
@@ -301,17 +301,7 @@ pub async fn approve(
     let chosen_items: Vec<&StoredItem> = pending.iter().copied().filter(|p| chosen.contains(&p.idx)).collect();
     let current = read_drafts(call, &s, &chosen_items).await?;
     for i in &chosen {
-        match current.get(i) {
-            Some(Ok(cur)) if Some(&cur.revision) == shown.get(i) && cur.sendable => {}
-            Some(Ok(cur)) if Some(&cur.revision) != shown.get(i) => {
-                bail!(
-                    "item {i}'s draft changed since it was shown; nothing was approved. Look at it again (`dove requests show {id}`)"
-                );
-            }
-            Some(Ok(_)) => bail!("item {i}'s draft was changed outside Dove and cannot be sent; nothing was approved"),
-            Some(Err(code)) => bail!("item {i}'s draft cannot be read ({code}); nothing was approved"),
-            None => bail!("item {i} was not read; nothing was approved"),
-        }
+        approvable(&id, *i, current.get(i), shown.get(i))?;
     }
     let now = util::now_unix();
     let cap = i64::from(call.app.cfg.limits.scheduled_sends_per_day);
@@ -381,6 +371,26 @@ pub async fn approve(
         Ok(json!({ "request_id": id, "status": status, "items": super::load_items(tx, &id)? }))
     })
     .await
+}
+
+/// Whether item `i` may be approved from its fresh read `cur`, given the revision `shown` to the operator. The same
+/// revision reads the same way, so a body cut off now was cut off in the show the approval is based on: refused, as
+/// the operator did not see all of it.
+fn approvable(id: &str, i: u32, cur: Option<&Result<Current, String>>, shown: Option<&String>) -> anyhow::Result<()> {
+    match cur {
+        Some(Ok(cur)) if Some(&cur.revision) != shown => bail!(
+            "item {i}'s draft changed since it was shown; nothing was approved. Look at it again (`dove requests show {id}`)"
+        ),
+        Some(Ok(cur)) if !cur.sendable => {
+            bail!("item {i}'s draft was changed outside Dove and cannot be sent; nothing was approved")
+        }
+        Some(Ok(cur)) if cur.content["body_truncated"] != false => {
+            bail!("item {i}'s text is too long to show in full, so it cannot be approved; nothing was approved")
+        }
+        Some(Ok(_)) => Ok(()),
+        Some(Err(code)) => bail!("item {i}'s draft cannot be read ({code}); nothing was approved"),
+        None => bail!("item {i} was not read; nothing was approved"),
+    }
 }
 
 /// Inside the approval transaction: every chosen item is still `pending` and its draft is still Dove's at the shown
@@ -484,6 +494,27 @@ pub async fn cancel(call: &mut AdminCall<'_>, id: String, items: Option<Vec<u32>
 mod tests {
     use super::*;
     use crate::store::Store;
+
+    #[test]
+    fn approval_needs_the_whole_text_and_the_shown_revision() {
+        let cur = |rev: &str, sendable: bool, truncated: Value| {
+            Ok(Current {
+                revision: rev.into(),
+                sendable,
+                content: json!({ "body_text": "x", "body_truncated": truncated }),
+            })
+        };
+        let shown = "rev".to_string();
+        let ok = |c: Result<Current, String>| approvable("r_1", 0, Some(&c), Some(&shown)).map_err(|e| e.to_string());
+        assert!(ok(cur("rev", true, json!(false))).is_ok());
+        assert!(ok(cur("rev", true, json!(true))).unwrap_err().contains("too long to show in full"));
+        // A read without the flag is not proof that the whole text was shown.
+        assert!(ok(cur("rev", true, Value::Null)).is_err());
+        assert!(ok(cur("other", true, json!(false))).unwrap_err().contains("changed since it was shown"));
+        assert!(ok(cur("rev", false, json!(false))).unwrap_err().contains("outside Dove"));
+        assert!(ok(Err("not_found".into())).unwrap_err().contains("cannot be read (not_found)"));
+        assert!(approvable("r_1", 0, None, Some(&shown)).is_err());
+    }
 
     /// The in-transaction check alone (the fresh read before it hides it in end-to-end tests): a stale `shown`, a
     /// draft that is no longer active, and an item that was decided meanwhile all refuse.
