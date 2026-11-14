@@ -501,6 +501,56 @@ async fn get_thread_groups_by_references() {
     assert!(!fx.h.imap.flags(u, "INBOX", last).unwrap().contains(&"\\Seen".to_string()));
 }
 
+/// get_thread reads all members in one round (PLAN A69): one EXAMINE and one metadata FETCH per folder, one body
+/// FETCH per message, no size probes. Before, every member cost its own session with EXAMINE, metadata, size and body.
+#[tokio::test]
+async fn get_thread_fetches_members_in_one_round() {
+    let fx = setup(plain()).await;
+    let u = &fx.u.user;
+    fx.h.imap.add_message_at(u, "INBOX", &mail("Ann <ann@example.org>", "Plan", "root@x", "", "first"), &[], DAY0);
+    let refs = |r: &str| format!("In-Reply-To: <{r}>\r\nReferences: <root@x>\r\n");
+    fx.h.imap.add_message_at(
+        u,
+        "Sent",
+        &mail("Me <info@example.org>", "Re: Plan", "r1@x", &refs("root@x"), "second"),
+        &["\\Seen"],
+        DAY0 + 60,
+    );
+    fx.h.imap.add_message_at(
+        u,
+        "INBOX",
+        &mail("Ann <ann@example.org>", "Re: Plan", "r2@x", &refs("r1@x"), "third"),
+        &[],
+        DAY0 + 120,
+    );
+    let last = fx.h.imap.add_message_at(
+        u,
+        "INBOX",
+        &mail("Ann <ann@example.org>", "Re: Plan", "r3@x", &refs("r2@x"), "fourth"),
+        &[],
+        DAY0 + 180,
+    );
+    fx.sync().await;
+    let tid = fx
+        .h
+        .ok(&fx.token, "get_thread", json!({"account": "info", "message_id": fx.id("INBOX", last).await}))
+        .await["thread_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mark = fx.h.imap.commands().len();
+    let v = fx.h.ok(&fx.token, "get_thread", json!({"account": "info", "thread_id": tid})).await;
+    let bodies: Vec<&str> =
+        v["messages"].as_array().unwrap().iter().map(|m| m["body_text"].as_str().unwrap().trim()).collect();
+    assert_eq!(bodies, ["first", "second", "third", "fourth"], "{v}");
+    let cmds = fx.commands_since(mark);
+    let count = |pat: &str| cmds.iter().filter(|c| c.contains(pat)).count();
+    assert_eq!(count("EXAMINE"), 2, "one per folder: {cmds:?}");
+    assert_eq!(count("BODY.PEEK[]"), 4, "{cmds:?}");
+    assert_eq!(count("(UID RFC822.SIZE)"), 0, "{cmds:?}");
+    assert_eq!(count("UID FETCH"), 2 + 4, "one metadata fetch per folder plus one body fetch per message: {cmds:?}");
+}
+
 /// A message over `index.max_message_bytes` is indexed from IMAP metadata only; its body is never fetched.
 #[tokio::test]
 async fn oversize_message_metadata_only() {
@@ -513,7 +563,8 @@ async fn oversize_message_metadata_only() {
     assert_eq!(fx.indexed().await.len(), 2);
     let cmds = fx.commands_since(mark);
     assert!(!cmds.iter().any(|c| c.contains(&format!("UID FETCH {big} (UID BODY.PEEK[])"))), "{cmds:?}");
-    assert!(cmds.iter().any(|c| c.contains(&format!("UID FETCH {big} (UID RFC822.SIZE)"))), "{cmds:?}");
+    // The size comes with the metadata fetch; no separate size probe (PLAN A69).
+    assert!(!cmds.iter().any(|c| c.contains("(UID RFC822.SIZE)")), "{cmds:?}");
     let v = fx.search(json!({"select": ["message_id", "subject", "size_bytes"], "where": pred("size_bytes", "gte", json!(10_000))})).await;
     assert_eq!(col(&v, "message_id"), vec![json!(fx.id("INBOX", big).await)], "{v}");
     assert_eq!(col(&v, "subject"), vec![Value::Null], "headers unknown: {v}");

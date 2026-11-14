@@ -1331,6 +1331,18 @@ impl ImapSession {
             .find(|(u, kv)| *u == uid && kv.iter().any(|(k, _)| k == "RFC822.SIZE"))
             .and_then(|(_, kv)| kv.into_iter().find(|(k, _)| k == "RFC822.SIZE").and_then(|(_, v)| v.num()))
             .ok_or(ImapError::Missing)?;
+        self.fetch_raw_sized(uid, size, max_bytes).await
+    }
+
+    /// [`Self::fetch_raw`] for a message whose `RFC822.SIZE` the caller already fetched (with [`Self::fetch_meta`]
+    /// in the same selected folder), saving the size probe. The literal cap still bounds what the server sends.
+    pub async fn fetch_raw_sized(
+        &mut self,
+        uid: u32,
+        size: u64,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, ImapError> {
+        self.selected()?;
         if size > max_bytes as u64 {
             return Ok(None);
         }

@@ -817,7 +817,7 @@ async fn fetch_groups_inner(
             out.lock().expect("lock").current = Some(id.clone());
             // Same admission limit as Gmail bodies: at most `body_jobs` raw messages in memory at once.
             let _permit = app.index.body_jobs.clone().acquire_owned().await.map_err(|_| ImapError::NotDispatched)?;
-            let raw = match s.fetch_raw(uid, max_bytes).await {
+            let raw = match s.fetch_raw_sized(uid, m.size, max_bytes).await {
                 Ok(r) => r,
                 Err(ImapError::Missing) => {
                     push(id, Fetched::Gone);

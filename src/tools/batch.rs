@@ -62,10 +62,20 @@ pub fn defs() -> Vec<ToolDef> {
     }]
 }
 
-struct Item {
-    id: String,
-    op: String,
-    args: Value,
+pub(super) struct Item {
+    pub id: String,
+    pub op: String,
+    pub args: Value,
+}
+
+/// A finished batch: per-item entries in input order (`{id, ok, result}` or `{id, ok: false, error}`), the text
+/// rendering of those items and the audit info for the one record of the call.
+pub(super) struct Run {
+    pub items: Vec<Value>,
+    pub text: String,
+    pub audit: AuditInfo,
+    pub ok: usize,
+    pub failed: usize,
 }
 
 fn parse_items(args: &Value) -> Result<Vec<Item>, ToolError> {
@@ -90,6 +100,10 @@ fn parse_items(args: &Value) -> Result<Vec<Item>, ToolError> {
             }
             let args = it.get("args").filter(|a| a.is_object()).cloned();
             let args = args.ok_or_else(|| ToolError::invalid("each item needs an 'args' object"))?;
+            if args.get("refs").is_some() || args.get("message_ids").is_some() {
+                // get_message with several ids is itself a batch.
+                return Err(ToolError::invalid("batch items read one message each; use ref or message_id"));
+            }
             Ok(Item { id: id.to_string(), op: op.to_string(), args })
         })
         .collect()
@@ -121,11 +135,22 @@ fn item_error(id: &str, e: &ToolError) -> Value {
 
 async fn batch_read(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
     let items = parse_items(&args)?;
+    let r = run(cx, &items).await;
+    Ok(ToolOutput {
+        extra: Vec::new(),
+        structured: json!({ "items": r.items, "ok_count": r.ok, "error_count": r.failed }),
+        text: format!("batch_read: {} ok, {} failed\n{}", r.ok, r.failed, r.text),
+        audit: r.audit,
+    })
+}
 
+/// Runs validated items under the shared limits: search row budget, per-read rate charge, bounded concurrency and
+/// the 64 KiB response budget. Also serves `get_message` with several ids.
+pub(super) async fn run(cx: &ToolCx, items: &[Item]) -> Run {
     // Row budget is assigned in input order before any work runs, so the outcome is deterministic.
     let mut rows_left = MAX_SEARCH_ROWS;
     let mut planned: Vec<Result<String, ToolError>> = Vec::with_capacity(items.len());
-    for it in &items {
+    for it in items {
         if it.op == "search_messages" {
             let want = search_rows(cx, &it.args);
             if want > rows_left {
@@ -234,12 +259,7 @@ async fn batch_read(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
         1 => accounts.pop_first(),
         _ => Some(accounts.into_iter().collect::<Vec<_>>().join(",")),
     };
-    Ok(ToolOutput {
-        extra: Vec::new(),
-        structured: json!({ "items": out_items, "ok_count": ok, "error_count": failed }),
-        text: format!("batch_read: {ok} ok, {failed} failed\n{text}"),
-        audit,
-    })
+    Run { items: out_items, text, audit, ok, failed }
 }
 
 #[cfg(test)]
@@ -257,6 +277,8 @@ mod tests {
             json!({"items": [{"id": "a", "op": "batch_read", "args": {}}]}),
             json!({"items": [{"id": "a", "op": "get_message", "args": []}]}),
             json!({"items": [{"id": "", "op": "get_message", "args": {}}]}),
+            json!({"items": [{"id": "a", "op": "get_message", "args": {"refs": ["x"]}}]}),
+            json!({"items": [{"id": "a", "op": "get_message", "args": {"account": "a", "message_ids": ["x"]}}]}),
         ];
         for b in bad {
             assert!(parse_items(&b).is_err(), "{b}");
