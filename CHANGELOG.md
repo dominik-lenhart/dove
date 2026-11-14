@@ -5,6 +5,8 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-11-14
+
 ### Changed
 
 - Installing and updating the client no longer needs root. The README and the deployment guide now separate the
@@ -269,7 +271,8 @@ First release.
   release only after verifying its minisign signature. The CLI hints at a new release at most once a day
   (`DOVE_NO_UPDATE_CHECK=1` turns it off); the server never checks for updates.
 
-[Unreleased]: https://github.com/dominik-lenhart/dove/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/dominik-lenhart/dove/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/dominik-lenhart/dove/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/dominik-lenhart/dove/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/dominik-lenhart/dove/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/dominik-lenhart/dove/compare/v0.5.0...v0.6.0
