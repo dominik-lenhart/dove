@@ -857,6 +857,25 @@ async fn pending_request_expires() {
     assert_eq!(states(&h, &id).await, ("expired".into(), vec![st("cancelled", Some("expired"))]));
     let v = show(&h, &id).await;
     assert!(approve(&h, &id, shown_of(&v), None, dove::admin::Late::Send).await.is_err());
+    // Closed requests are kept for `retention_days` (90) after they closed, then deleted with their items and note.
+    let closed = now + 7 * DAY + 10;
+    run(&h, closed + 90 * DAY - 10).await;
+    assert_eq!(states(&h, &id).await.0, "expired");
+    run(&h, closed + 90 * DAY + 10).await;
+    assert!(h.admin(AdminRequest::RequestsShow { id: id.clone() }).await.is_err(), "deleted");
+    let (rows, items): (i64, i64) = h
+        .app()
+        .store
+        .call(|c| {
+            Ok((
+                c.query_row("SELECT count(*) FROM requests", [], |r| r.get(0))?,
+                c.query_row("SELECT count(*) FROM request_items", [], |r| r.get(0))?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!((rows, items), (0, 0));
+    assert!(h.ok(&token, "list_requests", json!({})).await["requests"].as_array().unwrap().is_empty());
 }
 
 #[tokio::test]

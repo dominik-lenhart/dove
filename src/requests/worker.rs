@@ -3,7 +3,8 @@
 //! [`tick`] takes the clock as an argument (tests drive it; the service runs it every [`TICK`]). Per pass:
 //! 1. pending requests past `expires_at` expire;
 //! 2. scheduled items more than `late_grace_minutes` past their time end as `missed` (or `skipped:
-//!    condition_unknown` when they were waiting for a fresh index), before anything is sent;
+//!    condition_unknown` when they were waiting for a fresh index), before anything is sent; closed requests past
+//!    `retention_days` or beyond [`super::MAX_CLOSED_PER_CLIENT`] per client are deleted;
 //! 3. at most [`BATCH`] due items, oldest first, one at a time: request still approved, client live, mailbox active
 //!    and still granted with `draft`, the `unless_reply` condition, then the claim `scheduled → sending` (recorded
 //!    before the upstream write), then `tools::drafts::send_core` with the approved revision.
@@ -133,7 +134,8 @@ pub async fn tick(app: &Arc<App>, now: i64) -> anyhow::Result<TickReport> {
     let mut report = TickReport::default();
     let grace = app.cfg.requests.grace_secs();
 
-    // 1 and 2: expiry and missed items, in one transaction.
+    // 1 and 2: expiry and missed items, in one transaction; then old closed requests go.
+    let retention = app.cfg.requests.retention_days * 86_400;
     let (expired, ended) = app
         .store
         .call(move |c| {
@@ -193,6 +195,10 @@ pub async fn tick(app: &Arc<App>, now: i64) -> anyhow::Result<TickReport> {
                 )?;
                 close_if_finished(&tx, &rid)?;
                 ended.push(state);
+            }
+            let pruned = super::prune_closed(&tx, now, retention)?;
+            if pruned > 0 {
+                tracing::info!(pruned, "deleted closed requests past retention");
             }
             tx.commit()?;
             Ok((expiring.len(), ended))

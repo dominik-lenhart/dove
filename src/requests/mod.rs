@@ -37,6 +37,14 @@ pub const OPEN_STATUSES: &str = "('pending', 'approved')";
 pub const STATUSES: &[&str] = &["pending", "approved", "denied", "cancelled", "expired", "done"];
 /// Audit actor of the worker and of automatic cascades.
 pub const SCHEDULER: &str = "scheduler";
+/// Closed requests one client keeps at most; beyond it the oldest are deleted ([`prune_closed`]).
+pub const MAX_CLOSED_PER_CLIENT: i64 = 500;
+/// Requests deleted per [`prune_closed`] call, so one pass never holds the store long.
+const PRUNE_BATCH: i64 = 1000;
+/// When a closed request closed: its decision, or the last change of an item (an approved request becomes `done`
+/// when its last item ends).
+const CLOSED_AT: &str = "max(coalesce(r.decided_at, r.created_at), \
+     coalesce((SELECT max(i.updated_at) FROM request_items i WHERE i.request_id = r.id), 0))";
 
 /// One draft of a new send request.
 #[derive(Debug, Clone)]
@@ -342,6 +350,29 @@ pub fn cancel_for_disabled_account(tx: &Transaction, account_id: &str, now: i64)
     cancel_where(tx, "account_id", account_id, "account_disabled", now)
 }
 
+/// Deletes closed requests (denied, cancelled, expired, done) with their items and notes: those closed more than
+/// `retention_secs` before `now`, and each client's oldest beyond [`MAX_CLOSED_PER_CLIENT`]. At most
+/// [`PRUNE_BATCH`] per call; returns how many went. Audit records stay (they hold ids only).
+pub fn prune_closed(tx: &Transaction, now: i64, retention_secs: i64) -> anyhow::Result<usize> {
+    let closed = "('denied', 'cancelled', 'expired', 'done')";
+    let old = tx.execute(
+        &format!(
+            "DELETE FROM requests WHERE id IN (SELECT r.id FROM requests r WHERE r.status IN {closed} \
+             AND {CLOSED_AT} < ?1 LIMIT {PRUNE_BATCH})"
+        ),
+        [now - retention_secs],
+    )?;
+    let over = tx.execute(
+        &format!(
+            "DELETE FROM requests WHERE id IN (SELECT id FROM (SELECT r.id, row_number() OVER \
+             (PARTITION BY r.client_id ORDER BY {CLOSED_AT} DESC, r.created_at DESC, r.id DESC) AS n \
+             FROM requests r WHERE r.status IN {closed}) WHERE n > ?1 LIMIT {PRUNE_BATCH})"
+        ),
+        [MAX_CLOSED_PER_CLIENT],
+    )?;
+    Ok(old + over)
+}
+
 /// Writes one audit record for a request event (ids and a result code only).
 pub fn audit_event(
     c: &Connection,
@@ -434,6 +465,83 @@ mod tests {
         let id = id.to_string();
         s.call_blocking(move |c| Ok(c.query_row("SELECT status FROM requests WHERE id = ?1", [id], |r| r.get(0))?))
             .unwrap()
+    }
+
+    fn count(s: &Store, sql: &str) -> i64 {
+        let sql = sql.to_string();
+        s.call_blocking(move |c| Ok(c.query_row(&sql, [], |r| r.get(0))?)).unwrap()
+    }
+
+    fn prune(s: &Store, now: i64, retention: i64) -> usize {
+        s.call_blocking(move |c| {
+            let tx = c.transaction()?;
+            let n = prune_closed(&tx, now, retention)?;
+            tx.commit()?;
+            Ok(n)
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn closed_requests_are_pruned_by_age_and_per_client_cap() {
+        let s = store();
+        let day = 86_400;
+        let now = 1000 * day;
+        // c1, retention 90 days: closed 91 days ago (gone), 89 days ago (kept); a request created long ago that
+        // closed recently (its last item changed 10 days ago: kept); old open requests are never touched.
+        exec(
+            &s,
+            &format!(
+                "INSERT INTO requests(id, client_id, project_id, account_id, kind, status, created_at, expires_at, decided_at) VALUES
+                   ('old', 'c1', 'p', 'a', 'send', 'denied', 0, 0, {d91}),
+                   ('recent', 'c1', 'p', 'a', 'send', 'cancelled', 0, 0, {d89}),
+                   ('done', 'c1', 'p', 'a', 'send', 'done', 0, 0, {d100}),
+                   ('expired', 'c1', 'p', 'a', 'send', 'expired', {d100}, 0, NULL),
+                   ('pending', 'c1', 'p', 'a', 'send', 'pending', 0, 0, NULL),
+                   ('approved', 'c1', 'p', 'a', 'send', 'approved', 0, 0, {d100});
+                 INSERT INTO request_items(request_id, idx, draft_id, requested_rev, send_at, state, updated_at) VALUES
+                   ('old', 0, 'd', 'r', 0, 'denied', {d91}),
+                   ('done', 0, 'd', 'r', 0, 'sent', {d10}),
+                   ('approved', 0, 'd', 'r', 0, 'scheduled', 0);",
+                d91 = now - 91 * day,
+                d89 = now - 89 * day,
+                d100 = now - 100 * day,
+                d10 = now - 10 * day,
+            ),
+        );
+        assert_eq!(prune(&s, now, 90 * day), 2);
+        let left = |s: &Store| {
+            s.call_blocking(|c| {
+                let mut st = c.prepare("SELECT id FROM requests WHERE client_id = 'c1' ORDER BY id")?;
+                Ok(st.query_map([], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?)
+            })
+            .unwrap()
+        };
+        assert_eq!(left(&s), vec!["approved", "done", "pending", "recent"]);
+        assert_eq!(count(&s, "SELECT count(*) FROM request_items WHERE request_id = 'old'"), 0, "items go too");
+        // c2: 502 closed requests, the first two oldest. The cap keeps the newest 500 of c2 and leaves c1 alone.
+        let values: Vec<String> = (0..502)
+            .map(|i| format!("('c2-{i:03}', 'c2', 'p', 'a', 'send', 'done', 0, 0, {})", now - 1000 + i))
+            .collect();
+        exec(
+            &s,
+            &format!(
+                "INSERT INTO requests(id, client_id, project_id, account_id, kind, status, created_at, expires_at, decided_at) VALUES {};",
+                values.join(",")
+            ),
+        );
+        // An open request of c2 does not count towards the cap.
+        exec(
+            &s,
+            "INSERT INTO requests(id, client_id, project_id, account_id, kind, status, created_at, expires_at) \
+             VALUES ('c2-open', 'c2', 'p', 'a', 'send', 'pending', 0, 0)",
+        );
+        assert_eq!(prune(&s, now, 90 * day), 2);
+        assert_eq!(count(&s, "SELECT count(*) FROM requests WHERE client_id = 'c2' AND status = 'done'"), 500);
+        assert_eq!(count(&s, "SELECT count(*) FROM requests WHERE id IN ('c2-000', 'c2-001')"), 0, "oldest first");
+        assert_eq!(count(&s, "SELECT count(*) FROM requests WHERE id = 'c2-open'"), 1);
+        assert_eq!(left(&s).len(), 4);
+        assert_eq!(prune(&s, now, 90 * day), 0);
     }
 
     #[test]

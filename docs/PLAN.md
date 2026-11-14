@@ -670,4 +670,8 @@ hosts or reference hardware.
   gap and can fire while the reply waits for a retry. Its event only tells an agent to look, and the agent then reads
   the thread live. (j) For `unless_reply` a reply in Trash or Spam counts (`watch::Replies::Any`); the watch keeps
   ignoring both (`Replies::OutsideSpamTrash`). The index has one `spam_trash` flag, so spam in the thread skips the
-  send too.
+  send too. (k) Retention: the worker's tick deletes closed requests (denied, cancelled, expired, done) whose close
+  (decision, or the last item change for `done`) is older than `[requests] retention_days` (90), and each client's
+  oldest closed requests beyond `MAX_CLOSED_PER_CLIENT` (500), at most 1000 per tick (`requests::prune_closed`).
+  Items and the sealed note go with the request (`ON DELETE CASCADE`); audit records stay. No closing timestamp
+  column was added: the close time is derived from `decided_at` and the items' `updated_at`.

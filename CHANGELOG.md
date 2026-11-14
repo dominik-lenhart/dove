@@ -13,7 +13,8 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
   a draft changed afterwards is not sent. Nothing is retried after an unknown outcome, and an item that could not go
   out within `[requests] late_grace_minutes` (60) is dropped as `missed`. Agents follow their requests with
   `list_requests` and `cancel_request`. Needs `draft` on the mailbox, not `send` or `allow_send`; turn it off with
-  `[requests] enabled = false`.
+  `[requests] enabled = false`. Closed requests are deleted after `[requests] retention_days` (90), and each
+  connection keeps at most 500 of them.
 
 ## [0.9.0] - 2026-11-14
 

@@ -65,11 +65,14 @@ pub struct RequestsConfig {
     pub late_grace_minutes: i64,
     /// A pending request expires after this many days without a decision.
     pub pending_days: i64,
+    /// Closed requests (denied, cancelled, expired, done) are deleted this many days after they closed. Each client
+    /// also keeps at most `requests::MAX_CLOSED_PER_CLIENT` of them; older ones go first.
+    pub retention_days: i64,
 }
 
 impl Default for RequestsConfig {
     fn default() -> Self {
-        Self { enabled: true, late_grace_minutes: 60, pending_days: 7 }
+        Self { enabled: true, late_grace_minutes: 60, pending_days: 7, retention_days: 90 }
     }
 }
 
@@ -395,6 +398,9 @@ impl Config {
         if !(1..=1440).contains(&self.requests.late_grace_minutes) || !(1..=30).contains(&self.requests.pending_days) {
             bail!("requests.late_grace_minutes must be between 1 and 1440 and requests.pending_days between 1 and 30");
         }
+        if !(1..=3650).contains(&self.requests.retention_days) {
+            bail!("requests.retention_days must be between 1 and 3650");
+        }
         if self.limits.draft_attachment_bytes > MAX_DRAFT_ATTACHMENT_BYTES {
             bail!("limits.draft_attachment_bytes must be at most {MAX_DRAFT_ATTACHMENT_BYTES}");
         }
@@ -533,6 +539,7 @@ redact_secrets_default = false
 # enabled = true
 # late_grace_minutes = 60
 # pending_days = 7
+# retention_days = 90
 
 [oauth]
 # Downstream OAuth for MCP hosts (ChatGPT, Claude). Defaults shown.

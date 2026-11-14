@@ -192,6 +192,7 @@ The file holds no secrets. Unknown keys are rejected. Settings and defaults (fro
 | `requests.enabled` | `true` | Agents may ask for scheduled sends that the owner approves (see [Scheduled sends](#scheduled-sends-approved-by-the-owner)). `false` hides `request_send`, refuses it like `send_draft` without `allow_send`, and the worker sends nothing. |
 | `requests.late_grace_minutes` | `60` | An approved item that could not be sent within this time after its `send_at` ends as `missed` and is never sent (1 to 1440). |
 | `requests.pending_days` | `7` | A request nobody approved or denied expires after this many days (1 to 30). |
+| `requests.retention_days` | `90` | Closed requests (denied, cancelled, expired, done) are deleted, with their items and the agent's note, this many days after they closed (1 to 3650). Each connection also keeps at most 500 closed requests; older ones are deleted first. Audit records stay. |
 
 `limits` defaults: `body_bytes` 1 MiB, `client_requests_per_minute` 120, `client_burst` 40,
 `client_sends_per_hour` 20, `client_organize_per_hour` 500, `client_open_requests` 20 (pending or approved requests
