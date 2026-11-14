@@ -1,4 +1,4 @@
-//! Admin web UI hygiene (PLAN A73): session cookies, CSRF tokens, enrolment links, WebAuthn challenges and the
+//! Admin web UI hygiene (PLAN A74): session cookies, CSRF tokens, enrolment links, WebAuthn challenges and the
 //! mail content shown on the pages never reach the service log, the audit log or the plaintext state store.
 //! One test per file: it installs the process-wide log subscriber at TRACE level with the service log format.
 

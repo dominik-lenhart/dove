@@ -1,4 +1,4 @@
-//! Passkey sign-in, enrolment, sessions and step-up confirmation for the admin UI (design 5.2, PLAN A73).
+//! Passkey sign-in, enrolment, sessions and step-up confirmation for the admin UI (design 5.2, PLAN A74).
 //!
 //! - Challenges are generated here, kept in bounded in-memory pools, used once (taken out before they are checked)
 //!   and short-lived.
@@ -245,7 +245,7 @@ fn login_fail_key(ip: Option<IpAddr>) -> String {
 /// Charges a failed sign-in or enrolment to the per-address bucket and returns the status to answer: `refused`, or
 /// 429 once the bucket is empty. Only failures are charged and nothing is refused before it is checked, so a valid
 /// passkey always signs in: behind Tailscale Serve every caller shares `127.0.0.1`, and a local process must not be
-/// able to lock the owner out (PLAN A73 (i), the same rule as bearer failures on `/mcp`).
+/// able to lock the owner out (PLAN A74 (i), the same rule as bearer failures on `/mcp`).
 fn login_failed(app: &App, ip: Option<IpAddr>, refused: StatusCode) -> StatusCode {
     let n = app.cfg.admin_ui.login_failures_per_hour;
     match app.rate_limiter.check_hourly(&login_fail_key(ip), n, n) {

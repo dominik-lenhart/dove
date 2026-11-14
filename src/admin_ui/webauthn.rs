@@ -1,4 +1,4 @@
-//! WebAuthn registration and assertion checks for the admin UI's passkeys (design 5.2, PLAN A73).
+//! WebAuthn registration and assertion checks for the admin UI's passkeys (design 5.2, PLAN A74).
 //!
 //! Scope: attestation `none` (any `fmt` is accepted and its statement ignored, because Dove never relies on it),
 //! ES256 and EdDSA (Ed25519) credentials, user presence and user verification required, exact origin, no cross-origin

@@ -1,4 +1,4 @@
-//! Admin web UI under `/admin` (design 2026-11-14 section 5, PLAN A73).
+//! Admin web UI under `/admin` (design 2026-11-14 section 5, PLAN A74).
 //!
 //! Layers, outermost first:
 //! 1. [`guard`] (called by `http::guard` for every path under [`ADMIN_PREFIX`]): 404 unless the UI is enabled, not

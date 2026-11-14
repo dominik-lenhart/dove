@@ -1,4 +1,4 @@
-//! Admin web UI (design 2026-11-14 section 5, PLAN A73): the `/admin` guard, passkey enrolment and sign-in,
+//! Admin web UI (design 2026-11-14 section 5, PLAN A74): the `/admin` guard, passkey enrolment and sign-in,
 //! sessions, CSRF and Origin, step-up confirmation, the pages and their escaping. Passkeys are a software
 //! authenticator (`dove::admin_ui::soft_authenticator`); no browser is involved.
 
@@ -694,6 +694,63 @@ async fn approval_needs_a_passkey_confirmation_bound_to_that_approval() {
     let r = stepup_finish(&mut b, &p, &a.assert(&ch)).await;
     assert_eq!(r.status, 409, "{}", r.text);
     assert_eq!(request_status(&h, &r2).await["status"], "pending");
+}
+
+#[tokio::test]
+async fn access_requests_are_reviewed_and_approved_with_a_confirmation() {
+    let h = start().await;
+    h.mailbox("info", MB);
+    h.mailbox("billing", "billing@acme.test");
+    h.project("acme", &["info", "billing"]).await;
+    let token = h.token("acme", "agent", vec![g("info", "read")]).await;
+    let xss = "<script>alert(3)</script>";
+    let v = h
+        .ok(
+            &token,
+            "request_access",
+            json!({ "grants": [{ "account": "billing", "actions": "read" }], "duration_minutes": 120,
+                    "note": format!("Need the invoices {xss}") }),
+        )
+        .await;
+    let rid = v["request_id"].as_str().unwrap().to_string();
+    let mut a = SoftAuthenticator::es256(ORIGIN);
+    let mut b = Browser::new(&h);
+    enrol_with(&h, &mut b, "phone", &mut a).await;
+    let list = b.get("/admin/requests").await;
+    assert!(list.text.contains("asks for access to") && list.text.contains("for 2 hours"), "{}", list.text);
+    let page = b.get(&format!("/admin/requests/{rid}")).await;
+    for want in
+        ["asks for access for 2 hours", "billing", "Asks for", "Has now", "nothing", "Need the invoices &lt;script&gt;"]
+    {
+        assert!(page.text.contains(want), "{want} missing: {}", page.text);
+    }
+    assert!(!page.text.contains(xss));
+    assert!(page.text.contains("name=\"kind\" value=\"access\""));
+    // The session alone cannot grant: approval needs the passkey confirmation, which runs exactly the stored action
+    // (here with a shorter time).
+    let path = format!("/admin/requests/{rid}/approve");
+    let (p, ch, _) = stepup_begin(&mut b, &path, &[("kind", "access"), ("item", "0"), ("duration", "30")]).await;
+    assert_eq!(request_status(&h, &rid).await["status"], "pending");
+    let r = stepup_finish(&mut b, &p, &a.assert(&ch)).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let shown = h.admin(AdminRequest::RequestsShow { id: rid.clone() }).await.unwrap();
+    assert_eq!((shown["status"].as_str(), shown["decided_by"].as_str()), (Some("approved"), Some("web:phone")));
+    let until = time::OffsetDateTime::parse(
+        shown["granted_until"].as_str().unwrap(),
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap()
+    .unix_timestamp();
+    assert!((until - util::now_unix() - 1800).abs() < 60, "30 minutes, not the asked 2 hours");
+    let page = b.get(&format!("/admin/requests/{rid}?done=approved")).await;
+    assert!(page.text.contains("The access is granted") && page.text.contains("End access now"), "{}", page.text);
+    // A duration that is not a number is refused before any confirmation starts.
+    let r = b.post_form(&path, &[("kind", "access"), ("item", "0"), ("duration", "soon")]).await;
+    assert!(r.json()["error"].as_str().unwrap_or("").contains("minutes"), "{}", r.text);
+    // End it from the UI.
+    let r = b.post_form(&format!("/admin/requests/{rid}/cancel"), &[]).await;
+    assert_eq!(r.status, 303, "{}", r.text);
+    assert_ne!(request_status(&h, &rid).await["status"], "approved");
 }
 
 #[tokio::test]

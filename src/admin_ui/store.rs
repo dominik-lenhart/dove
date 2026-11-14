@@ -1,4 +1,4 @@
-//! Passkeys, enrolment links and sessions in the state store (PLAN A73). Tokens are stored as SHA-256 only.
+//! Passkeys, enrolment links and sessions in the state store (PLAN A74). Tokens are stored as SHA-256 only.
 
 use anyhow::{anyhow, bail};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};

@@ -67,7 +67,7 @@ pub struct Done {
 fn state_chip(state: &str) -> Markup {
     let class = match state {
         "pending" => "wait",
-        "approved" | "scheduled" | "sending" => "go",
+        "approved" | "scheduled" | "sending" | "granted" | "active" => "go",
         "sent" | "done" => "done",
         "denied" | "failed" | "send_unknown" | "missed" => "bad",
         _ => "quiet",
@@ -86,6 +86,10 @@ fn state_chip(state: &str) -> Markup {
         "failed" => "Failed",
         "missed" => "Missed",
         "send_unknown" => "Unknown outcome",
+        "granted" => "Granted",
+        "active" => "Active",
+        "ended" => "Ended",
+        "not_approved" => "Not approved",
         other => other,
     };
     h!("<span class=\"chip {}\">{}</span>", class, label.to_string())
@@ -158,6 +162,21 @@ pub async fn overview(State(app): State<Arc<App>>, Extension(s): Extension<WebSe
 }
 
 fn request_row(r: &Value) -> Markup {
+    if r["kind"] == "access" {
+        let n = r["access"]["grants"].as_array().map(Vec::len).unwrap_or(0);
+        let boxes = if n == 1 { "1 mailbox".to_string() } else { format!("{n} mailboxes") };
+        return h!(
+            "<a class=\"row\" href=\"/admin/requests/{}\"><span class=\"row-main\"><strong>{}</strong> \
+             <span class=\"muted\">asks for access to</span> {}</span>\
+             <span class=\"row-meta\">{} {} {}</span></a>",
+            text(&r["request_id"]),
+            text(&r["client"]),
+            boxes,
+            state_chip(&text(&r["status"])),
+            duration_text(r["access"]["duration_minutes"].as_i64()),
+            time_el(&text(&r["created_at"]))
+        );
+    }
     let items = r["items"].as_array().map(Vec::len).unwrap_or(0);
     let drafts = if items == 1 { "1 draft".to_string() } else { format!("{items} drafts") };
     h!(
@@ -336,6 +355,9 @@ pub async fn request_detail(
 }
 
 fn request_body(s: &WebSession, id: &str, v: &Value, done: Option<&str>) -> Markup {
+    if v["kind"] == "access" {
+        return access_body(s, id, v, done);
+    }
     let status = text(&v["status"]);
     let note = match v["note"].as_str() {
         Some(n) => h!(
@@ -432,6 +454,141 @@ fn request_body(s: &WebSession, id: &str, v: &Value, done: Option<&str>) -> Mark
         letters
     };
     h!("{}{}{}{}", done_notice(done), head, note, actions)
+}
+
+/// `for 2 hours`, `for 3 days`, `for 45 minutes`, or `permanently` (None).
+fn duration_text(minutes: Option<i64>) -> String {
+    match minutes {
+        None => "permanently".into(),
+        Some(m) if m % 1440 == 0 => format!("for {} day{}", m / 1440, if m == 1440 { "" } else { "s" }),
+        Some(m) if m % 60 == 0 => format!("for {} hour{}", m / 60, if m == 60 { "" } else { "s" }),
+        Some(m) => format!("for {m} minute{}", if m == 1 { "" } else { "s" }),
+    }
+}
+
+fn note_figure(v: &Value) -> Markup {
+    match v["note"].as_str() {
+        Some(n) => h!(
+            "<figure class=\"note\"><figcaption>Note from the agent</figcaption><blockquote>{}</blockquote></figure>",
+            n
+        ),
+        None => Markup::default(),
+    }
+}
+
+/// An access request (`request_access`): what the agent asks for per mailbox, what it has now, and the approval with an
+/// optional shorter duration. Approving widens grants, so it goes through the passkey confirmation like a send.
+fn access_body(s: &WebSession, id: &str, v: &Value, done: Option<&str>) -> Markup {
+    let status = text(&v["status"]);
+    let pending = status == "pending";
+    let decided = match v["decided_by"].as_str() {
+        Some(by) => h!(
+            "<p class=\"meta\">Decided by {} on {}</p>",
+            by,
+            v["decided_at"].as_str().map(time_el).unwrap_or_default()
+        ),
+        None => Markup::default(),
+    };
+    let until = match v["granted_until"].as_str() {
+        Some(t) => h!("<p class=\"meta\">Granted until {}</p>", time_el(t)),
+        None => Markup::default(),
+    };
+    let head = h!(
+        "<header class=\"req-head\"><p class=\"crumb\"><a href=\"/admin/requests\">Requests</a></p>\
+         <h1><strong>{}</strong> asks for access {}</h1>\
+         <p class=\"meta\">{} Project {}. Asked {}, expires {}.</p>{}{}</header>",
+        text(&v["client"]),
+        duration_text(v["duration_minutes"].as_i64()),
+        state_chip(&status),
+        text(&v["project"]),
+        time_el(&text(&v["created_at"])),
+        time_el(&text(&v["expires_at"])),
+        decided,
+        until
+    );
+    let grants = Markup::concat(v["grants"].as_array().into_iter().flatten().map(|g| {
+        let idx = g["idx"].as_u64().unwrap_or(0);
+        let mailbox = g["account"].as_str().unwrap_or("a removed mailbox").to_string();
+        let has = match g["has"].as_str() {
+            Some(a) if !a.is_empty() => a.to_string(),
+            _ => "nothing".into(),
+        };
+        let temporary = Markup::concat(
+            g["temporary"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|t| h!("<dd>{} until {}</dd>", text(&t["actions"]), time_el(&text(&t["expires_at"])))),
+        );
+        let temporary = if g["temporary"].as_array().is_some_and(|a| !a.is_empty()) {
+            h!("<dt>Temporary</dt>{}", temporary)
+        } else {
+            Markup::default()
+        };
+        let mut flags = Vec::new();
+        if g["in_project"] == false {
+            flags.push(Markup::lit("<span class=\"chip bad\">No longer in the project</span>"));
+        }
+        if let Some(st) = g["status"].as_str()
+            && st != "active"
+        {
+            flags.push(h!("<span class=\"chip quiet\">Mailbox {}</span>", st.replace('_', " ")));
+        }
+        let pick = if pending {
+            h!(
+                "<label class=\"pick\"><input type=\"checkbox\" name=\"item\" value=\"{}\" checked> Grant this</label>",
+                idx
+            )
+        } else {
+            Markup::default()
+        };
+        h!(
+            "<article class=\"grant\"><p class=\"when\">{} <strong>{}</strong> {}</p>{}\
+             <dl class=\"envelope\"><dt>Asks for</dt><dd>{}</dd><dt>Has now</dt><dd>{}</dd>{}</dl></article>",
+            state_chip(&text(&g["state"])),
+            mailbox,
+            Markup::concat(flags),
+            pick,
+            text(&g["asked"]),
+            has,
+            temporary
+        )
+    }));
+    let actions = if pending {
+        h!(
+            "<form id=\"approve\" method=\"post\" action=\"/admin/requests/{}/approve\" data-stepup>{}\
+             <input type=\"hidden\" name=\"kind\" value=\"access\">{}\
+             <p class=\"field\"><label for=\"duration\">Shorter time in minutes (optional)</label>\
+             <input id=\"duration\" name=\"duration\" type=\"number\" min=\"1\" max=\"43200\" inputmode=\"numeric\"></p>\
+             <div class=\"actionbar\"><p class=\"status\" role=\"status\" aria-live=\"polite\"></p>\
+             <button type=\"submit\" class=\"btn primary\">Approve selected</button>\
+             <button type=\"submit\" class=\"btn danger\" form=\"deny\">Deny request</button></div></form>\
+             <form id=\"deny\" method=\"post\" action=\"/admin/requests/{}/deny\" data-confirm=\"Deny this request? \
+             Nothing changes.\">{}</form>",
+            id,
+            csrf_input(s),
+            grants,
+            id,
+            csrf_input(s)
+        )
+    } else if status == "approved" && v["granted_until"].is_string() {
+        h!(
+            "{}<form method=\"post\" action=\"/admin/requests/{}/cancel\" data-confirm=\"End this access now?\">{}\
+             <div class=\"actionbar\"><button type=\"submit\" class=\"btn danger\">End access now</button></div></form>",
+            grants,
+            id,
+            csrf_input(s)
+        )
+    } else {
+        grants
+    };
+    let notice = match done {
+        Some("approved") => Markup::lit("<p class=\"notice ok\" role=\"status\">Approved. The access is granted.</p>"),
+        Some("denied") => Markup::lit("<p class=\"notice ok\" role=\"status\">Request denied. Nothing changes.</p>"),
+        Some("stopped") => Markup::lit("<p class=\"notice ok\" role=\"status\">Access ended.</p>"),
+        _ => Markup::default(),
+    };
+    h!("{}{}{}{}", notice, head, note_figure(v), actions)
 }
 
 /// One draft, shown like a letter. Pending items carry the approval checkbox and the revision that was shown.
@@ -538,11 +695,32 @@ pub async fn request_approve(
     let items = match chosen_items(&fields) {
         Ok(i) if !i.is_empty() => i,
         Ok(_) => {
-            return axum::Json(serde_json::json!({ "error": "Select at least one draft, or deny the request." }))
+            return axum::Json(serde_json::json!({ "error": "Select at least one item, or deny the request." }))
                 .into_response();
         }
         Err(e) => return axum::Json(serde_json::json!({ "error": e })).into_response(),
     };
+    if fields.iter().any(|(k, v)| k == "kind" && v == "access") {
+        // Access requests have no drafts and no revisions; the verb refuses this shape for a send request.
+        let duration_minutes = match fields.iter().find(|(k, _)| k == "duration").map(|(_, v)| v.trim()) {
+            None | Some("") => None,
+            Some(d) => match d.parse::<u32>() {
+                Ok(m) => Some(m),
+                Err(_) => {
+                    return axum::Json(serde_json::json!({ "error": "Enter the time in whole minutes." }))
+                        .into_response();
+                }
+            },
+        };
+        let action = AdminRequest::RequestsApprove {
+            id: id.clone(),
+            shown: vec![],
+            items: Some(items),
+            late: Late::Skip,
+            duration_minutes,
+        };
+        return begin_stepup(&app, &s, action, format!("/admin/requests/{}?done=approved", urlencode(&id))).await;
+    }
     let revs: HashMap<&str, &str> =
         fields.iter().filter_map(|(k, v)| k.strip_prefix("rev.").map(|i| (i, v.as_str()))).collect();
     let mut shown = Vec::new();

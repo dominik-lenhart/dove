@@ -51,7 +51,7 @@ pub struct Config {
     /// Agent requests: scheduled sends the operator approves (design 2026-11-14 section 4).
     #[serde(default)]
     pub requests: RequestsConfig,
-    /// The admin web UI under `/admin` (design 2026-11-14 section 5, PLAN A73). Off by default.
+    /// The admin web UI under `/admin` (design 2026-11-14 section 5, PLAN A74). Off by default.
     #[serde(default)]
     pub admin_ui: AdminUiConfig,
 }
@@ -69,7 +69,7 @@ pub struct AdminUiConfig {
     /// Requests per minute per client address under `/admin`.
     pub requests_per_minute: u32,
     /// Failed passkey sign-ins and enrolments per hour per client address; after that, failures answer 429. A valid
-    /// passkey always signs in (PLAN A73 (i)).
+    /// passkey always signs in (PLAN A74 (i)).
     pub login_failures_per_hour: u32,
 }
 

@@ -10,11 +10,12 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 - Admin web UI, part 1, under `/admin` on the existing listener (off by default: `[admin_ui] enabled = true` and
   `origin`). Sign-in with a passkey only (`dove admin passkey add --name <device>` prints a one-time link, valid for
   five minutes), sessions of 12 hours (`dove admin sessions list|revoke`, `dove admin passkey list|remove`). Pages:
-  Overview (checks, index status, waiting requests, next sends), Requests (review each draft like a mail, approve with
-  a fresh passkey confirmation, deny, stop scheduled drafts), Audit (search, verify the chain) and Settings (passkeys,
-  sessions). Every action runs the same admin verb as the CLI and is audited as `web:<passkey>`. The UI only answers on
-  its own host name, refuses any `Authorization` header and is never forwarded by the shipped Caddy and nginx
-  templates; `dove tailscale setup --admin` mounts it on the tailnet name and refuses while Funnel is on.
+  Overview (checks, index status, waiting requests, next sends), Requests (review each draft like a mail and each access
+  request per mailbox, approve with a fresh passkey confirmation, deny, stop scheduled drafts or end granted access),
+  Audit (search, verify the chain) and Settings (passkeys, sessions). Every action runs the same admin verb as the CLI
+  and is audited as `web:<passkey>`. The UI only answers on its own host name, refuses any `Authorization` header and is
+  never forwarded by the shipped Caddy and nginx templates; `dove tailscale setup --admin` mounts it on the tailnet name
+  and refuses while Funnel is on.
 
 ## [0.11.0] - 2026-11-14
 

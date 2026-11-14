@@ -450,6 +450,34 @@ a.row:hover {
   overflow-wrap: anywhere;
 }
 
+/* An access request: one plain card per mailbox (no airmail edge, nothing leaves). */
+.grant {
+  background: var(--sheet);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  margin: 1rem 0;
+  padding: 1rem 1.25rem;
+}
+
+.field label {
+  display: block;
+  font-size: 0.9rem;
+  color: var(--muted);
+  margin-bottom: 0.25rem;
+}
+
+.field input {
+  width: 100%;
+  max-width: 12rem;
+  min-height: 2.75rem;
+  padding: 0 0.6rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--sheet);
+  color: var(--ink);
+  font: inherit;
+}
+
 /* The letter: the one decorated element. An airmail edge marks mail that is about to leave. */
 .letter {
   position: relative;

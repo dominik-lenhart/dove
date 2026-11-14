@@ -775,3 +775,7 @@ hosts or reference hardware.
   (j) Unknown paths under `/admin` answer 404 before the session check (the plan said after): the route list is
   public in the source anyway. (k) The Overview shows the last doctor result (cached in memory); "Run checks" runs it.
   (l) The UI is refused in local mode and `dove tailscale setup --admin` refuses while Funnel is on for the port.
+  (m) Access requests (A73, merged while this was built) are shown per mailbox with what is asked and what the
+  connection has now; approval (with an optional shorter time in minutes) goes through the same passkey confirmation
+  as a send, and "End access now" is `requests cancel`. The send path refuses a duration and the access path takes
+  no revisions, so a forged `kind` field fails in the verb.
