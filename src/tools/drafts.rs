@@ -946,7 +946,6 @@ async fn send_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
 }
 
 /// What authorizes a send in [`send_core`].
-#[allow(dead_code)] // `Approved` is used by `requests::worker` (next commit).
 pub(crate) enum SendAuth {
     /// `send_draft`: the instance gate `allow_send` and the `send` action on the mailbox, re-read before dispatch,
     /// and the per-client `client_sends_per_hour` budget.

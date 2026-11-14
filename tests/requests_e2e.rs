@@ -568,3 +568,341 @@ async fn daily_cap_refuses_the_approval() {
     let v = show(&h, &id3).await;
     approve(&h, &id3, shown_of(&v), None, dove::admin::Late::Skip).await.unwrap();
 }
+
+// ------------------------------------------------------------------ the worker
+
+use dove::requests::worker::{TickReport, tick};
+use support::fake_google::Fault;
+
+/// A request for one draft per time in `times`, shown and approved as a whole.
+async fn approved(h: &Harness, token: &str, times: &[i64]) -> (String, Vec<String>) {
+    let (id, drafts) = requested(h, token, times).await;
+    let v = show(h, &id).await;
+    approve(h, &id, shown_of(&v), None, dove::admin::Late::Skip).await.unwrap();
+    (id, drafts)
+}
+
+async fn run(h: &Harness, now: i64) -> TickReport {
+    tick(h.app(), now).await.unwrap()
+}
+
+fn report(sent: usize, failed: usize, skipped: usize, missed: usize, unknown: usize, deferred: usize) -> TickReport {
+    TickReport { sent, failed, skipped, missed, unknown, expired: 0, deferred }
+}
+
+async fn send_items_audit(h: &Harness) -> Vec<(String, String, String)> {
+    h.app()
+        .store
+        .call(|c| {
+            let mut st = c.prepare(
+                "SELECT actor, object_ids, result_code FROM audit WHERE tool_or_action = 'request.send_item' ORDER BY seq",
+            )?;
+            Ok(st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?)
+        })
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn approved_items_are_sent_at_their_time() {
+    let (h, token) = setup().await;
+    let t = util::now_unix() + 3600;
+    let (id, drafts) = approved(&h, &token, &[t, t + 600]).await;
+    assert_eq!(run(&h, t - 1).await, TickReport::default());
+    assert_eq!(h.google.count("POST", "drafts/send"), 0);
+    assert_eq!(run(&h, t).await, report(1, 0, 0, 0, 0, 0));
+    assert_eq!(h.google.sent_messages(MB).len(), 1);
+    assert_eq!(states(&h, &id).await, ("approved".into(), vec![st("sent", None), st("scheduled", None)]));
+    assert_eq!(run(&h, t + 599).await, TickReport::default());
+    assert_eq!(run(&h, t + 600).await, report(1, 0, 0, 0, 0, 0));
+    assert_eq!(states(&h, &id).await, ("done".into(), vec![st("sent", None), st("sent", None)]));
+    // Nothing is sent twice.
+    assert_eq!(run(&h, t + 700).await, TickReport::default());
+    assert_eq!(h.google.count("POST", "drafts/send"), 2);
+    assert_eq!(h.google.sent_messages(MB).len(), 2);
+    let listed = h.ok(&token, "list_requests", json!({})).await;
+    let item = &listed["requests"][0]["items"][0];
+    assert_eq!(item["state"], "sent");
+    assert!(item["sent_message_id"].as_str().is_some_and(|s| !s.is_empty()));
+    // The drafts are recorded as sent, like send_draft does.
+    let (d0, d1) = (drafts[0].clone(), drafts[1].clone());
+    let own: Vec<String> = h
+        .app()
+        .store
+        .call(move |c| {
+            let mut s = c.prepare("SELECT state FROM own_drafts WHERE draft_id IN (?1, ?2)")?;
+            Ok(s.query_map([d0, d1], |r| r.get(0))?.collect::<Result<_, _>>()?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(own, vec!["sent", "sent"]);
+    h.google.assert_no_violations();
+}
+
+#[tokio::test]
+async fn approved_items_are_sent_at_their_time_over_smtp() {
+    let h = Harness::start().await;
+    h.imap_mailbox("info", MB).await;
+    h.project("acme", &["info"]).await;
+    let token = h.token("acme", "agent", vec![g("info", "read,draft")]).await;
+    let t = util::now_unix() + 3600;
+    let (id, _) = approved(&h, &token, &[t]).await;
+    assert_eq!(run(&h, t - 1).await, TickReport::default());
+    assert!(h.imap.sent_mails().is_empty());
+    assert_eq!(run(&h, t).await, report(1, 0, 0, 0, 0, 0));
+    assert_eq!(h.imap.sent_mails().len(), 1);
+    assert_eq!(states(&h, &id).await, ("done".into(), vec![st("sent", None)]));
+    assert_eq!(run(&h, t + 60).await, TickReport::default());
+    assert_eq!(h.imap.sent_mails().len(), 1);
+    h.imap.assert_only_allowlisted();
+}
+
+#[tokio::test]
+async fn approved_revision_is_binding() {
+    let (h, token) = setup_with(|c| c.allow_send = true).await;
+    let sender = h.token("acme", "sender", vec![g("info", "read,draft,send")]).await;
+    let t = util::now_unix() + 3600;
+    // Updated by the agent, deleted by the agent, edited by a person, and sent by the agent itself.
+    let (id, drafts) = approved(&h, &token, &[t, t, t]).await;
+    let (sid, sdrafts) = approved(&h, &sender, &[t]).await;
+    let v = show(&h, &id).await;
+    let rev = |i: usize| v["items"][i]["revision"].as_str().unwrap().to_string();
+    h.ok(
+        &token,
+        "update_draft",
+        json!({"account":"info","draft_id":drafts[0],"expected_revision":rev(0),"changes":{"body_text":"changed"}}),
+    )
+    .await;
+    h.ok(&token, "delete_draft", json!({"account":"info","draft_id":drafts[1]})).await;
+    let raw = String::from_utf8(h.google.draft_raw(MB, &drafts[2]).unwrap()).unwrap();
+    h.google.replace_draft_externally(MB, &drafts[2], raw.replace("Dear customer", "Dear friend").as_bytes());
+    let sv = show(&h, &sid).await;
+    h.ok(
+        &sender,
+        "send_draft",
+        json!({"account":"info","draft_id":sdrafts[0],"expected_revision":sv["items"][0]["revision"]}),
+    )
+    .await;
+    assert_eq!(h.google.count("POST", "drafts/send"), 1);
+    assert_eq!(run(&h, t).await, report(0, 4, 0, 0, 0, 0));
+    assert_eq!(
+        states(&h, &id).await,
+        (
+            "done".into(),
+            vec![st("failed", Some("draft_changed")), st("failed", Some("not_found")), st("failed", Some("draft_changed"))]
+        )
+    );
+    assert_eq!(states(&h, &sid).await, ("done".into(), vec![st("failed", Some("not_found"))]));
+    assert_eq!(h.google.count("POST", "drafts/send"), 1, "nothing sent by the worker, nothing twice");
+}
+
+#[tokio::test]
+async fn refused_send_fails_after_three_attempts() {
+    let (h, token) = setup().await;
+    let t = util::now_unix() + 3600;
+    let (id, _) = approved(&h, &token, &[t]).await;
+    for _ in 0..3 {
+        h.google.fail_next("POST", "drafts/send", Fault::Status(400, json!({"error":{"code":400}})));
+    }
+    assert_eq!(run(&h, t).await, report(0, 0, 0, 0, 0, 1));
+    assert_eq!(states(&h, &id).await.1, vec![st("scheduled", Some("upstream_error"))]);
+    assert_eq!(run(&h, t + 299).await, TickReport::default(), "five minutes apart");
+    assert_eq!(run(&h, t + 300).await, report(0, 0, 0, 0, 0, 1));
+    assert_eq!(run(&h, t + 600).await, report(0, 1, 0, 0, 0, 0));
+    assert_eq!(states(&h, &id).await, ("done".into(), vec![st("failed", Some("upstream_error"))]));
+    assert_eq!(h.google.count("POST", "drafts/send"), 3);
+    assert_eq!(run(&h, t + 900).await, TickReport::default());
+    assert!(h.google.sent_messages(MB).is_empty());
+}
+
+#[tokio::test]
+async fn not_dispatched_is_retried_until_grace() {
+    let (h, token) = setup().await;
+    let t = util::now_unix() + 3600;
+    let (id, _) = approved(&h, &token, &[t, t + 1800]).await;
+    let set_status = |s: &'static str| {
+        h.app().store.call(move |c| Ok(c.execute("UPDATE accounts SET status = ?1 WHERE alias = 'info'", [s])?))
+    };
+    // The mailbox needs reauthorization at send time: nothing is dispatched, the item waits.
+    set_status("reauth_required").await.unwrap();
+    assert_eq!(run(&h, t).await, report(0, 0, 0, 0, 0, 1));
+    assert_eq!(run(&h, t + 299).await, TickReport::default(), "retried five minutes later");
+    assert_eq!(run(&h, t + 300).await, report(0, 0, 0, 0, 0, 1));
+    assert_eq!(h.google.count("POST", "drafts/send"), 0);
+    // Back within the grace: sent late, but within it.
+    set_status("active").await.unwrap();
+    assert_eq!(run(&h, t + 600).await, report(1, 0, 0, 0, 0, 0));
+    assert_eq!(h.google.count("POST", "drafts/send"), 1);
+    // The second item never gets a working mailbox within its grace: it is missed, never sent.
+    set_status("reauth_required").await.unwrap();
+    assert_eq!(run(&h, t + 1800).await, report(0, 0, 0, 0, 0, 1));
+    set_status("active").await.unwrap();
+    assert_eq!(run(&h, t + 1800 + 3601).await, report(0, 0, 0, 1, 0, 0));
+    assert_eq!(states(&h, &id).await, ("done".into(), vec![st("sent", None), st("missed", Some("late"))]));
+    assert_eq!(h.google.count("POST", "drafts/send"), 1);
+}
+
+#[tokio::test]
+async fn due_items_are_bounded_and_missed_first() {
+    let (h, token) = setup().await;
+    let t = util::now_unix() + 3600;
+    let (id, _) = approved(&h, &token, &[t; 13]).await;
+    // Two items fell due long ago (the server was down), one a minute before the others.
+    set_send_at(&h, &id, 0, t - 3601).await;
+    set_send_at(&h, &id, 1, t - 7200).await;
+    set_send_at(&h, &id, 12, t - 60).await;
+    assert_eq!(run(&h, t).await, report(10, 0, 0, 2, 0, 0));
+    let (_, items) = states(&h, &id).await;
+    assert_eq!(items[..2], [st("missed", Some("late")), st("missed", Some("late"))]);
+    assert_eq!(items[12], st("sent", None), "oldest first");
+    assert_eq!(items[11], st("scheduled", None));
+    assert_eq!(items.iter().filter(|i| i.0 == "sent").count(), 10);
+    assert_eq!(h.google.count("POST", "drafts/send"), 10);
+    assert_eq!(run(&h, t + 30).await, report(1, 0, 0, 0, 0, 0));
+    assert_eq!(states(&h, &id).await.0, "done");
+}
+
+#[tokio::test]
+async fn unknown_outcome_is_never_retried() {
+    let (h, token) = setup().await;
+    let t = util::now_unix() + 3600;
+    let (id, _) = approved(&h, &token, &[t]).await;
+    h.google.fail_next("POST", "drafts/send", Fault::Status(503, json!({"error":{"code":503}})));
+    assert_eq!(run(&h, t).await, report(0, 0, 0, 0, 1, 0));
+    assert_eq!(states(&h, &id).await, ("done".into(), vec![st("send_unknown", Some("outcome_unknown"))]));
+    for later in [t + 300, t + 600, t + 3000] {
+        assert_eq!(run(&h, later).await, TickReport::default());
+    }
+    assert_eq!(h.google.count("POST", "drafts/send"), 1);
+}
+
+#[tokio::test]
+async fn restart_while_sending() {
+    let (mut h, token) = setup().await;
+    let t = util::now_unix() + 3600;
+    let (id, _) = approved(&h, &token, &[t]).await;
+    let rid = id.clone();
+    h.app()
+        .store
+        .call(move |c| Ok(c.execute("UPDATE request_items SET state = 'sending' WHERE request_id = ?1", [rid])?))
+        .await
+        .unwrap();
+    h.restart().await;
+    assert_eq!(states(&h, &id).await, ("done".into(), vec![st("send_unknown", Some("restart"))]));
+    assert_eq!(run(&h, t).await, TickReport::default());
+    assert_eq!(h.google.count("POST", "drafts/send"), 0);
+    let audit = send_items_audit(&h).await;
+    assert_eq!(audit.len(), 1);
+    assert_eq!(audit[0].2, "send_unknown");
+}
+
+#[tokio::test]
+async fn revoked_client_lost_grant_and_removed_mailbox_stop_items() {
+    let (h, token) = setup().await;
+    h.mailbox("ops", "ops@acme.test");
+    h.admin(AdminRequest::ProjectsAddAccount { project: "acme".into(), account: "ops".into() }).await.unwrap();
+    let t = util::now_unix() + 3600;
+    let other = h.token("acme", "other", vec![g("info", "read,draft"), g("ops", "read,draft")]).await;
+    let (revoked, _) = approved(&h, &token, &[t]).await;
+    let (narrowed, _) = approved(&h, &other, &[t]).await;
+    let mut ops_items = Vec::new();
+    for _ in 0..1 {
+        ops_items.push(draft(&h, &other, "ops").await);
+    }
+    let (od, orev) = &ops_items[0];
+    let ops_req = h
+        .ok(&other, "request_send", json!({"account":"ops","items":[{"draft_id":od,"expected_revision":orev,"send_at":at(t)}]}))
+        .await["request_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let v = show(&h, &ops_req).await;
+    approve(&h, &ops_req, shown_of(&v), None, dove::admin::Late::Skip).await.unwrap();
+    h.admin(AdminRequest::ClientsRevoke { name: "agent".into() }).await.unwrap();
+    assert_eq!(states(&h, &revoked).await, ("done".into(), vec![st("cancelled", Some("client_revoked"))]));
+    h.admin(AdminRequest::AccountsRemove { alias: "ops".into() }).await.unwrap();
+    let gone: i64 = {
+        let r = ops_req.clone();
+        h.app().store.call(move |c| Ok(c.query_row("SELECT count(*) FROM requests WHERE id = ?1", [r], |x| x.get(0))?)).await.unwrap()
+    };
+    assert_eq!(gone, 0, "rows of a removed mailbox are deleted with it");
+    assert!(audit_text(&h).await.contains(&ops_req), "the cancellation was audited before the rows went");
+    // Narrowed to read only after approval: the re-check before the claim fails it.
+    h.admin(AdminRequest::ClientsSetGrants { name: "other".into(), grants: vec![g("info", "read")] }).await.unwrap();
+    assert_eq!(run(&h, t).await, report(0, 1, 0, 0, 0, 0));
+    assert_eq!(states(&h, &narrowed).await, ("done".into(), vec![st("failed", Some("access_lost"))]));
+    assert_eq!(h.google.count("POST", "drafts/send"), 0);
+}
+
+#[tokio::test]
+async fn pending_request_expires() {
+    let (h, token) = setup().await;
+    let now = util::now_unix();
+    let (id, _) = requested(&h, &token, &[now + 3600]).await;
+    assert_eq!(run(&h, now + 7 * DAY - 10).await, TickReport::default());
+    let r = run(&h, now + 7 * DAY + 10).await;
+    assert_eq!(r, TickReport { expired: 1, ..Default::default() });
+    assert_eq!(states(&h, &id).await, ("expired".into(), vec![st("cancelled", Some("expired"))]));
+    let v = show(&h, &id).await;
+    assert!(approve(&h, &id, shown_of(&v), None, dove::admin::Late::Send).await.is_err());
+}
+
+#[tokio::test]
+async fn scheduled_send_writes_one_audit_row_without_content() {
+    let (h, token) = setup().await;
+    let t = util::now_unix() + 3600;
+    let (id, drafts) = approved(&h, &token, &[t]).await;
+    run(&h, t).await;
+    let rows = send_items_audit(&h).await;
+    assert_eq!(rows.len(), 1);
+    let (actor, ids, code) = &rows[0];
+    assert_eq!((actor.as_str(), code.as_str()), ("scheduler", "ok"));
+    assert!(ids.contains(&id) && ids.contains(&drafts[0]), "{ids}");
+    let audit = audit_text(&h).await;
+    for needle in ["Offer", "Dear customer", "c@example.org"] {
+        assert!(!audit.contains(needle), "{needle} reached the audit log");
+    }
+}
+
+#[tokio::test]
+async fn switched_off_after_approval_sends_nothing() {
+    let (mut h, token) = setup().await;
+    let t = util::now_unix() + 3600;
+    let (id, _) = approved(&h, &token, &[t]).await;
+    h.restart_with(|c| c.requests.enabled = false).await;
+    assert_eq!(run(&h, t).await, TickReport::default());
+    assert_eq!(run(&h, t + 3601).await, report(0, 0, 0, 1, 0, 0));
+    assert_eq!(states(&h, &id).await.1, vec![st("missed", Some("late"))]);
+    assert_eq!(h.google.count("POST", "drafts/send"), 0);
+}
+
+#[tokio::test]
+async fn expired_client_sends_nothing() {
+    // Expiry, unlike revocation, cancels nothing up front: the re-check before the claim must stop the item.
+    let (h, token) = setup().await;
+    let t = util::now_unix() + 3600;
+    let (id, _) = approved(&h, &token, &[t]).await;
+    h.app()
+        .store
+        .call(|c| Ok(c.execute("UPDATE clients SET expires_at = ?1 WHERE name = 'agent'", [util::now_unix() - 1])?))
+        .await
+        .unwrap();
+    assert_eq!(run(&h, t).await, report(0, 1, 0, 0, 0, 0));
+    assert_eq!(states(&h, &id).await, ("done".into(), vec![st("failed", Some("client_revoked"))]));
+    assert_eq!(h.google.count("POST", "drafts/send"), 0);
+}
+
+#[tokio::test]
+async fn concurrent_passes_send_once() {
+    let (h, token) = setup().await;
+    let t = util::now_unix() + 3600;
+    let (id, _) = approved(&h, &token, &[t, t, t]).await;
+    let (a, b, c) = tokio::join!(run(&h, t), run(&h, t), run(&h, t));
+    assert_eq!(a.sent + b.sent + c.sent, 3, "{a:?} {b:?} {c:?}");
+    for r in [a, b, c] {
+        assert_eq!((r.failed, r.unknown, r.skipped, r.missed, r.deferred), (0, 0, 0, 0, 0), "{r:?}");
+    }
+    assert_eq!(states(&h, &id).await, ("done".into(), vec![st("sent", None); 3]));
+    assert_eq!(h.google.count("POST", "drafts/send"), 3);
+    assert_eq!(send_items_audit(&h).await.len(), 3);
+}
