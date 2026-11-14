@@ -700,7 +700,7 @@ secret store, not in a project file. Grants are explicit per mailbox. Actions:
 | `read` | search, read, attachments, list folders and drafts | - |
 | `draft` | create, update and delete its own drafts | `read` |
 | `organize` | mark read/unread, star, add/remove labels (IMAP keywords), archive, move between folders, move out of Trash | `read` |
-| `delete` | move to Trash or Spam/Junk (also any folder below them), and move out of Spam/Junk; never a permanent delete | `organize` |
+| `delete` | move to Trash or Spam/Junk (also any folder below them), move out of Spam/Junk, and set or remove junk/not-junk keywords on IMAP (`$Junk`, `$NotJunk`, ...); never a permanent delete | `organize` |
 | `send` | `send_draft`, only with `allow_send = true` | `draft` |
 
 Presets are shorthands: `reader` = `read`, `drafter` = `read,draft`, `assistant` = `read,draft,organize`, `full` =

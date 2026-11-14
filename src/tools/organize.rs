@@ -65,7 +65,8 @@ pub fn defs() -> Vec<ToolDef> {
             description: concat!(
                 "Mark messages read or unread, star or unstar them, and add or remove labels (Gmail user labels; IMAP ",
                 "keywords). Flags: UNREAD, STARRED. At most 100 ids per call; each id gets its own result. ",
-                "Labels must already exist on Gmail. To move, archive or trash, use move_messages."
+                "Labels must already exist on Gmail. IMAP keywords with junk or spam in the name ($Junk, $NotJunk) ",
+                "train spam filters and need the delete permission. To move, archive or trash, use move_messages."
             ),
             capability: Capability::Organize,
             read_only: false,
@@ -465,6 +466,14 @@ fn imap_flags(flags: &[Flag], labels: &[String], adding: bool) -> Result<(Vec<St
     Ok((add, remove))
 }
 
+/// Whether an IMAP keyword is one mail clients and servers train spam filters on: `$Junk`, `$NotJunk`, `Junk`,
+/// `NotJunk`, `NonJunk`, `$Spam`, ... Any keyword containing `junk` or `spam` in any case counts (keywords are ASCII);
+/// a false hit only asks for the `delete` permission.
+fn is_junk_keyword(keyword: &str) -> bool {
+    let k = keyword.to_ascii_lowercase();
+    k.contains("junk") || k.contains("spam")
+}
+
 async fn imap_update(
     cx: &ToolCx,
     mb: &Mailbox,
@@ -481,6 +490,10 @@ async fn imap_update(
     let (a2, r2) = imap_flags(remove_flags, remove_labels, false)?;
     add.extend(a2);
     remove.extend(r2);
+    // Adding or removing a junk keyword is spam-filter training, like moving into or out of Junk (PLAN A64).
+    if add_labels.iter().chain(remove_labels).any(|l| is_junk_keyword(l)) {
+        require_delete(cx, mb, NeedsDelete::JunkKeyword)?;
+    }
     let ImapGroups { folders, groups, mut outcomes } = imap_groups(cx, mb, ids).await?;
     cx.commit()?;
     for ((folder_id, uidvalidity), members) in groups {
@@ -555,6 +568,8 @@ enum NeedsDelete {
     Into,
     /// Out of Spam/Junk: promotes mail the provider classified as spam into view (security review 2026-11-13).
     OutOfSpam,
+    /// A junk or not-junk keyword (`$Junk`, `$NotJunk`, `NonJunk`, ...): mail clients train spam filters on them.
+    JunkKeyword,
 }
 
 fn require_delete(cx: &ToolCx, mb: &Mailbox, why: NeedsDelete) -> Result<(), ToolError> {
@@ -563,6 +578,9 @@ fn require_delete(cx: &ToolCx, mb: &Mailbox, why: NeedsDelete) -> Result<(), Too
             ToolError::forbidden(match why {
                 NeedsDelete::Into => "moving to Trash or Spam needs the delete permission on this mailbox",
                 NeedsDelete::OutOfSpam => "moving messages out of Spam needs the delete permission on this mailbox",
+                NeedsDelete::JunkKeyword => {
+                    "setting or removing junk keywords trains spam filters and needs the delete permission on this mailbox"
+                }
             })
         } else {
             e

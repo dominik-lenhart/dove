@@ -181,6 +181,34 @@ async fn flags_and_keywords_round_trip() {
     h.imap.assert_only_allowlisted();
 }
 
+/// Junk and not-junk keywords train spam filters in mail clients and servers: setting or removing one needs `delete`
+/// (like leaving Junk), in any case, refused before any IMAP command. Other keywords stay `organize`.
+#[tokio::test]
+async fn junk_keywords_need_delete() {
+    let s = setup().await;
+    let (h, u) = (&s.h, &s.u);
+    let a = h.imap.add_message(&u.user, "INBOX", &raw("a"), &["$Junk"]);
+    let ia = imap_id(h, u, "INBOX", a).await;
+    h.imap.clear_commands();
+    for kw in ["$Junk", "$NotJunk", "Junk", "NotJunk", "NonJunk", "$junk", "$NOTJUNK", "$Spam", "NotSpam"] {
+        for key in ["add_labels", "remove_labels"] {
+            let args = json!({ "account": "info", "ids": [ia], key: [kw], "add_flags": ["STARRED"] });
+            assert_eq!(h.err(&s.assistant, "update_messages", args).await, "forbidden", "{key} {kw}");
+        }
+    }
+    assert!(h.imap.commands().is_empty(), "{:?}", h.imap.commands());
+    // Other keywords need only organize; delete allows junk keywords.
+    h.ok(&s.assistant, "update_messages", json!({ "account": "info", "ids": [ia], "add_labels": ["$Follow"] })).await;
+    h.ok(
+        &s.full,
+        "update_messages",
+        json!({ "account": "info", "ids": [ia], "remove_labels": ["$Junk"], "add_labels": ["$NotJunk"] }),
+    )
+    .await;
+    let flags = h.imap.flags(&u.user, "INBOX", a).unwrap();
+    assert!(flags.contains(&"$NotJunk".to_string()) && !flags.contains(&"$Junk".to_string()), "{flags:?}");
+}
+
 #[tokio::test]
 async fn move_with_move_capability() {
     let s = setup().await;

@@ -5,6 +5,12 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 
 ## [Unreleased]
 
+### Security
+
+- Setting or removing IMAP junk keywords (`$Junk`, `$NotJunk`, `NonJunk` and any keyword containing `junk` or `spam`,
+  in any case) needs the `delete` permission: mail clients train spam filters on them, like moving into or out of
+  Junk.
+
 ### Fixed
 
 - The hourly organize budget gives back only failures that certainly changed nothing. A Gmail move out of Trash whose

@@ -525,3 +525,13 @@ hosts or reference hardware.
   refunds everything. Gmail-over-IMAP moves now check "INBOX exists" before the first write, so no organize path
   returns a whole-call error after a write any more; the branch stays as the safe default and is pinned by a unit test
   of `organize::unused`.
+- A64. Junk keywords need `delete` (follow-up to A59 (b), 2026-11-14). Mail clients and servers train spam filters on
+  IMAP keywords (Thunderbird `Junk`/`NonJunk`, Apple Mail and RFC 5788 registry `$Junk`/`$NotJunk`, `NotJunk`), so an
+  `organize`-only agent could train a filter to promote spam or bury real mail. Adding or removing any keyword whose
+  name contains `junk` or `spam` (ASCII case-insensitive; keywords are ASCII by `imap::Keyword`) now needs `delete`,
+  checked for the whole call before any IMAP command. A substring match rather than a list: a false hit only asks for
+  more permission, while a missed spelling would train the filter. Gmail API: `update_messages` reaches user labels
+  only (`SPAM` is a system label and refused before any write in both directions), so Spam is reachable only through
+  `move_messages`, already gated. Gmail over IMAP: `update_messages` sets no keywords (labels go through
+  `X-GM-LABELS` on existing user-label folders; `[Gmail]/Spam` is a system folder and refused), so there is no
+  equivalent path. A Gmail user label named `Junk` is just a label; Gmail does not train on it.

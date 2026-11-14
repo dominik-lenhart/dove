@@ -509,3 +509,20 @@ async fn organize_budget_refunds_only_definitive_gmail_failures() {
     assert_eq!(results(&r), vec![(y.clone(), false, Some("upstream_error".into()))], "{r}");
     left(8).await;
 }
+
+/// Gmail has no spam-training keyword path: the `SPAM` label is a system label, which update_messages refuses before
+/// any write in both directions; only move_messages reaches Spam, behind `delete`.
+#[tokio::test]
+async fn spam_label_is_not_reachable_through_update_messages() {
+    let h = setup().await;
+    let t = h.token("acme", "agent", vec![g("info", "full")]).await;
+    let x = h.google.add_message(INFO, msg("x", &["INBOX", "SPAM"]));
+    h.google.clear_requests();
+    for key in ["add_labels", "remove_labels"] {
+        for label in ["SPAM", "Spam"] {
+            let args = json!({ "account": "info", "ids": [x], key: [label] });
+            assert_eq!(h.err(&t, "update_messages", args).await, "invalid_argument", "{key} {label}");
+        }
+    }
+    assert!(writes(&h).is_empty(), "{:?}", writes(&h));
+}
