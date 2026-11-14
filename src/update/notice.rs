@@ -203,13 +203,13 @@ pub async fn latest_known(cache: Option<&Path>, src: &Source, http: &reqwest::Cl
 }
 
 /// The notice for a newer release.
-pub fn notice_text(latest: &Version, installed: &Version) -> String {
-    format!("A new Dove version is available: {} (installed {}). Run: dove upgrade", tag(latest), tag(installed))
+pub fn notice_text(latest: &Version, installed: &Version, command: &str) -> String {
+    format!("A new Dove version is available: {} (installed {}). Run: {command}", tag(latest), tag(installed))
 }
 
 /// The notice, when `latest` is newer than the installed version.
-pub fn notice_line(latest: Option<&Version>, installed: &Version) -> Option<String> {
-    latest.filter(|l| *l > installed).map(|l| notice_text(l, installed))
+pub fn notice_line(latest: Option<&Version>, installed: &Version, command: &str) -> Option<String> {
+    latest.filter(|l| *l > installed).map(|l| notice_text(l, installed, command))
 }
 
 /// The production check for this binary (GitHub, user cache). The caller bounds it with [`NOTICE_BUDGET`].
@@ -218,7 +218,7 @@ pub async fn check() -> Option<String> {
     let http = super::http_client(LOOKUP_TIMEOUT).ok()?;
     let cache = cache_file(|k| std::env::var_os(k));
     let latest = latest_known(cache.as_deref(), &src, &http, crate::util::now_unix()).await;
-    notice_line(latest.as_ref(), &src.current)
+    notice_line(latest.as_ref(), &src.current, super::upgrade_command())
 }
 
 #[cfg(test)]
@@ -382,11 +382,11 @@ mod tests {
     #[test]
     fn line_only_for_newer_releases() {
         let cur = Version::new(0, 2, 0);
-        assert_eq!(notice_line(None, &cur), None);
-        assert_eq!(notice_line(Some(&Version::new(0, 2, 0)), &cur), None);
-        assert_eq!(notice_line(Some(&Version::new(0, 1, 9)), &cur), None);
+        assert_eq!(notice_line(None, &cur, "dove upgrade"), None);
+        assert_eq!(notice_line(Some(&Version::new(0, 2, 0)), &cur, "dove upgrade"), None);
+        assert_eq!(notice_line(Some(&Version::new(0, 1, 9)), &cur, "dove upgrade"), None);
         assert_eq!(
-            notice_line(Some(&Version::new(0, 3, 0)), &cur).unwrap(),
+            notice_line(Some(&Version::new(0, 3, 0)), &cur, "dove upgrade").unwrap(),
             "A new Dove version is available: v0.3.0 (installed v0.2.0). Run: dove upgrade"
         );
     }
