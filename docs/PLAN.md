@@ -732,3 +732,12 @@ hosts or reference hardware.
   until their expiry (the sweep runs regardless). (k) No redundancy check in `request_access`; `show` lists what the
   connection has now per mailbox. (l) Retention of a `done` access request counts from its decision, since requests
   have no closing timestamp; a temporary request closes at most 30 days after it, inside the 90-day retention.
+  Review follow-up (2026-11-14): (j) everything that can refuse `request_access` without creating a request (note
+  length, the open-request limit) is checked before any mailbox name is resolved, and a mailbox named twice (also by
+  alias and by address) becomes one grant with the actions of both, because a different answer for names inside the
+  project let an agent test project membership without the owner seeing a request. (k) Removing a mailbox from a
+  project cancels the requests naming it before the remaining rows are dropped, so each ended request has its
+  `request.cancel` record. (l) `list_accounts` hides `send` in temporary rights while `allow_send` is off, like in
+  `actions`. Left as is: `Actions::parse_grant` echoes up to 32 characters of the agent's own input back to the agent
+  (never to audit); the project check of `resolve_grants` at approval is shadowed by cancel-on-removal and has no test
+  of its own.

@@ -111,11 +111,19 @@ pub fn project_remove_account(tx: &Transaction, project: &str, alias: &str) -> a
         params![aid, pid],
     )?;
     // Temporary grants on the mailbox go with the grants; open access requests naming it are cancelled (PLAN A73).
-    let temporary = crate::requests::access::drop_extras(
+    // The requests go first: cancelling one deletes its rows and writes its `request.cancel` record, which a row
+    // already deleted could no longer be traced to.
+    let temporary: i64 = tx.query_row(
+        "SELECT count(*) FROM client_grant_extras WHERE account_id = ?1 \
+         AND client_id IN (SELECT id FROM clients WHERE project_id = ?2)",
+        params![aid, pid],
+        |r| r.get(0),
+    )?;
+    crate::requests::access::cancel_naming_account(tx, &aid, Some(&pid), "account_removed", util::now_unix())?;
+    crate::requests::access::drop_extras(
         tx,
         crate::requests::access::Scope::ProjectAccount { project_id: &pid, account_id: &aid },
     )?;
-    crate::requests::access::cancel_naming_account(tx, &aid, Some(&pid), "account_removed", util::now_unix())?;
     tx.execute("UPDATE clients SET auth_epoch = auth_epoch + 1 WHERE project_id = ?1", [&pid])?;
     // Outstanding invitations of the project could otherwise resurrect access after a re-add.
     let invitations = tx.execute("DELETE FROM invitations WHERE project_id = ?1 AND used_at IS NULL", [&pid])?;

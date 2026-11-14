@@ -429,7 +429,15 @@ async fn list_accounts(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError
                 v["temporary"] = Value::Array(
                     m.temporary
                         .iter()
-                        .map(|t| json!({ "actions": t.actions.to_string(), "expires_at": crate::util::rfc3339(t.expires_at) }))
+                        .map(|t| {
+                            // `send` stays hidden while the instance does not allow sending, as in `actions` above.
+                            let acts: Vec<&str> = Capability::ALL
+                                .into_iter()
+                                .filter(|&cap| t.actions.has(cap) && (cap != Capability::Send || cx.client.allow_send))
+                                .map(Capability::as_str)
+                                .collect();
+                            json!({ "actions": acts.join(","), "expires_at": crate::util::rfc3339(t.expires_at) })
+                        })
                         .collect(),
                 );
             }

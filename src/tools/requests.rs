@@ -76,7 +76,8 @@ pub fn defs() -> Vec<ToolDef> {
                 "(reader, drafter, assistant, full), e.g. actions \"read,draft\". With duration_minutes (1 to 43200, ",
                 "30 days) the rights end on their own; without it the request is for a permanent grant. Nothing changes ",
                 "until the owner approves; the owner may shorten the time or leave out mailboxes. The owner tells you ",
-                "the mailbox alias; there is no list of mailboxes you could ask for. Follow the outcome with list_requests."
+                "the mailbox alias; there is no list of mailboxes you could ask for. An approved temporary request counts as open until its ",
+                "rights end. Follow the outcome with list_requests."
             ),
             capability: Capability::Read,
             read_only: false,
@@ -476,15 +477,31 @@ async fn request_access(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolErro
         },
     };
     let note = opt_str(&args, "note")?.map(str::to_string);
+    // Everything that can refuse the call without leaving a request the owner sees is checked before any mailbox
+    // name is resolved, so an answer other than not_found never tells whether a name is in the project.
+    if note.as_deref().is_some_and(|n| n.chars().count() > requests::MAX_NOTE_CHARS) {
+        return Err(ToolError::invalid_at("note", format!("must be at most {} characters", requests::MAX_NOTE_CHARS)));
+    }
+    let too_many = || {
+        ToolError::invalid(format!(
+            "this connection already has {} open requests; wait for decisions or cancel one",
+            cx.app.cfg.limits.client_open_requests
+        ))
+    };
 
     // Accounts are looked up in the client's project only, by alias or address: an unknown name and a name outside
     // the project are the same not_found. The client's own grants play no part (asking is for what it lacks).
     let pid = cx.client.project_id.clone();
+    let cid = cx.client.client_id.clone();
+    let limit = cx.app.cfg.limits.client_open_requests;
     let names: Vec<String> = grants.iter().map(|g| g.account.clone()).collect();
-    let found: Vec<Option<(String, String)>> = cx
+    let found: Option<Vec<Option<(String, String)>>> = cx
         .app
         .store
         .call(move |c| {
+            if !access::has_room(c, &cid, limit)? {
+                return Ok(None);
+            }
             let mut st = c.prepare(
                 "SELECT a.id, a.alias FROM accounts a JOIN project_accounts pa ON pa.account_id = a.id \
                  WHERE pa.project_id = ?1 AND (a.alias = ?2 OR a.email = ?2)",
@@ -493,17 +510,24 @@ async fn request_access(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolErro
             for n in &names {
                 out.push(st.query_row(params![pid, n], |r| Ok((r.get(0)?, r.get(1)?))).optional()?);
             }
-            Ok(out)
+            Ok(Some(out))
         })
         .await?;
-    let mut asked: Vec<AskedGrant> = Vec::with_capacity(grants.len());
-    let mut aliases: Vec<String> = Vec::with_capacity(grants.len());
-    for (i, (g, f)) in grants.iter().zip(found).enumerate() {
+    let Some(found) = found else { return Err(too_many()) };
+    // A mailbox named twice (also once by alias and once by address) is one grant with the actions of both: an
+    // error here would tell that both names are in the project.
+    let mut merged: Vec<(String, String, crate::policy::Actions)> = Vec::with_capacity(grants.len());
+    for (g, f) in grants.iter().zip(found) {
         let Some((account_id, alias)) = f else { return Err(ToolError::not_found()) };
-        if asked.iter().any(|a| a.account_id == account_id) {
-            return Err(ToolError::invalid_at(format!("grants[{i}].account"), "names a mailbox twice"));
+        match merged.iter_mut().find(|m| m.0 == account_id) {
+            Some(m) => m.2 = m.2.union(&g.actions),
+            None => merged.push((account_id, alias, g.actions)),
         }
-        asked.push(AskedGrant { account_id, actions: g.actions.to_string() });
+    }
+    let mut asked: Vec<AskedGrant> = Vec::with_capacity(merged.len());
+    let mut aliases: Vec<String> = Vec::with_capacity(merged.len());
+    for (account_id, alias, actions) in merged {
+        asked.push(AskedGrant { account_id, actions: actions.to_string() });
         aliases.push(alias);
     }
 
@@ -532,12 +556,7 @@ async fn request_access(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolErro
         .await?;
     match created {
         Ok(_) => {}
-        Err(CreateError::TooManyOpen) => {
-            return Err(ToolError::invalid(format!(
-                "this connection already has {} open requests; wait for decisions or cancel one",
-                cx.app.cfg.limits.client_open_requests
-            )));
-        }
+        Err(CreateError::TooManyOpen) => return Err(too_many()),
         Err(CreateError::DraftAlreadyRequested(_)) => return Err(ToolError::internal()),
         Err(CreateError::Store(e)) => return Err(crate::error::internal_from(e)),
     }

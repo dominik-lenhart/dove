@@ -67,14 +67,20 @@ pub struct NewAccess {
     pub payload: Payload,
 }
 
-/// Records a `pending` access request; refuses when the client has `limits.client_open_requests` open requests.
-pub fn create(tx: &Transaction, cfg: &Config, new: NewAccess, now: i64) -> Result<String, CreateError> {
-    let open: i64 = tx.query_row(
+/// Whether the client may open another request (`limits.client_open_requests`). `request_access` asks this before it
+/// resolves any mailbox name, so the limit's error cannot tell whether a name is in the project.
+pub fn has_room(c: &Connection, client_id: &str, limit: u32) -> rusqlite::Result<bool> {
+    let open: i64 = c.query_row(
         &format!("SELECT count(*) FROM requests WHERE client_id = ?1 AND status IN {OPEN_STATUSES}"),
-        [&new.client_id],
+        [client_id],
         |r| r.get(0),
     )?;
-    if open >= i64::from(cfg.limits.client_open_requests) {
+    Ok(open < i64::from(limit))
+}
+
+/// Records a `pending` access request; refuses when the client has `limits.client_open_requests` open requests.
+pub fn create(tx: &Transaction, cfg: &Config, new: NewAccess, now: i64) -> Result<String, CreateError> {
+    if !has_room(tx, &new.client_id, cfg.limits.client_open_requests)? {
         return Err(CreateError::TooManyOpen);
     }
     let payload = serde_json::to_string(&new.payload).map_err(|e| CreateError::Store(e.into()))?;

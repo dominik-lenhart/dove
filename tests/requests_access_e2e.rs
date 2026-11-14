@@ -307,16 +307,6 @@ async fn union_and_dependency_rules() {
         assert_eq!(e["error"]["code"], "invalid_argument", "{actions}: {e}");
         assert_eq!(e["error"]["details"]["field"], field, "{actions}: {e}");
     }
-    let e = h
-        .call(
-            &fx.token,
-            "request_access",
-            json!({ "grants": [{ "account": "info", "actions": "read" },
-            { "account": "INFO@acme.test", "actions": "drafter" }] }),
-        )
-        .await
-        .1;
-    assert_eq!(e["error"]["details"]["field"], "grants[1].account", "{e}");
     // read,organize on top of read,draft: the union.
     let id = fx.ask(json!([{ "account": "info", "actions": "reader,organize" }]), Some(60)).await;
     fx.approve(&id, None, None).await.unwrap();
@@ -456,6 +446,12 @@ async fn set_grants_revoke_and_mailbox_removal_drop_extras() {
     assert_eq!(v["temporary_grants_deleted"], 1);
     assert_eq!((fx.extras().await, fx.status(&id).await.as_str()), (0, "done"));
     assert_eq!(fx.status(&pending).await, "cancelled");
+    // Both endings are on record, the approved request's as well as the pending one's.
+    for r in [&id, &pending] {
+        let q =
+            format!("SELECT count(*) FROM audit WHERE tool_or_action = 'request.cancel' AND object_ids LIKE '%{r}%'");
+        assert_eq!(fx.sql_i64(&q).await, 1, "request.cancel record of {r}");
+    }
     // Adding it back resurrects nothing.
     h.admin(AdminRequest::ProjectsAddAccount { project: "acme".into(), account: "billing".into() }).await.unwrap();
     assert_eq!(h.err(&fx.token, "list_labels", json!({ "account": "billing" })).await, "not_found");
@@ -538,6 +534,49 @@ async fn unknown_and_out_of_project_alias_are_identical() {
     assert_eq!(fx.sql_i64("SELECT count(*) FROM requests WHERE kind = 'access'").await, 1);
 }
 
+/// A call that is refused without leaving a request must answer the same for a mailbox of the project and for a
+/// foreign or unknown one; otherwise the agent could test project membership without the owner seeing anything.
+#[tokio::test]
+async fn refusals_do_not_tell_project_membership() {
+    let fx = setup_with(|c| c.limits.client_open_requests = 1).await;
+    let h = &fx.h;
+    let before = fx.sql_i64("SELECT count(*) FROM requests").await;
+
+    // A note that is too long: refused the same way for every name.
+    let long = "n".repeat(501);
+    let note = |account: &str| json!({ "grants": [{ "account": account, "actions": "read" }], "note": long });
+    let inside = h.call(&fx.token, "request_access", note("billing")).await;
+    assert_eq!(inside.1["error"]["code"], "invalid_argument", "{}", inside.1);
+    assert_eq!(inside.1["error"]["details"]["field"], "note");
+    assert_eq!(inside.1, h.call(&fx.token, "request_access", note("other")).await.1);
+    assert_eq!(inside.1, h.call(&fx.token, "request_access", note("nope")).await.1);
+
+    // A name given twice: with a foreign or unknown mailbox it stays not_found, inside the project it is one grant
+    // with the actions of both entries (also when one entry uses the address).
+    let twice = |account: &str| json!({ "grants": [{ "account": account, "actions": "read" }, { "account": account, "actions": "read" }] });
+    assert_eq!(h.call(&fx.token, "request_access", twice("other")).await.1["error"]["code"], "not_found");
+    assert_eq!(h.call(&fx.token, "request_access", twice("nope")).await.1["error"]["code"], "not_found");
+    assert_eq!(fx.sql_i64("SELECT count(*) FROM requests").await, before);
+    let merged = h
+        .ok(
+            &fx.token,
+            "request_access",
+            json!({ "grants": [{ "account": "billing", "actions": "read" },
+                               { "account": "BILLING@acme.test", "actions": "drafter" }] }),
+        )
+        .await;
+    assert_eq!(merged["grants"].as_array().unwrap().len(), 1, "{merged}");
+    assert_eq!(merged["grants"][0]["actions"], "read,draft");
+
+    // The open-request limit (now reached): the same answer for every name.
+    let ask = |account: &str| json!({ "grants": [{ "account": account, "actions": "read" }] });
+    let inside = h.call(&fx.token, "request_access", ask("info")).await;
+    assert_eq!(inside.1["error"]["code"], "invalid_argument", "{}", inside.1);
+    assert_eq!(inside.1, h.call(&fx.token, "request_access", ask("other")).await.1);
+    assert_eq!(inside.1, h.call(&fx.token, "request_access", ask("nope")).await.1);
+    assert_eq!(fx.sql_i64("SELECT count(*) FROM requests").await, before + 1);
+}
+
 #[tokio::test]
 async fn send_needs_allow_send() {
     let fx = setup().await;
@@ -559,6 +598,12 @@ async fn send_needs_allow_send() {
     fx.h.restart_with(|c| c.allow_send = true).await;
     fx.approve(&id, None, None).await.unwrap();
     assert!(fx.h.tool_names(&fx.token).await.contains(&"send_draft".to_string()));
+    // With the gate closed again the temporary right no longer lists `send`, like the mailbox's own actions.
+    fx.h.restart_with(|c| c.allow_send = false).await;
+    let accounts = fx.h.ok(&fx.token, "list_accounts", json!({})).await;
+    let info = accounts["accounts"].as_array().unwrap().iter().find(|a| a["account"] == "info").unwrap();
+    assert_eq!(info["temporary"][0]["actions"], "read,draft", "{info}");
+    assert!(!info["actions"].as_array().unwrap().iter().any(|a| a == "send"), "{info}");
 }
 
 #[tokio::test]
