@@ -5,6 +5,8 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-14
+
 ### Added
 
 - `dove sinks add --url-file <path>` reads the webhook URL from a file (owner-only mode, trimmed) or from standard
@@ -253,7 +255,8 @@ First release.
   release only after verifying its minisign signature. The CLI hints at a new release at most once a day
   (`DOVE_NO_UPDATE_CHECK=1` turns it off); the server never checks for updates.
 
-[Unreleased]: https://github.com/dominik-lenhart/dove/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/dominik-lenhart/dove/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/dominik-lenhart/dove/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/dominik-lenhart/dove/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/dominik-lenhart/dove/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/dominik-lenhart/dove/compare/v0.4.0...v0.5.0
