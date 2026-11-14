@@ -1634,7 +1634,9 @@ mod tests {
         assert_eq!(code(json!({"all":[{"field":"from","op":"eq","value":"a@b.c"}], "x":1})), "invalid_argument");
         assert_eq!(code(json!({"field":"from","op":"eq","value":"x".repeat(257)})), "invalid_argument");
         assert_eq!(code(json!({"field":"from","op":"in","value":vec!["a@b.c"; 101]})), "invalid_argument");
-        assert_eq!(code(json!({"field":"received_at","op":"gte","value":"2026-10-01"})), "invalid_argument");
+        assert_eq!(code(json!({"field":"received_at","op":"gte","value":"2026-10-01T10:00:00"})), "invalid_argument");
+        assert_eq!(code(json!({"field":"received_at","op":"eq","value":"2026-10-01"})), "invalid_argument");
+        assert!(parse(json!({"field":"received_at","op":"gte","value":"2026-10-01"})).is_ok());
         assert_eq!(code(json!({"field":"subject","op":"prefix","value":"a"})), "query_too_broad");
         assert_eq!(code(json!({"field":"subject","op":"prefix","value":"two words"})), "invalid_argument");
         let deep = json!({"all":[{"any":[{"not":{"all":[{"not":{"field":"is_unread","op":"eq","value":true}}]}}]}]});
