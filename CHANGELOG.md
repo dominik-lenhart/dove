@@ -5,6 +5,8 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-11-14
+
 ### Changed
 
 - Clearer descriptions for `list_accounts`, `list_labels`, `get_thread`, `get_draft`, `list_drafts`, `list_watches`,
@@ -380,7 +382,8 @@ First release.
   release only after verifying its minisign signature. The CLI hints at a new release at most once a day
   (`DOVE_NO_UPDATE_CHECK=1` turns it off); the server never checks for updates.
 
-[Unreleased]: https://github.com/dominik-lenhart/dove/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/dominik-lenhart/dove/compare/v0.12.1...HEAD
+[0.12.1]: https://github.com/dominik-lenhart/dove/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/dominik-lenhart/dove/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/dominik-lenhart/dove/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/dominik-lenhart/dove/compare/v0.9.0...v0.10.0
