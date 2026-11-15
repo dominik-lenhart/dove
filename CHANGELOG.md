@@ -5,6 +5,8 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-11-15
+
 ### Added
 
 - Admin web UI, part 2: pages for Connections (create a token or an invitation, change what a connection may do per
@@ -412,7 +414,8 @@ First release.
   release only after verifying its minisign signature. The CLI hints at a new release at most once a day
   (`DOVE_NO_UPDATE_CHECK=1` turns it off); the server never checks for updates.
 
-[Unreleased]: https://github.com/dominik-lenhart/dove/compare/v0.12.2...HEAD
+[Unreleased]: https://github.com/dominik-lenhart/dove/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/dominik-lenhart/dove/compare/v0.12.2...v0.13.0
 [0.12.2]: https://github.com/dominik-lenhart/dove/compare/v0.12.1...v0.12.2
 [0.12.1]: https://github.com/dominik-lenhart/dove/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/dominik-lenhart/dove/compare/v0.11.0...v0.12.0
