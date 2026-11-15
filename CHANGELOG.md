@@ -5,6 +5,8 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 
 ## [Unreleased]
 
+## [0.12.2] - 2026-11-15
+
 ### Fixed
 
 - Admin web UI: signing in, adding a passkey and confirming an approval failed in the browser ("Load failed" in
@@ -395,7 +397,8 @@ First release.
   release only after verifying its minisign signature. The CLI hints at a new release at most once a day
   (`DOVE_NO_UPDATE_CHECK=1` turns it off); the server never checks for updates.
 
-[Unreleased]: https://github.com/dominik-lenhart/dove/compare/v0.12.1...HEAD
+[Unreleased]: https://github.com/dominik-lenhart/dove/compare/v0.12.2...HEAD
+[0.12.2]: https://github.com/dominik-lenhart/dove/compare/v0.12.1...v0.12.2
 [0.12.1]: https://github.com/dominik-lenhart/dove/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/dominik-lenhart/dove/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/dominik-lenhart/dove/compare/v0.10.0...v0.11.0
