@@ -152,6 +152,9 @@ pub enum Command {
     /// Webhook sinks for watch push delivery (admin).
     #[command(subcommand)]
     Sinks(SinksCmd),
+    /// Watches agents have set up, across all clients (admin).
+    #[command(subcommand)]
+    Watches(WatchesCmd),
     /// Agent requests: review and approve scheduled sends (admin).
     #[command(subcommand)]
     Requests(RequestsCmd),
@@ -698,6 +701,11 @@ pub enum TailscaleCmd {
         /// ([admin_ui] enabled and origin). Refused while Funnel is on for the port.
         #[arg(long)]
         admin: bool,
+        /// Mount ONLY the admin web UI (/admin) on this port, tailnet-only, and enable it in the config file;
+        /// public_url and the public paths stay as they are. For a Dove that is public through its own reverse proxy:
+        /// pick a port of its own with --port.
+        #[arg(long, conflicts_with_all = ["admin", "funnel"])]
+        admin_only: bool,
         /// Print the commands and the config change without running anything.
         #[arg(long)]
         dry_run: bool,
@@ -718,6 +726,21 @@ pub enum OperationsCmd {
         account: String,
         #[arg(long)]
         request_key: String,
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum WatchesCmd {
+    /// List every watch: client, mailbox, kind, state and times (no filters or threads).
+    List {
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+    /// Delete one watch of any client; its events and queued pushes go with it.
+    Remove {
+        id: String,
         #[command(flatten)]
         admin: AdminOpts,
     },
@@ -1326,6 +1349,10 @@ fn admin_request(cmd: Command) -> anyhow::Result<(AdminOpts, AdminRequest)> {
             SinksCmd::List { admin } => (admin, R::SinksList),
             SinksCmd::Remove { name, admin } => (admin, R::SinksRemove { name }),
         },
+        Command::Watches(c) => match c {
+            WatchesCmd::List { admin } => (admin, R::WatchesList),
+            WatchesCmd::Remove { id, admin } => (admin, R::WatchesRemove { id }),
+        },
         Command::Requests(c) => match c {
             RequestsCmd::List { status, admin } => (admin, R::RequestsList { status }),
             RequestsCmd::Show { id, admin } => (admin, R::RequestsShow { id }),
@@ -1461,8 +1488,8 @@ async fn run_command(command: Command) -> anyhow::Result<()> {
         Command::Remote(cmd) => crate::client::run(*cmd).await,
         Command::Local(cmd) => crate::local::run(cmd).await,
         Command::Doctor { profile: Some(p), admin } => crate::client::doctor(Some(&p), admin.json).await,
-        Command::Tailscale(TailscaleCmd::Setup { config, port, funnel, admin, dry_run }) => {
-            let opts = crate::tailscale::SetupOpts { config, port, funnel, admin, dry_run };
+        Command::Tailscale(TailscaleCmd::Setup { config, port, funnel, admin, admin_only, dry_run }) => {
+            let opts = crate::tailscale::SetupOpts { config, port, funnel, admin, admin_only, dry_run };
             crate::tailscale::setup(&opts, &crate::tailscale::Tailscale::from_path(), &mut std::io::stdout()).await
         }
         Command::Doctor { profile: None, admin } => {

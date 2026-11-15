@@ -19,41 +19,57 @@ use crate::app::App;
 use crate::audit::SearchFilter;
 use crate::util;
 
-fn page(s: &WebSession, title: &str, nav: Nav, body: Markup) -> Response {
+pub(super) fn page(s: &WebSession, title: &str, nav: Nav, body: Markup) -> Response {
     html::respond(html::page(title, nav, s.csrf(), &s.label, body))
 }
 
-fn problem(s: &WebSession, title: &str, message: &str, back: &str) -> Response {
+pub(super) fn problem(s: &WebSession, title: &str, message: &str, back: &str) -> Response {
     let mut r = html::respond(html::problem(title, s.csrf(), &s.label, message, back));
     *r.status_mut() = axum::http::StatusCode::CONFLICT;
     r
 }
 
-fn result(r: AdminResponse) -> Result<Value, String> {
+pub(super) fn result(r: AdminResponse) -> Result<Value, String> {
     if r.ok { Ok(r.result.unwrap_or(Value::Null)) } else { Err(r.error.unwrap_or_else(|| "failed".into())) }
 }
 
-fn csrf_input(s: &WebSession) -> Markup {
+pub(super) fn csrf_input(s: &WebSession) -> Markup {
     h!("<input type=\"hidden\" name=\"csrf\" value=\"{}\">", s.csrf())
 }
 
-fn text(v: &Value) -> String {
+pub(super) fn text(v: &Value) -> String {
     v.as_str().unwrap_or("").to_string()
 }
 
-fn list(v: &Value) -> String {
+pub(super) fn list(v: &Value) -> String {
     v.as_array().map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")).unwrap_or_default()
 }
 
 /// Fixed confirmation messages after a redirect (`?done=`); unknown values show nothing, so a link cannot put text
 /// on the page.
-fn done_notice(done: Option<&str>) -> Markup {
+pub(super) fn done_notice(done: Option<&str>) -> Markup {
     let msg = match done {
         Some("approved") => "Approved. The drafts go out at their planned times.",
         Some("denied") => "Request denied. Nothing will be sent.",
         Some("stopped") => "Stopped. Those drafts will not be sent.",
         Some("removed") => "Passkey removed. Its sessions have ended.",
         Some("revoked") => "Sessions ended.",
+        Some("saved") => "Saved.",
+        Some("created") => "Created.",
+        Some("added") => "Added.",
+        Some("deleted") => "Removed.",
+        Some("client_revoked") => "Connection revoked. Its token no longer works.",
+        Some("grants") => "Access changed. Temporary grants of this connection were removed.",
+        Some("enabled") => "Enabled.",
+        Some("disabled") => "Disabled.",
+        Some("connected") => "Mailbox connected.",
+        Some("reconnected") => "Mailbox reconnected.",
+        Some("indexing") => "Indexing is on. The first sync runs in the background.",
+        Some("index_off") => "Indexing is off and the index was deleted.",
+        Some("rebuild") => "The index is being rebuilt in the background.",
+        Some("ended") => "Watch removed.",
+        Some("pruned") => "Old audit records were deleted.",
+        Some("rewrapped") => "Secrets are now sealed with the current key.",
         _ => return Markup::default(),
     };
     h!("<p class=\"notice ok\" role=\"status\">{}</p>", msg)
@@ -61,15 +77,15 @@ fn done_notice(done: Option<&str>) -> Markup {
 
 #[derive(Deserialize, Default)]
 pub struct Done {
-    done: Option<String>,
+    pub(super) done: Option<String>,
 }
 
-fn state_chip(state: &str) -> Markup {
+pub(super) fn state_chip(state: &str) -> Markup {
     let class = match state {
         "pending" => "wait",
         "approved" | "scheduled" | "sending" | "granted" | "active" => "go",
         "sent" | "done" => "done",
-        "denied" | "failed" | "send_unknown" | "missed" => "bad",
+        "denied" | "failed" | "send_unknown" | "missed" | "revoked" | "reauth_required" => "bad",
         _ => "quiet",
     };
     let label = match state {
@@ -88,6 +104,9 @@ fn state_chip(state: &str) -> Markup {
         "send_unknown" => "Unknown outcome",
         "granted" => "Granted",
         "active" => "Active",
+        "revoked" => "Revoked",
+        "disabled" => "Disabled",
+        "reauth_required" => "Needs sign-in",
         "ended" => "Ended",
         "not_approved" => "Not approved",
         other => other,
@@ -681,9 +700,9 @@ fn size(v: &Value) -> String {
 }
 
 /// Form fields as pairs (repeated `item` keys stay apart).
-type Fields = Form<Vec<(String, String)>>;
+pub(super) type Fields = Form<Vec<(String, String)>>;
 
-fn chosen_items(fields: &[(String, String)]) -> Result<Vec<u32>, String> {
+pub(super) fn chosen_items(fields: &[(String, String)]) -> Result<Vec<u32>, String> {
     fields
         .iter()
         .filter(|(k, _)| k == "item")
@@ -773,7 +792,7 @@ pub async fn request_cancel(
     }
 }
 
-fn urlencode(s: &str) -> String {
+pub(super) fn urlencode(s: &str) -> String {
     url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
 }
 
@@ -903,8 +922,24 @@ async fn audit_page(app: &Arc<App>, s: &WebSession, q: &AuditQuery, notice: Opti
         }
         Err(e) => h!("<p class=\"notice error\">{}</p>", e),
     };
-    let body = h!("<h1>Audit log</h1>{}{}{}", notice, form, list);
+    let prune = h!(
+        "<section class=\"block\"><h2>Retention</h2><p>Records older than {} days can be deleted. The chain stays \
+         verifiable from the oldest record kept.</p><form method=\"post\" action=\"/admin/audit/prune\" \
+         data-confirm=\"Delete audit records older than {} days?\">{}<button type=\"submit\" class=\"btn\">\
+         Delete old records</button></form></section>",
+        app.cfg.audit.retention_days,
+        app.cfg.audit.retention_days,
+        csrf_input(s)
+    );
+    let body = h!("<h1>Audit log</h1>{}{}{}{}", notice, form, list, prune);
     page(s, "Audit log", Nav::Audit, body)
+}
+
+pub async fn audit_prune(State(app): State<Arc<App>>, Extension(s): Extension<WebSession>) -> Response {
+    match result(run_action(&app, &s, AdminRequest::AuditPrune).await) {
+        Ok(_) => Redirect::to("/admin/audit?done=pruned").into_response(),
+        Err(e) => problem(&s, "Not deleted", &e, "/admin/audit"),
+    }
 }
 
 // ------------------------------------------------------------------ Settings
@@ -973,17 +1008,70 @@ pub async fn settings(
     };
     let body = h!(
         "{}<h1>Settings</h1><section class=\"block\"><h2>Passkeys</h2><div class=\"rows\">{}</div>\
-         <p class=\"hint\">To add a passkey, run <code>sudo dove admin passkey add --name &lt;device&gt;</code> on \
-         the server and open the link it prints on that device.</p></section>\
+         <form class=\"inline-form\" method=\"post\" action=\"/admin/settings/passkeys/add\" data-stepup>{}\
+         <div class=\"inline-fields\"><input name=\"name\" type=\"text\" required maxlength=\"64\" \
+         placeholder=\"Device, e.g. ipad\" aria-label=\"Name of the new passkey\" autocomplete=\"off\"></div>\
+         <button type=\"submit\" class=\"btn\">Add a passkey</button>\
+         <p class=\"status\" role=\"status\" aria-live=\"polite\"></p></form>\
+         <p class=\"hint\">Dove shows a link to open on the new device. On the server, \
+         <code>sudo dove admin passkey add --name &lt;device&gt;</code> does the same.</p></section>\
          <section class=\"block\"><h2>Sessions</h2><div class=\"rows\">{}</div>\
          <form method=\"post\" action=\"/admin/settings/sessions/revoke\" data-confirm=\"End every session, this \
-         one included?\">{}<button type=\"submit\" class=\"btn danger\">End all sessions</button></form></section>",
+         one included?\">{}<button type=\"submit\" class=\"btn danger\">End all sessions</button></form></section>\
+         <section class=\"block\"><h2>Keys</h2><p>After you add a new key file and restart Dove, seal every stored \
+         secret with the new key. Then the old key file can go.</p><form method=\"post\" \
+         action=\"/admin/settings/keys/rewrap\" data-confirm=\"Seal all stored secrets with the current key?\">{}\
+         <button type=\"submit\" class=\"btn\">Seal with the current key</button></form></section>\
+         <section class=\"block\"><h2>Export</h2><p>Projects, connections and mailboxes as JSON, without any \
+         secret.</p><p><a class=\"btn\" href=\"/admin/settings/export\" download>Download export</a></p></section>",
         done_notice(d.done.as_deref()),
         pk,
+        csrf_input(&s),
         ss,
+        csrf_input(&s),
         csrf_input(&s)
     );
     page(&s, "Settings", Nav::Settings, body)
+}
+
+pub async fn passkey_add(
+    State(app): State<Arc<App>>,
+    Extension(s): Extension<WebSession>,
+    Form(fields): Fields,
+) -> Response {
+    let Some(name) = super::kit::field(&fields, "name") else { return super::kit::form_error("Name the passkey.") };
+    let after = super::auth::After::Reveal(super::auth::RevealKind::EnrolLink);
+    super::auth::begin_stepup_then(&app, &s, AdminRequest::PasskeysAdd { name }, after).await
+}
+
+pub async fn keys_rewrap(State(app): State<Arc<App>>, Extension(s): Extension<WebSession>) -> Response {
+    match result(run_action(&app, &s, AdminRequest::KeysRotate).await) {
+        Ok(_) => Redirect::to("/admin/settings?done=rewrapped").into_response(),
+        Err(e) => problem(&s, "Not sealed", &e, "/admin/settings"),
+    }
+}
+
+/// The export as a download. `no-store` like every admin answer.
+pub async fn export(State(app): State<Arc<App>>, Extension(s): Extension<WebSession>) -> Response {
+    match result(run_action(&app, &s, AdminRequest::Export).await) {
+        Ok(v) => {
+            let body = serde_json::to_string_pretty(&v).unwrap_or_default();
+            let mut r = body.into_response();
+            let h = r.headers_mut();
+            h.insert(axum::http::header::CONTENT_TYPE, axum::http::HeaderValue::from_static("application/json"));
+            h.insert(
+                axum::http::header::CONTENT_DISPOSITION,
+                axum::http::HeaderValue::from_static("attachment; filename=\"dove-export.json\""),
+            );
+            r
+        }
+        Err(e) => problem(&s, "Export", &e, "/admin/settings"),
+    }
+}
+
+/// The phone's "More" tab: the sections that do not fit in the bottom bar.
+pub async fn more(Extension(s): Extension<WebSession>) -> Response {
+    page(&s, "More", Nav::Settings, h!("<h1>More</h1><div class=\"rows\">{}</div>", html::more_links()))
 }
 
 pub async fn passkey_remove(

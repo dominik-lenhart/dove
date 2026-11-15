@@ -521,3 +521,9 @@ cargo fmt
   front of it (`DOVE_DEMO_ORIGIN`), and in a browser without an authenticator override `navigator.credentials.create/get`
   with a WebCrypto ES256 soft authenticator. Overrides are lost on every navigation, so inject them again on each page.
   Assets are cache-busted by content hash (`admin_ui::asset_version`), not by crate version.
+- 2026-11-15: Admin UI part 2 (PLAN A75). Secret results of step-up verbs go through `auth::begin_stepup_then(..,
+  After::Reveal(kind))` and the one-time `/admin/reveal/<id>` page, never into a redirect URL. The `COVERAGE` test
+  reads every page module (`pages`, `auth`, `connections`, `mailboxes`, `projects`, `watches`); a new page file must be
+  added to that list or its verbs look uncovered. In the browser demo the soft authenticator's `get` override is lost on
+  every navigation (re-inject before each step-up), and the admin CSP blocks injected `<style>` tags: try CSS fixes
+  through `element.style` before restarting the demo.

@@ -60,9 +60,12 @@ hosts or reference hardware.
    - [~] Admin web UI, part 1 (design 2026-11-14 §5, A74): `/admin` guard and gate, passkey enrolment and sign-in on
      Dove's own WebAuthn verifier, sessions, CSRF/Origin, step-up bound to the action, pages Overview, Requests,
      Audit, Settings, `dove admin passkey|sessions`, `dove tailscale setup --admin` (`tests/admin_ui_e2e.rs`,
-     `tests/admin_ui_logs.rs`, `tests/tailscale_e2e.rs`, unit tests with the W3C vectors). Part 2: Connections,
-     Mailboxes, Projects, Watches and sinks. Unverified: a real browser and a real authenticator (platform passkey,
-     security key, synced passkey), and Tailscale Serve in front of it.
+     `tests/admin_ui_logs.rs`, `tests/tailscale_e2e.rs`, unit tests with the W3C vectors).
+   - [x] Admin web UI, part 2 (design 2026-11-14 §5.4, §4.6, A75): Connections, Mailboxes, Projects, Watches and
+     sinks, settings additions (add passkey, rewrap, export, audit prune), one-time result page, `dove watches`,
+     `[requests] notify_sink`, `dove tailscale setup --admin-only` (`tests/admin_ui_manage_e2e.rs`,
+     `tests/tailscale_e2e.rs`). Checked in a real browser over Tailscale Serve with a WebCrypto soft authenticator;
+     still unverified with a real platform passkey or security key.
 5. Hardening
    - [x] Fake Google server integration suite covering the automatable parts of AC1-AC21 (AC1, AC2, AC4, AC6, AC7,
      AC10, AC12, AC13, AC16, AC18 in `tests/mcp_e2e.rs`, `tests/connect_e2e.rs`; AC14, AC17, AC20 in
@@ -798,3 +801,15 @@ hosts or reference hardware.
   link is full admin for whoever opens it first within five minutes, so `passkey add` tells the operator to remove
   the passkey if the link was used by someone else; without a proxy secret a loopback caller chooses its
   `X-Forwarded-For` (older behaviour, A30), which with (i) no longer buys a second budget on loopback.
+- A75. Admin web UI, part 2 (2026-11-15; design 2026-11-14 §5.4, §4.6). (a) Results that are secrets (a new token,
+  an invitation code, a Google sign-in link, a passkey enrolment link) never go into a redirect URL or a flash cookie:
+  the confirmed action's result is kept in memory (32 entries, 300 s) bound to the session that confirmed it, and
+  `/admin/reveal/<id>` shows it once (`take_if` checks the session before taking it out, so another session cannot
+  burn it). Token creation, rotation and invitations need a step-up, so they all go through this page. (b) Operations
+  (`operations list|remove`) stay CLI only: the service does not implement them yet. (c) New pages run existing admin
+  verbs only; the two new verbs are `watches.list` and `watches.remove` (no step-up: the owner's own read and an end
+  of an agent's watch). (d) `notify_sink` events are queued in the transaction that creates the request
+  (`request_notices`, deleted with the request) and delivered by the requests worker with the watch deliveries'
+  backoff and attempt limit; the body carries ids, the kind and an admin URL, never a subject, address or note.
+  (e) `--admin-only` refuses a port that already serves Dove's public paths, so it cannot take the public mount off
+  a working setup, and never touches `public_url`.

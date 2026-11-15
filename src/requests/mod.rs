@@ -15,6 +15,26 @@
 //! operator only; audit records carry ids and result codes.
 
 pub mod access;
+
+/// Queues the owner notice for a new pending request when `[requests] notify_sink` is set (section 4.6). Runs in the
+/// transaction that creates the request, after its row exists (the notice references it).
+pub fn queue_notice(
+    tx: &rusqlite::Transaction,
+    cfg: &crate::config::Config,
+    request_id: &str,
+    kind: &str,
+    now: i64,
+) -> rusqlite::Result<()> {
+    if cfg.requests.notify_sink.is_none() {
+        return Ok(());
+    }
+    tx.execute(
+        "INSERT OR IGNORE INTO request_notices(request_id, kind, state, next_attempt_at, created_at) \
+         VALUES (?1, ?2, 'pending', ?3, ?3)",
+        rusqlite::params![request_id, kind, now],
+    )?;
+    Ok(())
+}
 pub mod admin;
 pub mod worker;
 
@@ -142,6 +162,7 @@ pub fn create_send(tx: &Transaction, cfg: &Config, new: NewSend, now: i64) -> Re
             expires_at
         ],
     )?;
+    queue_notice(tx, cfg, &new.id, "send", now)?;
     for (i, item) in new.items.iter().enumerate() {
         let ids = item.baseline_ids.as_ref().map(|v| serde_json::json!(v).to_string());
         tx.execute(

@@ -5,6 +5,21 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 
 ## [Unreleased]
 
+### Added
+
+- Admin web UI, part 2: pages for Connections (create a token or an invitation, change what a connection may do per
+  mailbox, hide secrets in lists, rotate, revoke), Mailboxes (connect Gmail or IMAP, check, reconnect, enable or
+  disable, indexing, send-as addresses and signatures for IMAP mailboxes), Projects and Watches and sinks. Settings
+  can now add a passkey, re-seal stored secrets with the current key and download the export; Audit can prune old
+  records. On phones the tab bar shows Overview, Requests, Connections, Mailboxes and More.
+- New tokens, invitation codes, Google sign-in links and passkey enrolment links are shown once on a separate page,
+  only in the browser that confirmed the action and for at most five minutes.
+- `dove watches list` and `dove watches remove <id>`: every agent watch across all connections, for the owner.
+- `[requests] notify_sink = "<sink>"`: Dove posts a signed `request_pending` event (request id, kind and a link to the
+  admin UI, never mail content) to that sink whenever an agent asks for a scheduled send or for more access.
+- `dove tailscale setup --admin-only`: mounts only `/admin` on the tailnet name and leaves `public_url` alone, for hosts
+  that publish Dove's public paths through their own reverse proxy.
+
 ## [0.12.2] - 2026-11-15
 
 ### Fixed

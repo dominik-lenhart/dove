@@ -298,6 +298,43 @@ pub fn end_reason(
 }
 
 /// Ends a watch. Reasons that withdraw access also drop its undelivered pushes.
+/// `watches list` (admin): every watch with its client, mailbox, kind, state and times, newest first. Filters, thread
+/// ids and message ids stay out: they can carry mail content.
+pub fn admin_list(conn: &Connection) -> anyhow::Result<Value> {
+    let mut st = conn.prepare(
+        "SELECT w.id, c.name, a.alias, w.kind, w.state, w.created_at, w.expires_at, w.deadline, s.name, w.end_reason, \
+         w.ended_at, (SELECT count(*) FROM watch_events e WHERE e.watch_id = w.id) \
+         FROM watches w JOIN clients c ON c.id = w.client_id JOIN accounts a ON a.id = w.account_id \
+         LEFT JOIN sinks s ON s.id = w.sink_id ORDER BY w.state, w.created_at DESC",
+    )?;
+    let rows = st.query_map([], |r| {
+        Ok(serde_json::json!({
+            "watch_id": r.get::<_, String>(0)?,
+            "client": r.get::<_, String>(1)?,
+            "account": r.get::<_, String>(2)?,
+            "kind": r.get::<_, String>(3)?,
+            "state": r.get::<_, String>(4)?,
+            "created_at": util::rfc3339(r.get(5)?),
+            "expires_at": util::rfc3339(r.get(6)?),
+            "deadline": r.get::<_, Option<i64>>(7)?.map(util::rfc3339),
+            "sink": r.get::<_, Option<String>>(8)?,
+            "end_reason": r.get::<_, Option<String>>(9)?,
+            "ended_at": r.get::<_, Option<i64>>(10)?.map(util::rfc3339),
+            "events": r.get::<_, i64>(11)?,
+        }))
+    })?;
+    Ok(Value::Array(rows.collect::<Result<_, _>>()?))
+}
+
+/// `watches remove` (admin): deletes one watch of any client.
+pub fn admin_remove(tx: &Connection, watch_id: &str) -> anyhow::Result<Value> {
+    // Events and their queued pushes cascade.
+    if tx.execute("DELETE FROM watches WHERE id = ?1", [watch_id])? == 0 {
+        anyhow::bail!("unknown watch '{}'", watch_id.chars().take(64).collect::<String>());
+    }
+    Ok(serde_json::json!({ "watch_id": watch_id, "deleted": true }))
+}
+
 pub fn end_watch(conn: &Connection, watch_id: &str, reason: &str, now: i64) -> anyhow::Result<()> {
     conn.execute(
         "UPDATE watches SET state = 'ended', ended_at = ?1, end_reason = ?2 WHERE id = ?3 AND state = 'active'",

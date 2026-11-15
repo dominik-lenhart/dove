@@ -443,6 +443,103 @@ async fn deliver_one(app: &Arc<App>, d: &Due) -> Outcome {
     outcome
 }
 
+// ------------------------------------------------------------------ request notices
+
+/// Sends the queued owner notices of new requests (`[requests] notify_sink`, design 2026-11-14 section 4.6) that are
+/// due at `now`. The body is `{ event, kind, request_id, url }`: ids and the admin UI link only. Signed like watch
+/// events; the event id is `req_<request id>`. Same retry schedule as watch deliveries.
+pub async fn deliver_request_notices(app: &Arc<App>, now: i64) -> anyhow::Result<DeliveryReport> {
+    let Some(sink_name) = app.cfg.requests.notify_sink.clone() else { return Ok(DeliveryReport::default()) };
+    let name = sink_name.clone();
+    #[allow(clippy::type_complexity)] // the sink row and the due notices
+    let (sink, due): (Option<(String, Option<Vec<u8>>, Vec<u8>)>, Vec<(String, String, i64)>) = app
+        .store
+        .call(move |c| {
+            let sink = c
+                .query_row("SELECT id, url_sealed, secret FROM sinks WHERE name = ?1", [&name], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })
+                .optional()?;
+            let mut st = c.prepare_cached(
+                "SELECT request_id, kind, attempts FROM request_notices WHERE state = 'pending' AND next_attempt_at <= ?1 \
+                 ORDER BY next_attempt_at LIMIT ?2",
+            )?;
+            let due = st.query_map(params![now, BATCH], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            Ok((sink, due.collect::<Result<_, _>>()?))
+        })
+        .await?;
+    let mut report = DeliveryReport { attempted: due.len(), ..Default::default() };
+    if due.is_empty() {
+        return Ok(report);
+    }
+    let opened = sink.as_ref().and_then(|(id, url, secret)| {
+        let url = url.as_deref().and_then(|b| open_url(&app.vault, id, b).ok())?;
+        let secret = app.vault.open_aux(SECRET_KIND, id, secret).ok()?;
+        Some((url, secret))
+    });
+    if opened.is_none() {
+        tracing::error!(sink = %sink_name, "the requests.notify_sink sink is missing or unreadable; notices are not sent");
+    }
+    let origin = app.cfg.admin_ui.origin().map(str::to_string);
+    let mut results = Vec::with_capacity(due.len());
+    for (request_id, kind, attempts) in due {
+        let outcome = match &opened {
+            None => Outcome::Fail(None),
+            Some((url, secret)) => {
+                let link = origin.as_ref().map(|o| format!("{o}/admin/requests/{request_id}"));
+                let body = serde_json::to_vec(&serde_json::json!({
+                    "event": "request_pending", "kind": kind, "request_id": request_id, "url": link,
+                }))?;
+                let t = util::now_unix();
+                let headers = [
+                    ("content-type", "application/json".to_string()),
+                    (EVENT_ID_HEADER, format!("req_{request_id}")),
+                    (SIGNATURE_HEADER, signature_header(secret, t, &body)),
+                ];
+                match app.google.gateway().post_sink(url, &headers, body, Instant::now() + DELIVERY_TIMEOUT).await {
+                    Ok(s) if (200..300).contains(&s) => Outcome::Delivered(s),
+                    Ok(s) if s == 408 || s == 429 || s >= 500 => Outcome::Retry(Some(s)),
+                    Ok(s) => Outcome::Fail(Some(s)),
+                    Err(GatewayError::NotAllowed) => Outcome::Fail(None),
+                    Err(_) => Outcome::Retry(None),
+                }
+            }
+        };
+        match &outcome {
+            Outcome::Delivered(_) => report.delivered += 1,
+            Outcome::Retry(_) => report.retrying += 1,
+            Outcome::Fail(_) => report.failed += 1,
+        }
+        if !matches!(outcome, Outcome::Delivered(_)) && opened.is_some() {
+            tracing::warn!(sink = %sink_name, attempt = attempts + 1, "request notice delivery failed");
+        }
+        results.push((request_id, attempts, outcome));
+    }
+    app.store
+        .call(move |c| {
+            let tx = c.transaction()?;
+            for (request_id, attempts, outcome) in results {
+                let attempts = attempts + 1;
+                let (state, status, next) = match outcome {
+                    Outcome::Delivered(s) => ("delivered", Some(s), now),
+                    Outcome::Retry(s) if attempts < MAX_ATTEMPTS => {
+                        ("pending", s, now + BACKOFF_SECS[(attempts as usize - 1).min(BACKOFF_SECS.len() - 1)])
+                    }
+                    Outcome::Retry(s) | Outcome::Fail(s) => ("failed", s, now),
+                };
+                tx.execute(
+                    "UPDATE request_notices SET state = ?1, attempts = ?2, next_attempt_at = ?3, last_status = ?4 \
+                     WHERE request_id = ?5 AND state = 'pending'",
+                    params![state, attempts, next, status, request_id],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await?;
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

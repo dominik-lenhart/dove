@@ -396,7 +396,9 @@ an older Dove release that are no longer public are removed. The list of paths i
 
 Options: `--config <file>` (default `/etc/dove/config.toml`), `--port <n>` (HTTPS port on the tailnet name, default
 443), `--funnel`, `--admin` (also mount `/admin` and enable `[admin_ui]`; refused together with `--funnel` and while
-Funnel is on for the port), `--dry-run`.
+Funnel is on for the port), `--admin-only` (mount only `/admin` and enable `[admin_ui]`, leave `public_url` and
+the public paths alone; for hosts whose public paths go through their own reverse proxy; refused on a port that
+already serves the public paths), `--dry-run`.
 
 If Tailscale only lets root change its configuration, `setup` says so and prints what to run: either
 `sudo dove tailscale setup ...`, or `sudo tailscale set --operator=$USER` once and then run it as yourself. It checks
@@ -782,6 +784,10 @@ owner was shown. `request_send` needs neither a `send` grant nor `allow_send`: t
 gate, and `allow_send` keeps its meaning "agents may send on their own". Switch the feature off with
 `[requests] enabled = false`.
 
+To hear about a new request on your phone, add a sink (`dove sinks add`, or under Watches in the admin UI) and name it
+in the config: `[requests] notify_sink = "<sink>"`. Dove then posts a signed `request_pending` event with the request
+id, its kind and a link to the admin UI. The event carries no mail content; open the link to decide.
+
 ```sh
 dove requests list                       # newest first; --status pending|approved|done|denied|cancelled|expired
 dove requests show <request-id>          # every draft as it is now: from, to, cc, bcc, subject, text, attachments
@@ -988,12 +994,15 @@ WantedBy=default.target
 ## Admin web UI
 
 Dove can serve a small web UI for the owner under `/admin`: an overview (checks, index status, waiting requests, next
-scheduled sends), the requests to review and approve, the audit log and the passkeys and sessions. It is off by default,
+scheduled sends), the requests to review and approve, connections, mailboxes, projects, watches and sinks, the audit
+log and the passkeys, sessions, keys and export. New tokens, invitation codes and sign-in links appear once, on a page
+only the browser that confirmed the action can open, for five minutes. It is off by default,
 runs on the same listener as the service and is meant for your own devices only, typically over your tailnet. It does
 not exist in local mode.
 
-The only way in is a passkey (a platform passkey on your phone or laptop, or a security key). Approving a request
-and removing a passkey ask for the passkey again, bound to exactly that action. Every
+The only way in is a passkey (a platform passkey on your phone or laptop, or a security key). Approving a request,
+changing what a connection may do, creating or rotating tokens and invitations, connecting or reconnecting a mailbox, adding a sink and
+adding or removing a passkey ask for the passkey again, bound to exactly that action. Every
 action runs the same admin verb as the CLI and is audited as `web:<passkey name>`. Agent tokens are never accepted:
 a request to `/admin` with an `Authorization` header is refused.
 

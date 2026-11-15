@@ -354,6 +354,8 @@ async fn execute(call: &mut AdminCall<'_>, req: AdminRequest) -> anyhow::Result<
         SinksSetProject { name, project } => crate::watch::sinks::set_project(call, name, project).await,
         SinksList => crate::watch::sinks::list(call).await,
         SinksRemove { name } => crate::watch::sinks::remove(call, name).await,
+        WatchesList => call.read(crate::watch::admin_list).await,
+        WatchesRemove { id } => call.tx(move |tx| crate::watch::admin_remove(tx, &id)).await,
         RequestsList { status } => call.read(move |c| crate::requests::admin::list(c, status.as_deref())).await,
         RequestsShow { id } => crate::requests::admin::show(call, id).await,
         RequestsApprove { id, shown, items, late, duration_minutes } => {

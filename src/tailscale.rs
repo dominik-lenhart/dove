@@ -196,6 +196,8 @@ pub struct Desired {
     pub funnel: bool,
     /// Also serve the admin UI prefix (tailnet only).
     pub admin: bool,
+    /// Serve Dove's public paths. False only for `--admin-only`, which mounts nothing but the admin UI.
+    pub public: bool,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -218,7 +220,7 @@ impl Plan {
 impl Desired {
     /// The paths this port should serve: the public ones, plus the admin prefix with `--admin`.
     pub fn paths(&self) -> Vec<&'static str> {
-        let mut p = PUBLIC_PATHS.to_vec();
+        let mut p = if self.public { PUBLIC_PATHS.to_vec() } else { Vec::new() };
         if self.admin {
             p.push(crate::admin_ui::ADMIN_PREFIX);
         }
@@ -245,6 +247,16 @@ pub fn plan(d: &Desired, cur: &Current) -> anyhow::Result<Plan> {
              (tailscale funnel --https={port} off) or mount the admin UI on another port with --port",
             port = d.port,
             host = d.host
+        );
+    }
+    if !d.public
+        && let Some(path) = cur.handlers.keys().find(|p| PUBLIC_PATHS.contains(&p.as_str()))
+    {
+        bail!(
+            "port {} of {} serves Dove's public paths ({path}); --admin-only would take them down. Use --admin on that \
+             port, or pick a port of its own for the admin UI with --port",
+            d.port,
+            d.host
         );
     }
     let wanted = d.paths();
@@ -458,6 +470,9 @@ pub struct SetupOpts {
     pub funnel: bool,
     /// Also mount `/admin` and enable `[admin_ui]` with this origin.
     pub admin: bool,
+    /// Mount only `/admin` on this port and enable `[admin_ui]`; `public_url` and the public paths stay as they are
+    /// (for a Dove that is public through its own reverse proxy).
+    pub admin_only: bool,
     pub dry_run: bool,
 }
 
@@ -467,7 +482,9 @@ impl SetupOpts {
         if self.funnel {
             f.push_str(" --funnel");
         }
-        if self.admin {
+        if self.admin_only {
+            f.push_str(" --admin-only");
+        } else if self.admin {
             f.push_str(" --admin");
         }
         f
@@ -514,9 +531,10 @@ pub async fn setup(opts: &SetupOpts, ts: &Tailscale, out: &mut dyn Write) -> any
             "HTTPS certificates are not enabled for this tailnet; turn on HTTPS in the Tailscale admin console (DNS page)"
         );
     }
-    if opts.funnel && opts.admin {
+    if opts.funnel && (opts.admin || opts.admin_only) {
         bail!("--admin and --funnel cannot be combined: the admin UI is tailnet-only");
     }
+    let admin = opts.admin || opts.admin_only;
     if opts.funnel {
         if !FUNNEL_PORTS.contains(&opts.port) {
             bail!("Funnel only works on ports 443, 8443 and 10000, not {}", opts.port);
@@ -530,14 +548,15 @@ pub async fn setup(opts: &SetupOpts, ts: &Tailscale, out: &mut dyn Write) -> any
         port: opts.port,
         upstream: format!("http://{}", cfg.listen),
         funnel: opts.funnel,
-        admin: opts.admin,
+        admin,
+        public: !opts.admin_only,
     };
     let serve = ts.json(&["serve", "status", "--json"]).await.map_err(|e| tailscale_failure(out, opts, e))?;
     let current = read_current(&serve, &desired.host, desired.port);
     let plan = plan(&desired, &current)?;
     let url = public_url(&desired.host, desired.port);
-    let mut new_text = set_public_url(&text, &url)?;
-    if opts.admin {
+    let mut new_text = if opts.admin_only { None } else { set_public_url(&text, &url)? };
+    if admin {
         let base = new_text.clone().unwrap_or_else(|| text.clone());
         if let Some(t) = set_admin_ui(&base, &url)? {
             new_text = Some(t);
@@ -545,7 +564,11 @@ pub async fn setup(opts: &SetupOpts, ts: &Tailscale, out: &mut dyn Write) -> any
     }
 
     writeln!(out, "Node:       {}", desired.host)?;
-    writeln!(out, "Public URL: {url}")?;
+    if opts.admin_only {
+        writeln!(out, "Public URL: unchanged ({}); only the admin UI is mounted here", cfg.public_url)?;
+    } else {
+        writeln!(out, "Public URL: {url}")?;
+    }
     writeln!(
         out,
         "Reachable:  {}",
@@ -557,7 +580,7 @@ pub async fn setup(opts: &SetupOpts, ts: &Tailscale, out: &mut dyn Write) -> any
         writeln!(out, "Only the public paths below are forwarded, and every MCP call still needs a connection token,")?;
         writeln!(out, "but anyone can now reach the sign-in and OAuth endpoints. Tailscale ACLs no longer apply.")?;
     }
-    if opts.admin {
+    if admin {
         writeln!(out, "Admin UI:   {url}/admin (tailnet only; sign in with a passkey)")?;
     }
     if plan.funnel_left_on {
@@ -574,7 +597,7 @@ pub async fn setup(opts: &SetupOpts, ts: &Tailscale, out: &mut dyn Write) -> any
         writeln!(
             out,
             "Tailscale serve already matches: {} paths on port {}. Nothing to change.",
-            PUBLIC_PATHS.len(),
+            desired.paths().len(),
             desired.port
         )?;
     } else {
@@ -584,6 +607,10 @@ pub async fn setup(opts: &SetupOpts, ts: &Tailscale, out: &mut dyn Write) -> any
         }
     }
     match &new_text {
+        Some(_) if opts.admin_only => {
+            writeln!(out, "Config:     set [admin_ui] enabled = true, origin = \"{url}\" in {}", opts.config.display())?
+        }
+        None if opts.admin_only => writeln!(out, "Config:     admin_ui.origin is already {url}")?,
         Some(_) if opts.admin => writeln!(
             out,
             "Config:     set public_url = \"{url}\" and [admin_ui] enabled = true, origin = \"{url}\" in {}",
@@ -628,6 +655,11 @@ pub async fn setup(opts: &SetupOpts, ts: &Tailscale, out: &mut dyn Write) -> any
         write_config(&opts.config, &t)?;
     }
     writeln!(out)?;
+    if opts.admin_only {
+        writeln!(out, "Done. Restart Dove so it serves the admin UI:  sudo systemctl restart dove")?;
+        writeln!(out, "Enrol a passkey for the admin UI:  sudo dove admin passkey add --name <device>")?;
+        return Ok(());
+    }
     writeln!(out, "Done. Restart Dove so it uses the new public_url:  sudo systemctl restart dove")?;
     writeln!(out, "Then check it with:  dove doctor")?;
     if opts.admin {
@@ -685,7 +717,7 @@ pub async fn doctor_check(public_url: &str, listen: &str, ts: &Tailscale) -> Opt
     // Funnel is the operator's choice: compare as if it stays as it is. A mounted admin UI is wanted, unless Funnel
     // exposes it (then `plan` refuses, and the row says why).
     let admin = cur.handlers.contains_key(crate::admin_ui::ADMIN_PREFIX);
-    let d = Desired { host, port, upstream: format!("http://{listen}"), funnel: cur.funnel, admin };
+    let d = Desired { host, port, upstream: format!("http://{listen}"), funnel: cur.funnel, admin, public: true };
     let p = match plan(&d, &cur) {
         Ok(p) => p,
         Err(e) => return row(false, e.to_string()),
@@ -725,6 +757,7 @@ mod tests {
             upstream: "http://127.0.0.1:8787".into(),
             funnel,
             admin: false,
+            public: true,
         }
     }
 
