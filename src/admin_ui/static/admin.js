@@ -181,6 +181,21 @@
       });
     });
 
+    // Shown-once secrets: copy to the clipboard, falling back to selecting the text.
+    document.querySelectorAll("[data-copy]").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        var field = document.getElementById(btn.getAttribute("data-copy"));
+        if (!field) return;
+        field.select();
+        var done = function () { btn.textContent = "Copied"; };
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(field.value).then(done, function () { btn.textContent = "Select and copy"; });
+        } else {
+          btn.textContent = "Select and copy";
+        }
+      });
+    });
+
     // Times are rendered in UTC by the server; show them in the reader's time zone when the browser can.
     document.querySelectorAll("time[datetime]").forEach(function (t) {
       var d = new Date(t.getAttribute("datetime"));

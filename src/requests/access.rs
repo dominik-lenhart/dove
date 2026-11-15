@@ -97,6 +97,7 @@ pub fn create(tx: &Transaction, cfg: &Config, new: NewAccess, now: i64) -> Resul
             now + cfg.requests.pending_days * 86_400
         ],
     )?;
+    super::queue_notice(tx, cfg, &new.id, "access", now)?;
     Ok(new.id)
 }
 

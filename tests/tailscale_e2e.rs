@@ -456,6 +456,41 @@ fn admin_flag_is_refused_whenever_funnel_could_expose_it() {
     assert!(!fake.file("funnel.txt").contains("8443"));
 }
 
+#[test]
+fn admin_only_mounts_just_the_admin_ui_and_keeps_public_url() {
+    let fake = Fake::new();
+    let original = config_text();
+    let (_d, cfg) = config_file(&original);
+    let url_before = public_url_of(&cfg);
+    let r = dove(&fake, &cfg, &["--admin-only", "--port", "8443"]);
+    assert_eq!(r.code, 0, "{}\n{}", r.stdout, r.stderr);
+    assert_eq!(fake.mounted(), vec![dove::admin_ui::ADMIN_PREFIX.to_string()]);
+    assert!(fake.file("serve.txt").contains("8443 /admin http://127.0.0.1:8787/admin"));
+    assert!(fake.file("funnel.txt").is_empty());
+    assert_eq!(public_url_of(&cfg), url_before, "public_url is not touched");
+    assert_eq!(admin_ui_of(&cfg), (Some(true), Some(format!("https://{HOST}:8443"))));
+    assert!(r.stdout.contains("only the admin UI"), "{}", r.stdout);
+    // Idempotent.
+    let before = fake.changes();
+    assert_eq!(dove(&fake, &cfg, &["--admin-only", "--port", "8443"]).code, 0);
+    assert_eq!(fake.changes(), before);
+
+    // On the port that serves the public paths it is refused instead of taking them down.
+    let fake = Fake::new();
+    let (_d, cfg) = config_file(&original);
+    assert_eq!(dove(&fake, &cfg, &[]).code, 0);
+    let before = fake.changes();
+    let text = std::fs::read_to_string(&cfg).unwrap();
+    let r = dove(&fake, &cfg, &["--admin-only"]);
+    assert_ne!(r.code, 0);
+    assert!(r.stderr.contains("public paths"), "{}", r.stderr);
+    assert_eq!(fake.changes(), before);
+    assert_eq!(std::fs::read_to_string(&cfg).unwrap(), text);
+    // And it never goes together with Funnel or --admin.
+    assert_ne!(dove(&fake, &cfg, &["--admin-only", "--funnel"]).code, 0);
+    assert_ne!(dove(&fake, &cfg, &["--admin-only", "--admin"]).code, 0);
+}
+
 const LISTEN: &str = "127.0.0.1:8787";
 
 async fn check(fake: &Fake, url: &str) -> Option<Value> {

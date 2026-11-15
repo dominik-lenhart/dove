@@ -13,6 +13,7 @@ pub const MIGRATIONS: &[&str] = &[
     V_REQUESTS,
     V_ACCESS_GRANTS,
     V_ADMIN_UI,
+    V_REQUEST_NOTICES,
 ];
 
 const V1: &str = r#"
@@ -470,4 +471,19 @@ CREATE TABLE admin_sessions (
     expires_at    INTEGER NOT NULL,
     last_seen_at  INTEGER NOT NULL
 );
+"#;
+
+/// `[requests] notify_sink` (design 2026-11-14 section 4.6): one queued notice per new pending request, sent to the
+/// named sink by the request worker. Ids only; deleted with the request.
+const V_REQUEST_NOTICES: &str = r#"
+CREATE TABLE request_notices (
+    request_id      TEXT PRIMARY KEY REFERENCES requests(id) ON DELETE CASCADE,
+    kind            TEXT NOT NULL,
+    state           TEXT NOT NULL CHECK (state IN ('pending', 'delivered', 'failed')),
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at INTEGER NOT NULL,
+    last_status     INTEGER,
+    created_at      INTEGER NOT NULL
+) WITHOUT ROWID;
+CREATE INDEX request_notices_due ON request_notices(state, next_attempt_at);
 "#;

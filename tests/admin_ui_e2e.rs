@@ -74,7 +74,7 @@ async fn audit_text(h: &Harness) -> String {
 }
 
 fn concrete(path: &str) -> String {
-    path.replace("{id}", "r_x").replace("{name}", "phone")
+    path.replace("{id}", "r_x").replace("{name}", "phone").replace("{alias}", "info")
 }
 
 // ------------------------------------------------------------------ guard
@@ -296,7 +296,8 @@ async fn authorization_header_is_refused_even_with_a_session() {
 
 #[tokio::test]
 async fn nothing_answers_without_a_session() {
-    let h = start().await;
+    // Six requests per route: more than the default per-minute budget of one address.
+    let h = start_with(|c| c.admin_ui.requests_per_minute = 1000).await;
     let mut b = Browser::new(&h);
     let a = enrol(&h, &mut Browser::new(&h), "phone").await;
     drop(a);

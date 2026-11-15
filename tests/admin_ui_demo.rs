@@ -147,6 +147,34 @@ async fn demo_server() {
     )
     .await;
 
+    // Part 2 pages: an IMAP mailbox with a send-as address, indexing, a project of its own, a watch and a sink.
+    h.imap_mailbox("privat", "dominik@strato.test").await;
+    h.admin(AdminRequest::AccountsAliasAdd {
+        account: "privat".into(),
+        address: "hallo@strato.test".into(),
+        name: Some("Dominik".into()),
+        envelope: false,
+    })
+    .await
+    .unwrap();
+    h.project("home", &["privat"]).await;
+    h.admin(AdminRequest::IndexEnable { alias: "info".into() }).await.unwrap();
+    h.ok(&support, "create_watch", json!({ "account": "info", "kind": "from", "from": "kunde@example.org" })).await;
+    h.admin(AdminRequest::SinksAdd {
+        name: "phone".into(),
+        project: "acme".into(),
+        url: "https://hooks.example.org/dove/notify".into(),
+        secret: dove::admin::Password(zeroize::Zeroizing::new("d".repeat(40))),
+    })
+    .await
+    .unwrap();
+    // A second IMAP user on the fake server, to try "Connect IMAP" (servers below, password "demo-password").
+    h.imap.add_user("neu@strato.test", "demo-password");
+    h.imap.add_folder("neu@strato.test", "Drafts", Some("\\Drafts"));
+    h.imap.add_folder("neu@strato.test", "Sent", Some("\\Sent"));
+    let (imap, smtp) = h.imap_endpoints();
+    println!("DEMO imap={}:{} {:?} smtp={}:{} {:?}", imap.host, imap.port, imap.tls, smtp.host, smtp.port, smtp.tls);
+
     let link = h.admin(AdminRequest::PasskeysAdd { name: "demo".into() }).await.unwrap();
     println!("\nDEMO base={} origin={origin}", h.base);
     println!("DEMO enrol={}", link["open_this_link"].as_str().unwrap());

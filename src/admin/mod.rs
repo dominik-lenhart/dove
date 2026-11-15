@@ -213,6 +213,13 @@ pub enum AdminRequest {
         name: String,
         project: String,
     },
+    /// Lists the watches of every client for the owner: ids, client, mailbox, kind and times. Filters and threads
+    /// are not shown.
+    WatchesList,
+    /// Deletes one watch; its events and queued pushes go with it.
+    WatchesRemove {
+        id: String,
+    },
 
     OperationsList,
     OperationsRemove {
@@ -352,6 +359,8 @@ impl AdminRequest {
             SinksSetProject { name, project } => ("sinks.set_project", Some(project.clone()), None, vec![name.clone()]),
             SinksList => ("sinks.list", None, None, vec![]),
             SinksRemove { name } => ("sinks.remove", None, None, vec![name.clone()]),
+            WatchesList => ("watches.list", None, None, vec![]),
+            WatchesRemove { id } => ("watches.remove", None, None, vec![id.clone()]),
             OperationsList => ("operations.list", None, None, vec![]),
             OperationsRemove { client, account, request_key } => {
                 ("operations.remove", None, Some(account.clone()), vec![client.clone(), request_key.clone()])

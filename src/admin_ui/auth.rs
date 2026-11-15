@@ -45,6 +45,9 @@ const ENROL_POOL: usize = 16;
 const STEPUP_TTL: Duration = Duration::from_secs(120);
 const STEPUP_POOL: usize = 64;
 const STEPUP_PER_SESSION: usize = 4;
+/// A shown-once result waits this long for its page.
+const REVEAL_TTL: Duration = Duration::from_secs(300);
+const REVEAL_POOL: usize = 32;
 /// The browser's WebAuthn timeout (milliseconds), a little shorter than the pools' lifetime.
 const CEREMONY_TIMEOUT_MS: u64 = 110_000;
 
@@ -112,6 +115,19 @@ impl<T> Pool<T> {
         (e.expires > now).then_some(e.value)
     }
 
+    /// Like [`Pool::take`], but leaves an entry that `owned` refuses in place (another session cannot use up a
+    /// result that is not its own).
+    fn take_if(&self, id: &str, owned: impl Fn(&T) -> bool) -> Option<T> {
+        let now = Instant::now();
+        let mut q = self.entries.lock().expect("lock");
+        let i = q.iter().position(|e| e.id.as_bytes().ct_eq(id.as_bytes()).into())?;
+        if q[i].expires > now && !owned(&q[i].value) {
+            return None;
+        }
+        let e = q.remove(i)?;
+        (e.expires > now).then_some(e.value)
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
         self.entries.lock().expect("lock").len()
@@ -130,7 +146,35 @@ struct StepUp {
     session_id: String,
     passkey_id: String,
     action: AdminRequest,
-    return_to: String,
+    after: After,
+}
+
+/// Where a confirmed action leads.
+pub enum After {
+    /// To this admin URL.
+    Redirect(String),
+    /// To a page that shows the verb's result once (a token or a link that is shown only now).
+    Reveal(RevealKind),
+}
+
+/// What a reveal page shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RevealKind {
+    /// A connection token (`ClientsCreate`, `ClientsRotate`).
+    Token,
+    /// An invitation code (`ClientsInvite`).
+    Invite,
+    /// The Google sign-in link that connects a Gmail mailbox (`AccountsConnect`, `AccountsReconnect`).
+    GmailLink,
+    /// A passkey enrolment link (`PasskeysAdd`).
+    EnrolLink,
+}
+
+/// The result of a confirmed action, kept in memory until its page is opened once by the same session.
+pub struct Reveal {
+    pub session_id: String,
+    pub kind: RevealKind,
+    pub result: serde_json::Value,
 }
 
 /// Sign-in challenges without server state. `/admin/login/options` is public, and behind Tailscale Serve every
@@ -199,6 +243,7 @@ pub struct Pools {
     login: LoginChallenges,
     enrol: Pool<EnrolPending>,
     stepup: Pool<StepUp>,
+    reveal: Pool<Reveal>,
     seen: SeenSessions,
 }
 
@@ -687,6 +732,11 @@ async fn enrol_check(app: &Arc<App>, body: &[u8], ip: Option<IpAddr>) -> Result<
 /// Starts a passkey confirmation of `action` for this session. Answers JSON for the page's script:
 /// `{ stepup: { id, publicKey } }`. `return_to` is where the browser goes after the action ran.
 pub async fn begin_stepup(app: &Arc<App>, s: &WebSession, action: AdminRequest, return_to: String) -> Response {
+    begin_stepup_then(app, s, action, After::Redirect(return_to)).await
+}
+
+/// Like [`begin_stepup`], with a choice of where the confirmed action leads.
+pub async fn begin_stepup_then(app: &Arc<App>, s: &WebSession, action: AdminRequest, after: After) -> Response {
     if !needs_step_up(&action) {
         return json_error(StatusCode::INTERNAL_SERVER_ERROR, "internal: this action has no confirmation step");
     }
@@ -704,7 +754,7 @@ pub async fn begin_stepup(app: &Arc<App>, s: &WebSession, action: AdminRequest, 
     let challenge: [u8; 32] = h.finalize().into();
     let id = new_ceremony_id();
     let session_id = s.id.clone();
-    let entry = StepUp { challenge, session_id: s.id.clone(), passkey_id: s.passkey_id.clone(), action, return_to };
+    let entry = StepUp { challenge, session_id: s.id.clone(), passkey_id: s.passkey_id.clone(), action, after };
     let stored = app.admin_ui.auth.stepup.put_bounded(
         STEPUP_POOL,
         STEPUP_TTL,
@@ -725,6 +775,11 @@ pub async fn begin_stepup(app: &Arc<App>, s: &WebSession, action: AdminRequest, 
         "allowCredentials": [ { "type": "public-key", "id": util::b64url(&passkey.credential_id) } ],
     }}}))
     .into_response()
+}
+
+/// Takes a shown-once result: only the session that confirmed the action gets it, and only once.
+pub fn take_reveal(app: &App, s: &WebSession, id: &str) -> Option<Reveal> {
+    app.admin_ui.auth.reveal.take_if(id, |r| r.session_id == s.id)
 }
 
 const CONFIRM_FAILED: &str = "The passkey confirmation failed. Nothing was changed. Try again.";
@@ -767,7 +822,16 @@ pub async fn stepup_finish(
     }
     let r = crate::admin::server::dispatch(&app, &s.actor(), p.action).await;
     if r.ok {
-        Json(json!({ "redirect": p.return_to })).into_response()
+        let to = match p.after {
+            After::Redirect(to) => to,
+            After::Reveal(kind) => {
+                let id = new_ceremony_id();
+                let reveal = Reveal { session_id: s.id.clone(), kind, result: r.result.unwrap_or_default() };
+                app.admin_ui.auth.reveal.put_evicting(REVEAL_POOL, REVEAL_TTL, id.clone(), reveal);
+                format!("/admin/reveal/{id}")
+            }
+        };
+        Json(json!({ "redirect": to })).into_response()
     } else {
         json_error(StatusCode::CONFLICT, r.error.as_deref().unwrap_or("the action failed"))
     }

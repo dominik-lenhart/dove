@@ -144,11 +144,14 @@ pub struct RequestsConfig {
     /// Closed requests (denied, cancelled, expired, done) are deleted this many days after they closed. Each client
     /// also keeps at most `requests::MAX_CLOSED_PER_CLIENT` of them; older ones go first.
     pub retention_days: i64,
+    /// Name of a sink (`dove sinks add`) that gets a signed notice `{ event, kind, request_id, url }` for every new
+    /// pending request, with the admin UI link of the request when the UI is on. Ids only, never content.
+    pub notify_sink: Option<String>,
 }
 
 impl Default for RequestsConfig {
     fn default() -> Self {
-        Self { enabled: true, late_grace_minutes: 60, pending_days: 7, retention_days: 90 }
+        Self { enabled: true, late_grace_minutes: 60, pending_days: 7, retention_days: 90, notify_sink: None }
     }
 }
 
@@ -617,6 +620,8 @@ redact_secrets_default = false
 # late_grace_minutes = 60
 # pending_days = 7
 # retention_days = 90
+# Post a signed request_pending event (ids and a link, no mail content) to this sink when an agent asks.
+# notify_sink = "phone"
 
 [admin_ui]
 # The owner's web UI under /admin (passkey sign-in). Reach it over the tailnet only, never through the public proxy

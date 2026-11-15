@@ -14,11 +14,17 @@
 
 pub mod auth;
 pub mod cbor;
+pub mod connections;
 pub mod html;
+pub mod kit;
+pub mod mailboxes;
 pub mod pages;
+pub mod projects;
+pub mod reveal;
 #[cfg(any(test, feature = "testing"))]
 pub mod soft_authenticator;
 pub mod store;
+pub mod watches;
 pub mod webauthn;
 
 use std::sync::Arc;
@@ -63,6 +69,34 @@ pub const ADMIN_PATHS: &[&str] = &[
     "/admin/settings",
     "/admin/settings/passkeys/{name}/remove",
     "/admin/settings/sessions/revoke",
+    "/admin/settings/passkeys/add",
+    "/admin/settings/keys/rewrap",
+    "/admin/settings/export",
+    "/admin/audit/prune",
+    "/admin/more",
+    "/admin/reveal/{id}",
+    "/admin/connections",
+    "/admin/connections/new",
+    "/admin/connections/{name}",
+    "/admin/connections/{name}/grants",
+    "/admin/connections/{name}/redaction",
+    "/admin/connections/{name}/rotate",
+    "/admin/connections/{name}/revoke",
+    "/admin/mailboxes",
+    "/admin/mailboxes/new",
+    "/admin/mailboxes/{alias}",
+    "/admin/mailboxes/{alias}/state",
+    "/admin/mailboxes/{alias}/reconnect",
+    "/admin/mailboxes/{alias}/index",
+    "/admin/mailboxes/{alias}/aliases",
+    "/admin/mailboxes/{alias}/signature",
+    "/admin/projects",
+    "/admin/projects/{name}",
+    "/admin/projects/{name}/accounts",
+    "/admin/watches",
+    "/admin/watches/{id}/remove",
+    "/admin/watches/sinks",
+    "/admin/watches/sinks/{name}",
 ];
 
 /// The only admin routes that answer without a session.
@@ -130,6 +164,34 @@ pub fn routes(app: Arc<App>) -> Router<Arc<App>> {
         .route("/admin/settings", get(pages::settings))
         .route("/admin/settings/passkeys/{name}/remove", post(pages::passkey_remove))
         .route("/admin/settings/sessions/revoke", post(pages::sessions_revoke))
+        .route("/admin/settings/passkeys/add", post(pages::passkey_add))
+        .route("/admin/settings/keys/rewrap", post(pages::keys_rewrap))
+        .route("/admin/settings/export", get(pages::export))
+        .route("/admin/audit/prune", post(pages::audit_prune))
+        .route("/admin/more", get(pages::more))
+        .route("/admin/reveal/{id}", get(reveal::show))
+        .route("/admin/connections", get(connections::list))
+        .route("/admin/connections/new", get(connections::new_form).post(connections::create))
+        .route("/admin/connections/{name}", get(connections::detail))
+        .route("/admin/connections/{name}/grants", post(connections::set_grants))
+        .route("/admin/connections/{name}/redaction", post(connections::redaction))
+        .route("/admin/connections/{name}/rotate", post(connections::rotate))
+        .route("/admin/connections/{name}/revoke", post(connections::revoke))
+        .route("/admin/mailboxes", get(mailboxes::list))
+        .route("/admin/mailboxes/new", get(mailboxes::new_form).post(mailboxes::create))
+        .route("/admin/mailboxes/{alias}", get(mailboxes::detail))
+        .route("/admin/mailboxes/{alias}/state", post(mailboxes::state))
+        .route("/admin/mailboxes/{alias}/reconnect", post(mailboxes::reconnect))
+        .route("/admin/mailboxes/{alias}/index", post(mailboxes::index))
+        .route("/admin/mailboxes/{alias}/aliases", post(mailboxes::aliases))
+        .route("/admin/mailboxes/{alias}/signature", post(mailboxes::signature))
+        .route("/admin/projects", get(projects::list).post(projects::create))
+        .route("/admin/projects/{name}", get(projects::detail))
+        .route("/admin/projects/{name}/accounts", post(projects::accounts))
+        .route("/admin/watches", get(watches::page_view))
+        .route("/admin/watches/{id}/remove", post(watches::remove_watch))
+        .route("/admin/watches/sinks", post(watches::add_sink))
+        .route("/admin/watches/sinks/{name}", post(watches::sink))
         // `route_layer`, not `layer`: a layer would also wrap the fallback, and merged into the public router that
         // fallback answers every unknown path of the listener (a 303 to the sign-in page instead of 404).
         .route_layer(middleware::from_fn_with_state(app, gate))
@@ -363,6 +425,8 @@ pub fn needs_step_up(req: &AdminRequest) -> bool {
         | SinksList
         | SinksRemove { .. }
         | SinksSetProject { .. }
+        | WatchesList
+        | WatchesRemove { .. }
         | OperationsList
         | OperationsRemove { .. }
         | RequestsList { .. }
@@ -383,68 +447,66 @@ pub enum Reach {
     Excluded(&'static str),
 }
 
-const PART2: &str = "part 2 of the admin UI (Connections, Mailboxes, Projects, Watches and sinks pages)";
+const NO_OPERATIONS: &str =
+    "the service does not implement the unknown-outcome operations verbs yet; they answer 'not available' everywhere";
 
 /// Every `AdminRequest` variant by name. `tests::every_verb_is_covered` checks the list against the enum and the
 /// handlers' source.
 pub const COVERAGE: &[(&str, Reach)] = &[
-    ("ProjectsCreate", Reach::Excluded(PART2)),
-    ("ProjectsAddAccount", Reach::Excluded(PART2)),
-    ("ProjectsRemoveAccount", Reach::Excluded(PART2)),
-    ("ProjectsList", Reach::Excluded(PART2)),
-    ("ProjectsShow", Reach::Excluded(PART2)),
-    ("AccountsList", Reach::Excluded(PART2)),
-    ("AccountsConnect", Reach::Excluded(PART2)),
-    ("AccountsReconnect", Reach::Excluded(PART2)),
-    ("AccountsConnectImap", Reach::Excluded(PART2)),
-    ("AccountsReconnectImap", Reach::Excluded(PART2)),
-    ("AccountsRemove", Reach::Excluded(PART2)),
-    ("AccountsDisable", Reach::Excluded(PART2)),
-    ("AccountsEnable", Reach::Excluded(PART2)),
-    ("AccountsCheck", Reach::Excluded(PART2)),
-    ("AccountsAliasAdd", Reach::Excluded(PART2)),
-    ("AccountsAliasList", Reach::Excluded(PART2)),
-    ("AccountsAliasRemove", Reach::Excluded(PART2)),
-    ("AccountsSignatureSet", Reach::Excluded(PART2)),
-    ("AccountsSignatureShow", Reach::Excluded(PART2)),
-    ("ClientsCreate", Reach::Excluded(PART2)),
-    ("ClientsSetGrants", Reach::Excluded(PART2)),
-    ("ClientsRotate", Reach::Excluded(PART2)),
-    ("ClientsRevoke", Reach::Excluded(PART2)),
-    ("ClientsShow", Reach::Excluded(PART2)),
-    ("ClientsSetRedaction", Reach::Excluded(PART2)),
-    ("ClientsList", Reach::Excluded(PART2)),
-    ("ClientsInvite", Reach::Excluded(PART2)),
+    ("ProjectsCreate", Reach::Ui("/admin/projects")),
+    ("ProjectsAddAccount", Reach::Ui("/admin/projects/{name}/accounts")),
+    ("ProjectsRemoveAccount", Reach::Ui("/admin/projects/{name}/accounts")),
+    ("ProjectsList", Reach::Ui("/admin/projects")),
+    ("ProjectsShow", Reach::Ui("/admin/projects/{name}")),
+    ("AccountsList", Reach::Ui("/admin/mailboxes")),
+    ("AccountsConnect", Reach::Ui("/admin/mailboxes/new")),
+    ("AccountsReconnect", Reach::Ui("/admin/mailboxes/{alias}/reconnect")),
+    ("AccountsConnectImap", Reach::Ui("/admin/mailboxes/new")),
+    ("AccountsReconnectImap", Reach::Ui("/admin/mailboxes/{alias}/reconnect")),
+    ("AccountsRemove", Reach::Ui("/admin/mailboxes/{alias}/state")),
+    ("AccountsDisable", Reach::Ui("/admin/mailboxes/{alias}/state")),
+    ("AccountsEnable", Reach::Ui("/admin/mailboxes/{alias}/state")),
+    ("AccountsCheck", Reach::Ui("/admin/mailboxes/{alias}/state")),
+    ("AccountsAliasAdd", Reach::Ui("/admin/mailboxes/{alias}/aliases")),
+    ("AccountsAliasList", Reach::Ui("/admin/mailboxes/{alias}")),
+    ("AccountsAliasRemove", Reach::Ui("/admin/mailboxes/{alias}/aliases")),
+    ("AccountsSignatureSet", Reach::Ui("/admin/mailboxes/{alias}/signature")),
+    ("AccountsSignatureShow", Reach::Ui("/admin/mailboxes/{alias}")),
+    ("ClientsCreate", Reach::Ui("/admin/connections/new")),
+    ("ClientsSetGrants", Reach::Ui("/admin/connections/{name}/grants")),
+    ("ClientsRotate", Reach::Ui("/admin/connections/{name}/rotate")),
+    ("ClientsRevoke", Reach::Ui("/admin/connections/{name}/revoke")),
+    ("ClientsShow", Reach::Ui("/admin/connections/{name}")),
+    ("ClientsSetRedaction", Reach::Ui("/admin/connections/{name}/redaction")),
+    ("ClientsList", Reach::Ui("/admin/connections")),
+    ("ClientsInvite", Reach::Ui("/admin/connections/new")),
     ("AuditTail", Reach::Excluded("the Audit page's search with no filter shows the newest records (AuditSearch)")),
     ("AuditSearch", Reach::Ui("/admin/audit")),
     ("AuditVerify", Reach::Ui("/admin/audit/verify")),
-    ("AuditPrune", Reach::Excluded(PART2)),
-    ("KeysRotate", Reach::Excluded(PART2)),
+    ("AuditPrune", Reach::Ui("/admin/audit/prune")),
+    ("KeysRotate", Reach::Ui("/admin/settings/keys/rewrap")),
     ("Doctor", Reach::Ui("/admin/health")),
     ("Version", Reach::Excluded("the version is part of the health checks (Doctor)")),
     ("Shutdown", Reach::Excluded("local mode only, where the admin UI does not exist")),
-    ("Export", Reach::Excluded(PART2)),
-    ("IndexEnable", Reach::Excluded(PART2)),
-    ("IndexDisable", Reach::Excluded(PART2)),
+    ("Export", Reach::Ui("/admin/settings/export")),
+    ("IndexEnable", Reach::Ui("/admin/mailboxes/{alias}/index")),
+    ("IndexDisable", Reach::Ui("/admin/mailboxes/{alias}/index")),
     ("IndexStatus", Reach::Ui("/admin")),
-    ("IndexRebuild", Reach::Excluded(PART2)),
-    ("SinksAdd", Reach::Excluded(PART2)),
-    ("SinksList", Reach::Excluded(PART2)),
-    ("SinksRemove", Reach::Excluded(PART2)),
-    ("SinksSetProject", Reach::Excluded(PART2)),
-    ("OperationsList", Reach::Excluded(PART2)),
-    ("OperationsRemove", Reach::Excluded(PART2)),
+    ("IndexRebuild", Reach::Ui("/admin/mailboxes/{alias}/index")),
+    ("SinksAdd", Reach::Ui("/admin/watches/sinks")),
+    ("SinksList", Reach::Ui("/admin/watches")),
+    ("SinksRemove", Reach::Ui("/admin/watches/sinks/{name}")),
+    ("SinksSetProject", Reach::Ui("/admin/watches/sinks/{name}")),
+    ("WatchesList", Reach::Ui("/admin/watches")),
+    ("WatchesRemove", Reach::Ui("/admin/watches/{id}/remove")),
+    ("OperationsList", Reach::Excluded(NO_OPERATIONS)),
+    ("OperationsRemove", Reach::Excluded(NO_OPERATIONS)),
     ("RequestsList", Reach::Ui("/admin/requests")),
     ("RequestsShow", Reach::Ui("/admin/requests/{id}")),
     ("RequestsApprove", Reach::Ui("/admin/requests/{id}/approve")),
     ("RequestsDeny", Reach::Ui("/admin/requests/{id}/deny")),
     ("RequestsCancel", Reach::Ui("/admin/requests/{id}/cancel")),
-    (
-        "PasskeysAdd",
-        Reach::Excluded(
-            "enrolment starts on the admin socket, the trust root (design 5.2); adding from the UI is part 2",
-        ),
-    ),
+    ("PasskeysAdd", Reach::Ui("/admin/settings/passkeys/add")),
     ("PasskeysList", Reach::Ui("/admin/settings")),
     ("PasskeysRemove", Reach::Ui("/admin/settings/passkeys/{name}/remove")),
     ("SessionsList", Reach::Ui("/admin/settings")),
@@ -478,10 +540,17 @@ mod tests {
         let covered: BTreeSet<String> = COVERAGE.iter().map(|(n, _)| (*n).to_string()).collect();
         assert_eq!(covered.len(), COVERAGE.len(), "duplicate entries");
         assert_eq!(covered, all, "COVERAGE must name every AdminRequest variant exactly once");
-        let handlers: String = [include_str!("pages.rs"), include_str!("auth.rs")]
-            .iter()
-            .map(|s| s.split("#[cfg(test)]").next().unwrap())
-            .collect();
+        let handlers: String = [
+            include_str!("pages.rs"),
+            include_str!("auth.rs"),
+            include_str!("connections.rs"),
+            include_str!("mailboxes.rs"),
+            include_str!("projects.rs"),
+            include_str!("watches.rs"),
+        ]
+        .iter()
+        .map(|s| s.split("#[cfg(test)]").next().unwrap())
+        .collect();
         for (name, reach) in COVERAGE {
             match reach {
                 Reach::Ui(route) => {

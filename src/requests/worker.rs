@@ -95,6 +95,9 @@ pub fn start(app: Arc<App>) -> tokio::task::JoinHandle<()> {
             if let Err(e) = tick(&app, util::now_unix()).await {
                 tracing::warn!(error = %e, "scheduled send tick failed");
             }
+            if let Err(e) = crate::watch::sinks::deliver_request_notices(&app, util::now_unix()).await {
+                tracing::warn!(error = %e, "request notice delivery failed");
+            }
             tokio::time::sleep(TICK).await;
         }
     })

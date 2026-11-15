@@ -140,11 +140,15 @@ pub fn respond(m: Markup) -> Response {
     r
 }
 
-/// Navigation entries (part 2 adds Connections, Mailboxes, Projects, Watches).
+/// Navigation entries.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Nav {
     Overview,
     Requests,
+    Connections,
+    Mailboxes,
+    Projects,
+    Watches,
     Audit,
     Settings,
     None,
@@ -197,6 +201,15 @@ const ICON_AUDIT: &str = "<path d=\"M14 3v4a1 1 0 0 0 1 1h4\"/><path d=\"M17 21H
                           2 0 0 1-2 2z\"/><path d=\"M9 13h6M9 17h4\"/>";
 const ICON_SETTINGS: &str = "<path d=\"M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1\"/><circle cx=\"15\" cy=\"6\" \
                              r=\"2\"/><circle cx=\"9\" cy=\"12\" r=\"2\"/><circle cx=\"17\" cy=\"18\" r=\"2\"/>";
+const ICON_CONNECTIONS: &str = "<path d=\"M9 15 15 9\"/><path d=\"m11 6 1.5-1.5a4.2 4.2 0 0 1 6 6L17 12\"/><path d=\"m13 \
+                                18-1.5 1.5a4.2 4.2 0 0 1-6-6L7 12\"/>";
+const ICON_MAILBOXES: &str = "<rect x=\"3\" y=\"5\" width=\"18\" height=\"14\" rx=\"2\"/><path d=\"m3.5 6.5 8.5 6 \
+                              8.5-6\"/>";
+const ICON_PROJECTS: &str = "<path d=\"M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z\"/>";
+const ICON_WATCHES: &str = "<path d=\"M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9\"/><path d=\"M10.3 21a1.9 1.9 0 0 0 \
+                            3.4 0\"/>";
+const ICON_MORE: &str = "<circle cx=\"5\" cy=\"12\" r=\"1.5\"/><circle cx=\"12\" cy=\"12\" r=\"1.5\"/><circle \
+                         cx=\"19\" cy=\"12\" r=\"1.5\"/>";
 const ICON_KEY: &str = "<circle cx=\"7.5\" cy=\"15.5\" r=\"4.5\"/><path d=\"m10.7 12.3 9.3-9.3M17 6l2.5 2.5M14.5 \
                         8.5 16.5 10.5\"/>";
 const ICON_SIGNOUT: &str = "<path d=\"M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4\"/><path d=\"m16 17 5-5-5-5M21 12H9\"/>";
@@ -213,8 +226,26 @@ pub fn page(title: &str, nav: Nav, csrf: &str, label: &str, body: Markup) -> Mar
     let navs = Markup::concat([
         item(Nav::Overview, "/admin", "Overview", ICON_OVERVIEW),
         item(Nav::Requests, "/admin/requests", "Requests", ICON_REQUESTS),
+        item(Nav::Connections, "/admin/connections", "Connections", ICON_CONNECTIONS),
+        item(Nav::Mailboxes, "/admin/mailboxes", "Mailboxes", ICON_MAILBOXES),
+        item(Nav::Projects, "/admin/projects", "Projects", ICON_PROJECTS),
+        item(Nav::Watches, "/admin/watches", "Watches", ICON_WATCHES),
         item(Nav::Audit, "/admin/audit", "Audit", ICON_AUDIT),
         item(Nav::Settings, "/admin/settings", "Settings", ICON_SETTINGS),
+    ]);
+    // Phones get five tabs; the last one leads to a list of the other sections.
+    let more = matches!(nav, Nav::Projects | Nav::Watches | Nav::Audit | Nav::Settings);
+    let more_tab = if more {
+        h!("<a href=\"/admin/more\" aria-current=\"page\">{}<span>More</span></a>", icon(ICON_MORE))
+    } else {
+        h!("<a href=\"/admin/more\">{}<span>More</span></a>", icon(ICON_MORE))
+    };
+    let tabs = Markup::concat([
+        item(Nav::Overview, "/admin", "Overview", ICON_OVERVIEW),
+        item(Nav::Requests, "/admin/requests", "Requests", ICON_REQUESTS),
+        item(Nav::Connections, "/admin/connections", "Connections", ICON_CONNECTIONS),
+        item(Nav::Mailboxes, "/admin/mailboxes", "Mailboxes", ICON_MAILBOXES),
+        more_tab,
     ]);
     let signout = h!(
         "<form class=\"signout\" method=\"post\" action=\"/admin/logout\"><input type=\"hidden\" name=\"csrf\" \
@@ -233,15 +264,35 @@ pub fn page(title: &str, nav: Nav, csrf: &str, label: &str, body: Markup) -> Mar
          <nav class=\"shell__tabs\" aria-label=\"Main\">{}</nav></div></body></html>",
         head(title, Some(csrf)),
         workspace("Dove admin, overview"),
-        navs.clone(),
+        navs,
         icon(ICON_KEY),
         label,
         signout.clone(),
         workspace("Dove admin, overview"),
         signout,
         body,
-        navs
+        tabs
     )
+}
+
+/// The sections behind the phone's "More" tab.
+pub fn more_links() -> Markup {
+    let link = |href: &'static str, text: &'static str, sub: &'static str, glyph: &'static str| {
+        h!(
+            "<a class=\"row\" href=\"{}\"><span class=\"row-main\">{}<strong>{}</strong>\
+             <span class=\"detail\">{}</span></span></a>",
+            href,
+            icon(glyph),
+            text,
+            sub
+        )
+    };
+    Markup::concat([
+        link("/admin/projects", "Projects", "Which mailboxes belong together", ICON_PROJECTS),
+        link("/admin/watches", "Watches and sinks", "What agents wait for, where Dove pushes", ICON_WATCHES),
+        link("/admin/audit", "Audit", "Every call and every admin action", ICON_AUDIT),
+        link("/admin/settings", "Settings", "Passkeys, sessions, keys, export", ICON_SETTINGS),
+    ])
 }
 
 /// A page without a session (sign-in, enrolment).
