@@ -146,17 +146,16 @@ pub async fn overview(State(app): State<Arc<App>>, Extension(s): Extension<WebSe
         h!("<h1>{} requests wait for you</h1>", count)
     };
     let body = h!(
-        "{}<section class=\"block\"><h2>Waiting for a decision</h2><div class=\"rows\">{}</div>\
-         <p><a href=\"/admin/requests\">All requests</a></p></section>\
+        "{}<div class=\"grid\"><section class=\"block wide\"><h2>Waiting for a decision</h2>\
+         <div class=\"rows\">{}</div><p><a href=\"/admin/requests\">All requests</a></p></section>\
          <section class=\"block\"><h2>Next sends</h2>{}</section>\
-         <section class=\"block\"><h2>Mailboxes</h2>{}</section>\
          <section class=\"block\"><h2>Health</h2>{}<p><a class=\"btn\" href=\"/admin/health\">Run checks</a></p>\
-         </section>",
+         </section><section class=\"block wide\"><h2>Mailboxes</h2>{}</section></div>",
         heading,
         waiting,
         next,
-        mailboxes,
-        health
+        health,
+        mailboxes
     );
     page(&s, "Overview", Nav::Overview, body)
 }
@@ -606,11 +605,17 @@ fn letter(it: &Value, pending: bool) -> Markup {
     if it.get("revision").is_some() && !sendable {
         flags.push(Markup::lit("<span class=\"chip bad\">Changed outside Dove, cannot be sent</span>"));
     }
-    if let Some(r) = it["reason"].as_str() {
+    // An item left out at approval is "not approved", not a second "denied" chip next to its reason.
+    let shown_state = if it["reason"] == "not_approved" { "not_approved".to_string() } else { state.clone() };
+    if let Some(r) = it["reason"].as_str().filter(|r| *r != "not_approved") {
         flags.push(h!("<span class=\"chip quiet\">{}</span>", r.replace('_', " ")));
     }
-    let when =
-        h!("<p class=\"when\">{} {} {}</p>", state_chip(&state), time_el(&text(&it["send_at"])), Markup::concat(flags));
+    let when = h!(
+        "<p class=\"when\">{} {} {}</p>",
+        state_chip(&shown_state),
+        time_el(&text(&it["send_at"])),
+        Markup::concat(flags)
+    );
     let pick = match (pending, it["revision"].as_str()) {
         (true, Some(rev)) if sendable => h!(
             "<label class=\"pick\"><input type=\"checkbox\" name=\"item\" value=\"{}\" checked> Send this draft</label>\

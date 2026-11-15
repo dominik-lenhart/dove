@@ -410,15 +410,30 @@ async fn security_headers_on_every_answer() {
         assert_eq!(r.header("cache-control"), "no-store", "{p}");
         assert!(!r.text.contains("<script>") && !r.text.contains("style="), "{p}: no inline script or style");
     }
+    // `connect-src 'self'` is what lets admin.js call /admin/login/*, /admin/enroll/* and /admin/stepup with fetch;
+    // without it browsers block those calls (Safari: "Load failed") and nobody can sign in.
     assert_eq!(
         CSP,
-        "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; form-action 'self'; \
-         frame-ancestors 'none'; base-uri 'none'"
+        "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; \
+         connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
     );
     let js = b.get("/admin/static/admin.js").await;
     assert!(js.header("content-type").starts_with("text/javascript"));
     assert_eq!(js.header("content-security-policy"), CSP);
+    assert!(js.text.contains("fetch("), "admin.js uses fetch, so the CSP must allow connect-src 'self'");
     assert!(b.get("/admin/static/admin.css").await.header("content-type").starts_with("text/css"));
+
+    // Assets are versioned by content, so a new build never serves a cached old stylesheet.
+    let page = b.get("/admin").await;
+    let v = dove::admin_ui::asset_version();
+    assert!(page.text.contains(&format!("/admin/static/admin.css?v={v}")), "stylesheet carries the content hash");
+    assert!(page.text.contains(&format!("/admin/static/admin.js?v={v}")), "script carries the content hash");
+
+    // The font is public (the sign-in page uses it) and is the real woff2 file.
+    let font = Browser::new(&h).get("/admin/static/inter.woff2").await;
+    assert_eq!(font.status, 200);
+    assert_eq!(font.header("content-type"), "font/woff2");
+    assert!(font.text.starts_with("wOF2"), "woff2 magic");
 }
 
 #[tokio::test]

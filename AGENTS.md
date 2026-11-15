@@ -514,3 +514,10 @@ cargo fmt
   `admin_ui::addr_key` (all of loopback is one caller); simulate other addresses with `X-Forwarded-For` plus
   `X-Dove-Proxy-Auth`. Sign-in challenges are stateless (`auth::LoginChallenges`); never add a public endpoint that
   stores per-request state in a pool that evicts.
+- 2026-11-15: The admin UI's CSP must keep `connect-src 'self'`: admin.js calls the sign-in, enrolment and step-up
+  endpoints with `fetch`, and `default-src 'none'` alone blocks them (Safari: "Load failed"). HTTP-level tests cannot see
+  that, so check UI changes in a real browser: `tests/admin_ui_demo.rs` (`--ignored`) starts a seeded harness with the UI
+  on and prints an enrolment link. WebAuthn needs an https origin with a DNS name, so put a TLS front with that origin in
+  front of it (`DOVE_DEMO_ORIGIN`), and in a browser without an authenticator override `navigator.credentials.create/get`
+  with a WebCrypto ES256 soft authenticator. Overrides are lost on every navigation, so inject them again on each page.
+  Assets are cache-busted by content hash (`admin_ui::asset_version`), not by crate version.
