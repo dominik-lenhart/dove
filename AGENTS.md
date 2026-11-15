@@ -334,7 +334,8 @@ cargo fmt
   `std::os::unix` APIs outside `cfg(unix)`; use `platform::{restrict_file, restrict_dir, ensure_private_dir,
   write_private_new}`. Integration test files that need Unix sockets, modes or `sudo` start with `#![cfg(unix)]`.
   Type-check the Windows code here with the `dove-t-mingw:local` image (Ubuntu 24.04 + mingw-w64; rebuild it from
-  `ubuntu:24.04` with `apt-get install gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 make perl` if it is gone), mounting
+  `ubuntu:24.04` with `apt-get install gcc libc6-dev gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 make perl` if it is
+  gone; host `gcc` is needed for build scripts), mounting
   `~/.rustup` and `~/.cargo`, `RUSTC_WRAPPER=` (sccache is not in the image) and a separate target dir:
   `heavy docker run --rm -u 1000:1000 -v ~/.rustup:/rustup -v ~/.cargo:/cargo -v $PWD:/src -w /src
   -e RUSTUP_HOME=/rustup -e CARGO_HOME=/cargo -e PATH=/cargo/bin:/usr/bin:/bin -e HOME=/tmp -e RUSTC_WRAPPER=
@@ -527,3 +528,7 @@ cargo fmt
   added to that list or its verbs look uncovered. In the browser demo the soft authenticator's `get` override is lost on
   every navigation (re-inject before each step-up), and the admin CSP blocks injected `<style>` tags: try CSS fixes
   through `element.style` before restarting the demo.
+- 2026-11-15: CodeQL runs as advanced setup (`.github/workflows/codeql.yml`, config `.github/codeql/codeql-config.yml`)
+  with `tests/` excluded, because test fixtures (fake IMAP passwords, canary assertions) produced dozens of false
+  "hard-coded credential" and "cleartext logging" alerts. GitHub's default setup must stay off, or the uploads conflict.
+  Findings in `#[cfg(test)]` modules under `src/` are still reported: dismiss them as "used in tests" with a comment.

@@ -1,0 +1,7 @@
+# CodeQL scans what Dove ships. Test code is left out: it is full of deliberate fake credentials for the in-process
+# fake IMAP and Google servers and of assertion messages that print test canaries, which CodeQL reports as hard-coded
+# secrets and cleartext logging. Production code (src/, deploy/, workflows) stays fully scanned; `#[cfg(test)]`
+# modules inside src/ are still scanned and their findings are dismissed one by one.
+name: dove
+paths-ignore:
+  - tests
