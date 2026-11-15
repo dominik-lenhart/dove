@@ -370,7 +370,7 @@ async fn settings_add_a_passkey_export_and_rewrap() {
     let (mut b, mut a) = signed_in(&h).await;
     let to = redirect(&confirm(&mut b, &mut a, "/admin/settings/passkeys/add", &[("name", "ipad")]).await);
     let link = secret_on(&b.get(&to).await.text);
-    assert!(link.starts_with(&format!("{ORIGIN}/admin/enroll#")), "{link}");
+    assert!(link.starts_with(&format!("{ORIGIN}/admin/enroll#")), "the page shows an enrolment link for this origin");
     // The link works on another device.
     let mut ipad = Browser::new(&h);
     let mut a2 = SoftAuthenticator::es256(ORIGIN);
