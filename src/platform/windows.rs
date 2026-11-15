@@ -437,15 +437,10 @@ unsafe fn check_dacl(dacl: *mut ACL, user: &Sid) -> Result<(), String> {
         return Err(format!("cannot read its access list: {}", io::Error::last_os_error()));
     }
     for i in 0..info.AceCount {
-        let mut ace: *mut c_void = std::ptr::null_mut();
-        if unsafe { GetAce(dacl, i, &mut ace) } == 0 {
-            return Err(format!("cannot read its access list: {}", io::Error::last_os_error()));
-        }
-        let header = unsafe { &*(ace as *const ACE_HEADER) };
-        match header.AceType {
+        let (kind, sid) = unsafe { ace_at(dacl, i) }.map_err(|e| format!("cannot read its access list: {e}"))?;
+        match kind {
             ACCESS_DENIED_ACE_TYPE => continue,
             ACCESS_ALLOWED_ACE_TYPE => {
-                let sid = unsafe { &(*(ace as *const ACCESS_ALLOWED_ACE)).SidStart } as *const u32 as PSID;
                 let trusted = user.equals(sid)
                     || [WinLocalSystemSid, WinBuiltinAdministratorsSid, WinCreatorOwnerSid]
                         .into_iter()
@@ -459,6 +454,34 @@ unsafe fn check_dacl(dacl: *mut ACL, user: &Sid) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// The type of entry `i` of an ACL and, for an allow entry, a pointer to its SID (null for every other type). The
+/// entry is checked before anything past its header is read: `GetAce` must return a non-null pointer, and an allow
+/// entry must be large enough to hold the fixed part of `ACCESS_ALLOWED_ACE`. Fields are read through raw pointers
+/// (`read_unaligned`, `addr_of!`), never through references into the system's buffer.
+///
+/// # Safety
+/// `dacl` must point to a valid ACL with more than `i` entries. The SID pointer is valid as long as that ACL is.
+unsafe fn ace_at(dacl: *mut ACL, i: u32) -> io::Result<(u8, PSID)> {
+    let mut out = std::mem::MaybeUninit::<*mut c_void>::uninit();
+    if unsafe { GetAce(dacl, i, out.as_mut_ptr()) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // GetAce succeeded, so it wrote the pointer.
+    let ace = unsafe { out.assume_init() };
+    if ace.is_null() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "the access list has an empty entry"));
+    }
+    let header = unsafe { std::ptr::read_unaligned(ace as *const ACE_HEADER) };
+    if header.AceType != ACCESS_ALLOWED_ACE_TYPE {
+        return Ok((header.AceType, std::ptr::null_mut()));
+    }
+    if (header.AceSize as usize) < std::mem::size_of::<ACCESS_ALLOWED_ACE>() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "the access list has a truncated entry"));
+    }
+    let sid = unsafe { std::ptr::addr_of!((*(ace as *const ACCESS_ALLOWED_ACE)).SidStart) } as PSID;
+    Ok((header.AceType, sid))
 }
 
 /// The allow entries of a kernel object's DACL (a named pipe, for example) as SID strings; `None` for a NULL DACL.
@@ -499,12 +522,8 @@ pub fn handle_allowed_sids(handle: RawHandle) -> io::Result<Option<Vec<String>>>
     }
     let mut out = Vec::new();
     for i in 0..info.AceCount {
-        let mut ace: *mut c_void = std::ptr::null_mut();
-        if unsafe { GetAce(dacl, i, &mut ace) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if unsafe { (*(ace as *const ACE_HEADER)).AceType } == ACCESS_ALLOWED_ACE_TYPE {
-            let sid = unsafe { &(*(ace as *const ACCESS_ALLOWED_ACE)).SidStart } as *const u32 as PSID;
+        let (kind, sid) = unsafe { ace_at(dacl, i) }?;
+        if kind == ACCESS_ALLOWED_ACE_TYPE {
             out.push(unsafe { Sid::copy_from(sid) }?.to_string_sid()?);
         }
     }
