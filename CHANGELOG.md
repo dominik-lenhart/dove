@@ -5,6 +5,19 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 
 ## [Unreleased]
 
+### Fixed
+
+- Admin web UI: signing in, adding a passkey and confirming an approval failed in the browser ("Load failed" in
+  Safari), because the page's Content-Security-Policy blocked the UI's own `fetch` calls. The policy now allows
+  `connect-src 'self'`.
+- Admin web UI: stylesheet and script URLs carry a hash of their content, so a new version is never shown with a
+  cached old stylesheet.
+
+### Changed
+
+- Admin web UI redesign: sidebar navigation on desktop and a bottom tab bar on phones, card layout for the overview,
+  requests shown like letters, calmer colours and the Inter typeface (bundled, no external requests).
+
 ## [0.12.1] - 2026-11-14
 
 ### Changed

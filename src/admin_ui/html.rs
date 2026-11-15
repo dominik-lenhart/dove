@@ -150,8 +150,6 @@ pub enum Nav {
     None,
 }
 
-const VERSION: &str = env!("CARGO_PKG_VERSION");
-
 fn head(title: &str, csrf: Option<&str>) -> Markup {
     let csrf_meta = match csrf {
         Some(t) => h!("<meta name=\"dove-csrf\" content=\"{}\">", t),
@@ -159,61 +157,99 @@ fn head(title: &str, csrf: Option<&str>) -> Markup {
     };
     h!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
-         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-         <meta name=\"color-scheme\" content=\"light dark\"><meta name=\"robots\" content=\"noindex\">{}\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">\
+         <meta name=\"color-scheme\" content=\"light\"><meta name=\"robots\" content=\"noindex\">{}\
          <title>{} – Dove</title>\
-         <link rel=\"stylesheet\" href=\"/admin/static/admin.css?v={}\">\
+         <link rel=\"preload\" href=\"/admin/static/inter.woff2\" as=\"font\" type=\"font/woff2\" \
+         crossorigin><link rel=\"stylesheet\" href=\"/admin/static/admin.css?v={}\">\
          <script src=\"/admin/static/admin.js?v={}\" defer></script></head>",
         csrf_meta,
         title,
-        VERSION,
-        VERSION
+        super::asset_version(),
+        super::asset_version()
     )
 }
 
-fn brand() -> Markup {
-    Markup::lit(
-        "<a class=\"brand\" href=\"/admin\" aria-label=\"Dove admin, overview\">\
-         <svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M3 13c4 0 6-2 8-6 1 3 3 5 6 5l4-2-2 4c-1 3-4 5-8 \
-         5H6l-3 3z\"/></svg><span>Dove</span></a>",
+/// The Dove mark: a bird in flight, filled.
+const MARK: &str = "<svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M2.5 13.2c3.6.3 6.1-1.4 8-5.2.9 2.6 \
+                    2.8 4.3 5.6 4.3l5.4-2.6-2.4 4.3c-1.3 3.4-4.4 5.5-8.4 5.5H6.3l-3.8 2.7 1.6-4.3z\"/></svg>";
+
+fn workspace(href_label: &'static str) -> Markup {
+    h!(
+        "<a class=\"workspace\" href=\"/admin\" aria-label=\"{}\"><span class=\"workspace__mark\">{}</span>\
+         <span class=\"workspace__text\"><span class=\"workspace__name\">Dove</span>\
+         <span class=\"workspace__sub\">Admin</span></span></a>",
+        href_label,
+        Markup::lit(MARK)
     )
 }
 
-/// A full page for a signed-in session.
+/// Line icons (24px grid, stroked with `currentColor`).
+fn icon(paths: &'static str) -> Markup {
+    h!("<svg class=\"icon\" viewBox=\"0 0 24 24\" aria-hidden=\"true\">{}</svg>", Markup::lit(paths))
+}
+const ICON_OVERVIEW: &str = "<rect x=\"3\" y=\"3\" width=\"7\" height=\"9\" rx=\"1.5\"/><rect x=\"14\" y=\"3\" \
+                             width=\"7\" height=\"5\" rx=\"1.5\"/><rect x=\"14\" y=\"12\" width=\"7\" height=\"9\" \
+                             rx=\"1.5\"/><rect x=\"3\" y=\"16\" width=\"7\" height=\"5\" rx=\"1.5\"/>";
+const ICON_REQUESTS: &str = "<path d=\"M22 12h-6l-2 3h-4l-2-3H2\"/><path d=\"M5.5 5.1 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 \
+                             0 2-2v-6l-3.5-6.9A2 2 0 0 0 16.8 4H7.2a2 2 0 0 0-1.7 1.1z\"/>";
+const ICON_AUDIT: &str = "<path d=\"M14 3v4a1 1 0 0 0 1 1h4\"/><path d=\"M17 21H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h7l5 5v11a2 \
+                          2 0 0 1-2 2z\"/><path d=\"M9 13h6M9 17h4\"/>";
+const ICON_SETTINGS: &str = "<path d=\"M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1\"/><circle cx=\"15\" cy=\"6\" \
+                             r=\"2\"/><circle cx=\"9\" cy=\"12\" r=\"2\"/><circle cx=\"17\" cy=\"18\" r=\"2\"/>";
+const ICON_KEY: &str = "<circle cx=\"7.5\" cy=\"15.5\" r=\"4.5\"/><path d=\"m10.7 12.3 9.3-9.3M17 6l2.5 2.5M14.5 \
+                        8.5 16.5 10.5\"/>";
+const ICON_SIGNOUT: &str = "<path d=\"M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4\"/><path d=\"m16 17 5-5-5-5M21 12H9\"/>";
+
+/// A full page for a signed-in session: the Keyset shell (rail on the left; on phones a bar and bottom tabs).
 pub fn page(title: &str, nav: Nav, csrf: &str, label: &str, body: Markup) -> Markup {
-    let item = |n: Nav, href: &'static str, text: &'static str| {
+    let item = |n: Nav, href: &'static str, text: &'static str, glyph: &'static str| {
         if n == nav {
-            h!("<a href=\"{}\" aria-current=\"page\">{}</a>", href, text)
+            h!("<a href=\"{}\" aria-current=\"page\">{}<span>{}</span></a>", href, icon(glyph), text)
         } else {
-            h!("<a href=\"{}\">{}</a>", href, text)
+            h!("<a href=\"{}\">{}<span>{}</span></a>", href, icon(glyph), text)
         }
     };
     let navs = Markup::concat([
-        item(Nav::Overview, "/admin", "Overview"),
-        item(Nav::Requests, "/admin/requests", "Requests"),
-        item(Nav::Audit, "/admin/audit", "Audit"),
-        item(Nav::Settings, "/admin/settings", "Settings"),
+        item(Nav::Overview, "/admin", "Overview", ICON_OVERVIEW),
+        item(Nav::Requests, "/admin/requests", "Requests", ICON_REQUESTS),
+        item(Nav::Audit, "/admin/audit", "Audit", ICON_AUDIT),
+        item(Nav::Settings, "/admin/settings", "Settings", ICON_SETTINGS),
     ]);
-    h!(
-        "{}<body><header class=\"top\"><div class=\"top-inner\">{}<nav aria-label=\"Main\">{}</nav>\
-         <form class=\"signout\" method=\"post\" action=\"/admin/logout\"><input type=\"hidden\" name=\"csrf\" \
-         value=\"{}\"><button type=\"submit\" title=\"Signed in with the passkey {}\">Sign out</button></form>\
-         </div></header><main id=\"main\">{}</main></body></html>",
-        head(title, Some(csrf)),
-        brand(),
-        navs,
+    let signout = h!(
+        "<form class=\"signout\" method=\"post\" action=\"/admin/logout\"><input type=\"hidden\" name=\"csrf\" \
+         value=\"{}\"><button type=\"submit\">{}<span>Sign out</span></button></form>",
         csrf,
+        icon(ICON_SIGNOUT)
+    );
+    h!(
+        "{}<body><a class=\"skip\" href=\"#main\">Skip to content</a><div class=\"shell\">\
+         <nav class=\"shell__nav\" aria-label=\"Main\">{}<div class=\"shell__links\">{}</div>\
+         <div class=\"shell__foot\"><div class=\"account\" title=\"Signed in with this passkey\">\
+         <span class=\"account__mark\">{}</span><span class=\"account__text\"><span class=\"account__name\">{}</span>\
+         <span class=\"account__sub\">Passkey</span></span></div>{}</div></nav>\
+         <header class=\"shell__bar\">{}{}</header>\
+         <main id=\"main\" class=\"shell__main\"><div class=\"page\">{}</div></main>\
+         <nav class=\"shell__tabs\" aria-label=\"Main\">{}</nav></div></body></html>",
+        head(title, Some(csrf)),
+        workspace("Dove admin, overview"),
+        navs.clone(),
+        icon(ICON_KEY),
         label,
-        body
+        signout.clone(),
+        workspace("Dove admin, overview"),
+        signout,
+        body,
+        navs
     )
 }
 
 /// A page without a session (sign-in, enrolment).
 fn bare(title: &str, body: Markup) -> Markup {
     h!(
-        "{}<body class=\"bare\"><main id=\"main\" class=\"narrow\">{}{}</main></body></html>",
+        "{}<body class=\"bare\"><main id=\"main\" class=\"bare-main\">{}{}</main></body></html>",
         head(title, None),
-        brand(),
+        workspace("Dove admin"),
         body
     )
 }

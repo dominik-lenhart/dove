@@ -51,6 +51,7 @@ pub const ADMIN_PATHS: &[&str] = &[
     "/admin/stepup",
     "/admin/static/admin.css",
     "/admin/static/admin.js",
+    "/admin/static/inter.woff2",
     "/admin/health",
     "/admin/requests",
     "/admin/requests/{id}",
@@ -74,11 +75,14 @@ pub const ADMIN_PUBLIC_PATHS: &[&str] = &[
     "/admin/enroll/finish",
     "/admin/static/admin.css",
     "/admin/static/admin.js",
+    "/admin/static/inter.woff2",
 ];
 
 /// Content-Security-Policy of every admin answer (design 5.4), exactly.
-pub const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; form-action 'self'; \
-                       frame-ancestors 'none'; base-uri 'none'";
+/// `connect-src 'self'` is required: the sign-in, enrolment and confirmation steps call the server with `fetch`, which
+/// `default-src 'none'` alone blocks (Safari reports it as "Load failed").
+pub const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'self'; \
+                       form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
 
 /// Session cookie name. `__Host-` makes browsers require `Secure`, `Path=/` and no `Domain`.
 pub const COOKIE: &str = "__Host-dove_admin";
@@ -114,6 +118,7 @@ pub fn routes(app: Arc<App>) -> Router<Arc<App>> {
         .route("/admin/stepup", post(auth::stepup_finish))
         .route("/admin/static/admin.css", get(static_css))
         .route("/admin/static/admin.js", get(static_js))
+        .route("/admin/static/inter.woff2", get(static_font))
         .route("/admin/health", get(pages::health))
         .route("/admin/requests", get(pages::requests))
         .route("/admin/requests/{id}", get(pages::request_detail))
@@ -148,13 +153,35 @@ pub(crate) fn addr_key(ip: Option<std::net::IpAddr>) -> String {
 
 const CSS: &str = include_str!("static/admin.css");
 const JS: &str = include_str!("static/admin.js");
+/// Inter (latin subset, variable weight), the Keyset typeface; SIL Open Font License, see `static/inter-license.txt`.
+const FONT: &[u8] = include_bytes!("static/inter-latin-variable.woff2");
 
 async fn static_css() -> Response {
     asset(CSS, "text/css; charset=utf-8")
 }
 
+async fn static_font() -> Response {
+    let mut r = FONT.into_response();
+    r.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("font/woff2"));
+    r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("private, max-age=86400"));
+    r
+}
+
 async fn static_js() -> Response {
     asset(JS, "text/javascript; charset=utf-8")
+}
+
+/// The `?v=` of the stylesheet and script URLs: a hash of both files, so a browser never keeps a stale copy after an
+/// update (the version number alone stays the same between builds of one release).
+pub fn asset_version() -> &'static str {
+    static V: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(CSS.as_bytes());
+        h.update(JS.as_bytes());
+        crate::util::b64url(&h.finalize()[..9])
+    });
+    &V
 }
 
 fn asset(body: &'static str, ctype: &'static str) -> Response {
@@ -471,8 +498,8 @@ mod tests {
         for p in ADMIN_PUBLIC_PATHS {
             assert!(ADMIN_PATHS.contains(p), "{p}");
         }
-        // Only sign-in, enrolment and the two static files answer without a session.
-        assert_eq!(ADMIN_PUBLIC_PATHS.len(), 8);
+        // Only sign-in, enrolment and the three static files answer without a session.
+        assert_eq!(ADMIN_PUBLIC_PATHS.len(), 9);
         assert!(is_admin_path("/admin") && is_admin_path("/admin/x") && !is_admin_path("/administrator"));
     }
 }
