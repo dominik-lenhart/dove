@@ -464,10 +464,12 @@ unsafe fn check_dacl(dacl: *mut ACL, user: &Sid) -> Result<(), String> {
 /// # Safety
 /// `dacl` must point to a valid ACL with more than `i` entries. The SID pointer is valid as long as that ACL is.
 unsafe fn ace_at(dacl: *mut ACL, i: u32) -> io::Result<(u8, PSID)> {
-    let mut ace: *mut c_void = std::ptr::null_mut();
-    if unsafe { GetAce(dacl, i, &mut ace) } == 0 {
+    let mut out = std::mem::MaybeUninit::<*mut c_void>::uninit();
+    if unsafe { GetAce(dacl, i, out.as_mut_ptr()) } == 0 {
         return Err(io::Error::last_os_error());
     }
+    // GetAce succeeded, so it wrote the pointer.
+    let ace = unsafe { out.assume_init() };
     if ace.is_null() {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "the access list has an empty entry"));
     }
