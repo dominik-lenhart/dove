@@ -66,6 +66,10 @@ hosts or reference hardware.
      `[requests] notify_sink`, `dove tailscale setup --admin-only` (`tests/admin_ui_manage_e2e.rs`,
      `tests/tailscale_e2e.rs`). Checked in a real browser over Tailscale Serve with a WebCrypto soft authenticator;
      still unverified with a real platform passkey or security key.
+   - [x] Admin UI as an installable app with Web Push (design 2026-11-16, A76): manifest, service worker, icons,
+     Notifications on the settings page, a push per new agent request to every device, `dove admin push
+     list|remove|test` (`tests/admin_push_e2e.rs`, RFC 8291 vector in `push::ece`). Delivery to the real Apple and
+     Google push services is unverified until the owner turns it on on a phone.
 5. Hardening
    - [x] Fake Google server integration suite covering the automatable parts of AC1-AC21 (AC1, AC2, AC4, AC6, AC7,
      AC10, AC12, AC13, AC16, AC18 in `tests/mcp_e2e.rs`, `tests/connect_e2e.rs`; AC14, AC17, AC20 in
@@ -813,3 +817,17 @@ hosts or reference hardware.
   backoff and attempt limit; the body carries ids, the kind and an admin URL, never a subject, address or note.
   (e) `--admin-only` refuses a port that already serves Dove's public paths, so it cannot take the public mount off
   a working setup, and never touches `public_url`.
+- A76. Admin UI as an app with Web Push (2026-11-16; design 2026-11-16 "admin push"). (a) Web Push is Dove's own code
+  on aws-lc-rs (RFC 8291 `aes128gcm`, RFC 8292 VAPID ES256), ported from rootnod's hub; the `web-push` crate pulls in
+  OpenSSL and `web-push-native` a second crypto stack with an advisory. (b) The VAPID private key is created on first
+  use and sealed in `meta` (vault kind `vapid_key`); `keys rotate` re-seals it and the subscriptions without changing
+  the key, so browsers stay subscribed. (c) The lock-screen text names the connection and what it asks for (mailbox
+  aliases, item count), never addresses, subjects, notes or drafts (owner's choice); it is built at delivery time, and
+  a request decided meanwhile is skipped. Payloads are padded to 512 bytes, TTL 24 h, `Urgency: high`. (d) Adding a
+  device needs a session but no step-up: a push carries no secret and a session can read requests already; the
+  subscription is a capability URL, so it never reaches the audit log or `Debug`. (e) 404/410 removes the device,
+  408/429/5xx/network retry five times (10 s to 30 min), other answers fail at once; delivery runs every 5 s in its own
+  task and one pass at a time. (f) The service worker lives at `/admin/sw.js` with `Service-Worker-Allowed: /admin` so
+  the overview is in scope; it caches nothing and opens only plain `/admin/...` paths. (g) A signed-out GET of an
+  admin page redirects to `/admin/login?next=<path>` (letters, digits, `-`, `_` segments only), so a tapped
+  notification lands on its request after signing in.

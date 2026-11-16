@@ -87,6 +87,78 @@
     return e && (e.name === "NotAllowedError" || e.name === "AbortError");
   }
 
+  // Where to go after signing in (`?next=`, set by the server for a page that needed a session, such as a request a
+  // notification opened). Only plain admin paths, the same rule as the server's.
+  function nextPath() {
+    var n = new URLSearchParams(window.location.search).get("next");
+    return n && /^\/admin(\/[A-Za-z0-9_-]+)*$/.test(n) ? n : null;
+  }
+
+  // ---------------------------------------------------------------- notifications (Web Push)
+
+  function pushSupported() {
+    return "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
+  }
+
+  function registerWorker() {
+    return navigator.serviceWorker.register("/admin/sw.js", { scope: "/admin" });
+  }
+
+  function deviceGuess() {
+    var ua = navigator.userAgent;
+    if (/iPhone/.test(ua)) return "iphone";
+    if (/iPad/.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1)) return "ipad";
+    if (/Android/.test(ua)) return "android";
+    if (/Macintosh/.test(ua)) return "mac";
+    if (/Windows/.test(ua)) return "windows";
+    if (/Linux/.test(ua)) return "linux";
+    return "browser";
+  }
+
+  function sameKey(sub, key) {
+    var have = sub.options && sub.options.applicationServerKey;
+    if (!have) return false;
+    var a = new Uint8Array(have), b = new Uint8Array(key);
+    if (a.length !== b.length) return false;
+    for (var i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+    return true;
+  }
+
+  async function pushOn(form) {
+    var st = form.querySelector(".status");
+    var buttons = form.querySelectorAll("button");
+    buttons.forEach(function (b) { b.disabled = true; });
+    say(st, "Asking for permission…");
+    try {
+      if ((await Notification.requestPermission()) !== "granted") {
+        throw new Error("Notifications are blocked for Dove on this device. Allow them in the settings, then try again.");
+      }
+      say(st, "Subscribing…");
+      await registerWorker();
+      var reg = await Promise.race([
+        navigator.serviceWorker.ready,
+        new Promise(function (_, reject) {
+          setTimeout(function () { reject(new Error("The service worker did not start. Reload the page and try again.")); }, 10000);
+        }),
+      ]);
+      var key = b64uDecode(form.getAttribute("data-push-key"));
+      var sub = await reg.pushManager.getSubscription();
+      if (sub && !sameKey(sub, key)) { await sub.unsubscribe(); sub = null; }
+      if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key });
+      var j = sub.toJSON();
+      var name = form.querySelector('input[name="name"]').value;
+      var r = await post("/admin/settings/push", {
+        name: name,
+        subscription: { endpoint: j.endpoint, keys: { p256dh: j.keys.p256dh, auth: j.keys.auth } },
+      });
+      if (!r.ok) throw new Error(r.data.error || "Dove did not accept the subscription.");
+      window.location.assign(r.data.redirect || "/admin/settings");
+    } catch (e) {
+      say(st, e.message || "Notifications could not be turned on.", "error");
+      buttons.forEach(function (b) { b.disabled = false; });
+    }
+  }
+
   async function login(btn) {
     var st = btn.parentNode.querySelector(".status");
     if (!supported()) return say(st, "This browser cannot use passkeys.", "error");
@@ -99,7 +171,7 @@
       var f = await post("/admin/login/finish", { id: o.data.id, credential: assertionJSON(cred) });
       if (!f.ok) throw new Error(f.data.error || "Sign-in failed.");
       say(st, "Signed in.", "ok");
-      window.location.assign(f.data.redirect || "/admin");
+      window.location.assign(nextPath() || f.data.redirect || "/admin");
     } catch (e) {
       say(st, cancelled(e) ? "Sign-in was cancelled." : e.message, "error");
       btn.disabled = false;
@@ -180,6 +252,23 @@
         }
       });
     });
+
+    // The service worker makes the admin installable and shows notifications. Registering it is harmless where
+    // push is unsupported.
+    if ("serviceWorker" in navigator) registerWorker().catch(function () {});
+
+    var pushForm = document.querySelector("[data-push-form]");
+    if (pushForm && pushSupported()) {
+      var hint = document.querySelector("[data-push-hint]");
+      if (hint) hint.hidden = true;
+      pushForm.hidden = false;
+      var nameField = pushForm.querySelector('input[name="name"]');
+      if (nameField && !nameField.value) nameField.value = deviceGuess();
+      pushForm.addEventListener("submit", function (ev) {
+        ev.preventDefault();
+        pushOn(pushForm);
+      });
+    }
 
     // Shown-once secrets: copy to the clipboard, falling back to selecting the text.
     document.querySelectorAll("[data-copy]").forEach(function (btn) {

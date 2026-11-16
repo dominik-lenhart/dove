@@ -163,7 +163,9 @@ fn head(title: &str, csrf: Option<&str>) -> Markup {
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">\
          <meta name=\"color-scheme\" content=\"light\"><meta name=\"robots\" content=\"noindex\">{}\
-         <title>{} – Dove</title>\
+         <title>{} – Dove</title><link rel=\"manifest\" href=\"/admin/manifest.webmanifest\">\
+         <meta name=\"theme-color\" content=\"#111110\"><meta name=\"apple-mobile-web-app-title\" content=\"Dove\">\
+         <link rel=\"apple-touch-icon\" href=\"/admin/static/icon-192.png\">\
          <link rel=\"preload\" href=\"/admin/static/inter.woff2\" as=\"font\" type=\"font/woff2\" \
          crossorigin><link rel=\"stylesheet\" href=\"/admin/static/admin.css?v={}\">\
          <script src=\"/admin/static/admin.js?v={}\" defer></script></head>",

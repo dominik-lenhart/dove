@@ -26,6 +26,7 @@ pub mod notifier;
 pub mod oauth;
 pub mod platform;
 pub mod policy;
+pub mod push;
 pub mod redact;
 pub mod requests;
 pub mod secrets;

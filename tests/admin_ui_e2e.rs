@@ -248,7 +248,7 @@ async fn sessions_do_not_outlive_a_disabled_ui() {
     h.restart_with(|c| c.admin_ui.enabled = true).await;
     b.base = h.base.clone();
     let r = b.get("/admin/settings").await;
-    assert_eq!((r.status, r.header("location").as_str()), (303, "/admin/login"));
+    assert_eq!((r.status, r.header("location").as_str()), (303, "/admin/login?next=/admin/settings"));
     assert_eq!(count(&h, "SELECT count(*) FROM admin_passkeys").await, 1, "passkeys stay");
 }
 
@@ -307,7 +307,10 @@ async fn nothing_answers_without_a_session() {
         for p in ADMIN_PATHS.iter().filter(|p| !ADMIN_PUBLIC_PATHS.contains(p)) {
             let path = concrete(p);
             let r = b.get(&path).await;
-            assert_eq!((r.status, r.header("location").as_str()), (303, "/admin/login"), "GET {path}");
+            // The sign-in page brings the browser back afterwards (`next`), for the overview without it.
+            let login = dove::admin_ui::login_url(&path);
+            assert!(login == "/admin/login" || login == format!("/admin/login?next={path}"), "{login}");
+            assert_eq!((r.status, r.header("location")), (303, login), "GET {path}");
             assert!(!r.text.contains("dove-csrf"));
             let r = b.post_form(&path, &[("csrf", "x")]).await;
             assert_eq!(r.status, 401, "POST {path}");
@@ -416,7 +419,8 @@ async fn security_headers_on_every_answer() {
     assert_eq!(
         CSP,
         "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; \
-         connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+         connect-src 'self'; worker-src 'self'; manifest-src 'self'; form-action 'self'; frame-ancestors 'none'; \
+         base-uri 'none'"
     );
     let js = b.get("/admin/static/admin.js").await;
     assert!(js.header("content-type").starts_with("text/javascript"));

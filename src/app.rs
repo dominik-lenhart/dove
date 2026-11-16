@@ -40,6 +40,8 @@ pub struct App {
     pub watch: crate::watch::Runtime,
     /// Admin web UI challenge pools and the last health check (`crate::admin_ui`).
     pub admin_ui: crate::admin_ui::Runtime,
+    /// Web Push delivery state (`crate::push`).
+    pub push: crate::push::Runtime,
     /// Graceful stop requested over the admin channel (local mode's `Shutdown`).
     pub shutdown: tokio::sync::Notify,
 }
@@ -102,6 +104,7 @@ impl App {
             oauth: crate::oauth::OAuthState::load(&cfg.oauth)?,
             watch: Default::default(),
             admin_ui: Default::default(),
+            push: Default::default(),
             shutdown: Default::default(),
             vault,
             pepper: Pepper::new(pepper),

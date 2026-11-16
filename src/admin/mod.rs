@@ -276,6 +276,23 @@ pub enum AdminRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
     },
+
+    /// Web Push (design 2026-11-16): registers this browser's subscription as a device named `name`.
+    PushAdd {
+        name: String,
+        subscription: crate::push::Subscription,
+    },
+    /// Devices that receive pushes.
+    PushList,
+    /// Stops pushing to a device.
+    PushRemove {
+        id: String,
+    },
+    /// Sends a test notification to one device (`id`) or all of them, and reports each outcome.
+    PushTest {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
 }
 
 /// The revision of one item's draft as `requests show` printed it; approval is refused when it changed since.
@@ -377,6 +394,11 @@ impl AdminRequest {
             PasskeysRemove { name } => ("passkeys.remove", None, None, vec![name.clone()]),
             SessionsList => ("sessions.list", None, None, vec![]),
             SessionsRevoke { id } => ("sessions.revoke", None, None, id.iter().cloned().collect()),
+            // Device names are operator-chosen labels; the subscription (a capability URL and keys) never appears.
+            PushAdd { name, .. } => ("push.add", None, None, vec![name.clone()]),
+            PushList => ("push.list", None, None, vec![]),
+            PushRemove { id } => ("push.remove", None, None, vec![id.clone()]),
+            PushTest { id } => ("push.test", None, None, id.iter().cloned().collect()),
         }
     }
 }

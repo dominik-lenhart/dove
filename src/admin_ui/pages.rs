@@ -70,6 +70,13 @@ pub(super) fn done_notice(done: Option<&str>) -> Markup {
         Some("ended") => "Watch removed.",
         Some("pruned") => "Old audit records were deleted.",
         Some("rewrapped") => "Secrets are now sealed with the current key.",
+        Some("push_on") => "Notifications are on for this device.",
+        Some("push_off") => "That device no longer gets notifications.",
+        Some("push_sent") => "Test notification sent. It should appear on the device in a few seconds.",
+        Some("push_failed") => {
+            "The test notification could not be delivered. Turn notifications off and on again on that device."
+        }
+        Some("push_gone") => "The push service says that device unsubscribed; it was removed.",
         _ => return Markup::default(),
     };
     h!("<p class=\"notice ok\" role=\"status\">{}</p>", msg)
@@ -1015,7 +1022,7 @@ pub async fn settings(
          <p class=\"status\" role=\"status\" aria-live=\"polite\"></p></form>\
          <p class=\"hint\">Dove shows a link to open on the new device. On the server, \
          <code>sudo dove admin passkey add --name &lt;device&gt;</code> does the same.</p></section>\
-         <section class=\"block\"><h2>Sessions</h2><div class=\"rows\">{}</div>\
+         {}<section class=\"block\"><h2>Sessions</h2><div class=\"rows\">{}</div>\
          <form method=\"post\" action=\"/admin/settings/sessions/revoke\" data-confirm=\"End every session, this \
          one included?\">{}<button type=\"submit\" class=\"btn danger\">End all sessions</button></form></section>\
          <section class=\"block\"><h2>Keys</h2><p>After you add a new key file and restart Dove, seal every stored \
@@ -1027,6 +1034,7 @@ pub async fn settings(
         done_notice(d.done.as_deref()),
         pk,
         csrf_input(&s),
+        super::push::settings_block(&app, &s).await,
         ss,
         csrf_input(&s),
         csrf_input(&s)

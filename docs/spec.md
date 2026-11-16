@@ -652,6 +652,12 @@ sinks (`dove sinks add`, watch push delivery, design 0.2 section 3). The gateway
 state store whenever a sink is added or removed; agents name sinks of their own project but never supply URLs. Sink
 URLs are stored sealed (vault kind `sink_url`).
 
+Amended 2026-11-16 (owner decision, Web Push to the owner's devices): `POST` of an encrypted Web Push message (RFC 8291,
+VAPID per RFC 8292) to an https endpoint on a known push service (`web.push.apple.com`, `fcm.googleapis.com`,
+`push.services.mozilla.com`, `notify.windows.com`, exact host or subdomain, default port). Endpoints come only from
+browsers the owner subscribed in the admin UI, are stored sealed (vault kind `push_subscription`) and are checked again
+by the gateway before every request. The message names the connection and the kind of request, never mail content.
+
 Explicitly denied: every other send route, `messages` with POST, `messages/import`,
 `messages/{id}/trash`, `messages/{id}/modify`, `messages/batchModify`, `messages/batchDelete`, DELETE on messages or
 threads, `threads/{id}/modify`, `threads/{id}/trash`, anything under `settings/` except the one GET above, `watch`,
