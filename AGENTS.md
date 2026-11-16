@@ -532,3 +532,10 @@ cargo fmt
   with `tests/` excluded, because test fixtures (fake IMAP passwords, canary assertions) produced dozens of false
   "hard-coded credential" and "cleartext logging" alerts. GitHub's default setup must stay off, or the uploads conflict.
   Findings in `#[cfg(test)]` modules under `src/` are still reported: dismiss them as "used in tests" with a comment.
+- 2026-11-16: Web Push (`src/push/`, PLAN A76). `push::ece` is checked against RFC 8291 Appendix A; the fake push
+  service in `tests/admin_push_e2e.rs` decrypts every push with the device keys, so payload tests read what a phone
+  would show. Tests must call `gateway().allow_loopback_push_for_tests()` (and again after `Harness::restart`) before
+  adding a device with a loopback endpoint; the harness starts no delivery loop, so call `push::deliver_due`. A
+  request push gets its text at delivery (`push::request_text`): a new request kind needs a line there. Admin pages
+  served without a session (manifest, icons, `sw.js`) go in `ADMIN_PUBLIC_PATHS`; an image or JS asset that the
+  browser fetches needs the matching CSP directive (`worker-src`, `manifest-src`).

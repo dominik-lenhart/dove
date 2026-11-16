@@ -16,8 +16,9 @@
 
 pub mod access;
 
-/// Queues the owner notice for a new pending request when `[requests] notify_sink` is set (section 4.6). Runs in the
-/// transaction that creates the request, after its row exists (the notice references it).
+/// Queues the owner notices for a new pending request: a push to every device (design 2026-11-16) and, when
+/// `[requests] notify_sink` is set, the webhook notice (section 4.6). Runs in the transaction that creates the
+/// request, after its row exists (the notices reference it).
 pub fn queue_notice(
     tx: &rusqlite::Transaction,
     cfg: &crate::config::Config,
@@ -25,6 +26,7 @@ pub fn queue_notice(
     kind: &str,
     now: i64,
 ) -> rusqlite::Result<()> {
+    crate::push::queue_request(tx, request_id, now)?;
     if cfg.requests.notify_sink.is_none() {
         return Ok(());
     }

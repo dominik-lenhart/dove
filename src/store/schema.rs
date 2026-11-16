@@ -14,6 +14,7 @@ pub const MIGRATIONS: &[&str] = &[
     V_ACCESS_GRANTS,
     V_ADMIN_UI,
     V_REQUEST_NOTICES,
+    V_PUSH,
 ];
 
 const V1: &str = r#"
@@ -486,4 +487,39 @@ CREATE TABLE request_notices (
     created_at      INTEGER NOT NULL
 ) WITHOUT ROWID;
 CREATE INDEX request_notices_due ON request_notices(state, next_attempt_at);
+"#;
+
+/// Web Push to the owner's devices (design 2026-11-16, PLAN A76).
+/// - `push_devices`: one browser subscription each. The endpoint and keys are sealed with the vault
+///   (`push::SUBSCRIPTION_KIND`, scope = id); `endpoint_hash` (SHA-256 of the endpoint) finds a re-subscribing device.
+/// - `push_outbox`: one row per device and notification. `kind = 'request'` rows name the request in `ref` and get their
+///   text at delivery time; other kinds carry `title`, `body` and `url` (no mail content in either).
+const V_PUSH: &str = r#"
+CREATE TABLE push_devices (
+    id                   TEXT PRIMARY KEY,
+    name                 TEXT NOT NULL,
+    endpoint_hash        BLOB NOT NULL UNIQUE,
+    subscription_sealed  BLOB NOT NULL,
+    service              TEXT NOT NULL,
+    created_at           INTEGER NOT NULL,
+    last_ok_at           INTEGER,
+    last_status          INTEGER,
+    failures             INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE push_outbox (
+    id              INTEGER PRIMARY KEY,
+    device_id       TEXT NOT NULL REFERENCES push_devices(id) ON DELETE CASCADE,
+    kind            TEXT NOT NULL,
+    ref             TEXT,
+    title           TEXT,
+    body            TEXT,
+    url             TEXT,
+    state           TEXT NOT NULL CHECK (state IN ('pending', 'delivered', 'failed', 'skipped')),
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at INTEGER NOT NULL,
+    last_status     INTEGER,
+    created_at      INTEGER NOT NULL
+);
+CREATE INDEX push_outbox_due ON push_outbox(state, next_attempt_at);
+CREATE INDEX push_outbox_device ON push_outbox(device_id);
 "#;

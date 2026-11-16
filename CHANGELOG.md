@@ -5,6 +5,15 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 
 ## [Unreleased]
 
+### Added
+
+- The admin web UI can be installed as an app (Add to Home Screen on iPhone and iPad, Install on Android and desktop)
+  and sends push notifications: turn them on per device under Settings, Notifications. Every new agent request (a
+  scheduled send or more access) pushes "<connection> wants to send 2 mails from <mailbox>" or "<connection> asks for
+  access to <mailbox>" to each device; tapping it opens the request, and approving still needs the passkey. No
+  addresses, subjects or notes leave the server. `dove admin push list|remove|test` manages the devices on the server.
+- Signing in after following a link to an admin page (for example from a notification) returns to that page.
+
 ## [0.13.0] - 2026-11-15
 
 ### Added

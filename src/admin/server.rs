@@ -362,6 +362,10 @@ async fn execute(call: &mut AdminCall<'_>, req: AdminRequest) -> anyhow::Result<
             crate::requests::admin::approve(call, id, shown, items, late, duration_minutes).await
         }
         RequestsDeny { id } => crate::requests::admin::deny(call, id).await,
+        PushAdd { name, subscription } => crate::push::admin_add(call, name, subscription).await,
+        PushList => crate::push::admin_list(call).await,
+        PushRemove { id } => crate::push::admin_remove(call, id).await,
+        PushTest { id } => crate::push::admin_test(call, id).await,
         RequestsCancel { id, items } => crate::requests::admin::cancel(call, id, items).await,
         PasskeysAdd { name } => {
             let Some(origin) = app.cfg.admin_ui.origin().map(str::to_string) else {
@@ -514,9 +518,10 @@ async fn keys_rotate(call: &mut AdminCall<'_>) -> anyhow::Result<Value> {
             }
             // Sink secrets and watch filters are sealed under the KEK too.
             n += crate::watch::sinks::rewrap_sealed(tx, &vault)?;
+            n += crate::push::rewrap_sealed(tx, &vault)?;
             let mut stmt = tx.prepare("SELECT DISTINCT kek_version FROM grants")?;
             let mut remaining: Vec<u32> = stmt.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
-            for v in crate::watch::sinks::sealed_versions(tx)? {
+            for v in crate::watch::sinks::sealed_versions(tx)?.into_iter().chain(crate::push::sealed_versions(tx)?) {
                 if !remaining.contains(&v) {
                     remaining.push(v);
                 }

@@ -1090,6 +1090,29 @@ The session cookie belongs to the host name, not to the port: another HTTPS serv
 replace it, which signs you out but gives that service nothing. If `passkey add` printed a link and the page says it
 was already used, and that was not you, remove that passkey at once with `sudo dove admin passkey remove <name>`.
 
+### Notifications on your phone
+
+The admin UI is an installable web app. On an iPhone or iPad, open it in Safari, choose Share, then Add to Home
+Screen, and open Dove from the Home Screen (iOS offers push only to installed web apps, iOS 16.4 or later). On Android
+and desktop browsers it works in the browser too. Sign in, open Settings, and under Notifications choose **Turn on
+for this device**. **Test** sends a test notification.
+
+From then on every new agent request shows a notification such as "claude-code asks for access to billing" or
+"claude-code wants to send 2 mails from info". Tapping it opens the request; approving still needs your passkey. The
+notification never contains an address, subject, note or draft text. Dove sends it encrypted to Apple's, Google's,
+Mozilla's or Microsoft's push service (the only destinations it accepts), which forward it to the device. Your phone
+does not need to be on the tailnet to receive it, only to open the admin UI.
+
+```sh
+sudo dove admin push list              # devices, last delivery, failures
+sudo dove admin push test              # a test notification to every device (--id <id> for one)
+sudo dove admin push remove <id>
+```
+
+A device that unsubscribes (the push service answers 404 or 410) is removed automatically. A push that cannot be
+delivered within 24 hours is dropped. Push is a convenience: requests wait on the Requests page whether or not a
+notification arrived. `[requests] notify_sink` still works alongside it.
+
 ## Backup and restore
 
 What the state store (`/var/lib/dove/state.db`) holds: wrapped per-mailbox keys, encrypted refresh tokens, keyed

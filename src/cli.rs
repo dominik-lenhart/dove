@@ -851,6 +851,32 @@ pub enum AdminCmd {
     /// Signed-in admin web UI sessions.
     #[command(subcommand)]
     Sessions(SessionsCmd),
+    /// Devices that get a push notification for each new agent request. Turn push on for a device in the admin web
+    /// UI under Settings.
+    #[command(subcommand)]
+    Push(PushCmd),
+}
+
+#[derive(Subcommand)]
+pub enum PushCmd {
+    /// Devices that receive pushes, with the outcome of their last push.
+    List {
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+    /// Stop pushing to a device (id from `dove admin push list`).
+    Remove {
+        id: String,
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+    /// Send a test notification to one device (--id) or all of them.
+    Test {
+        #[arg(long)]
+        id: Option<String>,
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1366,6 +1392,9 @@ fn admin_request(cmd: Command) -> anyhow::Result<(AdminOpts, AdminRequest)> {
             AdminCmd::Passkey(PasskeyCmd::Remove { name, admin }) => (admin, R::PasskeysRemove { name }),
             AdminCmd::Sessions(SessionsCmd::List { admin }) => (admin, R::SessionsList),
             AdminCmd::Sessions(SessionsCmd::Revoke { id, admin }) => (admin, R::SessionsRevoke { id }),
+            AdminCmd::Push(PushCmd::List { admin }) => (admin, R::PushList),
+            AdminCmd::Push(PushCmd::Remove { id, admin }) => (admin, R::PushRemove { id }),
+            AdminCmd::Push(PushCmd::Test { id, admin }) => (admin, R::PushTest { id }),
         },
         Command::Doctor { .. } | Command::Tailscale(_) => unreachable!("handled in run_command"),
         Command::Export { admin } => (admin, R::Export),

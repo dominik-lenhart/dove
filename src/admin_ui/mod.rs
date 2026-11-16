@@ -20,6 +20,7 @@ pub mod kit;
 pub mod mailboxes;
 pub mod pages;
 pub mod projects;
+pub mod push;
 pub mod reveal;
 #[cfg(any(test, feature = "testing"))]
 pub mod soft_authenticator;
@@ -58,6 +59,10 @@ pub const ADMIN_PATHS: &[&str] = &[
     "/admin/static/admin.css",
     "/admin/static/admin.js",
     "/admin/static/inter.woff2",
+    "/admin/static/icon-192.png",
+    "/admin/static/icon-512.png",
+    "/admin/manifest.webmanifest",
+    "/admin/sw.js",
     "/admin/health",
     "/admin/requests",
     "/admin/requests/{id}",
@@ -97,6 +102,9 @@ pub const ADMIN_PATHS: &[&str] = &[
     "/admin/watches/{id}/remove",
     "/admin/watches/sinks",
     "/admin/watches/sinks/{name}",
+    "/admin/settings/push",
+    "/admin/settings/push/{id}/test",
+    "/admin/settings/push/{id}/remove",
 ];
 
 /// The only admin routes that answer without a session.
@@ -110,13 +118,19 @@ pub const ADMIN_PUBLIC_PATHS: &[&str] = &[
     "/admin/static/admin.css",
     "/admin/static/admin.js",
     "/admin/static/inter.woff2",
+    // The app manifest, its icons and the service worker: browsers fetch them without the session cookie.
+    "/admin/static/icon-192.png",
+    "/admin/static/icon-512.png",
+    "/admin/manifest.webmanifest",
+    "/admin/sw.js",
 ];
 
 /// Content-Security-Policy of every admin answer (design 5.4), exactly.
 /// `connect-src 'self'` is required: the sign-in, enrolment and confirmation steps call the server with `fetch`, which
-/// `default-src 'none'` alone blocks (Safari reports it as "Load failed").
+/// `default-src 'none'` alone blocks (Safari reports it as "Load failed"). `worker-src` and `manifest-src` let the
+/// page register `/admin/sw.js` and load its app manifest (design 2026-11-16).
 pub const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'self'; \
-                       form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
+                       worker-src 'self'; manifest-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
 
 /// Session cookie name. `__Host-` makes browsers require `Secure`, `Path=/` and no `Domain`.
 pub const COOKIE: &str = "__Host-dove_admin";
@@ -153,6 +167,10 @@ pub fn routes(app: Arc<App>) -> Router<Arc<App>> {
         .route("/admin/static/admin.css", get(static_css))
         .route("/admin/static/admin.js", get(static_js))
         .route("/admin/static/inter.woff2", get(static_font))
+        .route("/admin/static/icon-192.png", get(static_icon_192))
+        .route("/admin/static/icon-512.png", get(static_icon_512))
+        .route("/admin/manifest.webmanifest", get(static_manifest))
+        .route("/admin/sw.js", get(static_sw))
         .route("/admin/health", get(pages::health))
         .route("/admin/requests", get(pages::requests))
         .route("/admin/requests/{id}", get(pages::request_detail))
@@ -192,6 +210,9 @@ pub fn routes(app: Arc<App>) -> Router<Arc<App>> {
         .route("/admin/watches/{id}/remove", post(watches::remove_watch))
         .route("/admin/watches/sinks", post(watches::add_sink))
         .route("/admin/watches/sinks/{name}", post(watches::sink))
+        .route("/admin/settings/push", post(push::add))
+        .route("/admin/settings/push/{id}/test", post(push::test))
+        .route("/admin/settings/push/{id}/remove", post(push::remove))
         // `route_layer`, not `layer`: a layer would also wrap the fallback, and merged into the public router that
         // fallback answers every unknown path of the listener (a 303 to the sign-in page instead of 404).
         .route_layer(middleware::from_fn_with_state(app, gate))
@@ -231,6 +252,41 @@ async fn static_font() -> Response {
 
 async fn static_js() -> Response {
     asset(JS, "text/javascript; charset=utf-8")
+}
+
+const SW: &str = include_str!("static/sw.js");
+const MANIFEST: &str = include_str!("static/manifest.webmanifest");
+const ICON_192: &[u8] = include_bytes!("static/icon-192.png");
+const ICON_512: &[u8] = include_bytes!("static/icon-512.png");
+
+/// The service worker. Served from `/admin/sw.js`, whose default scope would be `/admin/`; the header allows the
+/// scope `/admin` so the overview page itself is inside it. Never cached long: browsers check it for updates.
+async fn static_sw() -> Response {
+    let mut r = SW.into_response();
+    let h = r.headers_mut();
+    h.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/javascript; charset=utf-8"));
+    h.insert("service-worker-allowed", HeaderValue::from_static("/admin"));
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    r
+}
+
+async fn static_manifest() -> Response {
+    asset(MANIFEST, "application/manifest+json")
+}
+
+async fn static_icon_192() -> Response {
+    image(ICON_192)
+}
+
+async fn static_icon_512() -> Response {
+    image(ICON_512)
+}
+
+fn image(bytes: &'static [u8]) -> Response {
+    let mut r = bytes.into_response();
+    r.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("image/png"));
+    r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("private, max-age=86400"));
+    r
 }
 
 /// The `?v=` of the stylesheet and script URLs: a hash of both files, so a browser never keeps a stale copy after an
@@ -341,7 +397,7 @@ async fn gate(State(app): State<Arc<App>>, req: Request, next: Next) -> Response
         return if write {
             plain(StatusCode::UNAUTHORIZED, "sign in first")
         } else {
-            Redirect::to("/admin/login").into_response()
+            Redirect::to(&login_url(&path)).into_response()
         };
     };
     let req = if write {
@@ -370,6 +426,22 @@ async fn gate(State(app): State<Arc<App>>, req: Request, next: Next) -> Response
     let mut req = req;
     req.extensions_mut().insert(session);
     next.run(req).await
+}
+
+/// The sign-in page, with `next` set to `path` when it is a plain admin path (a notification opens
+/// `/admin/requests/<id>`; after signing in the browser goes there). Anything else signs in to the overview.
+pub fn login_url(path: &str) -> String {
+    if path != ADMIN_PREFIX && safe_next(path) { format!("/admin/login?next={path}") } else { "/admin/login".into() }
+}
+
+/// `/admin` followed by segments of letters, digits, `-` and `_` only (no dots, no `//`, nothing to escape).
+pub fn safe_next(path: &str) -> bool {
+    path.strip_prefix(ADMIN_PREFIX).is_some_and(|rest| {
+        rest.split('/')
+            .skip(1)
+            .all(|seg| !seg.is_empty() && seg.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
+            && (rest.is_empty() || rest.starts_with('/'))
+    })
 }
 
 /// Admin verbs that need a fresh passkey assertion bound to the exact request (design 5.2): approving a request,
@@ -435,7 +507,12 @@ pub fn needs_step_up(req: &AdminRequest) -> bool {
         | RequestsCancel { .. }
         | PasskeysList
         | SessionsList
-        | SessionsRevoke { .. } => false,
+        | SessionsRevoke { .. }
+        // Adding a device needs a session only: a push carries no secret, and a session can read requests already.
+        | PushAdd { .. }
+        | PushList
+        | PushRemove { .. }
+        | PushTest { .. } => false,
     }
 }
 
@@ -511,6 +588,10 @@ pub const COVERAGE: &[(&str, Reach)] = &[
     ("PasskeysRemove", Reach::Ui("/admin/settings/passkeys/{name}/remove")),
     ("SessionsList", Reach::Ui("/admin/settings")),
     ("SessionsRevoke", Reach::Ui("/admin/settings/sessions/revoke")),
+    ("PushAdd", Reach::Ui("/admin/settings/push")),
+    ("PushList", Reach::Ui("/admin/settings")),
+    ("PushRemove", Reach::Ui("/admin/settings/push/{id}/remove")),
+    ("PushTest", Reach::Ui("/admin/settings/push/{id}/test")),
 ];
 
 #[cfg(test)]
@@ -547,6 +628,7 @@ mod tests {
             include_str!("mailboxes.rs"),
             include_str!("projects.rs"),
             include_str!("watches.rs"),
+            include_str!("push.rs"),
         ]
         .iter()
         .map(|s| s.split("#[cfg(test)]").next().unwrap())
@@ -567,8 +649,9 @@ mod tests {
         for p in ADMIN_PUBLIC_PATHS {
             assert!(ADMIN_PATHS.contains(p), "{p}");
         }
-        // Only sign-in, enrolment and the three static files answer without a session.
-        assert_eq!(ADMIN_PUBLIC_PATHS.len(), 9);
+        // Only sign-in, enrolment, the three static files and the app files (manifest, icons, worker) answer
+        // without a session.
+        assert_eq!(ADMIN_PUBLIC_PATHS.len(), 13);
         assert!(is_admin_path("/admin") && is_admin_path("/admin/x") && !is_admin_path("/administrator"));
     }
 }

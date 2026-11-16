@@ -198,6 +198,8 @@ pub struct Gateway {
     sinks: RwLock<HashSet<String>>,
     /// Test builds only: sink URLs may be plain `http://` on a loopback address.
     plain_http_sinks: AtomicBool,
+    /// Test builds only: push endpoints may be plain `http://` on a loopback address.
+    loopback_push: AtomicBool,
 }
 
 /// A validated webhook sink URL: `https`, a host, no credentials, query or fragment. The normalized form (as the
@@ -293,6 +295,7 @@ impl Gateway {
             bytes_read: Default::default(),
             sinks: Default::default(),
             plain_http_sinks: AtomicBool::new(false),
+            loopback_push: AtomicBool::new(false),
         }
     }
 
@@ -327,6 +330,44 @@ impl Gateway {
         if parsed.as_str() != url || !self.sinks.read().expect("sink allowlist lock").contains(parsed.as_str()) {
             return Err(GatewayError::NotAllowed);
         }
+        let _p = self.acquire(None, Priority::Background, deadline).await?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(GatewayError::Deadline);
+        }
+        let mut req = self.http.post(parsed.as_str()).timeout(remaining.min(self.request_timeout)).body(body);
+        for (k, v) in headers {
+            req = req.header(*k, v);
+        }
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| if e.is_connect() { GatewayError::NotDispatched } else { GatewayError::Unknown })?;
+        Ok(resp.status().as_u16())
+    }
+
+    pub fn loopback_push(&self) -> bool {
+        self.loopback_push.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Test builds only: lets tests subscribe and push to `http://127.0.0.1:<port>`, a local fake push service.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn allow_loopback_push_for_tests(&self) {
+        self.loopback_push.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// POSTs one encrypted Web Push message (design 2026-11-16, spec 7.5 amendment): only to an endpoint on a known
+    /// push service (`push::Endpoint`, checked again here), no redirects, background priority.
+    pub async fn post_push(
+        &self,
+        endpoint: &str,
+        headers: &[(&'static str, String)],
+        body: Vec<u8>,
+        deadline: Instant,
+    ) -> Result<u16, GatewayError> {
+        let parsed =
+            crate::push::Endpoint::parse(endpoint, self.loopback_push()).map_err(|_| GatewayError::NotAllowed)?;
         let _p = self.acquire(None, Priority::Background, deadline).await?;
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
