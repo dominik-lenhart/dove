@@ -15,6 +15,7 @@ pub const MIGRATIONS: &[&str] = &[
     V_ADMIN_UI,
     V_REQUEST_NOTICES,
     V_PUSH,
+    V_SIGNATURES,
 ];
 
 const V1: &str = r#"
@@ -522,4 +523,57 @@ CREATE TABLE push_outbox (
 );
 CREATE INDEX push_outbox_due ON push_outbox(state, next_attempt_at);
 CREATE INDEX push_outbox_device ON push_outbox(device_id);
+"#;
+
+/// Named signatures with HTML and inline images (design 2026-11-17 "html signatures", PLAN A79).
+/// - `signatures`: per mailbox, unique name, plain `text` always, cleaned `html` optional.
+/// - `signature_images`: the `cid:` images of one signature (PNG, JPEG or GIF).
+/// - `signature_defaults`: the default per mailbox (`address = ''`) or per send-as alias address.
+/// - `own_drafts.composition`: how Dove composed its own draft (signature name, byte lengths), never content.
+///
+/// The plain-text `account_signatures` move over: the mailbox's becomes `default`, an alias's `alias-<n>`.
+const V_SIGNATURES: &str = r#"
+CREATE TABLE signatures (
+    id          INTEGER PRIMARY KEY,
+    account_id  TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    name        TEXT NOT NULL,
+    text        TEXT NOT NULL,
+    html        TEXT,
+    created_at  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL,
+    updated_by  TEXT NOT NULL,
+    UNIQUE (account_id, name)
+);
+
+CREATE TABLE signature_images (
+    signature_id INTEGER NOT NULL REFERENCES signatures(id) ON DELETE CASCADE,
+    cid          TEXT NOT NULL,
+    mime_type    TEXT NOT NULL,
+    bytes        BLOB NOT NULL,
+    PRIMARY KEY (signature_id, cid)
+) WITHOUT ROWID;
+
+CREATE TABLE signature_defaults (
+    account_id   TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    address      TEXT NOT NULL,
+    signature_id INTEGER NOT NULL REFERENCES signatures(id) ON DELETE CASCADE,
+    PRIMARY KEY (account_id, address)
+) WITHOUT ROWID;
+CREATE INDEX signature_defaults_sig ON signature_defaults(signature_id);
+
+CREATE TEMP TABLE legacy_sig AS
+    SELECT account_id, address, body, updated_at,
+           CASE address WHEN '' THEN 'default'
+                ELSE 'alias-' || (SELECT count(*) FROM account_signatures o
+                                  WHERE o.account_id = s.account_id AND o.address <> '' AND o.address <= s.address)
+           END AS name
+    FROM account_signatures s;
+INSERT INTO signatures(account_id, name, text, html, created_at, updated_at, updated_by)
+    SELECT account_id, name, body, NULL, updated_at, updated_at, 'migration' FROM legacy_sig;
+INSERT INTO signature_defaults(account_id, address, signature_id)
+    SELECT l.account_id, l.address, g.id FROM legacy_sig l JOIN signatures g ON g.account_id = l.account_id AND g.name = l.name;
+DROP TABLE legacy_sig;
+DROP TABLE account_signatures;
+
+ALTER TABLE own_drafts ADD COLUMN composition TEXT;
 "#;

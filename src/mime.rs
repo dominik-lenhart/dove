@@ -19,6 +19,10 @@ const MAX_SUBJECT_ENCODED: usize = 998;
 pub const MAX_BODY_BYTES: usize = 500 * 1024;
 /// Most attachments in one draft (spec 7.6).
 pub const MAX_DRAFT_ATTACHMENTS: usize = 10;
+/// Largest HTML part of a draft (the rendered body, signature and quote).
+pub const MAX_HTML_BYTES: usize = 2 * MAX_BODY_BYTES + 64 * 1024;
+/// Inline images of one draft (a signature's).
+pub const MAX_INLINE_IMAGES: usize = 6;
 /// Longest attachment filename Dove writes, in characters.
 const MAX_FILENAME_CHARS: usize = 200;
 
@@ -344,7 +348,8 @@ pub fn parse(raw: &[u8], limits: &Limits) -> Result<ParsedMessage, MimeError> {
             && rest_are_attachments
             && leaves >= 2
             && out.body_complete
-            && out.attachments.len() == leaves - 1);
+            && out.attachments.len() == leaves - 1)
+        || (out.body_complete && draft_layout(root_part).is_some_and(|l| l.html.is_some()));
 
     let is_att = |p: &MessagePart<'_>| {
         let f = p.attachment_name().map(str::trim).filter(|n| !n.is_empty()).map(str::to_string);
@@ -549,6 +554,31 @@ pub struct DraftFields {
     pub date: i64,
     /// Files attached after the text body (at most [`MAX_DRAFT_ATTACHMENTS`]). Empty: a plain text/plain message.
     pub attachments: Vec<DraftAttachment>,
+    /// An HTML alternative of the text body with its inline images (design 2026-11-17 "html signatures"). `None`: the
+    /// body is text/plain only.
+    pub html: Option<DraftHtml>,
+}
+
+/// The HTML alternative of a draft and the images it references as `cid:`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DraftHtml {
+    pub html: String,
+    pub images: Vec<InlineImage>,
+}
+
+/// An image shown inside the HTML (`multipart/related`, `Content-ID: <cid>`, `Content-Disposition: inline`).
+#[derive(Clone, PartialEq, Eq)]
+pub struct InlineImage {
+    /// Without angle brackets.
+    pub cid: String,
+    pub mime_type: String,
+    pub bytes: Vec<u8>,
+}
+
+impl std::fmt::Debug for InlineImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InlineImage").field("mime_type", &self.mime_type).field("len", &self.bytes.len()).finish()
+    }
 }
 
 /// One attachment of a Dove-built draft: decoded bytes plus the filename and MIME type Dove writes for it.
@@ -693,12 +723,62 @@ pub fn build_draft(f: &DraftFields) -> Result<Vec<u8>, MimeError> {
     }
     // Normalize to LF first so the builder's CRLF conversion cannot produce CR CR LF.
     let body = f.body_text.replace("\r\n", "\n").replace('\r', "\n");
+    if let Some(h) = &f.html {
+        if h.html.len() > MAX_HTML_BYTES {
+            return Err(invalid("HTML body too large"));
+        }
+        if h.images.len() > MAX_INLINE_IMAGES {
+            return Err(invalid("too many inline images"));
+        }
+        for i in &h.images {
+            let cid_ok = (1..=64).contains(&i.cid.len())
+                && i.cid.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+            if !cid_ok || !matches!(i.mime_type.as_str(), "image/png" | "image/jpeg" | "image/gif") {
+                return Err(invalid("invalid inline image"));
+            }
+        }
+    }
+    // The body: text/plain, or multipart/alternative (text, HTML), inside multipart/related when it has images.
+    let text_part = || MimePart::new("text/plain", BodyPart::Text(body.clone().into()));
+    let body_part = match &f.html {
+        None => None,
+        Some(h) => {
+            let html = h.html.replace("\r\n", "\n").replace('\r', "\n");
+            let alt = MimePart::new(
+                "multipart/alternative",
+                vec![text_part(), MimePart::new("text/html", BodyPart::Text(html.into()))],
+            );
+            if h.images.is_empty() {
+                Some(alt)
+            } else {
+                let mut parts = vec![alt];
+                for i in &h.images {
+                    parts.push(
+                        MimePart::new(
+                            BContentType::new(i.mime_type.clone()),
+                            BodyPart::Binary(base64_lines(&i.bytes).into()),
+                        )
+                        .inline()
+                        .cid(i.cid.clone())
+                        .transfer_encoding("base64"),
+                    );
+                }
+                Some(MimePart::new(
+                    BContentType::new("multipart/related").attribute("type", "multipart/alternative"),
+                    parts,
+                ))
+            }
+        }
+    };
     if f.attachments.is_empty() {
-        b = b.text_body(body);
+        b = match body_part {
+            Some(p) => b.body(p),
+            None => b.text_body(body),
+        };
     } else {
-        // multipart/mixed: the text body, then each attachment base64 encoded (also text/*, so the decoded bytes are
+        // multipart/mixed: the body, then each attachment base64 encoded (also text/*, so the decoded bytes are
         // exactly the input: no line-ending or charset conversion).
-        let mut parts = vec![MimePart::new("text/plain", BodyPart::Text(body.into()))];
+        let mut parts = vec![body_part.unwrap_or_else(text_part)];
         for a in &f.attachments {
             parts.push(
                 MimePart::new(BContentType::new(a.mime_type.clone()), BodyPart::Binary(base64_lines(&a.bytes).into()))
@@ -725,15 +805,80 @@ pub fn build_draft(f: &DraftFields) -> Result<Vec<u8>, MimeError> {
     Ok(out)
 }
 
-/// Reads back the fields of a Dove-built draft (text/plain, optionally with attachments: see
-/// [`ParsedMessage::is_draft_shape`]). Body line endings are normalized to LF. Attachment filenames and types are
-/// returned as found; callers sanitize them before rebuilding.
+/// The parts of a draft in the layouts Dove builds, by role:
+///
+/// ```text
+/// [multipart/mixed]                     only with attachments (each a leaf, Content-Disposition: attachment)
+///   [multipart/related]                 only with inline images (leaves image/*, with a Content-ID, not attachments)
+///     [multipart/alternative]           text/plain then text/html
+///       text/plain
+/// ```
+struct DraftLayout<'m> {
+    text: MessagePart<'m>,
+    html: Option<MessagePart<'m>>,
+    images: Vec<MessagePart<'m>>,
+    attachments: Vec<MessagePart<'m>>,
+}
+
+fn draft_layout(root: MessagePart<'_>) -> Option<DraftLayout<'_>> {
+    let is_att = |p: &MessagePart<'_>| !p.is_multipart() && p.content_disposition().is_some_and(|d| d.is_attachment());
+    let plain = |p: &MessagePart<'_>| {
+        !p.is_multipart() && mime_type_of(p) == "text/plain" && matches!(p.kind(), PartKind::Text) && !is_att(p)
+    };
+    let (body, attachments) = if mime_type_of(&root) == "multipart/mixed" {
+        let mut kids = root.children();
+        let body = kids.next()?;
+        let atts: Vec<_> = kids.collect();
+        if atts.is_empty() || !atts.iter().all(is_att) {
+            return None;
+        }
+        (body, atts)
+    } else {
+        (root, vec![])
+    };
+    let (alt, images) = if mime_type_of(&body) == "multipart/related" {
+        let mut kids = body.children();
+        let first = kids.next()?;
+        let images: Vec<_> = kids.collect();
+        let image_ok = |p: &MessagePart<'_>| {
+            !p.is_multipart()
+                && mime_type_of(p).starts_with("image/")
+                && !is_att(p)
+                && p.content_id().is_some_and(|c| !c.trim().is_empty())
+        };
+        if images.is_empty() || !images.iter().all(image_ok) {
+            return None;
+        }
+        (first, images)
+    } else {
+        (body, vec![])
+    };
+    let (text, html) = if mime_type_of(&alt) == "multipart/alternative" {
+        let kids: Vec<_> = alt.children().collect();
+        if kids.len() != 2 || mime_type_of(&kids[1]) != "text/html" || is_att(&kids[1]) || kids[1].is_multipart() {
+            return None;
+        }
+        (kids[0], Some(kids[1]))
+    } else {
+        if !images.is_empty() {
+            return None;
+        }
+        (alt, None)
+    };
+    plain(&text).then_some(DraftLayout { text, html, images, attachments })
+}
+
+/// Reads back the fields of a Dove-built draft (see [`ParsedMessage::is_draft_shape`] and [`draft_layout`]). Body line
+/// endings are normalized to LF. Attachment filenames and types are returned as found; callers sanitize them before
+/// rebuilding.
 pub fn read_draft_fields(raw: &[u8]) -> Result<DraftFields, MimeError> {
     let p = parse(raw, &Limits::default())?;
     if !p.is_draft_shape {
         return Err(invalid("unsupported structure"));
     }
     let mut attachments = Vec::new();
+    let mut html = None;
+    let mut body_text = p.text_plain.clone().unwrap_or_default();
     if !p.is_simple_text {
         let limits = Limits::default();
         let msg = MessageParser::new()
@@ -741,12 +886,33 @@ pub fn read_draft_fields(raw: &[u8]) -> Result<DraftFields, MimeError> {
             .max_depth(limits.max_depth)
             .parse(raw)
             .ok_or(MimeError::Unparseable)?;
-        for part in msg.root().parts().filter(|p| !p.is_multipart()).skip(1) {
+        let layout = draft_layout(msg.root().root_part()).ok_or_else(|| invalid("unsupported structure"))?;
+        body_text = layout.text.text().ok_or_else(|| invalid("unreadable text part"))?.into_owned();
+        for part in &layout.attachments {
             attachments.push(DraftAttachment {
                 filename: part.attachment_name().map(str::to_string).unwrap_or_default(),
-                mime_type: mime_type_of(&part),
+                mime_type: mime_type_of(part),
                 bytes: part.decoded().into_owned(),
             });
+        }
+        if let Some(h) = layout.html {
+            let text = h.text().ok_or_else(|| invalid("unreadable HTML part"))?;
+            let images = layout
+                .images
+                .iter()
+                .map(|i| InlineImage {
+                    cid: i
+                        .content_id()
+                        .unwrap_or_default()
+                        .trim()
+                        .trim_start_matches('<')
+                        .trim_end_matches('>')
+                        .to_string(),
+                    mime_type: mime_type_of(i),
+                    bytes: i.decoded().into_owned(),
+                })
+                .collect();
+            html = Some(DraftHtml { html: text.replace("\r\n", "\n"), images });
         }
     }
     Ok(DraftFields {
@@ -755,12 +921,13 @@ pub fn read_draft_fields(raw: &[u8]) -> Result<DraftFields, MimeError> {
         cc: p.cc,
         bcc: p.bcc,
         subject: p.subject.unwrap_or_default(),
-        body_text: p.text_plain.unwrap_or_default().replace("\r\n", "\n"),
+        body_text: body_text.replace("\r\n", "\n"),
         message_id: p.message_id_header.ok_or_else(|| invalid("draft has no Message-ID"))?,
         in_reply_to: p.in_reply_to.into_iter().next(),
         references: p.references,
         date: p.date.ok_or_else(|| invalid("draft has no Date"))?,
         attachments,
+        html,
     })
 }
 
@@ -785,6 +952,7 @@ mod tests {
             references: vec!["<root@example.org>".into(), "<orig@example.org>".into()],
             date: 1_700_000_000,
             attachments: vec![],
+            html: None,
         }
     }
 
@@ -936,12 +1104,119 @@ Subject: Bcc: kept\r\n\r\nBcc: body line stays\r\n";
         assert_eq!(build_draft(&g).unwrap(), raw);
     }
 
+    /// The parts of a raw message as (depth, content type, Content-ID, disposition) in tree order.
+    fn tree(raw: &[u8]) -> Vec<(usize, String, Option<String>, Option<String>)> {
+        let msg = MessageParser::new().parse(raw).unwrap();
+        let mut out = Vec::new();
+        let mut stack = vec![(0usize, msg.root().root_part())];
+        while let Some((d, p)) = stack.pop() {
+            out.push((
+                d,
+                mime_type_of(&p),
+                p.content_id().map(str::to_string),
+                p.content_disposition().map(|c| c.ctype().to_string()),
+            ));
+            let kids: Vec<_> = p.children().collect();
+            stack.extend(kids.into_iter().rev().map(|k| (d + 1, k)));
+        }
+        out
+    }
+
     #[test]
-    fn read_draft_rejects_multipart_html() {
+    fn html_draft_nests_related_alternative_and_attachments() {
+        let png = b"\x89PNG\r\n\x1a\nlogo".to_vec();
+        let gif = b"GIF89abanner".to_vec();
+        let mut f = fields();
+        f.body_text = "Hallo\n\n-- \nDominik\n".into();
+        f.html = Some(DraftHtml {
+            html: "<div>Hallo</div><img src=\"cid:keyset-logo\"><img src=\"cid:keyset-banner\">".into(),
+            images: vec![
+                InlineImage { cid: "keyset-logo".into(), mime_type: "image/png".into(), bytes: png.clone() },
+                InlineImage { cid: "keyset-banner".into(), mime_type: "image/gif".into(), bytes: gif.clone() },
+            ],
+        });
+        f.attachments = vec![DraftAttachment {
+            filename: "a.pdf".into(),
+            mime_type: "application/pdf".into(),
+            bytes: b"%PDF".to_vec(),
+        }];
+        let raw = build_draft(&f).unwrap();
+        let t = tree(&raw);
+        let kinds: Vec<(usize, &str)> = t.iter().map(|(d, m, _, _)| (*d, m.as_str())).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (0, "multipart/mixed"),
+                (1, "multipart/related"),
+                (2, "multipart/alternative"),
+                (3, "text/plain"),
+                (3, "text/html"),
+                (2, "image/png"),
+                (2, "image/gif"),
+                (1, "application/pdf"),
+            ]
+        );
+        let cid = |m: &str| t.iter().find(|x| x.1 == m).and_then(|x| x.2.clone()).unwrap();
+        assert_eq!(cid("image/png").trim_matches(['<', '>']), "keyset-logo");
+        assert_eq!(cid("image/gif").trim_matches(['<', '>']), "keyset-banner");
+        for img in ["image/png", "image/gif"] {
+            assert_eq!(t.iter().find(|x| x.1 == img).unwrap().3.as_deref(), Some("inline"), "{img} is inline");
+        }
+        assert_eq!(t.iter().find(|x| x.1 == "application/pdf").unwrap().3.as_deref(), Some("attachment"));
+        let text = String::from_utf8_lossy(&raw);
+        assert!(text.contains("type=\"multipart/alternative\""), "related names its root type");
+        // It is a Dove draft shape and reads back to the same fields, images included.
+        assert!(parse(&raw, &Limits::default()).unwrap().is_draft_shape);
+        let g = read_draft_fields(&raw).unwrap();
+        assert_eq!(g.body_text, f.body_text);
+        let h = g.html.as_ref().unwrap();
+        assert_eq!(h.html, f.html.as_ref().unwrap().html);
+        assert_eq!(
+            h.images.iter().map(|i| (&i.cid[..], &i.bytes[..])).collect::<Vec<_>>(),
+            vec![("keyset-logo", &png[..]), ("keyset-banner", &gif[..])]
+        );
+        assert_eq!(g.attachments.len(), 1);
+        // Without images there is no related layer; without attachments no mixed layer.
+        f.attachments.clear();
+        f.html.as_mut().unwrap().images.clear();
+        let kinds: Vec<String> = tree(&build_draft(&f).unwrap()).into_iter().map(|x| x.1).collect();
+        assert_eq!(kinds, ["multipart/alternative", "text/plain", "text/html"]);
+    }
+
+    #[test]
+    fn html_draft_refuses_bad_inline_images() {
+        let mut f = fields();
+        let img = |cid: &str, t: &str| InlineImage { cid: cid.into(), mime_type: t.into(), bytes: vec![1] };
+        for bad in [img("a b", "image/png"), img("", "image/png"), img("ok", "image/svg+xml"), img("ok", "text/html")] {
+            f.html = Some(DraftHtml { html: "<p>x</p>".into(), images: vec![bad] });
+            assert!(build_draft(&f).is_err());
+        }
+        f.html = Some(DraftHtml {
+            html: "<p>x</p>".into(),
+            images: (0..7).map(|i| img(&format!("i{i}"), "image/png")).collect(),
+        });
+        assert!(build_draft(&f).is_err(), "at most six images");
+    }
+
+    #[test]
+    fn read_draft_takes_text_and_html_alternatives_only() {
         let raw = b"From: a@x.org\r\nMessage-ID: <m@x>\r\nDate: Tue, 14 Nov 2023 22:13:20 +0000\r\nContent-Type: multipart/alternative; boundary=B\r\n\r\n--B\r\nContent-Type: text/plain\r\n\r\np\r\n--B\r\nContent-Type: text/html\r\n\r\n<p>h</p>\r\n--B--\r\n";
-        match read_draft_fields(raw) {
-            Err(MimeError::Invalid(m)) => assert_eq!(m, "unsupported structure"),
-            other => panic!("unexpected {other:?}"),
+        let f = read_draft_fields(raw).unwrap();
+        assert_eq!(f.body_text, "p");
+        assert_eq!(f.html.unwrap().html, "<p>h</p>");
+        // A third alternative, HTML first, or HTML alone are layouts Dove does not build.
+        for body in [
+            "--B\r\nContent-Type: text/plain\r\n\r\np\r\n--B\r\nContent-Type: text/html\r\n\r\nh\r\n--B\r\nContent-Type: text/enriched\r\n\r\ne\r\n--B--\r\n",
+            "--B\r\nContent-Type: text/html\r\n\r\nh\r\n--B\r\nContent-Type: text/plain\r\n\r\np\r\n--B--\r\n",
+            "--B\r\nContent-Type: text/html\r\n\r\nh\r\n--B--\r\n",
+        ] {
+            let raw = format!(
+                "From: a@x.org\r\nMessage-ID: <m@x>\r\nDate: Tue, 14 Nov 2023 22:13:20 +0000\r\nContent-Type: multipart/alternative; boundary=B\r\n\r\n{body}"
+            );
+            match read_draft_fields(raw.as_bytes()) {
+                Err(MimeError::Invalid(m)) => assert_eq!(m, "unsupported structure"),
+                other => panic!("unexpected {other:?}"),
+            }
         }
     }
 

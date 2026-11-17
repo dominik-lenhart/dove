@@ -139,6 +139,54 @@ mod tests {
         crate::platform::dir_is_private(&dir.path().join("data")).unwrap();
     }
 
+    /// The signatures migration turns each plain-text signature into a named one and keeps who it is the default for.
+    #[test]
+    fn signature_migration_keeps_texts_and_defaults() {
+        let mut c = Connection::open_in_memory().unwrap();
+        c.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+        // V_SIGNATURES is migration 15.
+        let n = 15;
+        for sql in &schema::MIGRATIONS[..n - 1] {
+            c.execute_batch(sql).unwrap();
+        }
+        c.execute_batch(
+            "INSERT INTO accounts(id, alias, email, status, provider) VALUES ('a', 'x', 'x@example.org', 'active', 'imap');
+             INSERT INTO accounts(id, alias, email, status, provider) VALUES ('b', 'y', 'y@example.org', 'active', 'gmail');
+             INSERT INTO account_signatures VALUES ('a', '', 'Mailbox text', 5), ('a', 'sales@example.org', 'Sales', 6),
+                 ('a', 'press@example.org', 'Press', 7), ('b', 'office@example.org', 'Office', 8);",
+        )
+        .unwrap();
+        let tx = c.transaction().unwrap();
+        tx.execute_batch(schema::MIGRATIONS[n - 1]).unwrap();
+        tx.commit().unwrap();
+        let rows: Vec<(String, String, String, String, i64)> = c
+            .prepare(
+                "SELECT d.account_id, d.address, s.name, s.text, s.updated_at FROM signature_defaults d \
+                 JOIN signatures s ON s.id = d.signature_id ORDER BY d.account_id, d.address",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let row = |a: &str, ad: &str, n: &str, t: &str, u: i64| (a.into(), ad.into(), n.into(), t.into(), u);
+        assert_eq!(
+            rows,
+            vec![
+                row("a", "", "default", "Mailbox text", 5),
+                row("a", "press@example.org", "alias-1", "Press", 7),
+                row("a", "sales@example.org", "alias-2", "Sales", 6),
+                row("b", "office@example.org", "alias-1", "Office", 8),
+            ]
+        );
+        assert!(c.query_row("SELECT 1 FROM account_signatures", [], |_| Ok(())).is_err(), "old table dropped");
+        c.execute("UPDATE own_drafts SET composition = NULL", []).unwrap();
+        // Removing an account takes its signatures and defaults along.
+        c.execute("DELETE FROM accounts WHERE id = 'a'", []).unwrap();
+        assert_eq!(c.query_row("SELECT count(*) FROM signatures", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        assert_eq!(c.query_row("SELECT count(*) FROM signature_defaults", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    }
+
     /// The Gmail-over-IMAP migration keeps every folder row and id and only widens the `special` check.
     #[test]
     fn gmail_imap_migration_keeps_folders() {

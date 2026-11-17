@@ -21,6 +21,7 @@ pub mod compose;
 pub mod contacts;
 pub mod coverage;
 pub mod digest;
+pub mod draft_body;
 pub mod drafts;
 pub mod drafts_imap;
 pub mod lenient;
@@ -28,6 +29,7 @@ pub mod organize;
 pub mod read;
 pub mod requests;
 pub mod search;
+pub mod signatures;
 pub mod watches;
 
 use std::future::Future;
@@ -281,6 +283,7 @@ pub fn registry() -> Vec<ToolDef> {
     v.extend(digest::defs());
     v.extend(batch::defs());
     v.extend(drafts::defs());
+    v.extend(signatures::defs());
     v.extend(watches::defs());
     v.extend(organize::defs());
     v.extend(requests::defs());

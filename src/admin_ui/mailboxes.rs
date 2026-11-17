@@ -249,7 +249,7 @@ async fn signature_form(app: &Arc<App>, s: &WebSession, mailbox: &str, address: 
     h!(
         "<form class=\"sig\" method=\"post\" action=\"{}/signature\">{}<input type=\"hidden\" name=\"for\" value=\"{}\">\
          <p class=\"field\"><label>{}<textarea name=\"signature\" rows=\"4\" maxlength=\"4000\">{}</textarea></label>\
-         <span class=\"hint\">Plain text. Dove adds it below new drafts. Leave empty to remove.</span></p>\
+         <span class=\"hint\">Plain text of the default signature (an HTML version stays). Leave empty to remove the default.</span></p>\
          <button type=\"submit\" class=\"btn\">Save signature</button></form>",
         base(mailbox),
         csrf_input(s),
@@ -257,6 +257,76 @@ async fn signature_form(app: &Arc<App>, s: &WebSession, mailbox: &str, address: 
         label,
         current
     )
+}
+
+/// The mailbox's named signatures with their defaults; HTML and images come from the CLI or an agent.
+async fn named_signatures(app: &Arc<App>, s: &WebSession, mailbox: &str) -> Markup {
+    let list = result(
+        run_action(app, s, AdminRequest::AccountsSignaturesList { account: mailbox.to_string(), include_html: false })
+            .await,
+    )
+    .ok()
+    .and_then(|v| v["signatures"].as_array().cloned())
+    .unwrap_or_default();
+    let hint = Markup::lit(
+        "<p class=\"hint\">Agents pick a signature by name; the default is used when they do not. HTML signatures \
+             with images are added with <code>dove accounts signatures set</code> or by an agent with the signatures \
+             permission.</p>",
+    );
+    if list.is_empty() {
+        return Markup::concat([Markup::lit("<p class=\"empty\">No named signatures yet.</p>"), hint]);
+    }
+    let rows = Markup::concat(list.iter().map(|x| {
+        let name = text(&x["name"]);
+        let defaults: Vec<String> = x["default_for"]
+            .as_array()
+            .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+            .unwrap_or_default();
+        let images = x["images"].as_array().map(Vec::len).unwrap_or(0);
+        let chips = Markup::concat([
+            if x["has_html"] == true {
+                Markup::lit("<span class=\"chip quiet\">HTML</span>")
+            } else {
+                Markup::default()
+            },
+            if images > 0 {
+                h!("<span class=\"chip quiet\">{} images</span>", images.to_string())
+            } else {
+                Markup::default()
+            },
+            if defaults.is_empty() {
+                Markup::default()
+            } else {
+                h!("<span class=\"chip\">Default for {}</span>", defaults.join(", "))
+            },
+        ]);
+        let make_default = if defaults.iter().any(|d| d == "mailbox") {
+            Markup::default()
+        } else {
+            h!(
+                "<form method=\"post\" action=\"{}/signatures\">{}<input type=\"hidden\" name=\"do\" value=\"default\">\
+             <input type=\"hidden\" name=\"name\" value=\"{}\"><button type=\"submit\" class=\"btn\">Make default\
+             </button></form>",
+                base(mailbox),
+                csrf_input(s),
+                name.clone()
+            )
+        };
+        h!(
+            "<div class=\"row\"><span class=\"row-main\"><strong>{}</strong> {}<span class=\"muted\">{}</span></span>\
+             <span class=\"row-meta\">{}<form method=\"post\" action=\"{}/signatures\">{}\
+             <input type=\"hidden\" name=\"do\" value=\"delete\"><input type=\"hidden\" name=\"name\" value=\"{}\">\
+             <button type=\"submit\" class=\"btn\">Delete</button></form></span></div>",
+            name.clone(),
+            chips,
+            text(&x["text"]).lines().next().unwrap_or_default().to_string(),
+            make_default,
+            base(mailbox),
+            csrf_input(s),
+            name
+        )
+    }));
+    Markup::concat([h!("<div class=\"rows\">{}</div>", rows), hint])
 }
 
 async fn detail_page(app: &Arc<App>, s: &WebSession, alias: &str, notice: Markup) -> Response {
@@ -369,7 +439,7 @@ async fn detail_page(app: &Arc<App>, s: &WebSession, alias: &str, notice: Markup
     let identities = result(run_action(app, s, AdminRequest::AccountsAliasList { account: alias.to_string() }).await)
         .unwrap_or_default();
     let aliases: Vec<Value> = identities["aliases"].as_array().cloned().unwrap_or_default();
-    let mut sigs = vec![signature_form(app, s, alias, None).await];
+    let mut sigs = vec![named_signatures(app, s, alias).await, signature_form(app, s, alias, None).await];
     for x in &aliases {
         sigs.push(signature_form(app, s, alias, Some(&text(&x["address"]))).await);
     }
@@ -538,6 +608,27 @@ pub async fn aliases(
         ),
         Some("remove") => (AdminRequest::AccountsAliasRemove { account: alias, address }, "deleted"),
         _ => return problem(&s, "Address", "unknown action", &b),
+    };
+    match result(run_action(&app, &s, req).await) {
+        Ok(_) => Redirect::to(&format!("{b}?done={done}")).into_response(),
+        Err(e) => problem(&s, "Not changed", &e, &b),
+    }
+}
+
+pub async fn signatures(
+    State(app): State<Arc<App>>,
+    Extension(s): Extension<WebSession>,
+    Path(alias): Path<String>,
+    axum::Form(f): Fields,
+) -> Response {
+    let b = base(&alias);
+    let Some(name) = field(&f, "name") else { return problem(&s, "Signature", "no signature named", &b) };
+    let (req, done) = match field(&f, "do").as_deref() {
+        Some("default") => {
+            (AdminRequest::AccountsSignatureDefault { account: alias, alias: None, name: Some(name) }, "saved")
+        }
+        Some("delete") => (AdminRequest::AccountsSignatureDelete { account: alias, name }, "deleted"),
+        _ => return problem(&s, "Signature", "unknown action", &b),
     };
     match result(run_action(&app, &s, req).await) {
         Ok(_) => Redirect::to(&format!("{b}?done={done}")).into_response(),

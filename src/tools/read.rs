@@ -1005,10 +1005,14 @@ async fn get_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
         render(&msg)
     );
     let _ = started;
+    let composition = match own {
+        Some(_) if !changed => super::drafts::composition_view(cx, mb, did, &f).await,
+        _ => None,
+    };
     Ok(ToolOutput {
         extra: Vec::new(),
         structured: json!({ "account": mb.alias, "draft_id": did, "revision": revision, "owned": own.is_some(),
-                            "editable_by_dove": own.is_some() && !changed && f.parsed.is_draft_shape, "message": msg }),
+                            "editable_by_dove": own.is_some() && !changed && f.parsed.is_draft_shape, "composition": composition, "message": msg }),
         text,
         audit: AuditInfo {
             account: Some(mb.alias.clone()),

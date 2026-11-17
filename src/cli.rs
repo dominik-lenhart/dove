@@ -268,9 +268,115 @@ pub enum AccountsCmd {
     /// Send-as aliases of an IMAP mailbox (Gmail keeps its send-as list in Gmail settings).
     #[command(subcommand)]
     Aliases(AliasesCmd),
-    /// Plain-text signatures appended to new drafts, per mailbox or per alias.
+    /// The default signature's plain text, per mailbox or per alias (older interface; see `signatures`).
     #[command(subcommand)]
     Signature(SignatureCmd),
+    /// Named signatures with HTML and inline images; agents pick one by name in create_draft.
+    #[command(subcommand)]
+    Signatures(SignaturesCmd),
+}
+
+#[derive(Subcommand)]
+pub enum SignaturesCmd {
+    List {
+        mailbox: String,
+        /// Also print each signature's HTML.
+        #[arg(long)]
+        html: bool,
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+    /// Create or change a named signature. Without --text the plain-text version is derived from the HTML. The
+    /// first signature of a mailbox becomes its default.
+    Set {
+        mailbox: String,
+        name: String,
+        /// HTML file (a fragment; cleaned to a safe subset). Images: https URLs or cid:<cid> with --image.
+        #[arg(long)]
+        html: Option<PathBuf>,
+        /// Plain-text file.
+        #[arg(long)]
+        text: Option<PathBuf>,
+        /// Inline image as CID=PATH (PNG, JPEG or GIF; at most 6, 512 KiB together). Replaces all images.
+        #[arg(long = "image", value_name = "CID=PATH")]
+        images: Vec<String>,
+        /// Remove the HTML and all images (text only).
+        #[arg(long, conflicts_with_all = ["html", "images"])]
+        text_only: bool,
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+    Delete {
+        mailbox: String,
+        name: String,
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+    /// Make NAME the default of the mailbox (or of --alias); --none removes that default.
+    Default {
+        mailbox: String,
+        #[arg(required_unless_present = "none", conflicts_with = "none")]
+        name: Option<String>,
+        #[arg(long)]
+        alias: Option<String>,
+        #[arg(long)]
+        none: bool,
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+}
+
+/// Reads a signature input file with a size cap.
+fn read_capped(path: &std::path::Path, cap: usize, what: &str) -> anyhow::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    std::fs::File::open(path)
+        .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", path.display()))?
+        .take(cap as u64 + 1)
+        .read_to_end(&mut buf)?;
+    if buf.len() > cap {
+        anyhow::bail!("the {what} file {} is larger than {cap} bytes", path.display());
+    }
+    Ok(buf)
+}
+
+fn signature_put(
+    mailbox: String,
+    name: String,
+    html: Option<PathBuf>,
+    text: Option<PathBuf>,
+    images: Vec<String>,
+    text_only: bool,
+) -> anyhow::Result<AdminRequest> {
+    use crate::signatures as s;
+    let utf8 =
+        |b: Vec<u8>, what: &str| String::from_utf8(b).map_err(|_| anyhow::anyhow!("the {what} file is not UTF-8"));
+    let html = match (html, text_only) {
+        (Some(p), _) => Some(utf8(read_capped(&p, s::MAX_RAW_HTML_BYTES, "HTML")?, "HTML")?),
+        (None, true) => Some(String::new()),
+        (None, false) => None,
+    };
+    let text =
+        text.map(|p| utf8(read_capped(&p, crate::identity::MAX_SIGNATURE_BYTES * 4, "text")?, "text")).transpose()?;
+    let images = if text_only {
+        Some(vec![])
+    } else if images.is_empty() {
+        None
+    } else {
+        let mut out = Vec::new();
+        for spec in images {
+            let (cid, path) =
+                spec.split_once('=').ok_or_else(|| anyhow::anyhow!("--image takes CID=PATH, got '{spec}'"))?;
+            let bytes = read_capped(std::path::Path::new(path), s::MAX_IMAGE_BYTES, "image")?;
+            out.push(crate::admin::SignatureImage {
+                cid: cid.to_string(),
+                mime_type: None,
+                data_base64: crate::util::b64std(&bytes),
+            });
+        }
+        Some(out)
+    };
+    Ok(AdminRequest::AccountsSignaturePut { account: mailbox, name, html, text, images })
 }
 
 #[derive(Subcommand)]
@@ -531,7 +637,7 @@ pub enum ClientsCmd {
         name: String,
         #[arg(long)]
         project: String,
-        /// alias=<actions or preset>, repeatable. Actions: read, draft, organize, delete, send. Presets: reader,
+        /// alias=<actions or preset>, repeatable. Actions: read, draft, organize, delete, send, signatures. Presets: reader,
         /// drafter, assistant, full (send is never in a preset: `work=assistant,send`).
         #[arg(long = "grant", required = true)]
         grants: Vec<String>,
@@ -1023,6 +1129,12 @@ fn render_request(v: &Value) -> String {
         for a in it["attachments"].as_array().into_iter().flatten() {
             out.push_str(&format!("    Attachment: {} ({} bytes)\n", t(&a["name"]), a["size"]));
         }
+        if let Some(sig) = it["html_signature"].as_str() {
+            out.push_str(&format!(
+                "    HTML: also sent as HTML with signature '{}' and its images\n",
+                terminal_safe(sig)
+            ));
+        }
         out.push_str("    ----\n");
         let body = terminal_safe(it["body_text"].as_str().unwrap_or(""));
         for line in body.lines() {
@@ -1273,6 +1385,20 @@ fn admin_request(cmd: Command) -> anyhow::Result<(AdminOpts, AdminRequest)> {
                 }
                 SignatureCmd::Show { mailbox, alias, admin } => {
                     (admin, R::AccountsSignatureShow { account: mailbox, alias })
+                }
+            },
+            AccountsCmd::Signatures(c) => match c {
+                SignaturesCmd::List { mailbox, html, admin } => {
+                    (admin, R::AccountsSignaturesList { account: mailbox, include_html: html })
+                }
+                SignaturesCmd::Set { mailbox, name, html, text, images, text_only, admin } => {
+                    (admin, signature_put(mailbox, name, html, text, images, text_only)?)
+                }
+                SignaturesCmd::Delete { mailbox, name, admin } => {
+                    (admin, R::AccountsSignatureDelete { account: mailbox, name })
+                }
+                SignaturesCmd::Default { mailbox, name, alias, none: _, admin } => {
+                    (admin, R::AccountsSignatureDefault { account: mailbox, alias, name })
                 }
             },
         },

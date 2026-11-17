@@ -72,6 +72,20 @@ impl Alert {
         }
     }
 
+    /// An agent created, changed or deleted a signature. `name` is a validated signature name (`[a-z0-9-]`); the push
+    /// names the mailbox and the connection only.
+    pub fn signature_changed(alias: &str, client: &str, name: &str, deleted: bool) -> Self {
+        let verb = if deleted { "deleted" } else { "changed" };
+        Alert {
+            message: format!("Client '{client}' {verb} signature '{name}' of mailbox '{alias}'."),
+            push: text(
+                "signature changed",
+                format!("{} {verb} a signature of {}", push::label(client), push::label(alias)),
+                page("mailboxes", alias),
+            ),
+        }
+    }
+
     /// A best-effort IMAP draft step failed; `message` names the mailbox and draft ids only.
     pub fn draft_cleanup(alias: &str, message: String) -> Self {
         Alert {

@@ -5,6 +5,25 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 
 ## [Unreleased]
 
+### Added
+
+- Named signatures with HTML and inline images: a mailbox can have several (for example `behoerden` and
+  `gastgeber`), one default per mailbox and per send-as address. A draft with an HTML signature is sent as HTML with a
+  plain-text alternative, the images as inline parts. `create_draft` takes `signature: "<name>"` or `false`; in replies
+  and forwards the signature sits above the quote or forwarded mail, in the text and the HTML version.
+- `update_draft` replaces only the agent's text above the signature and keeps signature and quote; `changes.signature`
+  switches or removes the signature. `get_draft` shows how Dove composed its own draft (`composition`).
+- Agents can manage signatures with `list_signatures` (needs `draft`) and `set_signature` / `delete_signature`, which
+  need the new `signatures` action (in no preset). Every change by an agent alerts the owner, and the text of an
+  agent's HTML signature is always derived from its HTML. A send request shows when the mail goes out as HTML.
+- `dove accounts signatures list|set|delete|default` with `--html`, `--text` and `--image cid=file`; the mailbox page
+  lists the signatures and can delete one or make it the default.
+
+### Changed
+
+- Plain-text signatures from earlier versions become named signatures (`default`, `alias-<n>`) on upgrade;
+  `dove accounts signature set|show` keeps working on the default signature's text.
+
 ## [0.16.0] - 2026-11-17
 
 ### Added

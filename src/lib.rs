@@ -32,6 +32,7 @@ pub mod redact;
 pub mod requests;
 pub mod secrets;
 pub mod serve;
+pub mod signatures;
 pub mod store;
 pub mod tailscale;
 pub mod tokens;

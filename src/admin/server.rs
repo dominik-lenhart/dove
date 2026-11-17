@@ -231,6 +231,41 @@ async fn execute(call: &mut AdminCall<'_>, req: AdminRequest) -> anyhow::Result<
         AccountsSignatureShow { account, alias } => {
             call.read(move |c| crate::identity::signature_show(c, &account, alias.as_deref())).await
         }
+        AccountsSignaturesList { account, include_html } => {
+            call.read(move |c| {
+                let aid = ops::account_id(c, &account)?;
+                Ok(serde_json::json!({ "account": account, "signatures": crate::signatures::list(c, &aid, include_html)? }))
+            })
+            .await
+        }
+        AccountsSignaturePut { account, name, html, text, images } => {
+            let images = match images {
+                None => None,
+                Some(list) => Some(
+                    list.into_iter()
+                        .map(|i| {
+                            let bytes = crate::util::b64_decode_any(&i.data_base64)
+                                .ok_or_else(|| anyhow::anyhow!("image '{}' is not base64", i.cid))?;
+                            crate::signatures::image(&i.cid, i.mime_type.as_deref(), bytes)
+                        })
+                        .collect::<anyhow::Result<Vec<_>>>()?,
+                ),
+            };
+            let change = crate::signatures::Change { name, html, text, images, derive_text: false };
+            call.tx(move |tx| crate::signatures::set(tx, &account, change, "operator")).await
+        }
+        AccountsSignatureDelete { account, name } => {
+            call.tx(move |tx| {
+                if !crate::signatures::delete(tx, &account, &name)? {
+                    anyhow::bail!("'{account}' has no signature '{name}'");
+                }
+                Ok(serde_json::json!({ "account": account, "name": name, "deleted": true }))
+            })
+            .await
+        }
+        AccountsSignatureDefault { account, alias, name } => {
+            call.tx(move |tx| crate::signatures::set_default(tx, &account, alias.as_deref(), name.as_deref())).await
+        }
         AccountsDisable { alias } => call.tx(move |tx| ops::account_set_enabled(tx, &alias, false)).await,
         AccountsEnable { alias } => call.tx(move |tx| ops::account_set_enabled(tx, &alias, true)).await,
         ClientsCreate { name, project, grants, expires, allow_ip, redact_secrets } => {

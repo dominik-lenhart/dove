@@ -877,15 +877,23 @@ fn letter(it: &Value, pending: bool) -> Markup {
     } else {
         h!("<ul class=\"attachments\" aria-label=\"Attachments\">{}</ul>", Markup::concat(attachments))
     };
+    let html_note = match it["html_signature"].as_str() {
+        Some(sig) => h!(
+            "<p class=\"hint\">Also sent as HTML: the same text with the signature '{}' and its images.</p>",
+            sig.to_string()
+        ),
+        None => Markup::default(),
+    };
     // The body is text and stays text: escaped into <pre>, never parsed as HTML.
     h!(
         "<article class=\"letter\"><div class=\"letter-top\">{}{}</div><dl class=\"envelope\">{}</dl>\
-         <h2 class=\"subject\">{}</h2><pre class=\"letter-body\">{}</pre>{}</article>",
+         <h2 class=\"subject\">{}</h2><pre class=\"letter-body\">{}</pre>{}{}</article>",
         when,
         pick,
         envelope,
         subject,
         text(&it["body_text"]),
+        html_note,
         attachments
     )
 }

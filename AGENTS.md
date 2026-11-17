@@ -548,3 +548,8 @@ cargo fmt
   chosen time); integration tests can only append at "now". The admin UI's chart is inline SVG with classes, never
   `style=` (the CSP blocks inline styles); check layout changes by dumping a page from a harness test and opening it
   with the static CSS in Playwright (`file://`), which is quicker than the TLS demo when no passkey flow is involved.
+- 2026-11-17: Signatures (`src/signatures.rs`, `src/tools/{draft_body,signatures}.rs`, PLAN A79). Draft bodies are
+  composed only through `draft_body::compose` (body, signature, quote or forward tail) and taken apart with
+  `draft_body::split` and the `own_drafts.composition` record; never search the text for `-- `. scraper sorts
+  attributes, so tests of cleaned HTML must expect alphabetical order. `push_outbox` gets rows only for registered
+  devices: tests of an alert without a device check `notifier.sent` and the `notifications` key instead.

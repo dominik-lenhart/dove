@@ -68,7 +68,7 @@ your normal Drafts folder, so your mail client is the review step.
   span every mailbox a token may use; one slow or broken mailbox is reported on its own instead of failing the call.
 - **Works with the mail you have.** Any IMAP/SMTP account with password or app-password login (presets for Strato,
   iCloud and Gmail). Gmail works with just an app password, labels included; the Gmail API through your own Google
-  Cloud project stays available. Send-as aliases and per-mailbox signatures.
+  Cloud project stays available. Send-as aliases and named HTML signatures with inline images.
 - **Search that understands mail.** Typed search over sender, recipient, subject, body, folder, unread, date and
   attachment text (PDF, DOCX, ODT, CSV). Every message is classified as personal, newsletter, notification or
   calendar, so "what's important" works without reading everything.
@@ -193,6 +193,8 @@ against remote callers and leaked tokens, not against your own agent's shell. De
 | `list_drafts`, `get_draft` | Drafts in the mailbox's Drafts folder | `read` |
 | `create_draft`, `update_draft` | New mail, threaded and quoted replies, forwards with attachments, files by reference or inline, alias and signature | `draft` |
 | `delete_draft` | Delete a draft Dove created and nobody changed | `draft` |
+| `list_signatures` | Named signatures of a mailbox (HTML with inline images, plain text, defaults) | `draft` |
+| `set_signature`, `delete_signature` | Create, change or delete a named signature; the owner is alerted | `signatures` |
 | `update_messages` | Mark read or unread, star, add or remove labels and keywords | `organize` |
 | `move_messages` | Archive, move to a folder or label, back to the inbox; to Trash or Spam only with `delete` | `organize` |
 | `send_draft` | Send a draft Dove created and nobody changed; off unless both send gates are open | `send` |
@@ -223,6 +225,8 @@ Grants are per token and per mailbox. Presets cover the usual cases, and you can
 - **`organize`** is reversible, so the approval page pre-selects it.
 - **`delete`** is opt-in: a steered agent could hide mail in Trash. It never deletes permanently; there is no tool
   for that.
+- **`signatures`** is in no preset either: a signature is text sent under the owner's name, so agents that may change
+  one need it granted explicitly, and every change alerts the owner.
 - **`send`** is in no preset. It needs an explicit grant on one mailbox *and* `allow_send = true` in the server
   configuration. It only sends drafts Dove created and nobody changed, never with recipients or content of its own,
   and never twice after an unknown outcome.
