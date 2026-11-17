@@ -5,6 +5,8 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-11-17
+
 ### Changed
 
 - Thread view searches (`group_by:"thread"`) walk the mailbox newest first and stop after one page instead of
@@ -488,7 +490,8 @@ First release.
   release only after verifying its minisign signature. The CLI hints at a new release at most once a day
   (`DOVE_NO_UPDATE_CHECK=1` turns it off); the server never checks for updates.
 
-[Unreleased]: https://github.com/dominik-lenhart/dove/compare/v0.18.0...HEAD
+[Unreleased]: https://github.com/dominik-lenhart/dove/compare/v0.19.0...HEAD
+[0.19.0]: https://github.com/dominik-lenhart/dove/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/dominik-lenhart/dove/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/dominik-lenhart/dove/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/dominik-lenhart/dove/compare/v0.15.0...v0.16.0
