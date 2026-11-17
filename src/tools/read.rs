@@ -166,7 +166,8 @@ pub fn defs() -> Vec<ToolDef> {
                     "account": account_schema(),
                     "own_only": { "type": "boolean", "default": true, "description": "List only drafts this project created." },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 50, "default": 20, "description": "Most drafts per page." },
-                    "page_token": { "type": "string", "description": "next_page_token of the previous page." }
+                    "page_token": { "type": "string", "description": "next_page_token of the previous page." },
+                    "cursor": { "type": "string", "description": "Same as page_token." }
                 }, "required": ["account"], "additionalProperties": false })
             },
             output_schema: || {
@@ -869,6 +870,7 @@ pub async fn owned_drafts(cx: &ToolCx, account_id: &str) -> Result<Vec<(String, 
 }
 
 async fn list_drafts(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
+    let args = super::lenient::page_alias(&args, "page_token")?;
     only_keys(&args, &["account", "own_only", "limit", "page_token"])?;
     let mb = account_arg(cx, &args, Capability::Read)?;
     if mb.provider == crate::policy::Provider::Imap {

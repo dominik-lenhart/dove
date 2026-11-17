@@ -15,7 +15,7 @@ use crate::error::ToolError;
 /// Which arguments of a tool are read leniently, and how.
 #[derive(Default)]
 pub struct Spec<'a> {
-    /// `(alias, canonical)`: the alias names the canonical argument. Giving both is an error.
+    /// `(alias, canonical)`: the alias names the canonical argument. Giving both with different values is an error.
     pub aliases: &'a [(&'a str, &'a str)],
     /// Lists: one non-list value becomes a one-element list; JSON text of a list is parsed.
     pub lists: &'a [&'a str],
@@ -34,8 +34,14 @@ pub fn normalize(args: &Value, spec: &Spec<'_>) -> Result<Value, ToolError> {
         if v.is_null() {
             continue;
         }
-        if obj.get(*canonical).is_some_and(|c| !c.is_null()) {
-            return Err(ToolError::invalid_at(*alias, format!("use '{canonical}' (or '{alias}'), not both")));
+        if let Some(c) = obj.get(*canonical).filter(|c| !c.is_null()) {
+            if *c == v {
+                continue;
+            }
+            return Err(ToolError::invalid_at(
+                *alias,
+                format!("use '{canonical}' (or '{alias}'), not both with different values"),
+            ));
         }
         obj.insert((*canonical).to_string(), v);
     }
@@ -67,6 +73,15 @@ pub fn normalize(args: &Value, spec: &Spec<'_>) -> Result<Value, ToolError> {
         }
     }
     Ok(out)
+}
+
+/// The two names paged tools use for "continue from here": `cursor` (search_messages, digest, list_watch_events) and
+/// `page_token` (list_drafts). Every paged tool accepts both (PLAN A82); this renames the other one to the tool's
+/// `canonical` name, so the strict parsers and "pass the cursor alone" checks see one argument. Output names do not
+/// change.
+pub fn page_alias(args: &Value, canonical: &'static str) -> Result<Value, ToolError> {
+    let alias = if canonical == "cursor" { "page_token" } else { "cursor" };
+    normalize(args, &Spec { aliases: &[(alias, canonical)], ..Default::default() })
 }
 
 /// An enum-like text argument read case-insensitively. Returns the canonical value from `allowed`. The error names
@@ -159,5 +174,19 @@ mod tests {
     fn alias_and_canonical_together_are_an_error() {
         let e = normalize(&json!({"account": "a", "accounts": ["b"]}), &spec()).unwrap_err();
         assert_eq!(e.audit_field().as_deref(), Some("account"));
+        // The same value under both names has one reading.
+        assert_eq!(normalize(&json!({"account": "a", "accounts": "a"}), &spec()).unwrap(), json!({"accounts": ["a"]}));
+    }
+
+    #[test]
+    fn page_names_are_aliases_of_each_other() {
+        assert_eq!(page_alias(&json!({"page_token": "x"}), "cursor").unwrap(), json!({"cursor": "x"}));
+        assert_eq!(
+            page_alias(&json!({"cursor": "x", "limit": 2}), "page_token").unwrap(),
+            json!({"page_token": "x", "limit": 2})
+        );
+        assert_eq!(page_alias(&json!({"cursor": "x", "page_token": "x"}), "cursor").unwrap(), json!({"cursor": "x"}));
+        let e = page_alias(&json!({"cursor": "x", "page_token": "y"}), "page_token").unwrap_err();
+        assert_eq!(e.audit_field().as_deref(), Some("cursor"));
     }
 }

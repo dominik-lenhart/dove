@@ -122,6 +122,7 @@ pub fn defs() -> Vec<ToolDef> {
                     "type": "object",
                     "properties": {
                         "cursor": { "type": "string", "description": "next_cursor of the previous call; omit for the oldest kept events." },
+                        "page_token": { "type": "string", "description": "Same as cursor." },
                         "watch_id": { "type": "string", "description": "Only events of this watch (from create_watch or list_watches)." },
                         "limit": { "type": "integer", "minimum": 1, "maximum": MAX_EVENTS, "default": DEFAULT_EVENTS, "description": "Most events returned." }
                     },
@@ -603,6 +604,7 @@ async fn delete_watch(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError>
 }
 
 async fn list_watch_events(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
+    let args = super::lenient::page_alias(&args, "cursor")?;
     only_keys(&args, &["cursor", "watch_id", "limit"])?;
     let limit = opt_u64(&args, "limit", DEFAULT_EVENTS, 1, MAX_EVENTS)? as i64;
     let after = match opt_str(&args, "cursor")? {

@@ -987,7 +987,7 @@ async fn search_errors_name_the_argument_and_how_to_fix_it() {
     let e = fx.refused(s, json!({"query": "invoice"}), "arguments", "unknown argument 'query'").await;
     assert!(e["message"].as_str().unwrap().contains("'where'"), "{e}");
     assert!(e["message"].as_str().unwrap().contains("This tool takes: accounts, source, where"), "{e}");
-    fx.refused(s, json!({"page_token": "x"}), "arguments", "'cursor'").await;
+    fx.refused(s, json!({"next_cursor": "x"}), "arguments", "'cursor'").await;
     fx.refused(s, json!({"Limit": 5}), "arguments", "Did you mean 'limit'").await;
     // Alias and canonical name together have no single reading.
     fx.refused(s, json!({"account": "info", "accounts": ["billing"]}), "account", "not both").await;
@@ -996,6 +996,27 @@ async fn search_errors_name_the_argument_and_how_to_fix_it() {
 #[tokio::test]
 async fn search_accepts_arguments_that_have_one_reading() {
     let fx = fixture().await;
+    // page_token is the cursor's other name (PLAN A82): the same page, also inside batch_read; one value under both
+    // names is fine, two different values are refused.
+    let first = fx.search(json!({"accounts": ["info"], "select": ["message_id"], "limit": 2})).await;
+    let cur = first["next_cursor"].as_str().unwrap().to_string();
+    let page2 = fx.search(json!({"cursor": cur})).await;
+    assert_eq!(fx.search(json!({"page_token": cur})).await["rows"], page2["rows"]);
+    assert_eq!(fx.search(json!({"page_token": cur, "cursor": cur})).await["rows"], page2["rows"]);
+    let (is_err, v) = fx.h.call(&fx.token, "search_messages", json!({"page_token": cur, "cursor": "c_other"})).await;
+    assert!(is_err);
+    assert_eq!(v["error"]["details"]["field"], "page_token");
+    let b =
+        fx.h.ok(
+            &fx.token,
+            "batch_read",
+            json!({"items": [{"id": "a", "op": "search_messages", "args": {"page_token": cur}},
+                             {"id": "b", "op": "search_messages", "args": {"accounts": ["info"], "limit": 98}}]}),
+        )
+        .await;
+    assert_eq!(b["items"][0]["result"]["rows"], page2["rows"], "{b}");
+    // The resumed item is charged its stored page size (2), not the default, so 98 more rows fit the batch's 100.
+    assert_eq!(b["items"][1]["ok"], true, "{b}");
     // One mailbox name, the singular `account`, and a list as JSON text all mean `accounts: ["info"]`.
     let want = fx.search(json!({"accounts": ["info"], "select": ["message_id"], "limit": 100})).await["rows"].clone();
     assert!(!want.as_array().unwrap().is_empty());

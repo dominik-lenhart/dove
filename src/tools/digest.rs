@@ -44,7 +44,8 @@ pub fn defs() -> Vec<ToolDef> {
                 "folders": { "type": "array", "maxItems": intel::MAX_FOLDERS, "items": { "type": "string" }, "default": ["INBOX"], "description": "Label ids or folder names as in list_labels." },
                 "category": { "type": "string", "enum": ["personal", "newsletter", "notification", "calendar"], "description": "Only threads of this category." },
                 "limit": { "type": "integer", "minimum": 1, "maximum": intel::MAX_LIMIT, "default": intel::DEFAULT_LIMIT, "description": "Most threads returned." },
-                "cursor": { "type": "string", "description": "Resume a previous result; pass alone." }
+                "cursor": { "type": "string", "description": "Resume a previous result; pass alone." },
+                "page_token": { "type": "string", "description": "Same as cursor." }
             }, "additionalProperties": false })
         },
         output_schema: || {
@@ -82,7 +83,6 @@ const DIGEST_HINTS: &[(&str, &str)] = &[
     ("days", "Use 'since', for example \"7d\" or a date."),
     ("mailbox", "Use 'accounts' (aliases from list_accounts)."),
     ("max_results", "Use 'limit'."),
-    ("page_token", "Use 'cursor': the next_cursor of the previous result, passed alone."),
 ];
 
 /// `since`: an RFC 3339 instant with offset, a UTC date (`2026-11-01`, start of that day) or a span back from now
@@ -155,6 +155,7 @@ fn parse_req(args: &Value) -> Result<DigestReq, ToolError> {
 }
 
 async fn digest(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
+    let args = lenient::page_alias(&args, "cursor")?;
     let (req, resumed): (DigestReq, Option<DigestPage>) = match opt_str(&args, "cursor")? {
         Some(c) => {
             // Resume with the cursor only: the query is bound to it.
