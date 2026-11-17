@@ -1096,3 +1096,128 @@ async fn health_page_runs_the_doctor_and_the_overview_remembers_it() {
     assert!(r.text.contains("audit chain") && r.text.contains("service version"), "{}", r.text);
     assert!(b.get("/admin").await.text.contains("Checked"));
 }
+
+/// Signs `b` in the way the page does after a notification: the sign-in carries the request page as `next`.
+async fn login_next(b: &mut Browser, a: &mut SoftAuthenticator, next: &str) {
+    let (id, ch) = login_options(b).await;
+    let r = b
+        .post_json("/admin/login/finish", json!({ "id": id, "credential": a.assert(&ch).to_json(), "next": next }))
+        .await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    b.get("/admin").await;
+}
+
+async fn approve_form(b: &mut Browser, id: &str, rev: &str) -> Resp {
+    b.post_form(&format!("/admin/requests/{id}/approve"), &[("item", "0"), ("rev.0", rev)]).await
+}
+
+/// PLAN A83: the passkey sign-in that a notification led to also confirms that one approval, once.
+#[tokio::test]
+async fn a_sign_in_from_a_notification_confirms_that_approval_once() {
+    let h = start().await;
+    let token = mailbox(&h).await;
+    let r1 = pending_request(&h, &token, "First", "One", None).await;
+    let r2 = pending_request(&h, &token, "Second", "Two", None).await;
+    let r3 = pending_request(&h, &token, "Third", "Three", None).await;
+    let mut a = SoftAuthenticator::es256(ORIGIN);
+    enrol_with(&h, &mut Browser::new(&h), "phone", &mut a).await;
+    let rev = |id: String| {
+        let h = &h;
+        async move { request_status(h, &id).await["revision"].as_str().unwrap().to_string() }
+    };
+    let (rev1, rev2, rev3) = (rev(r1.clone()).await, rev(r2.clone()).await, rev(r3.clone()).await);
+    // Signed in for r1: approving r2 still needs the passkey, and that does not use up r1's grace.
+    let mut b = Browser::new(&h);
+    login_next(&mut b, &mut a, &format!("/admin/requests/{r1}")).await;
+    let r = approve_form(&mut b, &r2, &rev2).await;
+    assert!(r.json()["stepup"].is_object(), "{}", r.text);
+    assert_eq!(request_status(&h, &r2).await["status"], "pending");
+    // r1 runs without a second prompt, as web:phone.
+    let r = approve_form(&mut b, &r1, &rev1).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.json()["redirect"], format!("/admin/requests/{r1}?done=approved"));
+    let st = request_status(&h, &r1).await;
+    assert_eq!((st["status"].as_str(), st["decided_by"].as_str()), (Some("approved"), Some("web:phone")));
+
+    // Single use: a failed attempt (stale revision) spends it, the next one needs the passkey.
+    let mut b = Browser::new(&h);
+    login_next(&mut b, &mut a, &format!("/admin/requests/{r2}")).await;
+    let r = approve_form(&mut b, &r2, "stale").await;
+    assert_eq!(r.status, 409, "{}", r.text);
+    let r = approve_form(&mut b, &r2, &rev2).await;
+    assert!(r.json()["stepup"].is_object(), "{}", r.text);
+    assert_eq!(request_status(&h, &r2).await["status"], "pending");
+
+    // The grace belongs to the session that signed in, and only a request page sets it.
+    let mut b = Browser::new(&h);
+    login_next(&mut b, &mut a, &format!("/admin/requests/{r3}")).await;
+    let mut other = Browser::new(&h);
+    login(&mut other, &mut a).await;
+    assert!(approve_form(&mut other, &r3, &rev3).await.json()["stepup"].is_object());
+    for next in [format!("/admin/requests/{r3}/approve"), "/admin/requests".to_string(), "/admin".to_string()] {
+        let mut c = Browser::new(&h);
+        login_next(&mut c, &mut a, &next).await;
+        assert!(approve_form(&mut c, &r3, &rev3).await.json()["stepup"].is_object(), "{next}");
+    }
+    assert_eq!(request_status(&h, &r3).await["status"], "pending");
+    // The session that signed in for r3 still has its grace.
+    assert_eq!(approve_form(&mut b, &r3, &rev3).await.status, 200);
+    assert_eq!(request_status(&h, &r3).await["status"], "approved");
+}
+
+/// PLAN A83: a session unused for an hour ends, even before its absolute expiry.
+#[tokio::test]
+async fn idle_sessions_end_and_sessions_name_their_device() {
+    let h = start().await;
+    let mut a = SoftAuthenticator::es256(ORIGIN);
+    let mut b = Browser::new(&h);
+    b.extra.push((
+        "user-agent".into(),
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) \
+         Version/18.0 Mobile/15E148 Safari/604.1"
+            .into(),
+    ));
+    enrol_with(&h, &mut b, "phone", &mut a).await;
+    let list = h.admin(AdminRequest::SessionsList).await.unwrap();
+    assert_eq!(list[0]["device"], "iPhone · Safari", "{list}");
+    assert!(b.get("/admin/settings").await.text.contains("iPhone · Safari"));
+    // No User-Agent at all: no label, and nothing breaks.
+    let mut plain = Browser::new(&h);
+    login(&mut plain, &mut a).await;
+    let list = h.admin(AdminRequest::SessionsList).await.unwrap();
+    assert!(list.as_array().unwrap().iter().any(|s| s["device"].is_null()), "{list}");
+
+    let idle = dove::admin_ui::store::SESSION_IDLE_SECS;
+    let set_seen = |ago: i64| {
+        let at = util::now_unix() - ago;
+        h.app().store.call(move |c| Ok(c.execute("UPDATE admin_sessions SET last_seen_at = ?1", [at])?))
+    };
+    set_seen(idle - 60).await.unwrap();
+    assert_eq!(b.get("/admin").await.status, 200, "used 59 minutes ago: still signed in");
+    set_seen(idle + 1).await.unwrap();
+    assert_eq!(b.get("/admin").await.status, 303, "idle for an hour: signed out");
+    assert_eq!(plain.get("/admin").await.status, 303);
+    assert!(
+        h.admin(AdminRequest::SessionsList).await.unwrap().as_array().unwrap().is_empty(),
+        "idle ones are not listed"
+    );
+    // A new sign-in clears the idle rows.
+    login(&mut b, &mut a).await;
+    assert_eq!(count(&h, "SELECT COUNT(*) FROM admin_sessions").await, 1);
+}
+
+/// PLAN A83: with one passkey, losing that device locks the owner out of the UI; the overview and settings say so.
+#[tokio::test]
+async fn a_single_passkey_is_pointed_out_until_there_is_a_second() {
+    let h = start().await;
+    let mut a = SoftAuthenticator::es256(ORIGIN);
+    let mut b = Browser::new(&h);
+    enrol_with(&h, &mut b, "phone", &mut a).await;
+    for page in ["/admin", "/admin/settings"] {
+        assert!(b.get(page).await.text.contains("Only one passkey can sign in"), "{page}");
+    }
+    enrol_with(&h, &mut Browser::new(&h), "laptop", &mut SoftAuthenticator::es256(ORIGIN)).await;
+    for page in ["/admin", "/admin/settings"] {
+        assert!(!b.get(page).await.text.contains("Only one passkey can sign in"), "{page}");
+    }
+}

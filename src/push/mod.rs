@@ -393,11 +393,21 @@ pub fn request_text(c: &Connection, request_id: &str) -> anyhow::Result<Option<T
     Ok(Some(Text { title: "Dove: approval needed".into(), body, url: format!("/admin/requests/{request_id}") }))
 }
 
-/// The plaintext of one push: `{title, body, url, tag}`, padded with spaces (still valid JSON) to [`PAYLOAD_SIZE`].
-pub fn payload(text: &Text, tag: &str) -> Vec<u8> {
+/// Requests waiting for the owner: the number on the app badge.
+pub fn pending_requests(c: &Connection, now: i64) -> rusqlite::Result<i64> {
+    c.query_row("SELECT count(*) FROM requests WHERE status = 'pending' AND expires_at > ?1", [now], |r| r.get(0))
+}
+
+/// The plaintext of one push: `{title, body, url, tag}` plus `badge` (open requests) when given, padded with spaces
+/// (still valid JSON) to [`PAYLOAD_SIZE`].
+pub fn payload(text: &Text, tag: &str, badge: Option<i64>) -> Vec<u8> {
     let mut body = text.body.clone();
     loop {
-        let p = json!({ "title": text.title, "body": body, "url": text.url, "tag": tag }).to_string().into_bytes();
+        let mut v = json!({ "title": text.title, "body": body, "url": text.url, "tag": tag });
+        if let Some(n) = badge {
+            v["badge"] = json!(n);
+        }
+        let p = v.to_string().into_bytes();
         if p.len() <= PAYLOAD_SIZE || body.is_empty() {
             let mut p = p;
             p.resize(PAYLOAD_SIZE.max(p.len()), b' ');
@@ -437,6 +447,8 @@ struct Due {
     kind: String,
     reference: Option<String>,
     text: Option<Text>,
+    /// Open requests at delivery time, for the app badge (request pushes only).
+    badge: Option<i64>,
     attempts: i64,
 }
 
@@ -469,6 +481,7 @@ pub async fn deliver_due(app: &Arc<App>, now: i64) -> anyhow::Result<Report> {
                         kind: r.get(3)?,
                         reference: r.get(4)?,
                         text,
+                        badge: None,
                         attempts: r.get(8)?,
                     })
                 })?;
@@ -478,6 +491,7 @@ pub async fn deliver_due(app: &Arc<App>, now: i64) -> anyhow::Result<Report> {
                         && let Some(id) = &d.reference
                     {
                         d.text = request_text(c, id)?;
+                        d.badge = Some(pending_requests(c, now)?);
                     }
                 }
                 let vapid = if due.is_empty() { None } else { Some(vapid(c, &vault)?) };
@@ -573,7 +587,7 @@ async fn send_one(
         let sub: Subscription = serde_json::from_slice(&plain)?;
         let t = sub.check(loopback).map_err(|e| anyhow!(e))?;
         let auth = vapid.authorization(&t.endpoint, subject, now)?;
-        let body = ece::encrypt(&payload(text, tag), &t.public, &t.auth).map_err(|e| anyhow!(e))?;
+        let body = ece::encrypt(&payload(text, tag, d.badge), &t.public, &t.auth).map_err(|e| anyhow!(e))?;
         Ok((t.endpoint, auth, body))
     })();
     let (endpoint, auth, body) = match built {
@@ -655,7 +669,7 @@ pub async fn admin_list(call: &AdminCall<'_>) -> anyhow::Result<Value> {
     call.read(|c| {
         let mut st = c.prepare(
             "SELECT d.id, d.name, d.service, d.created_at, d.last_ok_at, d.last_status, d.failures, \
-             (SELECT count(*) FROM push_outbox o WHERE o.device_id = d.id AND o.state = 'pending') \
+             (SELECT count(*) FROM push_outbox o WHERE o.device_id = d.id AND o.state = 'pending'), d.endpoint_hash \
              FROM push_devices d ORDER BY d.created_at DESC, d.id",
         )?;
         let rows = st.query_map([], |r| {
@@ -669,6 +683,9 @@ pub async fn admin_list(call: &AdminCall<'_>) -> anyhow::Result<Value> {
                 "last_status": r.get::<_, Option<i64>>(5)?,
                 "failures": r.get::<_, i64>(6)?,
                 "pending": r.get::<_, i64>(7)?,
+                // The first 12 bytes of the endpoint's SHA-256: lets a browser recognise its own subscription
+                // without the endpoint (a capability URL) leaving the server.
+                "fingerprint": util::b64url(&r.get::<_, Vec<u8>>(8)?[..12]),
             }))
         })?;
         Ok(Value::Array(rows.collect::<Result<_, _>>()?))
@@ -795,15 +812,16 @@ mod tests {
             body: "claude wants to send a mail".into(),
             url: "/admin/requests/r_1".into(),
         };
-        let p = payload(&t, "r_1");
+        let p = payload(&t, "r_1", None);
         assert_eq!(p.len(), PAYLOAD_SIZE);
         let v: Value = serde_json::from_slice(&p).unwrap();
         assert_eq!(v, json!({ "title": t.title, "body": t.body, "url": t.url, "tag": "r_1" }));
         // An overlong body is cut until it fits; the JSON stays valid.
         let long = Text { body: "ä".repeat(600), ..t };
-        let p = payload(&long, "r_1");
+        let p = payload(&long, "r_1", Some(3));
         assert_eq!(p.len(), PAYLOAD_SIZE);
-        assert!(serde_json::from_slice::<Value>(&p).is_ok());
+        let v: Value = serde_json::from_slice(&p).unwrap();
+        assert_eq!(v["badge"], 3, "the badge survives the cut");
     }
 
     #[test]

@@ -47,6 +47,10 @@ const STEPUP_POOL: usize = 64;
 const STEPUP_PER_SESSION: usize = 4;
 /// A shown-once result waits this long for its page.
 const REVEAL_TTL: Duration = Duration::from_secs(300);
+/// After a sign-in from a notification, its request can be approved once within this time without a second passkey
+/// prompt (PLAN A83).
+const GRACE_TTL: Duration = Duration::from_secs(120);
+const GRACE_POOL: usize = 32;
 const REVEAL_POOL: usize = 32;
 /// The browser's WebAuthn timeout (milliseconds), a little shorter than the pools' lifetime.
 const CEREMONY_TIMEOUT_MS: u64 = 110_000;
@@ -244,6 +248,8 @@ pub struct Pools {
     enrol: Pool<EnrolPending>,
     stepup: Pool<StepUp>,
     reveal: Pool<Reveal>,
+    /// Session id -> the request a fresh sign-in came to approve (single use, [`GRACE_TTL`]).
+    grace: Pool<String>,
     seen: SeenSessions,
 }
 
@@ -441,6 +447,54 @@ struct Finish<C> {
     credential: C,
 }
 
+/// A sign-in: the assertion plus the page the browser came for (`?next=`), if any.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LoginFinish {
+    id: String,
+    credential: AssertionJson,
+    #[serde(default)]
+    next: Option<String>,
+}
+
+/// A coarse device label from a User-Agent (`iPhone · Safari`): platform and browser family only, so sessions can be
+/// told apart without storing the User-Agent.
+pub fn device_label(ua: &str) -> String {
+    let platform = if ua.contains("iPhone") {
+        "iPhone"
+    } else if ua.contains("iPad") {
+        "iPad"
+    } else if ua.contains("Android") {
+        "Android"
+    } else if ua.contains("Macintosh") {
+        "Mac"
+    } else if ua.contains("Windows") {
+        "Windows"
+    } else if ua.contains("Linux") || ua.contains("X11") {
+        "Linux"
+    } else {
+        "Unknown device"
+    };
+    let browser = if ua.contains("Edg/") || ua.contains("EdgiOS") {
+        "Edge"
+    } else if ua.contains("Firefox/") || ua.contains("FxiOS") {
+        "Firefox"
+    } else if ua.contains("Chrome/") || ua.contains("CriOS") {
+        "Chrome"
+    } else if ua.contains("Safari/") {
+        "Safari"
+    } else {
+        "browser"
+    };
+    format!("{platform} · {browser}")
+}
+
+/// The request id of a `next` that is a request page, as a notification opens it.
+fn request_of(next: Option<&str>) -> Option<String> {
+    let id = next?.strip_prefix("/admin/requests/")?;
+    (super::safe_next(&format!("/admin/requests/{id}")) && !id.contains('/')).then(|| id.to_string())
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AssertionJson {
@@ -543,11 +597,16 @@ const SIGN_IN_FAILED: &str = "Sign-in failed. Try again with a passkey enrolled 
 pub async fn login_finish(
     State(app): State<Arc<App>>,
     Extension(ClientIp(ip)): Extension<ClientIp>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    match login_check(&app, &body, ip).await {
-        Ok(token) => {
+    let device = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).map(device_label);
+    match login_check(&app, &body, ip, device).await {
+        Ok((token, session_id, next)) => {
             tracing::info!("admin UI sign-in");
+            if let Some(request) = request_of(next.as_deref()) {
+                app.admin_ui.auth.grace.put_evicting(GRACE_POOL, GRACE_TTL, session_id, request);
+            }
             let mut r = Json(json!({ "redirect": "/admin" })).into_response();
             r.headers_mut().insert(header::SET_COOKIE, set_cookie(&token));
             r
@@ -561,9 +620,15 @@ pub async fn login_finish(
     }
 }
 
-/// The checks of a sign-in; on success the new session's cookie token (audited inside the session's transaction).
-async fn login_check(app: &Arc<App>, body: &[u8], ip: Option<IpAddr>) -> Result<String, &'static str> {
-    let f: Finish<AssertionJson> = serde_json::from_slice(body).map_err(|_| "body")?;
+/// The checks of a sign-in; on success the new session's cookie token and id and the `next` page (audited inside the
+/// session's transaction).
+async fn login_check(
+    app: &Arc<App>,
+    body: &[u8],
+    ip: Option<IpAddr>,
+    device: Option<String>,
+) -> Result<(String, String, Option<String>), &'static str> {
+    let f: LoginFinish = serde_json::from_slice(body).map_err(|_| "body")?;
     let challenge = app.admin_ui.auth.login.open(&f.id, util::now_unix()).ok_or("challenge")?;
     let a = f.credential.decode().ok_or("encoding")?;
     let cid = a.credential_id.clone();
@@ -580,19 +645,20 @@ async fn login_check(app: &Arc<App>, body: &[u8], ip: Option<IpAddr>) -> Result<
     }
     let token = util::b64url(&util::random_bytes::<32>());
     let t = token.clone();
-    app.store
+    let session_id = app
+        .store
         .call(move |c| {
             let now = util::now_unix();
             let tx = c.transaction()?;
             store::record_use(&tx, &passkey, asserted.sign_count, asserted.backup_state, now)?;
-            store::session_create(&tx, &t, &passkey.id, now)?;
+            let id = store::session_create(&tx, &t, &passkey.id, device.as_deref(), now)?;
             audit::append(&tx, &web_record(format!("web:{}", passkey.label), "admin_ui.login", vec![], "ok", ip))?;
             tx.commit()?;
-            Ok(())
+            Ok(id)
         })
         .await
         .map_err(|_| "store")?;
-    Ok(token)
+    Ok((token, session_id, f.next))
 }
 
 /// `POST /admin/logout`: ends this session.
@@ -668,9 +734,11 @@ pub async fn enrol_options(
 pub async fn enrol_finish(
     State(app): State<Arc<App>>,
     Extension(ClientIp(ip)): Extension<ClientIp>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    match enrol_check(&app, &body, ip).await {
+    let device = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).map(device_label);
+    match enrol_check(&app, &body, ip, device).await {
         Ok(token) => {
             tracing::info!("admin UI passkey enrolled");
             let mut r = Json(json!({ "redirect": "/admin" })).into_response();
@@ -691,7 +759,12 @@ pub async fn enrol_finish(
     }
 }
 
-async fn enrol_check(app: &Arc<App>, body: &[u8], ip: Option<IpAddr>) -> Result<String, &'static str> {
+async fn enrol_check(
+    app: &Arc<App>,
+    body: &[u8],
+    ip: Option<IpAddr>,
+    device: Option<String>,
+) -> Result<String, &'static str> {
     let f: Finish<RegistrationJson> = serde_json::from_slice(body).map_err(|_| "body")?;
     let p = app.admin_ui.auth.enrol.take(&f.id).ok_or("challenge")?;
     let (rp_id, origin) = rp(app).ok_or("config")?;
@@ -716,7 +789,7 @@ async fn enrol_check(app: &Arc<App>, body: &[u8], ip: Option<IpAddr>) -> Result<
                     return Ok(Err(code));
                 }
             };
-            store::session_create(&tx, &t, &id, now)?;
+            store::session_create(&tx, &t, &id, device.as_deref(), now)?;
             let actor = format!("web:{}", p.label);
             audit::append(&tx, &web_record(actor, "admin_ui.enrol", vec![p.label.clone()], "ok", ip))?;
             tx.commit()?;
@@ -739,6 +812,20 @@ pub async fn begin_stepup(app: &Arc<App>, s: &WebSession, action: AdminRequest, 
 pub async fn begin_stepup_then(app: &Arc<App>, s: &WebSession, action: AdminRequest, after: After) -> Response {
     if !needs_step_up(&action) {
         return json_error(StatusCode::INTERNAL_SERVER_ERROR, "internal: this action has no confirmation step");
+    }
+    // One passkey prompt from a notification to its approval: the sign-in it led to counts once, for that request
+    // only, within GRACE_TTL (PLAN A83).
+    if let (AdminRequest::RequestsApprove { id, .. }, After::Redirect(to)) = (&action, &after)
+        && app.admin_ui.auth.grace.take_if(&s.id, |r| r == id).is_some()
+    {
+        let to = to.clone();
+        tracing::info!("admin UI approval within the sign-in grace");
+        let r = crate::admin::server::dispatch(app, &s.actor(), action).await;
+        return if r.ok {
+            Json(json!({ "redirect": to })).into_response()
+        } else {
+            json_error(StatusCode::CONFLICT, r.error.as_deref().unwrap_or("the action failed"))
+        };
     }
     let Some((rp_id, _)) = rp(app) else { return json_error(StatusCode::NOT_FOUND, "not found") };
     let pid = s.passkey_id.clone();
@@ -840,6 +927,53 @@ pub async fn stepup_finish(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_labels_name_platform_and_browser_only() {
+        for (ua, want) in [
+            (
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Version/18.0 Mobile Safari/604.1",
+                "iPhone · Safari",
+            ),
+            (
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 CriOS/131.0 Mobile Safari/604.1",
+                "iPhone · Chrome",
+            ),
+            (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Version/18.0 Safari/605.1.15",
+                "Mac · Safari",
+            ),
+            (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36 Edg/131.0",
+                "Windows · Edge",
+            ),
+            (
+                "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 Chrome/131.0 Mobile Safari/537.36",
+                "Android · Chrome",
+            ),
+            ("Mozilla/5.0 (X11; Linux x86_64; rv:133.0) Gecko/20100101 Firefox/133.0", "Linux · Firefox"),
+            ("curl/8.5", "Unknown device · browser"),
+        ] {
+            assert_eq!(device_label(ua), want, "{ua}");
+        }
+    }
+
+    #[test]
+    fn only_a_request_page_opens_the_sign_in_grace() {
+        assert_eq!(request_of(Some("/admin/requests/r_abc-1")).as_deref(), Some("r_abc-1"));
+        for bad in [
+            None,
+            Some("/admin"),
+            Some("/admin/requests"),
+            Some("/admin/requests/"),
+            Some("/admin/requests/r/approve"),
+            Some("/admin/requests/a.b"),
+            Some("/admin/requests/x?y"),
+            Some("//admin/requests/r_1"),
+        ] {
+            assert_eq!(request_of(bad), None, "{bad:?}");
+        }
+    }
 
     #[test]
     fn pools_are_single_use_bounded_and_expire() {

@@ -16,6 +16,7 @@ pub const MIGRATIONS: &[&str] = &[
     V_REQUEST_NOTICES,
     V_PUSH,
     V_SIGNATURES,
+    V_SESSION_DEVICE,
 ];
 
 const V1: &str = r#"
@@ -576,4 +577,10 @@ DROP TABLE legacy_sig;
 DROP TABLE account_signatures;
 
 ALTER TABLE own_drafts ADD COLUMN composition TEXT;
+"#;
+
+/// Admin sessions name the kind of device that signed in (`iPhone · Safari`, from the User-Agent at sign-in), so the
+/// settings page can tell sessions apart (PLAN A83). A coarse label only, never the User-Agent itself.
+const V_SESSION_DEVICE: &str = r#"
+ALTER TABLE admin_sessions ADD COLUMN device TEXT;
 "#;

@@ -13,6 +13,8 @@ use crate::util;
 pub const ENROL_TTL_SECS: i64 = 5 * 60;
 /// A session lasts this long from sign-in (no sliding renewal).
 pub const SESSION_TTL_SECS: i64 = 12 * 3600;
+/// A session unused this long has ended (PLAN A83). `last_seen_at` moves at most once a minute.
+pub const SESSION_IDLE_SECS: i64 = 3600;
 /// Open enrolment links at once (expired ones are deleted first).
 const MAX_OPEN_ENROLMENTS: i64 = 10;
 /// Passkeys at most.
@@ -218,8 +220,17 @@ pub struct Session {
 }
 
 /// Creates a session for `passkey_id`; returns its id. Ends the oldest sessions beyond [`MAX_SESSIONS`].
-pub fn session_create(c: &Connection, token: &str, passkey_id: &str, now: i64) -> anyhow::Result<String> {
-    c.execute("DELETE FROM admin_sessions WHERE expires_at <= ?1", [now])?;
+pub fn session_create(
+    c: &Connection,
+    token: &str,
+    passkey_id: &str,
+    device: Option<&str>,
+    now: i64,
+) -> anyhow::Result<String> {
+    c.execute(
+        "DELETE FROM admin_sessions WHERE expires_at <= ?1 OR last_seen_at <= ?2",
+        params![now, now - SESSION_IDLE_SECS],
+    )?;
     c.execute(
         "DELETE FROM admin_sessions WHERE id IN (SELECT id FROM admin_sessions ORDER BY created_at DESC, id \
          LIMIT -1 OFFSET ?1)",
@@ -227,20 +238,22 @@ pub fn session_create(c: &Connection, token: &str, passkey_id: &str, now: i64) -
     )?;
     let id = util::new_id();
     c.execute(
-        "INSERT INTO admin_sessions (id, token_hash, passkey_id, created_at, expires_at, last_seen_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?4)",
-        params![id, token_hash(token), passkey_id, now, now + SESSION_TTL_SECS],
+        "INSERT INTO admin_sessions (id, token_hash, passkey_id, created_at, expires_at, last_seen_at, device) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?4, ?6)",
+        params![id, token_hash(token), passkey_id, now, now + SESSION_TTL_SECS, device],
     )?;
     Ok(id)
 }
 
-/// The session for a cookie token, if it exists and has not expired. Updates `last_seen_at` at most once a minute.
+/// The session for a cookie token, if it exists, has not expired and was used within [`SESSION_IDLE_SECS`]. Updates
+/// `last_seen_at` at most once a minute.
 pub fn session_lookup(c: &Connection, token: &str, now: i64) -> anyhow::Result<Option<Session>> {
     let row = c
         .query_row(
             "SELECT s.id, s.passkey_id, p.label, s.expires_at, s.last_seen_at FROM admin_sessions s \
-             JOIN admin_passkeys p ON p.id = s.passkey_id WHERE s.token_hash = ?1 AND s.expires_at > ?2",
-            params![token_hash(token), now],
+             JOIN admin_passkeys p ON p.id = s.passkey_id WHERE s.token_hash = ?1 AND s.expires_at > ?2 \
+             AND s.last_seen_at > ?3",
+            params![token_hash(token), now, now - SESSION_IDLE_SECS],
             |r| {
                 Ok((
                     Session { id: r.get(0)?, passkey_id: r.get(1)?, label: r.get(2)?, expires_at: r.get(3)? },
@@ -264,16 +277,18 @@ pub fn session_delete(c: &Connection, id: &str) -> anyhow::Result<()> {
 pub fn sessions_list(c: &Connection) -> anyhow::Result<Value> {
     let now = util::now_unix();
     let mut st = c.prepare(
-        "SELECT s.id, p.label, s.created_at, s.expires_at, s.last_seen_at FROM admin_sessions s \
-         JOIN admin_passkeys p ON p.id = s.passkey_id WHERE s.expires_at > ?1 ORDER BY s.created_at DESC",
+        "SELECT s.id, p.label, s.created_at, s.expires_at, s.last_seen_at, s.device FROM admin_sessions s \
+         JOIN admin_passkeys p ON p.id = s.passkey_id WHERE s.expires_at > ?1 AND s.last_seen_at > ?2 \
+         ORDER BY s.created_at DESC",
     )?;
-    let rows = st.query_map([now], |r| {
+    let rows = st.query_map(params![now, now - SESSION_IDLE_SECS], |r| {
         Ok(json!({
             "id": r.get::<_, String>(0)?,
             "passkey": r.get::<_, String>(1)?,
             "created_at": util::rfc3339(r.get(2)?),
             "expires_at": util::rfc3339(r.get(3)?),
             "last_seen_at": util::rfc3339(r.get(4)?),
+            "device": r.get::<_, Option<String>>(5)?,
         }))
     })?;
     Ok(json!(rows.collect::<Result<Vec<_>, _>>()?))

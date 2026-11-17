@@ -162,9 +162,11 @@ fn head(title: &str, csrf: Option<&str>) -> Markup {
     h!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">\
-         <meta name=\"color-scheme\" content=\"light\"><meta name=\"robots\" content=\"noindex\">{}\
+         <meta name=\"color-scheme\" content=\"light dark\"><meta name=\"robots\" content=\"noindex\">{}\
          <title>{} – Dove</title><link rel=\"manifest\" href=\"/admin/manifest.webmanifest\">\
-         <meta name=\"theme-color\" content=\"#111110\"><meta name=\"apple-mobile-web-app-title\" content=\"Dove\">\
+         <meta name=\"theme-color\" media=\"(prefers-color-scheme: light)\" content=\"#fefefe\">\
+         <meta name=\"theme-color\" media=\"(prefers-color-scheme: dark)\" content=\"#171716\">\
+         <meta name=\"apple-mobile-web-app-title\" content=\"Dove\">\
          <link rel=\"apple-touch-icon\" href=\"/admin/static/icon-192.png\">\
          <link rel=\"preload\" href=\"/admin/static/inter.woff2\" as=\"font\" type=\"font/woff2\" \
          crossorigin><link rel=\"stylesheet\" href=\"/admin/static/admin.css?v={}\">\
@@ -317,6 +319,18 @@ pub fn login_page() -> Markup {
              <p class=\"status\" role=\"status\" aria-live=\"polite\"></p>\
              <p class=\"hint\">No passkey yet? On the server, run <code>sudo dove admin passkey add --name \
              &lt;device&gt;</code> and open the link it prints.</p></section>",
+        ),
+    )
+}
+
+/// Shown by the service worker when the server cannot be reached. Static: it is cached on the device.
+pub fn offline_page() -> Markup {
+    bare(
+        "Offline",
+        Markup::lit(
+            "<section class=\"card signin\"><h1>No connection</h1>\
+             <p>Dove cannot be reached from this device right now. Nothing is shown or changed while you are \
+             offline.</p><a class=\"btn primary wide\" href=\"/admin\">Try again</a></section>",
         ),
     )
 }

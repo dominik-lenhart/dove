@@ -63,6 +63,7 @@ pub const ADMIN_PATHS: &[&str] = &[
     "/admin/static/icon-512.png",
     "/admin/manifest.webmanifest",
     "/admin/sw.js",
+    "/admin/offline",
     "/admin/health",
     "/admin/requests",
     "/admin/requests/{id}",
@@ -124,6 +125,8 @@ pub const ADMIN_PUBLIC_PATHS: &[&str] = &[
     "/admin/static/icon-512.png",
     "/admin/manifest.webmanifest",
     "/admin/sw.js",
+    // The static page the service worker shows without a connection (no data on it).
+    "/admin/offline",
 ];
 
 /// Content-Security-Policy of every admin answer (design 5.4), exactly.
@@ -172,6 +175,7 @@ pub fn routes(app: Arc<App>) -> Router<Arc<App>> {
         .route("/admin/static/icon-512.png", get(static_icon_512))
         .route("/admin/manifest.webmanifest", get(static_manifest))
         .route("/admin/sw.js", get(static_sw))
+        .route("/admin/offline", get(offline))
         .route("/admin/health", get(pages::health))
         .route("/admin/requests", get(pages::requests))
         .route("/admin/requests/{id}", get(pages::request_detail))
@@ -261,15 +265,37 @@ const MANIFEST: &str = include_str!("static/manifest.webmanifest");
 const ICON_192: &[u8] = include_bytes!("static/icon-192.png");
 const ICON_512: &[u8] = include_bytes!("static/icon-512.png");
 
-/// The service worker. Served from `/admin/sw.js`, whose default scope would be `/admin/`; the header allows the
-/// scope `/admin` so the overview page itself is inside it. Never cached long: browsers check it for updates.
+/// What the service worker keeps for offline use: the static offline page and the files it loads, nothing else.
+pub fn offline_assets() -> Vec<String> {
+    let v = asset_version();
+    vec![
+        "/admin/offline".into(),
+        format!("/admin/static/admin.css?v={v}"),
+        format!("/admin/static/admin.js?v={v}"),
+        "/admin/static/inter.woff2".into(),
+    ]
+}
+
+/// The service worker, with this build's asset version and offline file list filled in, so a new build is a new
+/// worker (browsers compare the bytes) and its cache never serves stale files. Served from `/admin/sw.js`, whose
+/// default scope would be `/admin/`; the header allows the scope `/admin` so the overview page itself is inside it.
+/// Never cached long: browsers check it for updates.
 async fn static_sw() -> Response {
-    let mut r = SW.into_response();
+    static BODY: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        let list = serde_json::to_string(&offline_assets()).expect("json");
+        SW.replace("\"__VERSION__\"", &format!("\"{}\"", asset_version())).replace("[\"__OFFLINE__\"]", &list)
+    });
+    let mut r = BODY.as_str().into_response();
     let h = r.headers_mut();
     h.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/javascript; charset=utf-8"));
     h.insert("service-worker-allowed", HeaderValue::from_static("/admin"));
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
     r
+}
+
+/// `GET /admin/offline`: the page the service worker shows when the server cannot be reached.
+async fn offline() -> Response {
+    html::respond(html::offline_page())
 }
 
 async fn static_manifest() -> Response {
@@ -448,7 +474,9 @@ pub fn safe_next(path: &str) -> bool {
 
 /// Admin verbs that need a fresh passkey assertion bound to the exact request (design 5.2): approving a request,
 /// widening grants, creating or rotating a token, connecting or reconnecting a mailbox, adding a sink, adding or
-/// removing a passkey. Exhaustive on purpose: a new verb must be classified here.
+/// removing a passkey, and (PLAN A83) what changes outgoing mail or weakens a protection: adding a send-as address,
+/// writing a signature or choosing a default one, turning secret redaction off, and adding a push device (it would
+/// learn of every request). Exhaustive on purpose: a new verb must be classified here.
 pub fn needs_step_up(req: &AdminRequest) -> bool {
     use AdminRequest::*;
     match req {
@@ -463,7 +491,14 @@ pub fn needs_step_up(req: &AdminRequest) -> bool {
         | AccountsReconnectImap { .. }
         | SinksAdd { .. }
         | PasskeysAdd { .. }
-        | PasskeysRemove { .. } => true,
+        | PasskeysRemove { .. }
+        | AccountsAliasAdd { .. }
+        | AccountsSignatureSet { .. }
+        | AccountsSignaturePut { .. }
+        | AccountsSignatureDefault { .. }
+        | PushAdd { .. } => true,
+        // Turning redaction on only tightens.
+        ClientsSetRedaction { enabled, .. } => !*enabled,
         ProjectsCreate { .. }
         | ProjectsAddAccount { .. }
         | ProjectsRemoveAccount { .. }
@@ -474,18 +509,13 @@ pub fn needs_step_up(req: &AdminRequest) -> bool {
         | AccountsDisable { .. }
         | AccountsEnable { .. }
         | AccountsCheck { .. }
-        | AccountsAliasAdd { .. }
         | AccountsAliasList { .. }
         | AccountsAliasRemove { .. }
-        | AccountsSignatureSet { .. }
         | AccountsSignatureShow { .. }
         | AccountsSignaturesList { .. }
-        | AccountsSignaturePut { .. }
         | AccountsSignatureDelete { .. }
-        | AccountsSignatureDefault { .. }
         | ClientsRevoke { .. }
         | ClientsShow { .. }
-        | ClientsSetRedaction { .. }
         | ClientsList
         | AuditTail { .. }
         | AuditSearch { .. }
@@ -515,8 +545,6 @@ pub fn needs_step_up(req: &AdminRequest) -> bool {
         | PasskeysList
         | SessionsList
         | SessionsRevoke { .. }
-        // Adding a device needs a session only: a push carries no secret, and a session can read requests already.
-        | PushAdd { .. }
         | PushList
         | PushRemove { .. }
         | PushTest { .. } => false,
@@ -659,14 +687,39 @@ mod tests {
         }
     }
 
+    /// PLAN A83: writes that change what goes out under the owner's name, or that weaken a protection, need the
+    /// passkey; their harmless counterparts stay plain writes.
+    #[test]
+    fn step_up_covers_outgoing_identity_redaction_off_and_new_devices() {
+        let req = |v: serde_json::Value| serde_json::from_value::<AdminRequest>(v).unwrap();
+        let sub = serde_json::json!({ "endpoint": "https://push.example/x", "keys": { "p256dh": "a", "auth": "b" } });
+        for (v, want) in [
+            (serde_json::json!({ "verb": "clients_set_redaction", "name": "a", "enabled": false }), true),
+            (serde_json::json!({ "verb": "clients_set_redaction", "name": "a", "enabled": true }), false),
+            (serde_json::json!({ "verb": "accounts_alias_add", "account": "a", "address": "x@y", "name": null }), true),
+            (serde_json::json!({ "verb": "accounts_alias_remove", "account": "a", "address": "x@y" }), false),
+            (
+                serde_json::json!({ "verb": "accounts_signature_set", "account": "a", "alias": null, "signature": "s" }),
+                true,
+            ),
+            (serde_json::json!({ "verb": "accounts_signature_put", "account": "a", "name": "n", "text": "s" }), true),
+            (serde_json::json!({ "verb": "accounts_signature_default", "account": "a", "name": "n" }), true),
+            (serde_json::json!({ "verb": "accounts_signature_delete", "account": "a", "name": "n" }), false),
+            (serde_json::json!({ "verb": "push_add", "name": "phone", "subscription": sub }), true),
+            (serde_json::json!({ "verb": "push_remove", "id": "p" }), false),
+        ] {
+            assert_eq!(needs_step_up(&req(v.clone())), want, "{v}");
+        }
+    }
+
     #[test]
     fn public_paths_are_admin_paths_and_few() {
         for p in ADMIN_PUBLIC_PATHS {
             assert!(ADMIN_PATHS.contains(p), "{p}");
         }
-        // Only sign-in, enrolment, the three static files and the app files (manifest, icons, worker) answer
-        // without a session.
-        assert_eq!(ADMIN_PUBLIC_PATHS.len(), 13);
+        // Only sign-in, enrolment, the three static files, the app files (manifest, icons, worker) and the offline
+        // page answer without a session.
+        assert_eq!(ADMIN_PUBLIC_PATHS.len(), 14);
         assert!(is_admin_path("/admin") && is_admin_path("/admin/x") && !is_admin_path("/administrator"));
     }
 }

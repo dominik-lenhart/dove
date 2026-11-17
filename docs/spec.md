@@ -36,15 +36,21 @@ so no operator's grants ever pass through anyone else's infrastructure.
 
 ### Non-goals (version 1)
 
+Several of these were lifted after v1; each line names where. The rest still hold.
+
 - N1. Raw message sending, scheduled sending and bulk sending are outside v1. Standard tokens have no send permission.
+  (Later: draft sending with a separate `send` grant, and scheduled sends approved by the owner, PLAN A71.)
 - N2. Deleting, trashing, archiving, labelling or marking messages read. Dove does not change existing mail.
-- N3. Gmail settings: filters, forwarding, send-as aliases, vacation replies.
+  (Later: organize tools behind their own grants and an hourly budget, `src/tools/organize.rs`.)
+- N3. Gmail settings: filters, forwarding, send-as aliases, vacation replies. (Dove keeps its own send-as addresses
+  and signatures for IMAP mailboxes, `src/identity.rs`; Gmail settings stay untouched.)
 - N4. Permanent raw MIME archives, attachment bytes and attachment text extraction are outside v1 (attachment reads
   and draft attachments were added later, see `docs/superpowers/specs/2026-11-12-imap-smtp-design.md`). Selected mailboxes can persist encrypted searchable message text and metadata (§7.9).
 - N5. Arbitrary SQL, vector search and a separate search service are outside v1.
 - N6. Multi-user or multi-tenant operation. There is one owner, one administrator, one server.
 - N7. General web administration. Operator administration remains local CLI; the minimal connection approval/OAuth page in §5.6 is part of v1.
-- N8. Additional mail providers in v1.
+  (Later: the passkey-protected admin UI under `/admin`, PLAN A74 to A77 and A83.)
+- N8. Additional mail providers in v1. (Later: IMAP/SMTP mailboxes, `src/imap/`.)
 
 ## 3. Terms
 
