@@ -457,10 +457,7 @@ pub(crate) fn field_coverage(
 ) -> anyhow::Result<()> {
     for t in targets {
         if category {
-            let n: i64 =
-                tx.query_row("SELECT count(*) FROM messages WHERE gen = ?1 AND category IS NULL", [t.gen_id], |r| {
-                    r.get(0)
-                })?;
+            let n: i64 = tx.query_row(crate::index::schema::CATEGORY_UNKNOWN_COUNT, [t.gen_id], |r| r.get(0))?;
             if n > 0 {
                 exceptions.push(coverage::field_gap(
                     &t.alias,
@@ -472,11 +469,7 @@ pub(crate) fn field_coverage(
             }
         }
         if attachments {
-            let n: i64 = tx.query_row(
-                "SELECT count(*) FROM messages WHERE gen = ?1 AND (att_complete IS NULL OR att_complete = 0)",
-                [t.gen_id],
-                |r| r.get(0),
-            )?;
+            let n: i64 = tx.query_row(crate::index::schema::ATT_INCOMPLETE_COUNT, [t.gen_id], |r| r.get(0))?;
             if n > 0 {
                 exceptions.push(coverage::field_gap(
                     &t.alias,

@@ -133,11 +133,7 @@ async fn search_contacts(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolErr
             let tx = c.unchecked_transaction()?;
             let Found { targets, states, mut exceptions } = collect_targets(&tx, &mbs, now, None)?;
             for t in &targets {
-                let n: i64 = tx.query_row(
-                    "SELECT count(*) FROM messages WHERE gen = ?1 AND category IS NULL",
-                    [t.gen_id],
-                    |r| r.get(0),
-                )?;
+                let n: i64 = tx.query_row(crate::index::schema::CATEGORY_UNKNOWN_COUNT, [t.gen_id], |r| r.get(0))?;
                 if n > 0 {
                     exceptions.push(super::coverage::field_gap(
                         &t.alias,

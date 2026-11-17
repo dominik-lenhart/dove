@@ -22,6 +22,7 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration::Sql(V4),
     Migration::Code(v5),
     Migration::Code(v_mail_intelligence),
+    Migration::Sql(V_COVERAGE_INDEXES),
 ];
 
 /// Name of a generation's FTS table. Derived only from the integer generation id, never from input.
@@ -325,6 +326,23 @@ CREATE INDEX addrs_name ON addrs(name_lc, gen, addr);
 INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES ('addrs', 'addrs_name', '1000000 40 2 1');
 "#;
 
+/// Rows of a generation whose category is unknown (uses `messages_category_unknown`).
+pub const CATEGORY_UNKNOWN_COUNT: &str = "SELECT count(*) FROM messages WHERE gen = ?1 AND category IS NULL";
+/// Rows of a generation whose attachment text is unknown or incomplete (uses `messages_att_incomplete`).
+pub const ATT_INCOMPLETE_COUNT: &str = "SELECT count(*) FROM messages WHERE gen = ?1 AND IFNULL(att_complete, 0) = 0";
+
+/// Coverage checks (`tools::search::field_coverage`, `tools::contacts`) count the rows whose category or attachment text is unknown
+/// before every query that uses them. Without an index that count read every row of the mailbox (over a second at
+/// 250k messages); these partial indexes hold only the unknown rows, which are none once a mailbox is rebuilt. The
+/// queries must use exactly these WHERE expressions, or SQLite cannot use the indexes.
+const V_COVERAGE_INDEXES: &str = r#"
+CREATE INDEX messages_category_unknown ON messages(gen) WHERE category IS NULL;
+CREATE INDEX messages_att_incomplete ON messages(gen) WHERE IFNULL(att_complete, 0) = 0;
+INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+    ('messages', 'messages_category_unknown', '250 25'),
+    ('messages', 'messages_att_incomplete', '2500 250');
+"#;
+
 fn v_mail_intelligence(tx: &Transaction<'_>) -> anyhow::Result<()> {
     tx.execute_batch(V_MAIL_INTELLIGENCE)?;
     let accounts: Vec<String> = {
@@ -541,5 +559,25 @@ mod tests {
         let n: i64 =
             c.query_row("SELECT count(*) FROM sqlite_stat1 WHERE idx = 'addrs_name'", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 1);
+    }
+
+    /// The coverage counts read only their partial index, never the mailbox's rows.
+    #[test]
+    fn coverage_counts_use_their_partial_indexes() {
+        let mut c = Connection::open_in_memory().unwrap();
+        migrate(&mut c).unwrap();
+        for (sql, idx) in
+            [(CATEGORY_UNKNOWN_COUNT, "messages_category_unknown"), (ATT_INCOMPLETE_COUNT, "messages_att_incomplete")]
+        {
+            let plan: Vec<String> = c
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map([1], |r| r.get(3))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            // Only the (normally zero) unknown rows are read from the table.
+            assert_eq!(plan, vec![format!("SEARCH messages USING INDEX {idx} (gen=?)")], "{sql}");
+        }
     }
 }

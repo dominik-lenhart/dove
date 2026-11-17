@@ -989,8 +989,8 @@ impl Scope<'_> {
 
 /// `from_self` as a filter: the message has a From address that is one of its mailbox's own addresses, or it carries
 /// the `SENT` label. One `IN` over a union of index lookups (`addrs_addr` per mailbox, the labels primary key).
-fn compile_from_self(q: &mut Sql, scope: &Scope<'_>) -> Result<(), ToolError> {
-    q.s("m.id IN (");
+fn compile_from_self(q: &mut Sql, scope: &Scope<'_>, plus: bool) -> Result<(), ToolError> {
+    q.s(if plus { "+m.id IN (" } else { "m.id IN (" });
     for (gen_id, addrs) in scope.self_sets()? {
         if addrs.is_empty() {
             continue;
@@ -1052,19 +1052,24 @@ fn gens(t: &[Target]) -> Vec<SqlValue> {
     t.iter().map(|t| SqlValue::Integer(t.gen_id)).collect()
 }
 
-fn compile_pred(q: &mut Sql, p: &Pred, scope: &Scope<'_>) -> Result<(), ToolError> {
+/// The id subqueries of an indexed predicate ("driver"): each yields message ids from an index (`addrs`, `labels`,
+/// `atts` or the generations' FTS tables) and the predicate is `m.id IN (one of them)`. `Ok(None)` for every other
+/// predicate. [`compile_pred`] and the cardinality probe ([`choose_strategy`]) both build these, so the probe counts
+/// exactly the ids the page query filters on.
+fn driver_subqueries(p: &Pred, scope: &Scope<'_>) -> Result<Option<Vec<Sql>>, ToolError> {
     use Field::*;
     let t = scope.targets;
-    let addr_sub = |q: &mut Sql, col: &str, vals: Vec<String>, roles: &[i64]| {
-        q.s(&format!("m.id IN (SELECT msg FROM addrs WHERE {col} IN "))
-            .list(vals.into_iter().map(SqlValue::Text))
+    let new = |text: &str| Sql { text: text.to_string(), params: vec![] };
+    let addr_sub = |col: &str, vals: Vec<String>, roles: &[i64]| {
+        let mut q = new(&format!("SELECT msg FROM addrs WHERE {col} IN "));
+        q.list(vals.into_iter().map(SqlValue::Text))
             .s(" AND gen IN ")
             .list(gens(t))
             .s(" AND role IN ")
-            .list(roles.iter().map(|r| SqlValue::Integer(*r)))
-            .s(")");
+            .list(roles.iter().map(|r| SqlValue::Integer(*r)));
+        q
     };
-    match p.field {
+    let subs = match p.field {
         From | To | Cc | Bcc | Participant => {
             let roles: &[i64] = match p.field {
                 From => &[ROLE_FROM],
@@ -1074,14 +1079,98 @@ fn compile_pred(q: &mut Sql, p: &Pred, scope: &Scope<'_>) -> Result<(), ToolErro
                 _ => &[ROLE_FROM, ROLE_TO, ROLE_CC, ROLE_BCC],
             };
             let vals = str_list(&p.value).iter().map(|s| norm_addr(s)).collect();
-            addr_sub(q, "addr", vals, roles);
+            vec![addr_sub("addr", vals, roles)]
         }
         FromDomain | RecipientDomain => {
             let roles: &[i64] = if p.field == FromDomain { &[ROLE_FROM] } else { &[ROLE_TO, ROLE_CC, ROLE_BCC] };
             let vals = str_list(&p.value).iter().map(|s| norm_domain(s)).collect();
-            addr_sub(q, "domain", vals, roles);
+            vec![addr_sub("domain", vals, roles)]
         }
-        Label | ThreadId | MessageId => {
+        Label => {
+            // Unqualified values apply to every searched mailbox; `alias:ID` only to that mailbox.
+            let mut plain = vec![];
+            let mut subs = vec![];
+            for v in str_list(&p.value) {
+                match split_qualified(scope, &v)? {
+                    (Some(g), id) => {
+                        let mut q = new("SELECT msg FROM labels WHERE label = ");
+                        q.p(SqlValue::Text(id.to_string())).s(" AND gen = ").p(SqlValue::Integer(g));
+                        subs.push(q);
+                    }
+                    (None, id) => plain.push(id.to_string()),
+                }
+            }
+            if !plain.is_empty() {
+                let mut q = new("SELECT msg FROM labels WHERE label IN ");
+                q.list(plain.into_iter().map(SqlValue::Text)).s(" AND gen IN ").list(gens(t));
+                subs.insert(0, q);
+            }
+            subs
+        }
+        Subject | BodyText | Text | AttachmentText => {
+            let Val::Str(s) = &p.value else { unreachable!() };
+            // MATCH runs only on the FTS tables of the eligible generations (spec 7.9), never on other accounts'.
+            // Generations without the attachment column have no attachment text to match.
+            let usable: Vec<&Target> = t.iter().filter(|x| p.field != AttachmentText || x.att_fts).collect();
+            if usable.is_empty() {
+                vec![]
+            } else {
+                let expr = fts_expr(p.field, p.op, s);
+                let mut q = new("");
+                for (i, target) in usable.iter().enumerate() {
+                    if i > 0 {
+                        q.s(" UNION ALL ");
+                    }
+                    let fts = super::schema::fts_table(target.gen_id);
+                    q.s(&format!("SELECT rowid FROM {fts} WHERE {fts} MATCH ")).p(SqlValue::Text(expr.clone()));
+                }
+                vec![q]
+            }
+        }
+        AttachmentName | AttachmentMime => {
+            if p.op == Op::EndsWith {
+                let rev: String = str_list(&p.value)[0].to_lowercase().chars().rev().collect();
+                let upper = format!("{rev}\u{10FFFF}");
+                let mut q = new("SELECT msg FROM atts WHERE name_rev >= ");
+                q.p(SqlValue::Text(rev)).s(" AND name_rev < ").p(SqlValue::Text(upper)).s(" AND gen IN ").list(gens(t));
+                vec![q]
+            } else {
+                let vals = str_list(&p.value).into_iter().map(|s| s.to_lowercase());
+                let col = if p.field == AttachmentName { "name_lc" } else { "mime_lc" };
+                let mut q = new(&format!("SELECT msg FROM atts WHERE {col} IN "));
+                q.list(vals.map(SqlValue::Text)).s(" AND gen IN ").list(gens(t));
+                vec![q]
+            }
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(subs))
+}
+
+/// `plus`: the predicate must not drive the query (`+m.id`, a filter on rows reached another way).
+fn compile_pred(q: &mut Sql, p: &Pred, scope: &Scope<'_>, plus: bool) -> Result<(), ToolError> {
+    use Field::*;
+    if let Some(subs) = driver_subqueries(p, scope)? {
+        if subs.is_empty() {
+            q.s("0");
+            return Ok(());
+        }
+        let id = if plus { "+m.id" } else { "m.id" };
+        if let [sub] = &subs[..] {
+            q.s(&format!("{id} IN (")).s(&sub.text).s(")");
+            q.params.extend(sub.params.iter().cloned());
+            return Ok(());
+        }
+        q.s("(0");
+        for sub in subs {
+            q.s(&format!(" OR {id} IN (")).s(&sub.text).s(")");
+            q.params.extend(sub.params);
+        }
+        q.s(")");
+        return Ok(());
+    }
+    match p.field {
+        ThreadId | MessageId => {
             // Unqualified values apply to every searched mailbox; `alias:ID` only to that mailbox.
             let mut plain = vec![];
             let mut qualified = vec![];
@@ -1092,33 +1181,12 @@ fn compile_pred(q: &mut Sql, p: &Pred, scope: &Scope<'_>) -> Result<(), ToolErro
                 }
             }
             q.s("(0");
-            if p.field == Label {
-                if !plain.is_empty() {
-                    q.s(" OR m.id IN (SELECT msg FROM labels WHERE label IN ")
-                        .list(plain.into_iter().map(SqlValue::Text))
-                        .s(" AND gen IN ")
-                        .list(gens(t))
-                        .s(")");
-                }
-                for (g, id) in qualified {
-                    q.s(" OR m.id IN (SELECT msg FROM labels WHERE label = ")
-                        .p(SqlValue::Text(id))
-                        .s(" AND gen = ")
-                        .p(SqlValue::Integer(g))
-                        .s(")");
-                }
-            } else {
-                let col = if p.field == ThreadId { "m.thread_id" } else { "m.gmail_id" };
-                if !plain.is_empty() {
-                    q.s(&format!(" OR {col} IN ")).list(plain.into_iter().map(SqlValue::Text));
-                }
-                for (g, id) in qualified {
-                    q.s(&format!(" OR ({col} = "))
-                        .p(SqlValue::Text(id))
-                        .s(" AND m.gen = ")
-                        .p(SqlValue::Integer(g))
-                        .s(")");
-                }
+            let col = if p.field == ThreadId { "m.thread_id" } else { "m.gmail_id" };
+            if !plain.is_empty() {
+                q.s(&format!(" OR {col} IN ")).list(plain.into_iter().map(SqlValue::Text));
+            }
+            for (g, id) in qualified {
+                q.s(&format!(" OR ({col} = ")).p(SqlValue::Text(id)).s(" AND m.gen = ").p(SqlValue::Integer(g)).s(")");
             }
             q.s(")");
         }
@@ -1153,58 +1221,26 @@ fn compile_pred(q: &mut Sql, p: &Pred, scope: &Scope<'_>) -> Result<(), ToolErro
             // Unknown (NULL) never matches the positive predicate.
             q.s("IFNULL(m.category IN ").list(vals.into_iter().map(SqlValue::Text)).s(", 0)");
         }
-        Subject | BodyText | Text | AttachmentText => {
-            let Val::Str(s) = &p.value else { unreachable!() };
-            // MATCH runs only on the FTS tables of the eligible generations (spec 7.9), never on other accounts'.
-            // Generations without the attachment column have no attachment text to match.
-            let usable: Vec<&Target> = t.iter().filter(|x| p.field != AttachmentText || x.att_fts).collect();
-            if usable.is_empty() {
-                q.s("0");
-            } else {
-                let expr = fts_expr(p.field, p.op, s);
-                q.s("m.id IN (");
-                for (i, target) in usable.iter().enumerate() {
-                    if i > 0 {
-                        q.s(" UNION ALL ");
-                    }
-                    let fts = super::schema::fts_table(target.gen_id);
-                    q.s(&format!("SELECT rowid FROM {fts} WHERE {fts} MATCH ")).p(SqlValue::Text(expr.clone()));
-                }
-                q.s(")");
-            }
-        }
         FromSelf => {
             let Val::Bool(b) = p.value else { unreachable!() };
             q.s(if b { "(" } else { "(NOT " });
-            compile_from_self(q, scope)?;
+            compile_from_self(q, scope, plus)?;
             q.s(")");
         }
-        AttachmentName | AttachmentMime => {
-            let vals = str_list(&p.value).into_iter().map(|s| s.to_lowercase());
-            if p.op == Op::EndsWith {
-                let rev: String = str_list(&p.value)[0].to_lowercase().chars().rev().collect();
-                let upper = format!("{rev}\u{10FFFF}");
-                q.s("m.id IN (SELECT msg FROM atts WHERE name_rev >= ")
-                    .p(SqlValue::Text(rev))
-                    .s(" AND name_rev < ")
-                    .p(SqlValue::Text(upper))
-                    .s(" AND gen IN ")
-                    .list(gens(t))
-                    .s(")");
-            } else {
-                let col = if p.field == AttachmentName { "name_lc" } else { "mime_lc" };
-                q.s(&format!("m.id IN (SELECT msg FROM atts WHERE {col} IN "))
-                    .list(vals.map(SqlValue::Text))
-                    .s(" AND gen IN ")
-                    .list(gens(t))
-                    .s(")");
-            }
-        }
+        From | To | Cc | Bcc | Participant | FromDomain | RecipientDomain | Label | Subject | BodyText | Text
+        | AttachmentText | AttachmentName | AttachmentMime => unreachable!("driver predicates are compiled above"),
     }
     Ok(())
 }
 
-fn compile_expr(q: &mut Sql, e: &Expr, scope: &Scope<'_>) -> Result<(), ToolError> {
+/// Which predicate drives a `Driven` page: its position in the depth-first order of the filter (the order
+/// [`compile_expr`] and [`choose_strategy`] both visit). Every other id lookup becomes a per-row filter.
+struct Drive {
+    pred: Option<usize>,
+    seen: usize,
+}
+
+fn compile_expr(q: &mut Sql, e: &Expr, scope: &Scope<'_>, drive: &mut Drive) -> Result<(), ToolError> {
     match e {
         Expr::All(v) | Expr::Any(v) => {
             let join = if matches!(e, Expr::All(_)) { " AND " } else { " OR " };
@@ -1213,16 +1249,20 @@ fn compile_expr(q: &mut Sql, e: &Expr, scope: &Scope<'_>) -> Result<(), ToolErro
                 if i > 0 {
                     q.s(join);
                 }
-                compile_expr(q, x, scope)?;
+                compile_expr(q, x, scope, drive)?;
             }
             q.s(")");
         }
         Expr::Not(x) => {
             q.s("(NOT ");
-            compile_expr(q, x, scope)?;
+            compile_expr(q, x, scope, drive)?;
             q.s(")");
         }
-        Expr::Pred(p) => compile_pred(q, p, scope)?,
+        Expr::Pred(p) => {
+            let plus = drive.pred.is_some_and(|d| d != drive.seen);
+            drive.seen += 1;
+            compile_pred(q, p, scope, plus)?
+        }
     }
     Ok(())
 }
@@ -1246,26 +1286,120 @@ fn sort_terms(order: &[(OrderField, Dir)]) -> Vec<(&'static str, Dir)> {
     v
 }
 
-fn where_clause(req: &SearchReq, scope: &Scope<'_>, page: bool) -> Result<Sql, ToolError> {
+fn where_clause(req: &SearchReq, scope: &Scope<'_>, page: Option<Strategy>) -> Result<Sql, ToolError> {
     let mut q = Sql { text: String::new(), params: vec![] };
-    // Newest-first pages over several mailboxes walk `messages_recent` in order and stop after limit + 1 rows; the
-    // unary `+` keeps the planner from sorting every row of every mailbox via the gen-prefixed indexes instead.
-    let ordered_walk = page
-        && scope.targets.len() > 1
-        && !req.include_spam_trash
-        && req.order.first().is_some_and(|(f, _)| *f == OrderField::ReceivedAt);
-    q.s(if ordered_walk { "+m.gen IN " } else { "m.gen IN " }).list(gens(scope.targets));
+    let (gen_term, spam_term) = match page {
+        // Newest-first pages over several mailboxes walk `messages_recent` in order and stop after limit + 1 rows; the
+        // unary `+` keeps the planner from sorting every row of every mailbox via the gen-prefixed indexes instead.
+        Some(Strategy::Planner)
+            if scope.targets.len() > 1
+                && !req.include_spam_trash
+                && req.order.first().is_some_and(|(f, _)| *f == OrderField::ReceivedAt) =>
+        {
+            ("+m.gen IN ", "m.spam_trash")
+        }
+        // The id lookups of a selective predicate drive the query: `+` disables every index that starts with `gen`
+        // or `spam_trash`, so only the rowid path is left and at most PROBE_LIMIT rows are fetched and sorted.
+        Some(Strategy::Driven(_)) => ("+m.gen IN ", "+m.spam_trash"),
+        // `Walk` names its index in `FROM` (see `page_sql`).
+        _ => ("m.gen IN ", "m.spam_trash"),
+    };
+    q.s(gen_term).list(gens(scope.targets));
     // SPAM/TRASH are excluded unless requested; the IN form keeps the (gen, spam_trash, ...) indexes usable.
     if req.include_spam_trash {
-        q.s(" AND m.spam_trash IN (0, 1)");
+        q.s(&format!(" AND {spam_term} IN (0, 1)"));
     } else {
-        q.s(" AND m.spam_trash = 0");
+        q.s(&format!(" AND {spam_term} = 0"));
     }
     if let Some(f) = &req.filter {
         q.s(" AND ");
-        compile_expr(&mut q, f, scope)?;
+        let pred = match page {
+            Some(Strategy::Driven(i)) => Some(i),
+            _ => None,
+        };
+        compile_expr(&mut q, f, scope, &mut Drive { pred, seen: 0 })?;
     }
     Ok(q)
+}
+
+// ------------------------------------------------------------------ page strategy (PLAN A80)
+
+/// How a newest-first page runs. SQLite's planner sees one fixed statistic per index and cannot tell a frequent
+/// label or term from a rare one, so it either fetched and sorted every match of a frequent value (hundreds of ms at
+/// 250k messages) or walked the date index past millions of rows for a rare one. A bounded count of each indexed
+/// predicate decides instead. Every strategy runs the same filter, order and keyset seek; only the access path
+/// differs, so results and cursors are identical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Strategy {
+    /// No hint beyond the multi-mailbox walk: other orders, spam/trash included, thread view.
+    Planner,
+    /// The indexed predicate at this depth-first position matches at most [`PROBE_LIMIT`] ids: fetch those and sort
+    /// them. The other id lookups become per-row filters, so the planner cannot pick a larger one.
+    Driven(usize),
+    /// Every indexed predicate matches more (or there is none): walk the date index in order, test the predicates per
+    /// row and stop after `limit + 1` matches.
+    Walk,
+}
+
+/// Matches up to which fetching and sorting beats walking the date index (measured in `docs/benchmarks.md`).
+pub const PROBE_LIMIT: i64 = 1000;
+
+/// The predicates every match must satisfy (top-level `all` nesting flattened; `any` and `not` are skipped), with
+/// their depth-first position in the whole filter.
+fn conjuncts<'a>(e: &'a Expr, top: bool, seen: &mut usize, out: &mut Vec<(usize, &'a Pred)>) {
+    match e {
+        Expr::Pred(p) => {
+            if top {
+                out.push((*seen, p));
+            }
+            *seen += 1;
+        }
+        Expr::All(v) => v.iter().for_each(|x| conjuncts(x, top, seen, out)),
+        Expr::Any(v) => v.iter().for_each(|x| conjuncts(x, false, seen, out)),
+        Expr::Not(x) => conjuncts(x, false, seen, out),
+    }
+}
+
+/// Picks the strategy of a page query. The probe counts index entries only (`addrs`, `labels`, `atts`, FTS
+/// doclists), at most `probe_limit + 1` per predicate ([`PROBE_LIMIT`] in production), and never reads message rows.
+pub fn choose_strategy(
+    conn: &Connection,
+    req: &SearchReq,
+    scope: &Scope<'_>,
+    probe_limit: i64,
+) -> anyhow::Result<Strategy> {
+    if req.group_by_thread
+        || req.include_spam_trash
+        || scope.targets.is_empty()
+        || req.order.first().is_none_or(|(f, _)| *f != OrderField::ReceivedAt)
+    {
+        return Ok(Strategy::Planner);
+    }
+    let mut preds = vec![];
+    if let Some(f) = &req.filter {
+        conjuncts(f, true, &mut 0, &mut preds);
+    }
+    for (pos, p) in preds {
+        // Ids are selective by nature and have their own indexes (`messages_thread`, `messages_gmail_id`).
+        if matches!(p.field, Field::ThreadId | Field::MessageId) {
+            return Ok(Strategy::Planner);
+        }
+        let Some(subs) = driver_subqueries(p, scope)? else { continue };
+        let [sub] = &subs[..] else {
+            // `0` (no generation has the column): nothing to drive or walk. Several lookups (labels qualified by
+            // mailbox) are an OR the rowid path cannot use: a per-row filter of the walk.
+            if subs.is_empty() {
+                return Ok(Strategy::Planner);
+            }
+            continue;
+        };
+        let sql = format!("SELECT count(*) FROM ({} LIMIT {})", sub.text, probe_limit + 1);
+        let n: i64 = conn.query_row(&sql, params_from_iter(sub.params.iter().cloned()), |r| r.get(0))?;
+        if n <= probe_limit {
+            return Ok(Strategy::Driven(pos));
+        }
+    }
+    Ok(Strategy::Walk)
 }
 
 const ROW_COLS: &str = "m.account_id, m.gmail_id, m.received_at, m.size_bytes, m.subject_missing, m.subject_key, \
@@ -1308,15 +1442,25 @@ fn order_by(q: &mut Sql, terms: &[(&str, Dir)]) {
 }
 
 /// The page query: filters, keyset seek after `after`, order and `limit + 1` rows.
-pub fn page_sql(req: &SearchReq, scope: &Scope<'_>, after: &[KeyValue]) -> Result<(String, Vec<SqlValue>), ToolError> {
+pub fn page_sql(
+    req: &SearchReq,
+    scope: &Scope<'_>,
+    after: &[KeyValue],
+    strategy: Strategy,
+) -> Result<(String, Vec<SqlValue>), ToolError> {
     if req.group_by_thread {
         return thread_page_sql(req, scope, after);
     }
-    let w = where_clause(req, scope, true)?;
+    let w = where_clause(req, scope, Some(strategy))?;
     let terms = sort_terms(&req.order);
     let mut q = Sql { text: "SELECT ".into(), params: vec![] };
     row_cols(&mut q, req, scope)?;
-    q.s(" FROM messages m WHERE ");
+    q.s(match strategy {
+        // Walked backwards both yield received_at DESC, (account_id, gmail_id) ASC: the default order.
+        Strategy::Walk if scope.targets.len() == 1 => " FROM messages m INDEXED BY messages_date WHERE ",
+        Strategy::Walk => " FROM messages m INDEXED BY messages_recent WHERE ",
+        _ => " FROM messages m WHERE ",
+    });
     q.s(&w.text);
     q.params.extend(w.params);
     if !after.is_empty() {
@@ -1338,7 +1482,7 @@ pub fn count_sql(req: &SearchReq, scope: &Scope<'_>) -> Result<(String, Vec<SqlV
         reply_filter(&mut q, req);
         return Ok((q.text, q.params));
     }
-    let w = where_clause(req, scope, false)?;
+    let w = where_clause(req, scope, None)?;
     Ok((format!("SELECT count(*) FROM messages m WHERE {}", w.text), w.params))
 }
 
@@ -1360,7 +1504,7 @@ fn thread_terms(order: &[(OrderField, Dir)]) -> Vec<(&'static str, Dir)> {
 ///   self (`last_in`). The status therefore does not depend on the filter: a reply filed under `SENT` counts even when
 ///   the filter asks for `INBOX`.
 fn threads_cte(req: &SearchReq, scope: &Scope<'_>) -> Result<Sql, ToolError> {
-    let w = where_clause(req, scope, false)?;
+    let w = where_clause(req, scope, None)?;
     let mut q = Sql {
         text: "WITH hit AS (SELECT m.gen AS gen, m.account_id AS account_id, m.thread_id AS thread_id, \
                count(*) AS matched FROM messages m WHERE "
@@ -1489,7 +1633,22 @@ pub fn run_page(
     if req.group_by_thread {
         return run_thread_page(conn, req, scope, after);
     }
-    let (sql, params) = page_sql(req, scope, after)?;
+    let strategy = choose_strategy(conn, req, scope, PROBE_LIMIT)?;
+    run_page_with(conn, req, scope, after, strategy)
+}
+
+/// [`run_page`] with a given strategy (tests compare the strategies).
+pub fn run_page_with(
+    conn: &Connection,
+    req: &SearchReq,
+    scope: &Scope<'_>,
+    after: &[KeyValue],
+    strategy: Strategy,
+) -> anyhow::Result<(Vec<Row>, bool)> {
+    if req.group_by_thread {
+        return run_thread_page(conn, req, scope, after);
+    }
+    let (sql, params) = page_sql(req, scope, after, strategy)?;
     let alias: HashMap<&str, &str> = scope.targets.iter().map(|t| (t.account_id.as_str(), t.alias.as_str())).collect();
     let mut st = conn.prepare(&sql)?;
     let mut rows = st.query(params_from_iter(params))?;
@@ -1592,7 +1751,7 @@ pub fn matching_rows(conn: &Connection, filter: &Expr, scope: &Scope<'_>, rows: 
         group_by_thread: false,
         awaiting_reply: None,
     };
-    let w = where_clause(&req, scope, false)?;
+    let w = where_clause(&req, scope, None)?;
     let mut q = Sql { text: format!("SELECT m.id FROM messages m WHERE {} AND m.id IN ", w.text), params: w.params };
     q.list(rows.iter().map(|r| SqlValue::Integer(*r)));
     let mut st = conn.prepare(&q.text)?;
@@ -1611,7 +1770,18 @@ pub fn explain_latest(conn: &Connection, req: &SearchReq, scope: &Scope<'_>) -> 
 
 /// EXPLAIN QUERY PLAN lines for a page query (tests verify hot paths).
 pub fn explain(conn: &Connection, req: &SearchReq, scope: &Scope<'_>) -> anyhow::Result<Vec<String>> {
-    let (sql, params) = if req.count_only { count_sql(req, scope)? } else { page_sql(req, scope, &[])? };
+    let strategy = if req.count_only { Strategy::Planner } else { choose_strategy(conn, req, scope, PROBE_LIMIT)? };
+    explain_with(conn, req, scope, strategy)
+}
+
+/// EXPLAIN QUERY PLAN lines for a page query run with `strategy`.
+pub fn explain_with(
+    conn: &Connection,
+    req: &SearchReq,
+    scope: &Scope<'_>,
+    strategy: Strategy,
+) -> anyhow::Result<Vec<String>> {
+    let (sql, params) = if req.count_only { count_sql(req, scope)? } else { page_sql(req, scope, &[], strategy)? };
     let mut st = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
     let rows = st.query_map(params_from_iter(params), |r| r.get::<_, String>(3))?;
     Ok(rows.collect::<Result<_, _>>()?)

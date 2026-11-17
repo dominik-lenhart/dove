@@ -671,9 +671,13 @@ async fn indexed_search_makes_no_gmail_calls_and_uses_indexes() {
             {"not": pred("subject", "phrase", json!("quick brown"))}]}, "select": ["subject"]});
         let req = dove::tools::search::parse_index_req(&args).unwrap();
         let known = HashMap::new();
-        let (sql, _) =
-            query::page_sql(&req, &Scope { targets: &targets[..n], known: &known, selves: &HashMap::new() }, &[])
-                .unwrap();
+        let (sql, _) = query::page_sql(
+            &req,
+            &Scope { targets: &targets[..n], known: &known, selves: &HashMap::new() },
+            &[],
+            query::Strategy::Walk,
+        )
+        .unwrap();
         assert_eq!(fts_names(&sql), mine(n), "{sql}");
         let lines = plan_n(args, n).await;
         assert_eq!(fts_names(&lines.join("\n")), mine(n), "{lines:?}");
@@ -1195,4 +1199,143 @@ async fn refused_arguments_reach_the_audit_log_as_a_field_path_only() {
         ]
     );
     assert!(rows.iter().all(|r| r.0 == "invalid_argument" && !r.1.contains(marker)));
+}
+
+/// Page strategies (PLAN A80): every access path returns the same rows and cursor keys on every page, and the probe
+/// picks the path by the bounded count of each indexed predicate.
+#[tokio::test]
+async fn page_strategies_return_identical_pages() {
+    use query::Strategy;
+    let fx = fixture().await;
+    let mut targets = vec![];
+    for alias in ["info", "billing"] {
+        let aid = fx.accounts[alias].clone();
+        let st = fx.h.app().index.write(move |c| Ok(load_state(c, &aid)?.unwrap())).await.unwrap();
+        targets.push(Target {
+            account_id: fx.accounts[alias].clone(),
+            alias: alias.into(),
+            gen_id: st.serving_gen().unwrap(),
+            att_fts: true,
+        });
+    }
+    let filters = vec![
+        Value::Null,
+        pred("label", "eq", json!("INBOX")),
+        json!({"all": [pred("label", "eq", json!("INBOX")), pred("is_unread", "eq", json!(false))]}),
+        pred("text", "terms", json!("fox")),
+        json!({"all": [pred("label", "eq", json!("INBOX")), pred("text", "terms", json!("invoice"))]}),
+        json!({"all": [pred("label", "eq", json!("INBOX")), {"not": pred("from", "eq", json!("anna@example.com"))}]}),
+        json!({"any": [pred("from", "eq", json!("anna@example.com")), pred("label", "eq", json!("SENT"))]}),
+        pred("from_self", "eq", json!(true)),
+        json!({"all": [pred("label", "eq", json!("INBOX")),
+            pred("received_at", "gte", json!("2026-10-01T00:00:00Z"))]}),
+        json!({"all": [{"all": [pred("from_domain", "eq", json!("hetzner.com"))]},
+            pred("attachment_name", "ends_with", json!(".pdf"))]}),
+    ];
+    let mut checked = 0;
+    for filter in &filters {
+        for order in [json!([{"field": "received_at", "dir": "desc"}]), json!([{"field": "received_at", "dir": "asc"}])]
+        {
+            for spam in [false, true] {
+                for n in [1, 2] {
+                    let mut args = json!({"select": ["message_id", "subject"], "limit": 2, "order_by": order,
+                        "include_spam_trash": spam});
+                    if !filter.is_null() {
+                        args["where"] = filter.clone();
+                    }
+                    let req = dove::tools::search::parse_index_req(&args).unwrap();
+                    let preds = filter.to_string().matches("\"field\"").count();
+                    let mut strategies = vec![Strategy::Planner, Strategy::Walk];
+                    strategies.extend((0..preds).map(Strategy::Driven));
+                    let tg: Vec<Target> = targets[..n].to_vec();
+                    let pages =
+                        fx.h.app()
+                            .index
+                            .read(Instant::now() + Duration::from_secs(10), move |c| {
+                                let (known, selves) = (HashMap::new(), self_sets(&tg));
+                                let scope = Scope { targets: &tg, known: &known, selves: &selves };
+                                let mut all = vec![];
+                                for s in strategies {
+                                    let mut rows = vec![];
+                                    let mut after = vec![];
+                                    loop {
+                                        let (page, more) = query::run_page_with(c, &req, &scope, &after, s)?;
+                                        rows.extend(page.iter().map(|r| (r.gmail_id.clone(), r.key.clone())));
+                                        if !more {
+                                            break;
+                                        }
+                                        after = page.last().unwrap().key.clone();
+                                    }
+                                    all.push((s, rows));
+                                }
+                                Ok(all)
+                            })
+                            .await
+                            .unwrap();
+                    let (_, reference) = &pages[0];
+                    for (s, rows) in &pages[1..] {
+                        assert_eq!(rows, reference, "{s:?} differs for {args} over {n} mailbox(es)");
+                    }
+                    checked += reference.len();
+                }
+            }
+        }
+    }
+    assert!(checked > 100, "the filters match rows: {checked}");
+
+    // The probe: a predicate with more indexed matches than the limit is walked, one within it drives the query.
+    let choose = |args: Value, probe: i64, n: usize| {
+        let tg: Vec<Target> = targets[..n].to_vec();
+        let app = fx.h.app().clone();
+        async move {
+            let req = dove::tools::search::parse_index_req(&args).unwrap();
+            app.index
+                .read(Instant::now() + Duration::from_secs(5), move |c| {
+                    let (known, selves) = (HashMap::new(), self_sets(&tg));
+                    let scope = Scope { targets: &tg, known: &known, selves: &selves };
+                    let s = query::choose_strategy(c, &req, &scope, probe)?;
+                    Ok((s, query::explain_with(c, &req, &scope, s)?))
+                })
+                .await
+                .unwrap()
+        }
+    };
+    let inbox = json!({"where": pred("label", "eq", json!("INBOX"))});
+    // info + billing hold 7 INBOX messages (A, B, C, F, G, H, I).
+    assert_eq!(choose(inbox.clone(), 7, 2).await.0, Strategy::Driven(0));
+    let (s, plan) = choose(inbox.clone(), 6, 2).await;
+    assert_eq!(s, Strategy::Walk);
+    assert_eq!(plan[0], "SEARCH m USING INDEX messages_recent (spam_trash=?)", "{plan:?}");
+    assert!(!plan.iter().any(|l| l.contains("TEMP B-TREE")), "the walk stops after limit + 1 rows: {plan:?}");
+    let (s, plan) = choose(inbox.clone(), 3, 1).await;
+    assert_eq!(s, Strategy::Walk);
+    assert_eq!(plan[0], "SEARCH m USING INDEX messages_date (gen=? AND spam_trash=?)", "{plan:?}");
+    // The smaller lookup drives, even when it comes second; the larger one is a per-row filter.
+    let carl =
+        json!({"where": {"all": [pred("label", "eq", json!("INBOX")), pred("from", "eq", json!("carl@example.com"))]}});
+    let (s, plan) = choose(carl, 2, 2).await;
+    assert_eq!(s, Strategy::Driven(1));
+    assert_eq!(plan[0], "SEARCH m USING INTEGER PRIMARY KEY (rowid=?)", "{plan:?}");
+    assert!(plan.iter().any(|l| l.contains("addrs_addr")), "{plan:?}");
+    assert!(!plan.iter().any(|l| l.starts_with("SCAN m")), "{plan:?}");
+    // SENT (1 message) drives although the planner's statistics rate an address lookup (anna: 4) as cheaper.
+    let sent =
+        json!({"where": {"all": [pred("from", "eq", json!("anna@example.com")), pred("label", "eq", json!("SENT"))]}});
+    let (s, plan) = choose(sent, 2, 2).await;
+    assert_eq!(s, Strategy::Driven(1));
+    assert_eq!(plan[0], "SEARCH m USING INTEGER PRIMARY KEY (rowid=?)", "{plan:?}");
+    assert_eq!(plan[2], "SEARCH labels USING PRIMARY KEY (label=? AND gen=?)", "labels drive: {plan:?}");
+    // Lookups only inside `any`/`not` cannot drive: walk.
+    let any =
+        json!({"where": {"any": [pred("from", "eq", json!("carl@example.com")), pred("label", "eq", json!("SENT"))]}});
+    assert_eq!(choose(any, 1000, 2).await.0, Strategy::Walk);
+    assert_eq!(choose(json!({}), 1000, 2).await.0, Strategy::Walk);
+    // Ids, other orders and spam/trash keep the planner's choice.
+    assert_eq!(choose(json!({"where": pred("thread_id", "eq", json!("t"))}), 1000, 2).await.0, Strategy::Planner);
+    let mut by_size = inbox.clone();
+    by_size["order_by"] = json!([{"field": "size_bytes", "dir": "desc"}]);
+    assert_eq!(choose(by_size, 1000, 2).await.0, Strategy::Planner);
+    let mut spam = inbox;
+    spam["include_spam_trash"] = json!(true);
+    assert_eq!(choose(spam, 1000, 2).await.0, Strategy::Planner);
 }
