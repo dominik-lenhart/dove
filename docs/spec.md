@@ -547,7 +547,9 @@ The operator enables full-text indexing by mailbox. An enabled index stores sear
   the service user, `0700`. One process writes it.
 - **Notifier:** sends owner notifications for `reauth_required`, repeated upstream errors, a burst of denied calls or
   a client used from a new IP. Channel configurable (for example an HTTP webhook to ntfy, Slack or e-mail). Messages
-  carry no mail content.
+  carry no mail content. Amendment 2026-11-17 (PLAN A77): every notification also goes as a Web Push to the owner's
+  devices with text that names only the mailbox or connection, and a health watcher adds a stalled sync and low disk
+  space.
 - **Admin socket:** Unix domain socket for the CLI (FR-C1).
 
 ### 7.2 Data model

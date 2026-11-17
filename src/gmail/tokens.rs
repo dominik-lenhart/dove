@@ -177,7 +177,10 @@ impl TokenManager {
                 .notifier
                 .notify_once(
                     &format!("reauth:{account_id}:{generation}"),
-                    &format!("Mailbox '{alias}' needs to be reconnected: run `dove accounts reconnect {alias}`."),
+                    crate::notifier::Alert::reauth(
+                        alias,
+                        &format!("needs to be reconnected: run `dove accounts reconnect {alias}`."),
+                    ),
                 )
                 .await;
         }

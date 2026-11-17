@@ -342,7 +342,7 @@ pub struct Text {
 }
 
 /// A label for the lock screen: control characters dropped, at most 40 characters.
-fn label(s: &str) -> String {
+pub(crate) fn label(s: &str) -> String {
     let s: String = s.chars().filter(|c| !c.is_control()).collect();
     if s.chars().count() > 40 { format!("{}…", s.chars().take(39).collect::<String>()) } else { s }
 }

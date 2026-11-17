@@ -539,3 +539,8 @@ cargo fmt
   request push gets its text at delivery (`push::request_text`): a new request kind needs a line there. Admin pages
   served without a session (manifest, icons, `sw.js`) go in `ADMIN_PUBLIC_PATHS`; an image or JS asset that the
   browser fetches needs the matching CSP directive (`worker-src`, `manifest-src`).
+- 2026-11-17: Owner alerts (PLAN A77) are `notifier::Alert` values; a new alert needs a constructor there with its own
+  lock-screen text (alias or connection name only), never a free-text push. `health::tick_with(app, now, disk_free)`
+  drives the watcher in tests (the harness starts none); fake a stall with `UPDATE sync_state SET last_success_at = ..`
+  through `app.index.write`. The fake push service and decrypting `Device` live in `tests/support/push.rs`. A mailbox
+  synced in a test has a cached access token, so a reauth test needs a second, unsynced mailbox.

@@ -5,6 +5,16 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 
 ## [Unreleased]
 
+### Added
+
+- Owner alerts now arrive as push notifications on every device that has notifications on: a mailbox that needs
+  reconnecting, a connection used from a new address, a burst of denied calls, an IMAP draft that needs a look, and
+  two new checks that run every 5 minutes, a mailbox that has not synced for 2 hours (and once more when it syncs
+  again) and less than 1 GiB free for Dove's data. The notification names the mailbox or connection only, never an
+  address or IP, and opens the page where it can be fixed.
+- The Health page shows each mailbox's sync state (last sync, messages to retry, last error) and whether alerts reach a
+  device. `dove doctor` reports the free space for the data directory.
+
 ## [0.14.0] - 2026-11-16
 
 ### Added

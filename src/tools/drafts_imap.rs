@@ -147,7 +147,7 @@ async fn read_back(conn: &Conn, cx: &ToolCx, drafts: &Folder, au: AppendUid) -> 
 /// Reports a best-effort cleanup failure to the operator once (no content: ids and the alias only).
 async fn report(cx: &ToolCx, mb: &Mailbox, key: String, message: String) {
     tracing::warn!(account = %mb.account_id, kind = %key.split(':').next().unwrap_or_default(), "IMAP draft cleanup step failed");
-    let _ = cx.app.notifier.notify_once(&key, &message).await;
+    let _ = cx.app.notifier.notify_once(&key, crate::notifier::Alert::draft_cleanup(&mb.alias, message)).await;
 }
 
 /// Flags and expunges exactly one Dove-owned draft UID.

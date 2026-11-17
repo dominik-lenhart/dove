@@ -4,91 +4,15 @@
 
 mod support;
 
-use std::sync::atomic::{AtomicU16, Ordering};
-use std::sync::{Arc, Mutex};
-
 use dove::admin::AdminRequest;
-use dove::push::{self, Subscription, SubscriptionKeys, ece};
+use std::sync::atomic::Ordering;
+
+use dove::push;
 use dove::util;
 use serde_json::{Value, json};
 use support::admin_ui::{self as ui, Browser, ORIGIN};
 use support::harness::{Harness, g};
-
-type Hit = (String, axum::http::HeaderMap, Vec<u8>);
-
-/// A push service on loopback: records each POST and answers with a settable status.
-#[derive(Clone)]
-struct PushService {
-    hits: Arc<Mutex<Vec<Hit>>>,
-    status: Arc<AtomicU16>,
-    base: String,
-}
-
-impl PushService {
-    async fn start() -> Self {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let s = PushService {
-            hits: Arc::default(),
-            status: Arc::new(AtomicU16::new(201)),
-            base: format!("http://{}", listener.local_addr().unwrap()),
-        };
-        let sc = s.clone();
-        let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
-            let sc = sc.clone();
-            async move {
-                let path = req.uri().path().to_string();
-                let headers = req.headers().clone();
-                let body = axum::body::to_bytes(req.into_body(), 1 << 20).await.unwrap().to_vec();
-                sc.hits.lock().unwrap().push((path, headers, body));
-                axum::http::StatusCode::from_u16(sc.status.load(Ordering::SeqCst)).unwrap()
-            }
-        });
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-        s
-    }
-
-    fn hits(&self) -> Vec<Hit> {
-        self.hits.lock().unwrap().clone()
-    }
-
-    fn set(&self, status: u16) {
-        self.status.store(status, Ordering::SeqCst);
-    }
-}
-
-/// A browser's side of a subscription: its ECDH private key and auth secret.
-struct Device {
-    private: [u8; 32],
-    auth: [u8; 16],
-    path: String,
-}
-
-impl Device {
-    fn new(n: u8) -> Self {
-        Device { private: [n; 32], auth: [n.wrapping_add(100); 16], path: format!("/push/dev{n}") }
-    }
-
-    fn subscription(&self, svc: &PushService) -> Subscription {
-        Subscription {
-            endpoint: format!("{}{}", svc.base, self.path),
-            keys: SubscriptionKeys {
-                p256dh: util::b64url(&ece::public_key(&self.private).unwrap()),
-                auth: util::b64url(&self.auth),
-            },
-        }
-    }
-
-    fn json(&self, svc: &PushService) -> Value {
-        serde_json::to_value(self.subscription(svc)).unwrap()
-    }
-
-    /// Decrypts a push like the browser would; returns the padded plaintext.
-    fn open(&self, body: &[u8]) -> Vec<u8> {
-        ece::decrypt(body, &self.private, &self.auth).expect("the push decrypts with the device's keys")
-    }
-}
+use support::push::{Device, PushService};
 
 struct Fx {
     h: Harness,
