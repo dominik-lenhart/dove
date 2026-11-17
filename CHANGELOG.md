@@ -5,6 +5,8 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-11-17
+
 ### Added
 
 - The overview shows agent activity: calls today, failed or refused calls, writes in the last 7 days, a 14-day chart
@@ -446,7 +448,8 @@ First release.
   release only after verifying its minisign signature. The CLI hints at a new release at most once a day
   (`DOVE_NO_UPDATE_CHECK=1` turns it off); the server never checks for updates.
 
-[Unreleased]: https://github.com/dominik-lenhart/dove/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/dominik-lenhart/dove/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/dominik-lenhart/dove/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/dominik-lenhart/dove/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/dominik-lenhart/dove/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/dominik-lenhart/dove/compare/v0.12.2...v0.13.0
