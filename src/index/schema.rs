@@ -23,6 +23,7 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration::Code(v5),
     Migration::Code(v_mail_intelligence),
     Migration::Sql(V_COVERAGE_INDEXES),
+    Migration::Sql(V_CONTACT_INDEXES),
 ];
 
 /// Name of a generation's FTS table. Derived only from the integer generation id, never from input.
@@ -341,6 +342,18 @@ CREATE INDEX messages_att_incomplete ON messages(gen) WHERE IFNULL(att_complete,
 INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
     ('messages', 'messages_category_unknown', '250 25'),
     ('messages', 'messages_att_incomplete', '2500 250');
+"#;
+
+/// Index V8 (PLAN A81): `search_contacts` aggregates every `addrs` row of its candidate addresses. Each row cost two
+/// table reads, the `addrs` row for the display name and the wide `messages` row for date and spam flag, and SQLCipher
+/// decrypts a page for most of them (about 0.4 s for 2,000 candidates across five 20k mailboxes). `addrs_addr` now
+/// ends with `name` and `messages_id_date` holds what the aggregate needs from a message, so it reads indexes only.
+const V_CONTACT_INDEXES: &str = r#"
+DROP INDEX addrs_addr;
+CREATE INDEX addrs_addr ON addrs(addr, gen, role, msg, name);
+CREATE INDEX messages_id_date ON messages(id, spam_trash, received_at);
+UPDATE sqlite_stat1 SET stat = '1000000 40 30 20 1 1' WHERE tbl = 'addrs' AND idx = 'addrs_addr';
+INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES ('messages', 'messages_id_date', '250000 1 1 1');
 "#;
 
 fn v_mail_intelligence(tx: &Transaction<'_>) -> anyhow::Result<()> {

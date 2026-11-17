@@ -1307,7 +1307,9 @@ async fn contact_and_digest_queries_use_indexes() {
         });
     }
     let plans = |n: usize| {
-        let t: Vec<Target> = targets[..n].to_vec();
+        // Five entries repeat the two mailboxes: the planner estimates by the length of the `gen IN` list, and with
+        // five it once read the name branch through `addrs_addr` plus a table fetch per row.
+        let t: Vec<Target> = targets.iter().cycle().take(n).cloned().collect();
         let app = fx.h.app().clone();
         async move {
             app.index
@@ -1322,18 +1324,20 @@ async fn contact_and_digest_queries_use_indexes() {
                         category: None,
                         limit: 20,
                     };
+                    let chunk: Vec<String> = (0..200).map(|i| format!("p{i}@example.com")).collect();
                     Ok((
                         intel::explain_candidates(c, &t, &q)?,
                         intel::explain_candidates(c, &t, &n)?,
                         intel::explain_threads(c, &d, &t)?,
+                        intel::explain_aggregate(c, &t, &chunk)?,
                     ))
                 })
                 .await
                 .unwrap()
         }
     };
-    for n in [1, 2] {
-        let (by_query, recent, threads) = plans(n).await;
+    for n in [1, 2, 5] {
+        let (by_query, recent, threads, aggregate) = plans(n).await;
         let joined = |v: &[String]| v.join(" | ");
         // Address and name searches read covering indexes of `addrs` only (two branches), never the message table.
         let reads: Vec<&String> =
@@ -1350,6 +1354,14 @@ async fn contact_and_digest_queries_use_indexes() {
             "{threads:?}"
         );
         assert!(!threads.iter().any(|l| l.starts_with("SCAN m ") && !l.contains("INDEX")), "{threads:?}");
+        // The aggregate reads indexes only: no `addrs` row for the name, no wide message row (PLAN A81).
+        assert!(aggregate.iter().any(|l| l.contains("SEARCH a USING COVERING INDEX addrs_addr")), "{aggregate:?}");
+        assert!(
+            aggregate.iter().any(|l| l.contains("SEARCH m USING COVERING INDEX messages_id_date")),
+            "{aggregate:?}"
+        );
+        assert!(aggregate.iter().any(|l| l.contains("SEARCH l USING PRIMARY KEY")), "{aggregate:?}");
+        assert!(!joined(&aggregate).contains("INTEGER PRIMARY KEY"), "{aggregate:?}");
     }
 }
 

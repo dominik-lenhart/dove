@@ -275,6 +275,25 @@ Same corpus and command (`DOVE_BENCH_FAST=1`, 250k messages, 25 mailboxes), serv
 in 5 mailboxes: unread inbox 94.7 -> 7.9 ms, frequent label 63.8 -> 3.6, sent by self 86.5 -> 8.9, newsletters
 102.4 -> 4.0, attachment text 99.7 -> 5.9.
 
+## After the thread walk and index-only contacts (PLAN A81, 2026-11-17)
+
+Same corpus and command, service p95 in ms. "Before" is the A80 column.
+
+| query | before | after |
+|---|--:|--:|
+| group_by thread, newest 20 | 2551.6 | 26.4 |
+| group_by thread, INBOX | 1967.9 | 66.5 |
+| group_by thread, awaiting_reply | 2091.2 | 59.8 |
+| group_by thread, text: project | 1483.7 | 75.0 |
+| search_contacts: ann | 1919.9 | 353.6 |
+| search_contacts: schmidt | 1529.9 | 251.2 |
+| search_contacts: no query (top) | 1587.3 | 325.0 |
+
+The thread view walks the date index and aggregates only candidate threads in batches. `search_contacts` still
+aggregates every `addrs` row of up to 2,000 candidates (about 1 µs per row now that it reads indexes only); the rest
+is the two `LIKE` scans over the covering address and name indexes. Every other query is unchanged within noise;
+`count_only` (345 ms) still counts every match.
+
 ## Not fixed here
 
 These are design-level changes to the query compiler and the index schema, not a contained fix, and the planner and
@@ -286,7 +305,7 @@ in the order of effect:
    walk `messages_recent` (or `messages_date` for one mailbox) and test the predicates with correlated `EXISTS`, which
    stops after `limit + 1` rows. Both paths need identical ordering and cursor keys; the existing contract tests and
    this benchmark's plan output check that.
-2. A per-generation `threads` table maintained by ingest (thread id, newest time, count, last in/out), so the first
-   page of the thread view is an index walk.
-3. A per-generation contacts aggregate maintained by ingest (address, name, received, sent, first/last).
+2. Done differently (PLAN A81): instead of a maintained `threads` table, the thread view walks the date index and
+   aggregates only candidate threads.
+3. Done differently (PLAN A81): instead of a maintained contacts table, the aggregate reads covering indexes only.
 4. Done (PLAN A80): the slow part was the coverage count, now on partial indexes; the predicates themselves walk.

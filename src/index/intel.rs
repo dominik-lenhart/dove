@@ -5,7 +5,7 @@
 //! transaction on a blocking thread and are bounded: contact search looks at most [`MAX_CANDIDATES`] addresses, the
 //! digest at most one year of mail and `limit + 1` threads per page.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, params_from_iter};
@@ -107,37 +107,7 @@ pub fn score(sent: i64, received: i64, last_ms: i64, now_ms: i64) -> f64 {
 /// Candidate addresses: those matching `query` in the address or a display name, or (no query) those of the newest
 /// [`RECENT_MESSAGES`] messages. Returns the addresses and whether the cap cut the list.
 fn candidates(conn: &Connection, t: &[Target], req: &ContactReq<'_>) -> anyhow::Result<(Vec<String>, bool)> {
-    let mut params: Vec<SqlValue> = vec![];
-    let sql = match req.query {
-        Some(q) => {
-            let pat = SqlValue::Text(like_contains(&q.to_lowercase()));
-            let g = marks(t.len());
-            for _ in 0..2 {
-                params.push(pat.clone());
-                params.extend(gens(t));
-            }
-            // Two covering index scans (addrs_addr, addrs_name) instead of one scan with OR.
-            format!(
-                "SELECT addr FROM addrs WHERE addr LIKE ? ESCAPE '\\' AND gen IN {g} \
-                 UNION SELECT addr FROM addrs WHERE name_lc LIKE ? ESCAPE '\\' AND gen IN {g} LIMIT {}",
-                MAX_CANDIDATES + 1
-            )
-        }
-        None => {
-            params.extend(gens(t));
-            params.extend(gens(t));
-            params.push(SqlValue::Integer(RECENT_MESSAGES));
-            // The unary `+` keeps several mailboxes on the `messages_recent` newest-first walk, as in search.
-            let walk = if t.len() > 1 { "+m.gen" } else { "m.gen" };
-            format!(
-                "SELECT DISTINCT addr FROM addrs WHERE gen IN {} AND msg IN \
-                 (SELECT m.id FROM messages m WHERE {walk} IN {} AND m.spam_trash = 0 \
-                  ORDER BY m.received_at DESC LIMIT ?)",
-                marks(t.len()),
-                marks(t.len())
-            )
-        }
-    };
+    let (sql, params) = candidate_sql(t, req);
     let mut st = conn.prepare(&sql)?;
     let mut found: Vec<String> = st.query_map(params_from_iter(params), |r| r.get(0))?.collect::<Result<_, _>>()?;
     let truncated = found.len() > MAX_CANDIDATES;
@@ -155,7 +125,6 @@ pub fn explain_candidates(conn: &Connection, t: &[Target], req: &ContactReq<'_>)
 }
 
 fn candidate_sql(t: &[Target], req: &ContactReq<'_>) -> (String, Vec<SqlValue>) {
-    // Same text as in `candidates`, rebuilt for EXPLAIN without running it.
     let mut params: Vec<SqlValue> = vec![];
     match req.query {
         Some(q) => {
@@ -166,9 +135,12 @@ fn candidate_sql(t: &[Target], req: &ContactReq<'_>) -> (String, Vec<SqlValue>) 
                 params.extend(gens(t));
             }
             (
+                // Two covering index scans instead of one scan with OR. Named, because with several mailboxes the
+                // planner read the name branch through `addrs_addr` and fetched every row for `name_lc`.
                 format!(
-                    "SELECT addr FROM addrs WHERE addr LIKE ? ESCAPE '\\' AND gen IN {g} \
-                     UNION SELECT addr FROM addrs WHERE name_lc LIKE ? ESCAPE '\\' AND gen IN {g} LIMIT {}",
+                    "SELECT addr FROM addrs INDEXED BY addrs_addr WHERE addr LIKE ? ESCAPE '\\' AND gen IN {g} \
+                     UNION SELECT addr FROM addrs INDEXED BY addrs_name WHERE name_lc LIKE ? ESCAPE '\\' AND gen IN {g} \
+                     LIMIT {}",
                     MAX_CANDIDATES + 1
                 ),
                 params,
@@ -193,6 +165,37 @@ fn candidate_sql(t: &[Target], req: &ContactReq<'_>) -> (String, Vec<SqlValue>) 
     }
 }
 
+/// The aggregate over every `addrs` row of the candidate addresses `chunk`. It reads only `addrs_addr` (which ends
+/// with `name`), `messages_id_date` and the labels key: the mailbox comes from the row's generation, not from
+/// `messages.account_id`, which would read the wide message row again.
+fn aggregate_sql(t: &[Target], chunk: &[String]) -> (String, Vec<SqlValue>) {
+    let sql = format!(
+        "SELECT addr, \
+            sum(role = {ROLE_FROM}), sum(role > {ROLE_FROM}), min(at), max(at), \
+            max(CASE WHEN name IS NOT NULL THEN printf('%020d', at) || name END), \
+            group_concat(DISTINCT gen) \
+         FROM (SELECT a.addr AS addr, a.role AS role, a.name AS name, m.received_at AS at, a.gen AS gen, \
+                  (a.role IN ({ROLE_TO}, {ROLE_CC}, {ROLE_BCC}) AND EXISTS \
+                     (SELECT 1 FROM labels l WHERE l.label = 'SENT' AND l.gen = a.gen AND l.msg = a.msg)) AS is_sent \
+               FROM addrs a JOIN messages m ON m.id = a.msg \
+               WHERE a.addr IN {} AND a.gen IN {} AND m.spam_trash = 0) \
+         WHERE role = {ROLE_FROM} OR is_sent GROUP BY addr",
+        marks(chunk.len()),
+        marks(t.len())
+    );
+    let mut params: Vec<SqlValue> = chunk.iter().map(|a| SqlValue::Text(a.clone())).collect();
+    params.extend(gens(t));
+    (sql, params)
+}
+
+/// `EXPLAIN QUERY PLAN` of the aggregate for `chunk` (tests verify it reads indexes only).
+pub fn explain_aggregate(conn: &Connection, t: &[Target], chunk: &[String]) -> anyhow::Result<Vec<String>> {
+    let (sql, params) = aggregate_sql(t, chunk);
+    let mut st = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+    let rows = st.query_map(params_from_iter(params), |r| r.get::<_, String>(3))?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
 /// Contacts of the mailboxes in `t`, best first. Statistics count only exchanged mail: messages from the address
 /// and sent mail to it (not mail that merely names it in Cc).
 pub fn contacts(conn: &Connection, t: &[Target], req: &ContactReq<'_>) -> anyhow::Result<ContactResult> {
@@ -200,27 +203,10 @@ pub fn contacts(conn: &Connection, t: &[Target], req: &ContactReq<'_>) -> anyhow
         return Ok(ContactResult { contacts: vec![], truncated: false });
     }
     let (cands, truncated) = candidates(conn, t, req)?;
-    let alias: HashMap<String, &str> = HashMap::new();
-    let _ = alias;
-    let alias_of = |account_id: &str| t.iter().find(|x| x.account_id == account_id).map(|x| x.alias.clone());
+    let alias_of = |gen_id: i64| t.iter().find(|x| x.gen_id == gen_id).map(|x| x.alias.clone());
     let mut out: BTreeMap<String, Contact> = BTreeMap::new();
     for chunk in cands.chunks(CHUNK) {
-        let sql = format!(
-            "SELECT addr, \
-                sum(role = {ROLE_FROM}), sum(role > {ROLE_FROM}), min(at), max(at), \
-                max(CASE WHEN name IS NOT NULL THEN printf('%020d', at) || name END), \
-                group_concat(DISTINCT acc) \
-             FROM (SELECT a.addr AS addr, a.role AS role, a.name AS name, m.received_at AS at, m.account_id AS acc, \
-                      (a.role IN ({ROLE_TO}, {ROLE_CC}, {ROLE_BCC}) AND EXISTS \
-                         (SELECT 1 FROM labels l WHERE l.label = 'SENT' AND l.gen = a.gen AND l.msg = a.msg)) AS is_sent \
-                   FROM addrs a JOIN messages m ON m.id = a.msg \
-                   WHERE a.addr IN {} AND a.gen IN {} AND m.spam_trash = 0) \
-             WHERE role = {ROLE_FROM} OR is_sent GROUP BY addr",
-            marks(chunk.len()),
-            marks(t.len())
-        );
-        let mut params: Vec<SqlValue> = chunk.iter().map(|a| SqlValue::Text(a.clone())).collect();
-        params.extend(gens(t));
+        let (sql, params) = aggregate_sql(t, chunk);
         let mut st = conn.prepare(&sql)?;
         let mut rows = st.query(params_from_iter(params))?;
         while let Some(r) = rows.next()? {
@@ -232,7 +218,7 @@ pub fn contacts(conn: &Connection, t: &[Target], req: &ContactReq<'_>) -> anyhow
                 .get::<_, Option<String>>(6)?
                 .unwrap_or_default()
                 .split(',')
-                .filter_map(alias_of)
+                .filter_map(|g| g.parse().ok().and_then(alias_of))
                 .collect::<std::collections::BTreeSet<_>>()
                 .into_iter()
                 .collect();

@@ -5,6 +5,14 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 
 ## [Unreleased]
 
+### Changed
+
+- Thread view searches (`group_by:"thread"`) walk the mailbox newest first and stop after one page instead of
+  grouping every matching message first: the first page at 250,000 messages takes well under 100 ms instead of
+  about 2 s. Results and page cursors are unchanged.
+- `search_contacts` reads only indexes and is several times faster on large mailboxes. The index gets one new and one
+  extended index on upgrade.
+
 ## [0.18.0] - 2026-11-17
 
 ### Changed

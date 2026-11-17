@@ -93,7 +93,7 @@ hosts or reference hardware.
      Gmail calls per indexed search. **Targets missed:** 12 of 24 queries with a 8.1 target (structured p95 <= 100 ms,
      FTS <= 250 ms) exceed it at 250k messages, `group_by:"thread"` takes 1.5-2.6 s and `search_contacts` about 2 s.
      Cause and options in `docs/benchmarks.md` (A72); after A80 23 of 24 meet their target at 250k (not `count_only`),
-     thread view and `search_contacts` still open. Still unmeasured: live Gmail escape hatch, sync lag, cold
+     A81 makes the thread view and `search_contacts` read a page or index-only paths. Still unmeasured: live Gmail escape hatch, sync lag, cold
      OS cache, PDF/DOCX attachment text, container memory.
    - [~] Deployment: systemd unit, container, Caddy allowlist, backup docs, SECURITY.md, README (files written:
      `deploy/` (systemd, Containerfile, compose, Caddyfile, nginx), `docs/deployment.md`, `README.md`, `SECURITY.md`,
@@ -886,3 +886,20 @@ hosts or reference hardware.
   `messages_att_incomplete`) and the queries use their exact expressions (`index::schema::*_COUNT`). (e) Not done
   here: `count_only` still counts every match, and the thread view and `search_contacts` aggregate every match
   (options 2 and 3).
+- A81. Thread view and contacts without aggregate tables (2026-11-17; step 4 "search performance", second part;
+  options 2 and 3 of `docs/benchmarks.md`). Maintained `threads`/`contacts` tables (updated by ingest, relabel,
+  delete, purge and rebuild) were rejected: a second source of truth with its own consistency bugs for two read
+  paths. (a) A newest-first thread page (`group_by:"thread"`, spam/trash excluded, no small driving predicate) walks
+  the date index (`messages_date` / `messages_recent`) newest first, collects thread ids in the order of their newest
+  message, and aggregates only those candidates in batches through the same thread CTE (`threads_cte(.., Some(ids))`,
+  every other lookup plussed, `AND m.thread_id IN (..)`); the first `limit + 1` threads whose aggregate passes the
+  filters are the page (`index::query::walk_thread_heads`). A batch ends only where the message time changes, so ties
+  sort by (mailbox, thread id) as in the CTE; the cursor seek is applied to the aggregated head. After
+  `THREAD_WALK_BUDGET` = 20,000 candidates without a full page (a rare filter) the page falls back to the CTE.
+  Oldest-first, spam/trash and a predicate with at most `PROBE_LIMIT` entries keep the CTE.
+  `tests/search_contract.rs::thread_walk_matches_the_aggregate_query` compares both paths page by page. (b)
+  `search_contacts` aggregates every `addrs` row of up to 2,000 candidate addresses; index migration 8 lets it read
+  indexes only: `addrs_addr` ends with `name`, `messages_id_date(id, spam_trash, received_at)` replaces the wide
+  message row, the mailbox comes from `addrs.gen`. The candidate scans name their covering indexes (`INDEXED BY`):
+  with five mailboxes the planner read the name branch through `addrs_addr` and fetched every row. (c) Still open:
+  `count_only` counts every match.
