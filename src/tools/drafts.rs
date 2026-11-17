@@ -145,8 +145,9 @@ pub fn defs() -> Vec<ToolDef> {
                 "Send one existing draft this project created, unchanged since expected_revision (from get_draft or the ",
                 "last update_draft); a mismatch fails with draft_conflict. Only listed when the operator enabled ",
                 "sending and granted send on this mailbox; otherwise ask the owner with request_send, which also ",
-                "schedules. Accepts no recipients or content. outcome_unknown means the mail may have gone out: never ",
-                "retry it, check Sent."
+                "schedules. Accepts no recipients or content. The mailbox's send_policy (list_accounts) can refuse ",
+                "recipients with forbidden (details.reason recipient_not_allowed or recipients_unverified): then use ",
+                "request_send. outcome_unknown means the mail may have gone out: never retry it, check Sent."
             ),
             capability: Capability::Send,
             read_only: false,
@@ -1199,13 +1200,23 @@ pub(crate) async fn send_core(
         ));
     }
     // IMAP: fresh check, envelope and credentials are prepared before the send is claimed.
-    let imap = match mb.provider {
+    let (imap, recipients) = match mb.provider {
         Provider::Gmail => {
-            fresh_checked(cx, mb, &draft_id, &own, expected).await?;
-            None
+            let f = fresh_checked(cx, mb, &draft_id, &own, expected).await?;
+            let p = &f.parsed;
+            (None, p.to.iter().chain(&p.cc).chain(&p.bcc).map(|a| a.email.clone()).collect::<Vec<_>>())
         }
-        Provider::Imap => Some(super::drafts_imap::prepare_send(cx, mb, &own, expected).await?),
+        Provider::Imap => {
+            let p = super::drafts_imap::prepare_send(cx, mb, &own, expected).await?;
+            let r = p.recipients().to_vec();
+            (Some(p), r)
+        }
     };
+    // The owner's recipient rules bind sends the agent starts on its own; an approved request was seen by the owner
+    // (PLAN A82). Checked on the draft as it is on the server, before the claim and any upstream write.
+    if matches!(auth, SendAuth::Grant) {
+        crate::send_policy::check(&cx.app, &mb.account_id, mb.index_enabled, &recipients).await?;
+    }
 
     // Recheck policy immediately before dispatch from the durable store (spec 6.3).
     let (cid, aid) = (cx.client.client_id.clone(), mb.account_id.clone());

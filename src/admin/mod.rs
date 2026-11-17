@@ -119,6 +119,16 @@ pub enum AdminRequest {
         account: String,
         alias: Option<String>,
     },
+    /// Recipient rules for the agent's direct sends (PLAN A82): `allow_domains` (empty: any) and
+    /// `unknown_recipients` (`allow` or `refuse`). An open policy removes the rules.
+    AccountsSendPolicySet {
+        account: String,
+        allow_domains: Vec<String>,
+        unknown_recipients: String,
+    },
+    AccountsSendPolicyShow {
+        account: String,
+    },
     /// The mailbox's named signatures (design 2026-11-17 "html signatures").
     AccountsSignaturesList {
         account: String,
@@ -377,6 +387,20 @@ impl AdminRequest {
                 vec![],
             ),
             AccountsSignatureShow { account, .. } => ("accounts.signature_show", None, Some(account.clone()), vec![]),
+            // Domains stay out of the audit log: only how many and the unknown-recipient switch.
+            AccountsSendPolicySet { account, allow_domains, unknown_recipients } => (
+                "accounts.send_policy_set",
+                None,
+                Some(account.clone()),
+                vec![
+                    format!("domains:{}", allow_domains.len()),
+                    format!(
+                        "unknown:{}",
+                        if unknown_recipients.trim().eq_ignore_ascii_case("refuse") { "refuse" } else { "allow" }
+                    ),
+                ],
+            ),
+            AccountsSendPolicyShow { account } => ("accounts.send_policy_show", None, Some(account.clone()), vec![]),
             AccountsSignaturesList { account, .. } => ("accounts.signatures_list", None, Some(account.clone()), vec![]),
             AccountsSignaturePut { account, name, .. } => {
                 ("accounts.signature_put", None, Some(account.clone()), vec![format!("signature:{name}")])

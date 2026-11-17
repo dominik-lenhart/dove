@@ -31,6 +31,7 @@ pub mod push;
 pub mod redact;
 pub mod requests;
 pub mod secrets;
+pub mod send_policy;
 pub mod serve;
 pub mod signatures;
 pub mod store;

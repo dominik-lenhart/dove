@@ -17,6 +17,7 @@ pub const MIGRATIONS: &[&str] = &[
     V_PUSH,
     V_SIGNATURES,
     V_SESSION_DEVICE,
+    V_SEND_POLICY,
 ];
 
 const V1: &str = r#"
@@ -583,4 +584,14 @@ ALTER TABLE own_drafts ADD COLUMN composition TEXT;
 /// settings page can tell sessions apart (PLAN A83). A coarse label only, never the User-Agent itself.
 const V_SESSION_DEVICE: &str = r#"
 ALTER TABLE admin_sessions ADD COLUMN device TEXT;
+"#;
+
+/// Recipient rules for direct sends (PLAN A82). `allow_domains` is a JSON array of lowercased domains.
+const V_SEND_POLICY: &str = r#"
+CREATE TABLE account_send_policy (
+    account_id         TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+    allow_domains      TEXT NOT NULL,
+    unknown_recipients TEXT NOT NULL CHECK (unknown_recipients IN ('allow', 'refuse')),
+    updated_at         INTEGER NOT NULL
+);
 "#;

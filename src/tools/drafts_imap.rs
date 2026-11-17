@@ -322,6 +322,13 @@ pub(super) struct PreparedSend {
     pub thread_id: String,
 }
 
+impl PreparedSend {
+    /// The envelope recipients (To, Cc and Bcc of the draft on the server).
+    pub(super) fn recipients(&self) -> &[String] {
+        &self.rcpts
+    }
+}
+
 /// Fresh check, envelope recipients from To/Cc/Bcc, the submission bytes without `Bcc`, and credentials, all before
 /// the send is claimed.
 pub(super) async fn prepare_send(

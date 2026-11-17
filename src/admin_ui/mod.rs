@@ -97,6 +97,7 @@ pub const ADMIN_PATHS: &[&str] = &[
     "/admin/mailboxes/{alias}/aliases",
     "/admin/mailboxes/{alias}/signature",
     "/admin/mailboxes/{alias}/signatures",
+    "/admin/mailboxes/{alias}/send-policy",
     "/admin/projects",
     "/admin/projects/{name}",
     "/admin/projects/{name}/accounts",
@@ -209,6 +210,7 @@ pub fn routes(app: Arc<App>) -> Router<Arc<App>> {
         .route("/admin/mailboxes/{alias}/aliases", post(mailboxes::aliases))
         .route("/admin/mailboxes/{alias}/signature", post(mailboxes::signature))
         .route("/admin/mailboxes/{alias}/signatures", post(mailboxes::signatures))
+        .route("/admin/mailboxes/{alias}/send-policy", post(mailboxes::send_policy))
         .route("/admin/projects", get(projects::list).post(projects::create))
         .route("/admin/projects/{name}", get(projects::detail))
         .route("/admin/projects/{name}/accounts", post(projects::accounts))
@@ -496,7 +498,9 @@ pub fn needs_step_up(req: &AdminRequest) -> bool {
         | AccountsSignatureSet { .. }
         | AccountsSignaturePut { .. }
         | AccountsSignatureDefault { .. }
-        | PushAdd { .. } => true,
+        | PushAdd { .. }
+        // Loosening the recipient rules widens what an agent may send on its own.
+        | AccountsSendPolicySet { .. } => true,
         // Turning redaction on only tightens.
         ClientsSetRedaction { enabled, .. } => !*enabled,
         ProjectsCreate { .. }
@@ -512,6 +516,7 @@ pub fn needs_step_up(req: &AdminRequest) -> bool {
         | AccountsAliasList { .. }
         | AccountsAliasRemove { .. }
         | AccountsSignatureShow { .. }
+        | AccountsSendPolicyShow { .. }
         | AccountsSignaturesList { .. }
         | AccountsSignatureDelete { .. }
         | ClientsRevoke { .. }
@@ -584,6 +589,8 @@ pub const COVERAGE: &[(&str, Reach)] = &[
     ("AccountsAliasRemove", Reach::Ui("/admin/mailboxes/{alias}/aliases")),
     ("AccountsSignatureSet", Reach::Ui("/admin/mailboxes/{alias}/signature")),
     ("AccountsSignatureShow", Reach::Ui("/admin/mailboxes/{alias}")),
+    ("AccountsSendPolicySet", Reach::Ui("/admin/mailboxes/{alias}/send-policy")),
+    ("AccountsSendPolicyShow", Reach::Ui("/admin/mailboxes/{alias}")),
     ("AccountsSignaturesList", Reach::Ui("/admin/mailboxes/{alias}")),
     (
         "AccountsSignaturePut",

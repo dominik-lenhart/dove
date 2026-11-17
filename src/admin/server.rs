@@ -231,6 +231,10 @@ async fn execute(call: &mut AdminCall<'_>, req: AdminRequest) -> anyhow::Result<
         AccountsSignatureShow { account, alias } => {
             call.read(move |c| crate::identity::signature_show(c, &account, alias.as_deref())).await
         }
+        AccountsSendPolicySet { account, allow_domains, unknown_recipients } => {
+            call.tx(move |tx| crate::send_policy::set(tx, &account, &allow_domains, &unknown_recipients)).await
+        }
+        AccountsSendPolicyShow { account } => call.read(move |c| crate::send_policy::show(c, &account)).await,
         AccountsSignaturesList { account, include_html } => {
             call.read(move |c| {
                 let aid = ops::account_id(c, &account)?;

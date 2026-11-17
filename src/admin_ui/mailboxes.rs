@@ -259,6 +259,33 @@ async fn signature_form(app: &Arc<App>, s: &WebSession, mailbox: &str, address: 
     )
 }
 
+/// Recipient rules for the agent's direct sends (PLAN A82). Saving needs a passkey: looser rules let an agent send
+/// to more people on its own.
+async fn send_policy_section(app: &Arc<App>, s: &WebSession, mailbox: &str) -> Markup {
+    let v = result(run_action(app, s, AdminRequest::AccountsSendPolicyShow { account: mailbox.to_string() }).await)
+        .unwrap_or_default();
+    let p = &v["send_policy"];
+    let domains: Vec<String> = p["allow_domains"].as_array().map(|a| a.iter().map(text).collect()).unwrap_or_default();
+    let refuse = p["unknown_recipients"] == "refuse";
+    let checked = |on: bool| if on { Markup::lit(" checked") } else { Markup::default() };
+    h!(
+        "<section class=\"block\"><h2>Sending rules</h2><p class=\"hint\">Apply when an agent sends on its own \
+         (send_draft). Sends you approve as a request are not checked.</p>\
+         <form class=\"sig\" method=\"post\" action=\"{}/send-policy\">{}\
+         <p class=\"field\"><label>Allowed recipient domains<textarea name=\"domains\" rows=\"3\" maxlength=\"8000\">{}</textarea></label>\
+         <span class=\"hint\">One per line; subdomains are included. Empty: any domain.</span></p>\
+         <fieldset class=\"field\"><legend>Recipients this mailbox has never exchanged mail with</legend>\
+         <label class=\"check\"><input type=\"radio\" name=\"unknown_recipients\" value=\"allow\"{}> <span>Allow</span></label>\
+         <label class=\"check\"><input type=\"radio\" name=\"unknown_recipients\" value=\"refuse\"{}> <span>Refuse (needs the index)</span></label>\
+         </fieldset><button type=\"submit\" class=\"btn\">Save sending rules</button></form></section>",
+        base(mailbox),
+        csrf_input(s),
+        domains.join("\n"),
+        checked(!refuse),
+        checked(refuse)
+    )
+}
+
 /// The mailbox's named signatures with their defaults; HTML and images come from the CLI or an agent.
 async fn named_signatures(app: &Arc<App>, s: &WebSession, mailbox: &str) -> Markup {
     let list = result(
@@ -485,7 +512,7 @@ async fn detail_page(app: &Arc<App>, s: &WebSession, alias: &str, notice: Markup
     let body = h!(
         "{}<header class=\"page-head\"><p class=\"crumb\"><a href=\"/admin/mailboxes\">Mailboxes</a></p><h1>{}</h1>\
          <p class=\"meta\">{} {}</p></header><section class=\"block\"><dl class=\"facts\">{}</dl>{}</section>\
-         <section class=\"block\"><h2>Reconnect</h2>{}</section>{}{}\
+         <section class=\"block\"><h2>Reconnect</h2>{}</section>{}{}{}\
          <section class=\"block\"><h2>Signatures</h2>{}</section>",
         notice,
         alias.to_string(),
@@ -496,6 +523,7 @@ async fn detail_page(app: &Arc<App>, s: &WebSession, alias: &str, notice: Markup
         reconnect,
         index,
         alias_section,
+        send_policy_section(app, s, alias).await,
         Markup::concat(sigs)
     );
     page(s, "Mailbox", Nav::Mailboxes, body)
@@ -654,4 +682,32 @@ pub async fn signature(
         f.iter().find(|(k, _)| k == "signature").map(|(_, v)| v.replace("\r\n", "\n")).filter(|v| !v.trim().is_empty());
     let req = AdminRequest::AccountsSignatureSet { account: alias, alias: field(&f, "for"), signature };
     begin_stepup(&app, &s, req, format!("{b}?done=saved")).await
+}
+
+pub async fn send_policy(
+    State(app): State<Arc<App>>,
+    Extension(s): Extension<WebSession>,
+    Path(alias): Path<String>,
+    axum::Form(f): Fields,
+) -> Response {
+    let b = base(&alias);
+    let domains: Vec<String> = f
+        .iter()
+        .filter(|(k, _)| k == "domains")
+        .flat_map(|(_, v)| v.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect::<Vec<_>>())
+        .collect();
+    // Checked before the passkey prompt, so a typo does not cost a step-up.
+    if let Err(e) = crate::send_policy::parse_domains(&domains) {
+        return problem(&s, "Not saved", &e.to_string(), &b);
+    }
+    let unknown_recipients = match field(&f, "unknown_recipients").as_deref() {
+        Some("refuse") => "refuse",
+        _ => "allow",
+    };
+    let action = AdminRequest::AccountsSendPolicySet {
+        account: alias,
+        allow_domains: domains,
+        unknown_recipients: unknown_recipients.to_string(),
+    };
+    begin_stepup(&app, &s, action, format!("{b}?done=saved")).await
 }
