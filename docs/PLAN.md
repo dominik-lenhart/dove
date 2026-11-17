@@ -92,7 +92,8 @@ hosts or reference hardware.
      125-229 MiB for sequential queries (260 MiB with 4 concurrent clients, 323 MiB with queries during ingest), zero
      Gmail calls per indexed search. **Targets missed:** 12 of 24 queries with a 8.1 target (structured p95 <= 100 ms,
      FTS <= 250 ms) exceed it at 250k messages, `group_by:"thread"` takes 1.5-2.6 s and `search_contacts` about 2 s.
-     Cause and options in `docs/benchmarks.md` (open, A72). Still unmeasured: live Gmail escape hatch, sync lag, cold
+     Cause and options in `docs/benchmarks.md` (A72); after A80 23 of 24 meet their target at 250k (not `count_only`),
+     thread view and `search_contacts` still open. Still unmeasured: live Gmail escape hatch, sync lag, cold
      OS cache, PDF/DOCX attachment text, container memory.
    - [~] Deployment: systemd unit, container, Caddy allowlist, backup docs, SECURITY.md, README (files written:
      `deploy/` (systemd, Containerfile, compose, Caddyfile, nginx), `docs/deployment.md`, `README.md`, `SECURITY.md`,

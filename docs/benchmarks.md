@@ -225,13 +225,63 @@ rows match (`SEARCH m USING INDEX messages_recent (spam_trash=?)`), so they cost
   (`USE TEMP B-TREE FOR GROUP BY`, `SEARCH m USING INDEX messages_size`): cost proportional to the whole mailbox.
 * `search_contacts` aggregates the `addrs` rows of every message that matches.
 
+## After the page strategy (PLAN A80, 2026-11-17)
+
+Same corpus and command (`DOVE_BENCH_FAST=1`, 250k messages, 25 mailboxes), service p95 in ms. "Before" is the
+25-mailbox column above.
+
+| query | before | after | target |
+|---|--:|--:|--:|
+| unread inbox, newest 20 | 344.1 | 46.0 | 100 |
+| from the most frequent sender | 143.1 | 12.2 | 100 |
+| from a mid-frequency sender | 5.6 | 6.3 | 100 |
+| from a rare sender | 4.5 | 4.3 | 100 |
+| from_domain of a newsletter sender | 5.6 | 5.2 | 100 |
+| label Label_10 (frequent user label) | 216.0 | 14.7 | 100 |
+| label Label_100 (rare user label) | 5.8 | 6.5 | 100 |
+| label Label_12 and last 30 days | 121.0 | 4.5 | 100 |
+| has attachment, last year | 4.7 | 5.8 | 100 |
+| starred | 63.7 | 6.7 | 100 |
+| sent by self | 338.2 | 48.3 | 100 |
+| newsletters (category) | 542.9 | 6.2 | 100 |
+| count: unread inbox | 338.7 | 380.7 | 100 |
+| text: project (about 25 % of mail) | 299.4 | 25.4 | 250 |
+| text: meeting (about 12 %) | 227.5 | 25.7 | 250 |
+| text: invoice (about 4 %) | 127.7 | 10.7 | 250 |
+| text: quarterly (about 0.4 %) | 11.2 | 14.7 | 250 |
+| text: zebrafish (about 27 messages) | 9.4 | 8.5 | 250 |
+| text: project AND meeting | 119.1 | 17.6 | 250 |
+| text: project, INBOX, last 90 days | 331.1 | 58.9 | 250 |
+| text: invoice, from a frequent sender | 137.6 | 16.6 | 250 |
+| subject: baba (most frequent word) | 373.1 | 140.3 | 250 |
+| attachment_text: ledgerline | 556.0 | 10.8 | 250 |
+| text: prefix proj* | 295.6 | 32.0 | 250 |
+| group_by thread, newest 20 | 2558.4 | 2551.6 | - |
+| group_by thread, INBOX | 2049.2 | 1967.9 | - |
+| group_by thread, awaiting_reply | 1999.1 | 2091.2 | - |
+| group_by thread, text: project | 1467.2 | 1483.7 | - |
+| digest last 7 days, INBOX | 70.8 | 67.4 | - |
+| digest last 30 days, newsletters | 587.3 | 89.4 | - |
+| digest last 365 days | 324.6 | 322.6 | - |
+| search_contacts: ann | 2406.3 | 1919.9 | - |
+| search_contacts: schmidt | 2029.6 | 1529.9 | - |
+| search_contacts: no query (top) | 2118.6 | 1587.3 | - |
+| select: subject only | 5.1 | 3.6 | - |
+| select: default | 4.4 | 4.3 | - |
+| select: detail | 5.0 | 4.9 | - |
+
+23 of the 24 queries with a target now meet it; `count_only` (it still counts every match) does not. The thread view and
+`search_contacts` are unchanged: they aggregate every match (options 2 and 3 below). The first search on 50k messages
+in 5 mailboxes: unread inbox 94.7 -> 7.9 ms, frequent label 63.8 -> 3.6, sent by self 86.5 -> 8.9, newsletters
+102.4 -> 4.0, attachment text 99.7 -> 5.9.
+
 ## Not fixed here
 
 These are design-level changes to the query compiler and the index schema, not a contained fix, and the planner and
 cursor semantics are security-relevant, so they are reported rather than patched in a benchmark PR (PLAN A72). Options,
 in the order of effect:
 
-1. Pick the strategy per query from a bounded cardinality probe: count up to K (for example 2,000) matches of the most
+1. Done (PLAN A80, with an index-only probe and `INDEXED BY` instead of correlated `EXISTS`). Pick the strategy per query from a bounded cardinality probe: count up to K (for example 2,000) matches of the most
    selective indexed predicate (label, address, FTS term); at or below K keep the current materialize-and-sort, above K
    walk `messages_recent` (or `messages_date` for one mailbox) and test the predicates with correlated `EXISTS`, which
    stops after `limit + 1` rows. Both paths need identical ordering and cursor keys; the existing contract tests and
@@ -239,4 +289,4 @@ in the order of effect:
 2. A per-generation `threads` table maintained by ingest (thread id, newest time, count, last in/out), so the first
    page of the thread view is an index walk.
 3. A per-generation contacts aggregate maintained by ingest (address, name, received, sent, first/last).
-4. An index for `category` and one for attachment-text presence, or a bounded probe as in 1.
+4. Done (PLAN A80): the slow part was the coverage count, now on partial indexes; the predicates themselves walk.
