@@ -325,8 +325,11 @@ async fn create_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError>
                 "applies to replies only (with reply_to_message_id)",
             ));
         }
-        Some("all") => Some(ReplyRecipients::All),
-        Some(_) => Some(ReplyRecipients::Sender),
+        Some(mode) => {
+            // Like quoting, deriving copies the original's addresses into a draft the caller can read back.
+            cx.client.authorize_id(Capability::Read, &mb.account_id)?;
+            Some(if mode == "all" { ReplyRecipients::All } else { ReplyRecipients::Sender })
+        }
         None => None,
     };
     let from_arg = match opt_str(&args, "from_address")? {
