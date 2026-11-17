@@ -75,6 +75,7 @@ pub async fn run_with_log(config_path: &Path, log: Option<std::fs::File>) -> any
     crate::watch::start(app.clone());
     crate::requests::worker::start(app.clone());
     crate::push::start(app.clone());
+    crate::health::start(app.clone());
     tracing::info!(listen = %app.cfg.listen, "dove started");
     run_until_shutdown(app).await
 }

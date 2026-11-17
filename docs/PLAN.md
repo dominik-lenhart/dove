@@ -70,6 +70,9 @@ hosts or reference hardware.
      Notifications on the settings page, a push per new agent request to every device, `dove admin push
      list|remove|test` (`tests/admin_push_e2e.rs`, RFC 8291 vector in `push::ece`). Delivery to the real Apple and
      Google push services is unverified until the owner turns it on on a phone.
+   - [x] Health alerts over Web Push (design 2026-11-17, A77): every owner notification also pushes, a health watcher
+     alerts on a stalled sync (and its recovery) and on low disk space, the Health page lists mailbox sync state
+     (`tests/health_alerts_e2e.rs`).
 5. Hardening
    - [x] Fake Google server integration suite covering the automatable parts of AC1-AC21 (AC1, AC2, AC4, AC6, AC7,
      AC10, AC12, AC13, AC16, AC18 in `tests/mcp_e2e.rs`, `tests/connect_e2e.rs`; AC14, AC17, AC20 in
@@ -831,3 +834,13 @@ hosts or reference hardware.
   the overview is in scope; it caches nothing and opens only plain `/admin/...` paths. (g) A signed-out GET of an
   admin page redirects to `/admin/login?next=<path>` (letters, digits, `-`, `_` segments only), so a tapped
   notification lands on its request after signing in.
+- A77. Health alerts over Web Push (2026-11-17; design 2026-11-17 "health alerts"). (a) Every notifier event is a typed
+  `notifier::Alert` with a log/webhook message and a separate lock-screen text built in its constructor (mailbox alias
+  or connection name plus the kind of problem; the new-address alert keeps the IP in the log only). `notify_once`
+  writes the dedupe row and one `push_outbox` row per device (kind `alert`) in one transaction. (b) `health::tick`
+  runs every 5 minutes. A mailbox is stalled when indexing is on, the account is active, and the last successful sync
+  (or `enabled_at` before the first) is older than 2 hours or three polling intervals, whichever is longer, while the
+  sync is either complete or failing: a first backfill that makes progress has no `last_success_at` yet and is not
+  stalled. Recovery sends one "syncs again" alert. Mailboxes that need reconnecting are left to the reauth alert.
+  (c) Low disk: below 1 GiB free (`statvfs`, unprivileged blocks) alerts once; it clears at 2 GiB, so a value
+  hovering around the mark does not alert repeatedly. (d) No restore drill: Dove does not manage backups.

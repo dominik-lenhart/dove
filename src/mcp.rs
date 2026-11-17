@@ -248,10 +248,7 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
         tokio::spawn(async move {
             let _ = app2
                 .notifier
-                .notify_once(
-                    &format!("newip:{name}:{ipstr}"),
-                    &format!("Client '{name}' was used from a new IP address {ipstr}."),
-                )
+                .notify_once(&format!("newip:{name}:{ipstr}"), crate::notifier::Alert::new_ip(&name, &ipstr))
                 .await;
         });
     }
@@ -356,7 +353,7 @@ pub fn record_denial(app: &Arc<App>, ctx: &ClientCtx, code: ErrorCode) {
     if matches!(code, ErrorCode::NotFound | ErrorCode::Forbidden) && app.denials.record(&ctx.client_id) {
         let (app2, name) = (app.clone(), ctx.client_name.clone());
         tokio::spawn(async move {
-            app2.notifier.send(&format!("Client '{name}' had a burst of denied calls in the last minutes.")).await;
+            app2.notifier.send(crate::notifier::Alert::denial_burst(&name)).await;
         });
     }
 }

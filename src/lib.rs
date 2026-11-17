@@ -12,6 +12,7 @@ pub mod config;
 pub mod content;
 pub mod error;
 pub mod gmail;
+pub mod health;
 pub mod http;
 pub mod identity;
 pub mod imap;

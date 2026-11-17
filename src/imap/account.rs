@@ -230,9 +230,11 @@ pub async fn mark_auth_failure(app: &App, account_id: &str, generation: i64, ali
             .notifier
             .notify_once(
                 &format!("reauth:{account_id}:{generation}"),
-                &format!(
-                    "Mailbox '{alias}' rejected its password: run `dove accounts reconnect {alias}` with the current \
-                     (app) password."
+                crate::notifier::Alert::reauth(
+                    alias,
+                    &format!(
+                        "rejected its password: run `dove accounts reconnect {alias}` with the current (app) password."
+                    ),
                 ),
             )
             .await;

@@ -592,6 +592,10 @@ async fn doctor(app: &Arc<App>) -> Value {
     let (_, key) = app.index_key.current();
     let idx = crate::index::db::open(&app.cfg.index_db_path(), key, &app.cfg.index);
     add("index_encryption", idx.is_ok(), idx.err().map(|e| e.to_string()).unwrap_or_default());
+    match crate::health::disk_free(&app.cfg.data_dir) {
+        Some(free) => add("data_dir_free", free >= crate::health::LOW_DISK_BYTES, format!("{} MiB free", free >> 20)),
+        None => add("data_dir_free", true, "not measured on this platform".into()),
+    }
     let verify = app.store.call(|c| audit::verify(c)).await;
     add(
         "audit_chain",

@@ -1113,6 +1113,12 @@ A device that unsubscribes (the push service answers 404 or 410) is removed auto
 delivered within 24 hours is dropped. Push is a convenience: requests wait on the Requests page whether or not a
 notification arrived. `[requests] notify_sink` still works alongside it.
 
+The same devices get Dove's alerts: a mailbox that needs reconnecting, a connection used from a new address, a burst
+of denied calls, an IMAP draft that needs a look, a mailbox that has not synced for 2 hours (and once more when it
+syncs again), and less than 1 GiB free for Dove's data directory. Each alert is sent once until the problem is gone.
+They also go to the service log and to `[notifier] webhook_url` if set. The Health page shows the sync state of every
+mailbox and whether alerts reach a device.
+
 ## Backup and restore
 
 What the state store (`/var/lib/dove/state.db`) holds: wrapped per-mailbox keys, encrypted refresh tokens, keyed

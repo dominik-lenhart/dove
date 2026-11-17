@@ -287,7 +287,9 @@ fn lag_text(secs: i64) -> String {
 
 pub async fn health(State(app): State<Arc<App>>, Extension(s): Extension<WebSession>) -> Response {
     let r = result(run_action(&app, &s, AdminRequest::Doctor).await);
-    let body = match r {
+    let index = result(run_action(&app, &s, AdminRequest::IndexStatus { alias: None }).await);
+    let devices = result(run_action(&app, &s, AdminRequest::PushList).await);
+    let checks = match r {
         Ok(checks) => {
             if let Ok(mut h) = app.admin_ui.health.lock() {
                 *h = Some((util::now_unix(), checks.clone()));
@@ -303,11 +305,86 @@ pub async fn health(State(app): State<Arc<App>>, Extension(s): Extension<WebSess
                     label
                 )
             });
-            h!("<h1>Health</h1><div class=\"rows\">{}</div>", Markup::concat(rows))
+            h!("<div class=\"rows\">{}</div>", Markup::concat(rows))
         }
-        Err(e) => h!("<h1>Health</h1><p class=\"notice error\">{}</p>", e),
+        Err(e) => h!("<p class=\"notice error\">{}</p>", e),
     };
+    let mailboxes = match &index {
+        Ok(v) => sync_rows(v),
+        Err(e) => h!("<p class=\"notice error\">{}</p>", e),
+    };
+    let alerts = match &devices {
+        Ok(v) => {
+            let n = v.as_array().map(Vec::len).unwrap_or(0);
+            let reach = match n {
+                0 => Markup::lit(
+                    "<p><span class=\"chip wait\">No device</span> Alerts go to the log only. \
+                     <a href=\"/admin/settings#notifications\">Turn on notifications</a> on your phone.</p>",
+                ),
+                1 => Markup::lit("<p><span class=\"chip done\">1 device</span> gets alerts as notifications.</p>"),
+                n => h!("<p><span class=\"chip done\">{} devices</span> get alerts as notifications.</p>", n),
+            };
+            h!(
+                "{}<p class=\"meta\">Dove alerts you when a mailbox needs reconnecting or has not synced for 2 hours, \
+                 when the disk is almost full, when a connection is used from a new address, and after a burst of \
+                 denied calls.</p>",
+                reach
+            )
+        }
+        Err(e) => h!("<p class=\"notice error\">{}</p>", e),
+    };
+    let body = h!(
+        "<h1>Health</h1><div class=\"grid\"><section class=\"block wide\"><h2>Mailboxes</h2>{}</section>\
+         <section class=\"block wide\"><h2>Alerts</h2>{}</section>\
+         <section class=\"block wide\"><h2>Checks</h2>{}</section></div>",
+        mailboxes,
+        alerts,
+        checks
+    );
     page(&s, "Health", Nav::Overview, body)
+}
+
+/// One row per mailbox on the health page: whether it can be used, how fresh its index is, and what failed last.
+fn sync_rows(v: &Value) -> Markup {
+    let accounts: Vec<&Value> = v["accounts"].as_array().map(|a| a.iter().collect()).unwrap_or_default();
+    if accounts.is_empty() {
+        return Markup::lit("<p class=\"empty\">No mailboxes are connected.</p>");
+    }
+    let rows = accounts.iter().map(|a| {
+        let alias = text(&a["account"]);
+        let lag = a["lag_seconds"].as_i64();
+        let (chip, label) = match (text(&a["account_status"]).as_str(), text(&a["stage"]).as_str()) {
+            ("reauth_required", _) => ("bad", "Reconnect"),
+            ("disabled", _) => ("quiet", "Off"),
+            (_, "disabled") => ("quiet", "Not indexed"),
+            _ if lag.is_some_and(|l| l > crate::health::STALL_SECS) => ("bad", "Not syncing"),
+            _ if a["last_error"].is_string() => ("wait", "Retrying"),
+            (_, "ready") => ("done", "Up to date"),
+            _ => ("wait", "Indexing"),
+        };
+        let mut detail = Vec::new();
+        if let Some(l) = lag {
+            detail.push(lag_text(l).trim_start_matches(", ").to_string());
+        }
+        if let Some(n) = a["retry_pending"].as_i64().filter(|n| *n > 0) {
+            detail.push(format!("{n} messages to retry"));
+        }
+        if let Some(e) = a["last_error"].as_str() {
+            let e: String = e.chars().take(120).collect();
+            detail.push(format!("last error: {e}"));
+        }
+        h!(
+            "<a class=\"row\" href=\"/admin/mailboxes/{}\"><span class=\"row-main\"><strong>{}</strong>\
+             <span class=\"detail\">{}</span></span><span class=\"row-meta\"><span class=\"chip {}\">{}</span>\
+             </span></a>",
+            alias.clone(),
+            alias,
+            detail.join(" · "),
+            chip,
+            label
+        )
+    });
+    h!("<div class=\"rows\">{}</div>", Markup::concat(rows))
 }
 
 // ------------------------------------------------------------------ Requests
