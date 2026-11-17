@@ -264,7 +264,8 @@ async fn failed_message_is_recorded_and_retried() {
     assert_eq!(status(h).await["stage"], "ready");
     assert_eq!(status(h).await["retry_pending"], 1);
     // The gap is reported: partial coverage, and require_complete refuses.
-    let v = search(&fx, json!({"select": ["subject"]})).await;
+    let (before, v) = (dove::util::now_unix(), search(&fx, json!({"select": ["subject"]})).await);
+    let after = dove::util::now_unix();
     assert_eq!(v["coverage"], "partial");
     assert_eq!(v["exceptions"][0]["reason"], "messages pending retry");
     assert_eq!(h.err(&fx.token, "search_messages", json!({"count_only": true})).await, "index_incomplete");
@@ -288,7 +289,8 @@ async fn failed_message_is_recorded_and_retried() {
     let expected = attempt_at.max(run_at);
     assert_eq!(ex["next_retry_at"], dove::util::rfc3339(expected), "{ex}");
     let secs = ex["retry_after_seconds"].as_i64().unwrap();
-    assert!((expected - dove::util::now_unix() - 2..=expected - dove::util::now_unix()).contains(&secs), "{ex}");
+    // Computed while the search ran: between the clock before and after it (a slow runner crosses seconds).
+    assert!((expected - after..=expected - before).contains(&secs), "{ex}");
     // Both orders of the two times are covered: a record due far later than the next pass, and one due sooner.
     for (attempt, run) in [(run_at + 5000, run_at), (run_at - 25, run_at)] {
         h.app()
