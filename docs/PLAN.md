@@ -909,6 +909,35 @@ hosts or reference hardware.
   message row, the mailbox comes from `addrs.gen`. The candidate scans name their covering indexes (`INDEXED BY`):
   with five mailboxes the planner read the name branch through `addrs_addr` and fetched every row. (c) Still open:
   `count_only` counts every match.
+- A82. Agent features package (2026-11-17): reply recipients, page aliases, `create_label`, recipient rules for
+  direct sends. (a) `create_draft` derives recipients only when asked (`reply_recipients: "sender" | "all"`, replies
+  only, needs `read` like quoting): To is the original's Reply-To, else From, or its To when the mailbox sent it (own
+  From or `SENT` label); "all" adds its To and Cc as Cc. Own addresses (account address, Gmail send-as list or IMAP
+  aliases, any case) and duplicates are dropped; explicit `to`/`cc`/`bcc` win over derived places; the 50-recipient
+  cap counts both; the argument is part of the idempotency hash. Display names from the original are kept only as
+  one clean header line. (b) `cursor` and `page_token` are one argument in every paged tool (`search_messages`,
+  `digest`, `list_watch_events`, `list_drafts`, and search items in `batch_read`, normalized in `parse_items` so the
+  row budget sees the same cursor): `lenient::page_alias` renames to the tool's own name; the same value under both
+  names is accepted, two different values are `invalid_argument` on the alias. Output names stay. (c) `create_label`
+  (`organize`, one unit of `client_organize_per_hour`, refunded only for definitive failures): Gmail `POST labels`
+  on the gateway allowlist (needs `gmail.modify`; a definitive refusal re-lists and returns a label that appeared
+  meanwhile), IMAP `CREATE` of an `imap::NewFolder` (levels split at `/`, modified UTF-7, joined with the server's
+  delimiter; empty levels, `*`/`%`, leading `\`, padded levels, a level containing the server delimiter, nesting
+  without hierarchy and `INBOX` are refused). Gmail over IMAP is refused in the tool and again in the session (a
+  folder there is a label; Dove leaves label creation to Gmail). An existing name (Gmail: any case; IMAP: ASCII case)
+  is returned with `created: false`; IMAP records the listing like `list_labels`, so `move_messages` works at once.
+  System names (INBOX, SENT, TRASH, SPAM, DRAFT(S), STARRED, UNREAD, IMPORTANT, CHAT, OUTBOX, `CATEGORY_*`) are
+  refused. (d) Recipient rules (`account_send_policy`, store migration `V_SEND_POLICY`): `allow_domains` (exact or subdomain,
+  lowercased ASCII with at least one dot) and `unknown_recipients: allow | refuse`. Checked in `send_core` for
+  `SendAuth::Grant` only, on To/Cc/Bcc of the draft as the server has it (Gmail: the fresh `drafts.get`; IMAP: the
+  envelope recipients), before `cx.commit()`, the send budget, the claim and any write. "Exchanged mail" = the
+  published generation (`active_gen`; a partial first backfill does not count) has an `addrs` row from the address,
+  or to/cc/bcc on a `SENT` message; no published generation or a failed index read is `recipients_unverified` (fail
+  closed). Domain failures are reported first. Errors are `forbidden` with `details {reason, count}` and point at
+  `request_send`; approved sends (`SendAuth::Approved`) are never checked, the owner saw the recipients. From headers
+  can be forged, so `refuse` narrows but `allow_domains` is the hard limit. An open policy deletes the row. Setting
+  needs step-up in the admin UI (loosening widens what an agent may send); audit rows carry `domains:<n>` and
+  `unknown:<mode>`, never domains. `list_accounts` shows `send_policy` for mailboxes the connection may send from.
 - A83. Admin app hardening (2026-11-17, review of the PWA). (a) Step-up also covers what changes mail under the
   owner's name or weakens a protection: adding a send-as address, setting a signature or a default signature,
   turning secret redaction off (on stays a plain write) and registering a push device (a device sees every request).

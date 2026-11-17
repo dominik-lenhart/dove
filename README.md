@@ -230,7 +230,9 @@ Grants are per token and per mailbox. Presets cover the usual cases, and you can
   one need it granted explicitly, and every change alerts the owner.
 - **`send`** is in no preset. It needs an explicit grant on one mailbox *and* `allow_send = true` in the server
   configuration. It only sends drafts Dove created and nobody changed, never with recipients or content of its own,
-  and never twice after an unknown outcome.
+  and never twice after an unknown outcome. Per mailbox you can also restrict whom an agent may send to on its own
+  (`dove accounts send-policy set <mailbox> --allow-domain example.org --unknown-recipients refuse`, or "Sending
+  rules" in the admin UI); refused sends point the agent at `request_send`.
 
 Presets are expanded when the token is created, so a later change to a preset never widens an existing token.
 

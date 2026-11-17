@@ -7,6 +7,15 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 
 ### Added
 
+- `create_label` creates a Gmail label or an IMAP folder (nested with `/`), so agents can file mail into new labels
+  without the owner doing it first. An existing label is returned instead of a duplicate. Needs `organize` and counts
+  against the hourly organize budget; Gmail mailboxes connected over IMAP still create labels in Gmail.
+- `create_draft` can fill in reply recipients: `reply_recipients: "sender"` answers the sender (or the Reply-To, or
+  the recipients of your own sent mail), `"all"` also copies everyone else. Your own addresses are left out.
+- Sending rules per mailbox: allow only certain recipient domains, and optionally only people the mailbox has already
+  exchanged mail with. They apply when an agent sends on its own; sends you approve are not affected. Set them with
+  `dove accounts send-policy set` or in the admin UI under "Sending rules" (confirmed with your passkey). Agents see
+  the rules in `list_accounts` and are pointed to `request_send` when a recipient is refused.
 - Admin app: dark mode that follows the system setting, an offline page when the server cannot be reached, the
   number of open requests as the app icon badge, and Requests and Settings shortcuts on the app icon.
 - Admin app: a notice when this device no longer gets notifications (iOS can drop them silently) or when no device
@@ -15,6 +24,7 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 
 ### Changed
 
+- Every paged tool accepts both `cursor` and `page_token` for the next page.
 - Admin app: opening a request from a notification needs one Face ID or passkey prompt instead of two. The sign-in
   also confirms the approval of that one request for two minutes; everything else still asks again.
 - Admin app: adding a send-as address, setting or choosing a signature, turning secret redaction off and turning
