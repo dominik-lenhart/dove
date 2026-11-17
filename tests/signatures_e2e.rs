@@ -597,6 +597,12 @@ async fn agent_changes_alert_the_owner_and_the_audit_holds_no_content() {
     f.h.ok(&f.writer, "set_signature", json!({ "account": "box", "name": "x", "make_default": true })).await;
     let n = f.h.app().notifier.sent.lock().unwrap().iter().filter(|m| m.contains("signature")).count();
     assert_eq!(n, 5 + 2 + 2, "two reverts, one create, one default change; the repeated default stays quiet");
+    // With no mailbox default left, an otherwise identical call that makes `x` the default again alerts too.
+    f.h.admin(AdminRequest::AccountsSignatureDefault { account: "box".into(), alias: None, name: None }).await.unwrap();
+    let r = f.h.ok(&f.writer, "set_signature", json!({ "account": "box", "name": "x", "text": "x" })).await;
+    assert_eq!(r["became_default"], true);
+    let n = f.h.app().notifier.sent.lock().unwrap().iter().filter(|m| m.contains("signature")).count();
+    assert_eq!(n, 10);
     f.h.ok(&f.drafter, "create_draft", create("box")).await;
     let hits: i64 =
         f.h.app()

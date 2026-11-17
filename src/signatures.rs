@@ -118,8 +118,9 @@ fn clip(s: &str) -> String {
 
 /// Elements kept (with their allowed attributes).
 const KEEP: &[&str] = &[
-    "a", "b", "br", "div", "em", "font", "hr", "i", "img", "p", "small", "span", "strong", "table", "tbody", "td",
-    "th", "thead", "tr", "u", "center", "sup", "sub",
+    // No `small`, `sub`, `sup` or `big`: nested, they change the text size without a style rule to check.
+    "a", "b", "br", "div", "em", "font", "hr", "i", "img", "p", "span", "strong", "table", "tbody", "td", "th", "thead",
+    "tr", "u", "center",
 ];
 /// Elements dropped together with their content.
 const DROP: &[&str] = &[
@@ -141,20 +142,19 @@ const ATTRS: &[&str] = &[
     "role",
     "alt",
     "title",
+    // `color` (on `font`) passes the same check as the CSS colour; `bgcolor` and `size` are dropped.
     "color",
-    "bgcolor",
     "dir",
     "face",
-    "size",
     "colspan",
     "rowspan",
 ];
 
-/// CSS properties a signature may set. Nothing that hides or moves content (`display`, `visibility`, `opacity`,
-/// `position`, `overflow`, `max-height`, `text-indent`, ...): the plain-text version must show everything the HTML shows.
+/// CSS properties a signature may set, each with its own value rule ([`css_value_ok`]). Nothing that hides or moves
+/// content (`display`, `visibility`, `opacity`, `position`, `overflow`, `text-indent`, backgrounds, ...): the plain-text
+/// version must show everything the HTML shows.
 const CSS: &[&str] = &[
     "color",
-    "background-color",
     "font-family",
     "font-size",
     "font-weight",
@@ -188,25 +188,121 @@ const CSS: &[&str] = &[
     "height",
 ];
 
-/// A readable font size: at least 9px, 7pt, 0.6em/rem or 60%, or a keyword from `x-small` up.
-fn readable_font_size(v: &str) -> bool {
-    if ["x-small", "small", "medium", "large", "x-large", "xx-large", "inherit"].contains(&v) {
-        return true;
-    }
-    let split = v.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(v.len());
+/// A number with a unit, e.g. `13px` -> (13.0, "px").
+fn number_unit(v: &str) -> Option<(f64, &str)> {
+    let split = v.find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-')).unwrap_or(v.len());
     let (num, unit) = v.split_at(split);
-    let Ok(n) = num.parse::<f64>() else { return false };
-    match unit {
-        "px" => n >= 9.0,
-        "pt" => n >= 7.0,
-        "em" | "rem" => n >= 0.6,
-        "%" => n >= 60.0,
-        _ => false,
+    num.parse::<f64>().ok().filter(|n| n.is_finite()).map(|n| (n, unit))
+}
+
+/// Named colours a signature may use (all dark enough to read on white).
+const NAMED_COLORS: &[(&str, (u8, u8, u8))] = &[
+    ("black", (0, 0, 0)),
+    ("gray", (128, 128, 128)),
+    ("grey", (128, 128, 128)),
+    ("dimgray", (105, 105, 105)),
+    ("darkgray", (169, 169, 169)),
+    ("navy", (0, 0, 128)),
+    ("blue", (0, 0, 255)),
+    ("red", (255, 0, 0)),
+    ("maroon", (128, 0, 0)),
+    ("green", (0, 128, 0)),
+    ("darkgreen", (0, 100, 0)),
+    ("purple", (128, 0, 128)),
+    ("teal", (0, 128, 128)),
+    ("olive", (128, 128, 0)),
+];
+
+/// An opaque colour: `#rgb`, `#rrggbb`, `rgb(r, g, b)` or a name from [`NAMED_COLORS`]. Anything with an alpha part
+/// (`#rgba`, `rgba()`, `/`), `hsl()`, `transparent` or `currentcolor` is None.
+fn opaque_color(v: &str) -> Option<(u8, u8, u8)> {
+    let v = v.trim();
+    if let Some(hex) = v.strip_prefix('#') {
+        let d = |s: &str| u8::from_str_radix(s, 16).ok();
+        return match hex.len() {
+            3 if hex.is_ascii() => {
+                let c = |i: usize| d(&hex[i..i + 1]).map(|x| x * 17);
+                Some((c(0)?, c(1)?, c(2)?))
+            }
+            6 if hex.is_ascii() => Some((d(&hex[0..2])?, d(&hex[2..4])?, d(&hex[4..6])?)),
+            _ => None,
+        };
+    }
+    if let Some(inner) = v.strip_prefix("rgb(").and_then(|r| r.strip_suffix(')')) {
+        let parts: Vec<u8> = inner.split(',').map(|p| p.trim().parse::<u8>()).collect::<Result<_, _>>().ok()?;
+        return match parts[..] {
+            [r, g, b] => Some((r, g, b)),
+            _ => None,
+        };
+    }
+    NAMED_COLORS.iter().find(|(n, _)| *n == v).map(|(_, c)| *c)
+}
+
+/// A text colour readable on white: opaque, with a WCAG contrast ratio of at least 1.8 (light grey passes, white,
+/// near-white and anything see-through do not). Signatures set no background, so white is what mail clients show.
+fn readable_color(v: &str) -> bool {
+    let Some((r, g, b)) = opaque_color(v) else { return false };
+    let lin = |c: u8| {
+        let c = f64::from(c) / 255.0;
+        if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+    };
+    let l = 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b);
+    1.05 / (l + 0.05) >= 1.8
+}
+
+/// Whether `value` is allowed for `prop` (both lowercased and trimmed).
+fn css_value_ok(prop: &str, value: &str) -> bool {
+    let tokens = || value.split_whitespace();
+    // Non-negative lengths up to `max` px (or 0, or `auto`).
+    let length = |t: &str, max: f64| {
+        t == "0"
+            || t == "auto"
+            || number_unit(t).is_some_and(|(n, u)| {
+                (0.0..=max).contains(&n)
+                    && matches!(u, "px" | "pt" | "%" | "em" | "")
+                    && (!u.is_empty() || n == 0.0)
+                    && (u != "%" || n <= 100.0)
+                    && (u != "em" || n <= max / 16.0)
+            })
+    };
+    match prop {
+        "color" => readable_color(value),
+        // Absolute sizes only, so nesting cannot shrink text.
+        "font-size" => number_unit(value).is_some_and(|(n, u)| match u {
+            "px" => (9.0..=72.0).contains(&n),
+            "pt" => (7.0..=54.0).contains(&n),
+            _ => false,
+        }),
+        "vertical-align" => {
+            ["baseline", "top", "middle", "bottom", "text-top", "text-bottom"].contains(&value)
+                || number_unit(value).is_some_and(|(n, u)| u == "px" && (-10.0..=10.0).contains(&n))
+        }
+        "line-height" => {
+            value == "normal"
+                || number_unit(value).is_some_and(|(n, u)| match u {
+                    "" => (0.8..=3.0).contains(&n),
+                    "px" => (9.0..=80.0).contains(&n),
+                    "%" => (80.0..=300.0).contains(&n),
+                    _ => false,
+                })
+        }
+        "letter-spacing" => {
+            value == "normal" || number_unit(value).is_some_and(|(n, u)| u == "px" && (0.0..=5.0).contains(&n))
+        }
+        p if p.starts_with("margin") || p.starts_with("padding") => {
+            let n = tokens().count();
+            (1..=4).contains(&n) && tokens().all(|t| length(t, 60.0))
+        }
+        "width" | "max-width" | "min-width" | "height" => length(value, 1200.0),
+        // Borders cannot hide text; their colour may be anything opaque, so only references and tricks are refused.
+        _ => !value
+            .char_indices()
+            .any(|(i, c)| c == '-' && value[i + 1..].starts_with(|n: char| n.is_ascii_digit() || n == '.')),
     }
 }
 
 /// Keeps the allowed declarations of a `style` value (None when nothing is left). Values never reference anything
-/// (`url(`, `expression`, `@import`, escapes), never go negative (no pulling text out of view) and colors are opaque.
+/// (`url(`, `expression`, `@import`, escapes, `var(`, `calc(`) and pass the rule of their property.
 fn clean_style(v: &str) -> Option<String> {
     let mut kept = Vec::new();
     for decl in v.split(';') {
@@ -228,16 +324,11 @@ fn clean_style(v: &str) -> Option<String> {
             ">",
             "var(",
             "calc(",
+            "!",
         ]
         .iter()
         .any(|b| value.contains(b));
-        let negative = value
-            .char_indices()
-            .any(|(i, c)| c == '-' && value[i + 1..].starts_with(|n: char| n.is_ascii_digit() || n == '.'));
-        let see_through = ["transparent", "rgba(", "hsla(", "#0000"].iter().any(|t| value.contains(t))
-            || (value.starts_with('#') && matches!(value.len(), 5 | 9));
-        let size_ok = prop != "font-size" || readable_font_size(&value);
-        if !bad && !negative && !see_through && size_ok {
+        if !bad && css_value_ok(&prop, &value) {
             kept.push(format!("{prop}:{value}"));
         }
     }
@@ -329,6 +420,7 @@ pub fn clean_html(raw: &str, cids: &BTreeSet<String>) -> anyhow::Result<(String,
                     }
                     false
                 }
+                "color" => readable_color(&v.trim().to_ascii_lowercase()),
                 a => ATTRS.contains(&a),
             };
             if keep {
@@ -406,10 +498,14 @@ pub fn text_from_html(html: &str) -> anyhow::Result<String> {
         if name == "a"
             && let Some(href) = el.value().attr("href")
         {
-            let shown = el.text().collect::<String>().to_lowercase();
+            // Compared without spaces and separators, so "+49 176 1234" shows tel:+491761234.
+            let squash = |t: &str| {
+                t.chars().filter(|c| !c.is_whitespace() && !"-()/.".contains(*c)).collect::<String>().to_lowercase()
+            };
+            let shown = el.text().collect::<String>();
             let bare = href.trim().trim_start_matches("mailto:").trim_start_matches("tel:");
             let core = bare.trim_start_matches("https://").trim_start_matches("http://").trim_end_matches('/');
-            if !shown.trim().is_empty() && !shown.contains(&core.to_lowercase()) {
+            if !shown.trim().is_empty() && !squash(&shown).contains(&squash(core)) {
                 stack.push(Ev::Push(format!(" <{bare}>")));
             }
         }
@@ -551,7 +647,7 @@ pub fn set(tx: &Transaction, mailbox: &str, c: Change, actor: &str) -> anyhow::R
         let mut new: Vec<&Image> = images.iter().collect();
         new.sort_by(|a, b| a.cid.cmp(&b.cid));
         e.text != text || e.html != html || e.images.iter().collect::<Vec<_>>() != new
-    });
+    }) || became_default;
     Ok(json!({
         "account": mailbox, "name": c.name, "created": existing.is_none(), "changed": changed, "has_html": html.is_some(),
         "text_bytes": text.len(), "images": images.iter().map(|i| &i.cid).collect::<Vec<_>>(),
@@ -758,6 +854,23 @@ mod tests {
             "width:calc(0px)",
             "background-color:var(--x)",
             "font-family:x;background:url(https://e.vil/p)",
+            "color:#fff",
+            "color:#fefefe",
+            "color:white",
+            "color:rgb(255,255,255)",
+            "color:rgb(0 0 0 / 0)",
+            "color:hsl(0,0%,0%)",
+            "color:currentcolor",
+            "background-color:#000",
+            "font-size:1em",
+            "font-size:100%",
+            "font-size:8px",
+            "letter-spacing:-3px",
+            "line-height:0",
+            "vertical-align:-500px",
+            "padding:9999px",
+            "margin:0 0 0 -50px",
+            "color:#000 !important",
         ] {
             let kept = style(hidden).unwrap_or_default();
             let expected = if hidden.starts_with("font-family") { "font-family:x" } else { "" };
@@ -766,6 +879,16 @@ mod tests {
         // An element whose whole style is dropped loses the attribute.
         let (out, _) = clean_html("<span style=\"display:none\">geheim</span>", &BTreeSet::new()).unwrap();
         assert_eq!(out, "<span>geheim</span>");
+        // The legacy attributes and tags follow the same rules; the template's styles all pass.
+        let (out, _) = clean_html(
+            "<font color=\"#ffffff\" size=\"1\" bgcolor=\"#fff\">a</font><font color=\"#17171A\">b</font>\
+             <small><small>c</small></small><sup>d</sup>",
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        assert_eq!(out, "<font>a</font><font color=\"#17171A\">b</font>cd");
+        let kept = "color:#b0b0b8;font-size:11px;vertical-align:-4px;padding-top:14px;line-height:1.5";
+        assert_eq!(style(kept).as_deref(), Some(kept));
     }
 
     #[test]
@@ -806,6 +929,8 @@ mod tests {
             t,
             "Dominik Lenhart\nKontakt <https://keyset.cloud/kontakt> | dominik@keyset.cloud | Tel. <+4930123>"
         );
+        let t = text_from_html("<a href=\"tel:+4917663236211\">+49 176 63236211</a>").unwrap();
+        assert_eq!(t, "+49 176 63236211");
     }
 
     #[test]

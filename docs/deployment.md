@@ -692,9 +692,9 @@ dove accounts signatures delete work gastgeber
 
 The HTML references its images as `cid:<name>` (the name after `--image`); every image must be used and every `cid:`
 must have an image. Dove cleans the HTML to a safe subset before storing it: layout tags (tables, `div`, `p`, `span`,
-`b`, `i`, `a`, `img`, `br`, ...), inline `style` limited to colours, fonts (at least 9px), spacing, borders and sizes
-(nothing that hides or moves text: no `display`, `visibility`, `opacity`, `position`, negative values or transparent
-colours), links only to `https:`, `http:`,
+`b`, `i`, `a`, `img`, `br`, ...), inline `style` limited to text colours that are opaque and readable on white, fonts in px or pt (at least 9px), bounded
+spacing, borders and sizes (nothing that hides or moves text: no backgrounds, `display`, `visibility`, `opacity`,
+`position`, negative offsets or transparent colours; `small`, `sub`, `sup`, `bgcolor` and `size` are dropped), links only to `https:`, `http:`,
 `mailto:` and `tel:`, images only `cid:` or `https:`; scripts, forms, iframes, event handlers and comments are dropped.
 Without `--text` the plain text is derived from the HTML: one line per line break, paragraph or cell, images left out.
 The first signature of a mailbox becomes its default. `dove accounts signature set|show` (singular, from 0.6) still
