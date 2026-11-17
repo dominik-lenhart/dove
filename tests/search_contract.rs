@@ -1339,3 +1339,167 @@ async fn page_strategies_return_identical_pages() {
     spam["include_spam_trash"] = json!(true);
     assert_eq!(choose(spam, 1000, 2).await.0, Strategy::Planner);
 }
+
+/// Thread walk (PLAN A81): the newest-first walk returns the same threads, columns and cursor keys as the aggregate
+/// query on every page, including threads that share their newest time, spam inside threads, replies from the
+/// mailbox itself and `awaiting_reply`.
+#[tokio::test]
+async fn thread_walk_matches_the_aggregate_query() {
+    use query::Strategy;
+    let h = Harness::start().await;
+    let mut accounts = HashMap::new();
+    for (alias, email) in [("info", "info@acme.test"), ("billing", "billing@acme.test")] {
+        accounts.insert(alias, h.mailbox(alias, email));
+    }
+    // Deterministic corpus: 40 threads per mailbox, 1 to 4 messages each, newest times often shared.
+    let mut seed: u64 = 7;
+    let mut next = move |n: u64| {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (seed >> 33) % n
+    };
+    let base = at("2026-10-01T00:00:00Z");
+    let words = ["alpha", "bravo", "charlie", "delta"];
+    for (alias, email) in [("info", "info@acme.test"), ("billing", "billing@acme.test")] {
+        for t in 0..40u64 {
+            let tid = format!("{alias}-t{t:02}");
+            let msgs = 1 + next(4);
+            for k in 0..msgs {
+                // Slots of 10 minutes; few slots, so different threads often share a time.
+                let when = base + (next(25) as i64) * 600_000 + (k as i64) * 3_600_000;
+                let own = next(3) == 0;
+                let mut labels = vec![if own { "SENT" } else { "INBOX" }.to_string()];
+                if next(5) == 0 {
+                    labels = vec!["SPAM".into()];
+                }
+                if next(4) == 0 {
+                    labels.push("UNREAD".into());
+                }
+                let from = if own { email.to_string() } else { format!("p{}@example.com", next(6)) };
+                let to = if own { "x@example.com".to_string() } else { email.to_string() };
+                let mut spec = m(
+                    &from,
+                    &[to.as_str()],
+                    &format!("Topic {t}"),
+                    words[next(4) as usize],
+                    "2026-10-01T00:00:00Z",
+                    &[],
+                );
+                spec.labels = labels;
+                spec.internal_date_ms = when;
+                spec.thread_id = Some(tid.clone());
+                h.google.add_message(email, spec);
+            }
+        }
+    }
+    let mut targets = vec![];
+    for alias in ["info", "billing"] {
+        h.admin(AdminRequest::IndexEnable { alias: alias.into() }).await.unwrap();
+        let r = sync_account(h.app(), &accounts[alias]).await.unwrap();
+        assert_eq!(r.stage, "ready", "{alias}: {r:?}");
+        let aid = accounts[alias].clone();
+        let st = h.app().index.write(move |c| Ok(load_state(c, &aid)?.unwrap())).await.unwrap();
+        targets.push(Target {
+            account_id: accounts[alias].clone(),
+            alias: alias.into(),
+            gen_id: st.serving_gen().unwrap(),
+            att_fts: true,
+        });
+    }
+    let select = json!([
+        "thread_id",
+        "subject",
+        "message_count",
+        "matched_count",
+        "last_sender_is_self",
+        "last_inbound_at",
+        "last_outbound_at",
+        "awaiting_reply",
+        "received_at"
+    ]);
+    let filters = vec![
+        Value::Null,
+        pred("label", "eq", json!("INBOX")),
+        pred("text", "terms", json!("alpha")),
+        pred("is_unread", "eq", json!(true)),
+        json!({"all": [pred("label", "eq", json!("INBOX")), pred("text", "terms", json!("bravo"))]}),
+        pred("from_self", "eq", json!(true)),
+    ];
+    let mut threads_seen = 0;
+    for filter in &filters {
+        for awaiting in [Value::Null, json!(true), json!(false)] {
+            for limit in [1, 3, 7] {
+                for n in [1, 2] {
+                    let mut args = json!({"group_by": "thread", "select": select, "limit": limit});
+                    if !filter.is_null() {
+                        args["where"] = filter.clone();
+                    }
+                    if !awaiting.is_null() {
+                        args["awaiting_reply"] = awaiting.clone();
+                    }
+                    let req = dove::tools::search::parse_index_req(&args).unwrap();
+                    let tg: Vec<Target> = targets[..n].to_vec();
+                    let pages = h
+                        .app()
+                        .index
+                        .read(Instant::now() + Duration::from_secs(20), move |c| {
+                            let (known, selves) = (HashMap::new(), self_sets(&tg));
+                            let scope = Scope { targets: &tg, known: &known, selves: &selves };
+                            let mut all = vec![];
+                            for s in [Strategy::Planner, Strategy::Walk] {
+                                let mut rows = vec![];
+                                let mut after = vec![];
+                                loop {
+                                    let (page, more) = query::run_page_with(c, &req, &scope, &after, s)?;
+                                    rows.extend(page.iter().map(|r| (r.key.clone(), Value::Object(r.values.clone()))));
+                                    if !more {
+                                        break;
+                                    }
+                                    after = page.last().unwrap().key.clone();
+                                }
+                                all.push(rows);
+                            }
+                            Ok(all)
+                        })
+                        .await
+                        .unwrap();
+                    assert_eq!(pages[1], pages[0], "walk differs for {args} over {n} mailbox(es)");
+                    threads_seen += pages[0].len();
+                }
+            }
+        }
+    }
+    assert!(threads_seen > 500, "the cases return threads: {threads_seen}");
+
+    // The walk gives up after its budget (the caller then runs the aggregate query), and the probe sends small
+    // filters and oldest-first pages to the aggregate query.
+    let tg = targets.clone();
+    h.app()
+        .index
+        .read(Instant::now() + Duration::from_secs(5), move |c| {
+            let (known, selves) = (HashMap::new(), self_sets(&tg));
+            let scope = Scope { targets: &tg, known: &known, selves: &selves };
+            let req = |a: Value| dove::tools::search::parse_index_req(&a).unwrap();
+            let all = req(json!({"group_by": "thread", "limit": 5}));
+            assert!(query::walk_thread_heads(c, &all, &scope, &[], 3)?.is_none());
+            assert_eq!(query::walk_thread_heads(c, &all, &scope, &[], 1000)?.unwrap().len(), 6);
+            assert_eq!(query::choose_strategy(c, &all, &scope, 1000)?, Strategy::Walk);
+            let inbox = req(json!({"group_by": "thread", "where": pred("label", "eq", json!("INBOX"))}));
+            assert_eq!(query::choose_strategy(c, &inbox, &scope, 1000)?, Strategy::Planner);
+            assert_eq!(query::choose_strategy(c, &inbox, &scope, 3)?, Strategy::Walk);
+            // A batch is found through `messages_thread`, never through the filter's (large) id lists.
+            // (A large batch with an address filter: by its statistics the planner would rather start from the address.)
+            let ids: Vec<String> = (0..500).map(|i| format!("info-t{i:02}")).collect();
+            let from = req(json!({"group_by": "thread", "where": pred("from", "eq", json!("p1@example.com"))}));
+            let plan = query::explain_thread_batch(c, &from, &scope, &ids)?;
+            assert!(
+                plan.iter().any(|l| l.starts_with("SEARCH m USING INDEX messages_thread (thread_id=?")),
+                "{plan:?}"
+            );
+            assert!(!plan.iter().any(|l| l.contains("SEARCH m USING INTEGER PRIMARY KEY")), "{plan:?}");
+            let asc = req(json!({"group_by": "thread", "order_by": [{"field": "received_at", "dir": "asc"}]}));
+            assert_eq!(query::choose_strategy(c, &asc, &scope, 1000)?, Strategy::Planner);
+            Ok(())
+        })
+        .await
+        .unwrap();
+}

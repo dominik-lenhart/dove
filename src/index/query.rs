@@ -1362,19 +1362,35 @@ fn conjuncts<'a>(e: &'a Expr, top: bool, seen: &mut usize, out: &mut Vec<(usize,
 
 /// Picks the strategy of a page query. The probe counts index entries only (`addrs`, `labels`, `atts`, FTS
 /// doclists), at most `probe_limit + 1` per predicate ([`PROBE_LIMIT`] in production), and never reads message rows.
+/// For the thread view (newest threads first) `Walk` means [`walk_thread_heads`]; every other answer keeps the
+/// aggregate query, which is cheap when an indexed predicate is small.
 pub fn choose_strategy(
     conn: &Connection,
     req: &SearchReq,
     scope: &Scope<'_>,
     probe_limit: i64,
 ) -> anyhow::Result<Strategy> {
-    if req.group_by_thread
-        || req.include_spam_trash
-        || scope.targets.is_empty()
-        || req.order.first().is_none_or(|(f, _)| *f != OrderField::ReceivedAt)
-    {
+    if req.include_spam_trash || scope.targets.is_empty() {
         return Ok(Strategy::Planner);
     }
+    if req.group_by_thread {
+        if req.order.first().is_some_and(|(_, d)| *d == Dir::Asc) {
+            return Ok(Strategy::Planner);
+        }
+        return Ok(match probe(conn, req, scope, probe_limit)? {
+            Strategy::Walk => Strategy::Walk,
+            _ => Strategy::Planner,
+        });
+    }
+    if req.order.first().is_none_or(|(f, _)| *f != OrderField::ReceivedAt) {
+        return Ok(Strategy::Planner);
+    }
+    probe(conn, req, scope, probe_limit)
+}
+
+/// The bounded count of each top-level indexed predicate: `Driven` for the first within `probe_limit`, `Planner`
+/// for ids or a predicate that compiles to `0`, else `Walk`.
+fn probe(conn: &Connection, req: &SearchReq, scope: &Scope<'_>, probe_limit: i64) -> anyhow::Result<Strategy> {
     let mut preds = vec![];
     if let Some(f) = &req.filter {
         conjuncts(f, true, &mut 0, &mut preds);
@@ -1477,7 +1493,7 @@ pub fn page_sql(
 
 pub fn count_sql(req: &SearchReq, scope: &Scope<'_>) -> Result<(String, Vec<SqlValue>), ToolError> {
     if req.group_by_thread {
-        let mut q = threads_cte(req, scope)?;
+        let mut q = threads_cte(req, scope, None)?;
         q.s(" SELECT count(*) FROM th");
         reply_filter(&mut q, req);
         return Ok((q.text, q.params));
@@ -1503,8 +1519,14 @@ fn thread_terms(order: &[(OrderField, Dir)]) -> Vec<(&'static str, Dir)> {
 /// * `th`: per thread the message count, latest time, latest non-draft time from self (`last_out`) and not from
 ///   self (`last_in`). The status therefore does not depend on the filter: a reply filed under `SENT` counts even when
 ///   the filter asks for `INBOX`.
-fn threads_cte(req: &SearchReq, scope: &Scope<'_>) -> Result<Sql, ToolError> {
-    let w = where_clause(req, scope, None)?;
+///
+/// `only` restricts `hit` to these thread ids (the thread walk resolves its candidates in batches): every id lookup
+/// of the filter becomes a per-row test so the `messages_thread` index drives.
+fn threads_cte(req: &SearchReq, scope: &Scope<'_>, only: Option<&[String]>) -> Result<Sql, ToolError> {
+    let mut w = where_clause(req, scope, only.map(|_| Strategy::Driven(usize::MAX)))?;
+    if let Some(ids) = only {
+        w.s(" AND m.thread_id IN ").list(ids.iter().map(|t| SqlValue::Text(t.clone())));
+    }
     let mut q = Sql {
         text: "WITH hit AS (SELECT m.gen AS gen, m.account_id AS account_id, m.thread_id AS thread_id, \
                count(*) AS matched FROM messages m WHERE "
@@ -1544,7 +1566,7 @@ pub fn thread_page_sql(
     after: &[KeyValue],
 ) -> Result<(String, Vec<SqlValue>), ToolError> {
     let terms = thread_terms(&req.order);
-    let mut q = threads_cte(req, scope)?;
+    let mut q = threads_cte(req, scope, None)?;
     q.s(" SELECT gen, account_id, thread_id, matched, n, last_at, last_out, last_in FROM th");
     reply_filter(&mut q, req);
     if !after.is_empty() {
@@ -1630,9 +1652,6 @@ pub fn run_page(
     scope: &Scope<'_>,
     after: &[KeyValue],
 ) -> anyhow::Result<(Vec<Row>, bool)> {
-    if req.group_by_thread {
-        return run_thread_page(conn, req, scope, after);
-    }
     let strategy = choose_strategy(conn, req, scope, PROBE_LIMIT)?;
     run_page_with(conn, req, scope, after, strategy)
 }
@@ -1646,7 +1665,7 @@ pub fn run_page_with(
     strategy: Strategy,
 ) -> anyhow::Result<(Vec<Row>, bool)> {
     if req.group_by_thread {
-        return run_thread_page(conn, req, scope, after);
+        return run_thread_page(conn, req, scope, after, strategy);
     }
     let (sql, params) = page_sql(req, scope, after, strategy)?;
     let alias: HashMap<&str, &str> = scope.targets.iter().map(|t| (t.account_id.as_str(), t.alias.as_str())).collect();
@@ -1677,6 +1696,118 @@ pub fn run_page_with(
     Ok((out, more))
 }
 
+/// EXPLAIN QUERY PLAN lines of the walk's batch query for the threads `ids` (tests verify `messages_thread` drives).
+pub fn explain_thread_batch(
+    conn: &Connection,
+    req: &SearchReq,
+    scope: &Scope<'_>,
+    ids: &[String],
+) -> anyhow::Result<Vec<String>> {
+    let mut q = threads_cte(req, scope, Some(ids))?;
+    q.s(" SELECT gen FROM th");
+    let mut st = conn.prepare(&format!("EXPLAIN QUERY PLAN {}", q.text))?;
+    let rows = st.query_map(params_from_iter(q.params), |r| r.get::<_, String>(3))?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// A thread of the thread view: (gen, account_id, thread_id, matched, n, last_at, last_out, last_in).
+type Head = (i64, String, String, i64, i64, i64, Option<i64>, Option<i64>);
+
+fn head(r: &rusqlite::Row<'_>) -> rusqlite::Result<Head> {
+    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?))
+}
+
+/// Candidate threads the walk examines before it gives up and runs the aggregate query instead.
+pub const THREAD_WALK_BUDGET: usize = 20_000;
+
+/// The newest threads first without aggregating every match (PLAN A81). Messages are read newest first from the date
+/// index; the first message seen of a thread is a candidate, and candidates are resolved in batches by the same
+/// aggregate as [`threads_cte`], restricted to their ids. A candidate becomes a row when the thread matches the
+/// filter and the reply filter and sorts after the cursor. Without a cursor the first message seen is the thread's
+/// newest. With one, the walk starts at the cursor's time: a thread whose newest message lies above it is met at an
+/// older message, but its `last_at` is then above the cursor and the seek drops it. Batches end only
+/// between two message times, so threads with the same `last_at` are ordered by `(account_id, thread_id)` exactly
+/// as the aggregate query orders them. Returns `None` after `budget` candidates without a full page.
+pub fn walk_thread_heads(
+    conn: &Connection,
+    req: &SearchReq,
+    scope: &Scope<'_>,
+    after: &[KeyValue],
+    budget: usize,
+) -> anyhow::Result<Option<Vec<Head>>> {
+    let cursor = match after {
+        [] => None,
+        [KeyValue::Int(at), KeyValue::Text(acc), KeyValue::Text(tid)] => Some((*at, acc.as_str(), tid.as_str())),
+        _ => return Err(super::cursor::invalid().into()),
+    };
+    let mut q = Sql {
+        text: format!(
+            "SELECT m.gen, m.account_id, m.thread_id, m.received_at FROM messages m INDEXED BY {} WHERE m.gen IN ",
+            if scope.targets.len() == 1 { "messages_date" } else { "messages_recent" }
+        ),
+        params: vec![],
+    };
+    q.list(gens(scope.targets)).s(" AND m.spam_trash = 0");
+    if let Some((at, _, _)) = cursor {
+        q.s(" AND m.received_at <= ").p(SqlValue::Integer(at));
+    }
+    q.s(" ORDER BY m.received_at DESC");
+    let want = req.limit + 1;
+    let mut heads: Vec<Head> = vec![];
+    let mut seen: std::collections::HashSet<(i64, String)> = std::collections::HashSet::new();
+    let mut pending: Vec<(i64, String, i64)> = vec![];
+    let mut batch = want;
+    let resolve = |pending: &mut Vec<(i64, String, i64)>, heads: &mut Vec<Head>| -> anyhow::Result<()> {
+        let mut ids: Vec<String> = pending.iter().map(|(_, t, _)| t.clone()).collect();
+        ids.sort();
+        ids.dedup();
+        let mut cte = threads_cte(req, scope, Some(&ids))?;
+        cte.s(" SELECT gen, account_id, thread_id, matched, n, last_at, last_out, last_in FROM th");
+        reply_filter(&mut cte, req);
+        let mut st = conn.prepare(&cte.text)?;
+        let found: HashMap<(i64, String), Head> = st
+            .query_map(params_from_iter(cte.params), head)?
+            .map(|h| h.map(|h| ((h.0, h.2.clone()), h)))
+            .collect::<Result<_, _>>()?;
+        let mut rows: Vec<Head> = pending
+            .drain(..)
+            .filter_map(|(g, t, _)| found.get(&(g, t)).cloned())
+            .filter(|h| match cursor {
+                None => true,
+                Some((at, acc, tid)) => h.5 < at || (h.5 == at && (h.1.as_str(), h.2.as_str()) > (acc, tid)),
+            })
+            .collect();
+        rows.sort_by(|a, b| b.5.cmp(&a.5).then_with(|| a.1.cmp(&b.1)).then_with(|| a.2.cmp(&b.2)));
+        heads.extend(rows);
+        Ok(())
+    };
+    let mut st = conn.prepare(&q.text)?;
+    let mut rows = st.query(params_from_iter(q.params))?;
+    while let Some(r) = rows.next()? {
+        let (gen_id, thread_id, at): (i64, String, i64) = (r.get(0)?, r.get(2)?, r.get(3)?);
+        // A batch ends only where the message time changes, so equal `last_at` values are sorted together.
+        if pending.len() >= batch && pending.last().is_some_and(|p| p.2 != at) {
+            resolve(&mut pending, &mut heads)?;
+            if heads.len() >= want {
+                heads.truncate(want);
+                return Ok(Some(heads));
+            }
+            batch = (batch * 2).min(1024);
+        }
+        if seen.insert((gen_id, thread_id.clone())) {
+            if seen.len() > budget {
+                return Ok(None);
+            }
+            pending.push((gen_id, thread_id, at));
+        }
+    }
+    if !pending.is_empty() {
+        resolve(&mut pending, &mut heads)?;
+    }
+    heads.truncate(want);
+    Ok(Some(heads))
+}
+
 /// One page of the thread view: the threads in thread order, each projected from its latest message plus the
 /// per-thread columns. The row key is `(last_at, account_id, thread_id)`.
 fn run_thread_page(
@@ -1684,15 +1815,20 @@ fn run_thread_page(
     req: &SearchReq,
     scope: &Scope<'_>,
     after: &[KeyValue],
+    strategy: Strategy,
 ) -> anyhow::Result<(Vec<Row>, bool)> {
-    type Head = (i64, String, String, i64, i64, i64, Option<i64>, Option<i64>);
-    let (sql, params) = thread_page_sql(req, scope, after)?;
-    let mut st = conn.prepare(&sql)?;
-    let heads: Vec<Head> = st
-        .query_map(params_from_iter(params), |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?))
-        })?
-        .collect::<Result<_, _>>()?;
+    let walked = match strategy {
+        Strategy::Walk => walk_thread_heads(conn, req, scope, after, THREAD_WALK_BUDGET)?,
+        _ => None,
+    };
+    let heads = match walked {
+        Some(h) => h,
+        None => {
+            let (sql, params) = thread_page_sql(req, scope, after)?;
+            let mut st = conn.prepare(&sql)?;
+            st.query_map(params_from_iter(params), head)?.collect::<Result<_, _>>()?
+        }
+    };
     let more = heads.len() > req.limit;
     let mut out = Vec::with_capacity(heads.len().min(req.limit));
     for (gen_id, account_id, thread_id, matched, n, last_at, last_out, last_in) in heads.into_iter().take(req.limit) {

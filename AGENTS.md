@@ -560,3 +560,9 @@ cargo fmt
   through a bloom filter without touching message rows, so a walk is cheap until a predicate needs a column; every
   rowid fetch costs about 2 µs. To compare a branch with `main` in the benchmark, give each its own target dir: a
   shared `CARGO_TARGET_DIR` across worktrees silently measured `main`'s binary twice.
+- 2026-11-17: Index row reads cost about 3-4 µs each because SQLCipher decrypts a page per wide `messages` or `addrs`
+  row; an aggregate over thousands of rows should read covering indexes only (`messages_id_date`, `addrs_addr` with
+  `name`, PLAN A81) and take the mailbox from `gen`, not `messages.account_id`. The planner's choice can flip with the
+  length of a `gen IN (..)` list, so plan tests run with one, two and five targets (`targets.iter().cycle()`). The
+  thread view's walk (`index::query::walk_thread_heads`) must stay equal to the CTE:
+  `thread_walk_matches_the_aggregate_query` pages both.
