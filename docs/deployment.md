@@ -709,8 +709,10 @@ rendered again from its current version, and `changes.signature` switches or rem
 
 Agents can manage signatures themselves with `list_signatures` (any connection with `draft`) and `set_signature` /
 `delete_signature`, which need the `signatures` action on that mailbox. It is in no preset; grant it explicitly
-(`--grant work=drafter,signatures`). Every change by an agent sends you an alert (at most one per signature and day)
-and is audited with the signature's name, never its content.
+(`--grant work=drafter,signatures`). For an agent, a signature with HTML always gets its text derived from the HTML, so
+the text you read (for example when approving a `request_send`, which also says when the mail goes out as HTML) says
+what recipients see. Every change by an agent sends you an alert (an identical retry does not) and is audited with the
+signature's name, never its content.
 
 ### New IMAP mail (IDLE push)
 

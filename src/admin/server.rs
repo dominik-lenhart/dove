@@ -251,7 +251,7 @@ async fn execute(call: &mut AdminCall<'_>, req: AdminRequest) -> anyhow::Result<
                         .collect::<anyhow::Result<Vec<_>>>()?,
                 ),
             };
-            let change = crate::signatures::Change { name, html, text, images };
+            let change = crate::signatures::Change { name, html, text, images, derive_text: false };
             call.tx(move |tx| crate::signatures::set(tx, &account, change, "operator")).await
         }
         AccountsSignatureDelete { account, name } => {

@@ -342,6 +342,9 @@ pub struct Change {
     pub text: Option<String>,
     /// Replaces all images.
     pub images: Option<Vec<Image>>,
+    /// Agent changes: a signature with HTML always gets the text derived from that HTML, so the text the owner reads
+    /// (for example when approving a send) cannot say something else than the HTML the recipient sees.
+    pub derive_text: bool,
 }
 
 fn account_id_of(conn: &Connection, mailbox: &str) -> anyhow::Result<String> {
@@ -407,8 +410,12 @@ pub fn set(tx: &Transaction, mailbox: &str, c: Change, actor: &str) -> anyhow::R
             None
         }
     };
-    // Text: given, else derived from new HTML, else kept.
+    if c.derive_text && html.is_some() && c.text.is_some() {
+        bail!("a signature with HTML gets its text derived from the HTML; leave text out");
+    }
+    // Text: given, else derived from new HTML, else kept (for `derive_text`, derived again whenever there is HTML).
     let text = match (&c.text, &html, &existing) {
+        (None, Some(h), _) if c.derive_text => text_from_html(h)?,
         (Some(t), _, _) => identity::clean_signature(t)?,
         (None, Some(h), _) if c.html.is_some() || existing.is_none() => text_from_html(h)?,
         (None, _, Some(e)) => e.text.clone(),

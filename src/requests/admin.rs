@@ -214,6 +214,8 @@ async fn read_drafts(
                 let content = json!({
                     "from": m["from"], "to": m["to"], "cc": m["cc"], "bcc": m["bcc"], "subject": m["subject"],
                     "body_text": m["body_text"], "body_truncated": m["body_truncated"], "attachments": attachments,
+                    // The HTML version is this text plus the signature's HTML (whose text is in body_text).
+                    "html_signature": if v["composition"]["has_html"] == true { v["composition"]["signature"].clone() } else { Value::Null },
                 });
                 Ok(Current { revision, sendable, content })
             }

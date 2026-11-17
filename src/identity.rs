@@ -223,8 +223,13 @@ pub fn signature_set(
                     }
                 }
             };
-            let change =
-                crate::signatures::Change { name: name.clone(), html: None, text: Some(body.clone()), images: None };
+            let change = crate::signatures::Change {
+                name: name.clone(),
+                html: None,
+                text: Some(body.clone()),
+                images: None,
+                derive_text: false,
+            };
             crate::signatures::set(tx, mailbox, change, "operator")?;
             crate::signatures::set_default(tx, mailbox, alias, Some(&name))?;
             Ok(json!({ "account": mailbox, "alias": alias.map(|_| &key), "signature_bytes": body.len(), "name": name }))

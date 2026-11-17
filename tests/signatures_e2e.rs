@@ -459,6 +459,8 @@ async fn set_signature_validates_its_input() {
         ),
         (json!({ "html": "<script>x</script>" }), "signature"),
         (json!({ "text": "x", "for_address": "a@example.org" }), "for_address"),
+        // An agent cannot give HTML a text version that says something else.
+        (json!({ "html": "<b>Bank: DE00</b>", "text": "Bank: DE99" }), "text"),
         (json!({ "name": "Groß", "text": "x" }), "name"),
         (json!({}), "signature"),
     ] {
@@ -490,6 +492,18 @@ async fn set_signature_validates_its_input() {
     assert_eq!(l["signatures"][0]["default_for"], json!(["mailbox"]));
     let l = f.h.ok(&f.drafter, "list_signatures", json!({ "account": "box" })).await;
     assert!(l["signatures"][0].get("html").is_none());
+    // Nor change the text of a signature that has HTML.
+    let (err, v) = f.h.call(&f.writer, "set_signature", set(json!({ "text": "Etwas anderes" }))).await;
+    assert!(err, "{v}");
+    let l = f.h.ok(&f.drafter, "list_signatures", json!({ "account": "box" })).await;
+    assert_eq!(l["signatures"][0]["text"], "Mit HTML");
+    // Dropping the HTML makes a text of its own possible again.
+    f.h.ok(&f.writer, "set_signature", set(json!({ "html": "", "text": "Wieder Text" }))).await;
+    let l = f.h.ok(&f.drafter, "list_signatures", json!({ "account": "box" })).await;
+    assert_eq!(
+        (l["signatures"][0]["text"].as_str(), l["signatures"][0]["has_html"].as_bool()),
+        (Some("Wieder Text"), Some(false))
+    );
 }
 
 #[tokio::test]
@@ -537,12 +551,35 @@ async fn defaults_follow_the_sender_and_make_default() {
 async fn agent_changes_alert_the_owner_and_the_audit_holds_no_content() {
     let f = fx().await;
     f.two_signatures("box").await;
-    f.h.ok(&f.writer, "set_signature", json!({ "account": "box", "name": "behoerden", "text": "Andere Zeile" })).await;
+    f.h.ok(
+        &f.writer,
+        "set_signature",
+        json!({ "account": "box", "name": "behoerden", "html": "<i>Andere Zeile</i>", "images": [] }),
+    )
+    .await;
     let sent = f.h.app().notifier.sent.lock().unwrap().clone();
     let about: Vec<_> = sent.iter().filter(|m| m.contains("signature")).collect();
-    // One alert per signature and day: behoerden twice changed, gastgeber once.
-    assert_eq!(about.len(), 2, "{sent:?}");
+    // Every distinct change alerts: behoerden created and changed, gastgeber created.
+    assert_eq!(about.len(), 3, "{sent:?}");
     assert!(about[0].contains("'writer' changed signature 'behoerden' of mailbox 'box'"), "{about:?}");
+    // An identical retry stays quiet; a deletion always alerts.
+    f.h.ok(
+        &f.writer,
+        "set_signature",
+        json!({ "account": "box", "name": "behoerden", "html": "<b>Andere Zeile</b>", "images": [] }),
+    )
+    .await;
+    f.h.ok(
+        &f.writer,
+        "set_signature",
+        json!({ "account": "box", "name": "behoerden", "html": "<b>Andere Zeile</b>", "images": [] }),
+    )
+    .await;
+    f.h.ok(&f.writer, "delete_signature", json!({ "account": "box", "name": "gastgeber" })).await;
+    let sent = f.h.app().notifier.sent.lock().unwrap().clone();
+    let about: Vec<_> = sent.iter().filter(|m| m.contains("signature")).collect();
+    assert_eq!(about.len(), 5, "{sent:?}");
+    assert!(about[4].contains("deleted signature 'gastgeber'"), "{about:?}");
     let pushes: i64 = f
         .h
         .app()
@@ -550,7 +587,7 @@ async fn agent_changes_alert_the_owner_and_the_audit_holds_no_content() {
         .call(|c| Ok(c.query_row("SELECT count(*) FROM notifications WHERE key LIKE 'signature:%'", [], |r| r.get(0))?))
         .await
         .unwrap();
-    assert_eq!(pushes, 2, "one dedup key per signature and day");
+    assert_eq!(pushes, 4, "one dedup key per distinct change");
     f.h.ok(&f.drafter, "create_draft", create("box")).await;
     let hits: i64 =
         f.h.app()
@@ -579,7 +616,7 @@ async fn agent_changes_alert_the_owner_and_the_audit_holds_no_content() {
         })
         .await
         .unwrap();
-    assert_eq!(named, 2);
+    assert_eq!(named, 4, "one audit record per call, identical retries included");
 }
 
 #[tokio::test]
@@ -644,4 +681,25 @@ async fn operator_verbs_manage_named_signatures() {
     };
     assert!(serde_json::to_vec(&big).unwrap().len() > 64 * 1024);
     f.h.admin(big).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_send_request_shows_that_the_mail_goes_out_as_html() {
+    let f = fx().await;
+    f.two_signatures("box").await;
+    let token = f.h.token("p", "asker", vec![g("box", "read,draft")]).await;
+    let c = f.h.ok(&token, "create_draft", create("box")).await;
+    let plain = {
+        let mut a = create("box");
+        a["signature"] = json!(false);
+        f.h.ok(&token, "create_draft", a).await
+    };
+    let at = dove::util::rfc3339(dove::util::now_unix() + 3600);
+    let item = |d: &Value| json!({ "draft_id": d["draft_id"], "expected_revision": d["revision"], "send_at": at });
+    let r = f.h.ok(&token, "request_send", json!({ "account": "box", "items": [item(&c), item(&plain)] })).await;
+    let shown = f.h.admin(AdminRequest::RequestsShow { id: r["request_id"].as_str().unwrap().into() }).await.unwrap();
+    let text = shown.to_string();
+    assert_eq!(text.matches("\"html_signature\":\"behoerden\"").count(), 1, "{shown}");
+    assert_eq!(text.matches("\"html_signature\":null").count(), 1, "{shown}");
+    assert!(text.contains("Keyset GmbH"), "the signature's text is part of the approved body");
 }

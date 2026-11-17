@@ -1129,6 +1129,12 @@ fn render_request(v: &Value) -> String {
         for a in it["attachments"].as_array().into_iter().flatten() {
             out.push_str(&format!("    Attachment: {} ({} bytes)\n", t(&a["name"]), a["size"]));
         }
+        if let Some(sig) = it["html_signature"].as_str() {
+            out.push_str(&format!(
+                "    HTML: also sent as HTML with signature '{}' and its images\n",
+                terminal_safe(sig)
+            ));
+        }
         out.push_str("    ----\n");
         let body = terminal_safe(it["body_text"].as_str().unwrap_or(""));
         for line in body.lines() {

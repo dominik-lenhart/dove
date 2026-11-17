@@ -138,11 +138,16 @@ fn audit(alias: &str, name: &str) -> AuditInfo {
     }
 }
 
-async fn alert(cx: &ToolCx, alias: &str, account_id: &str, name: &str, deleted: bool) {
-    let day = util::now_unix() / 86_400;
-    let key = format!("signature:{account_id}:{name}:{day}");
-    let a = crate::notifier::Alert::signature_changed(alias, &cx.client.client_name, name, deleted);
-    let _ = cx.app.notifier.notify_once(&key, a).await;
+/// Alerts the owner of a change (`fingerprint` of the call, deduplicated so an identical retry stays quiet) or a
+/// deletion (always).
+async fn alert(cx: &ToolCx, alias: &str, account_id: &str, name: &str, fingerprint: Option<&str>) {
+    let a = crate::notifier::Alert::signature_changed(alias, &cx.client.client_name, name, fingerprint.is_none());
+    match fingerprint {
+        Some(f) => {
+            let _ = cx.app.notifier.notify_once(&format!("signature:{account_id}:{name}:{f}"), a).await;
+        }
+        None => cx.app.notifier.send(a).await,
+    }
 }
 
 async fn list_signatures(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
@@ -227,7 +232,30 @@ async fn set_signature(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError
     }
     let actor = format!("client:{}", cx.client.client_name);
     let (alias, n2) = (mb.alias.clone(), name.clone());
-    let change = Change { name: name.clone(), html, text, images };
+    if text.is_some() && html.as_deref().is_some_and(|h| !h.trim().is_empty()) {
+        return Err(ToolError::invalid_at(
+            "text",
+            "a signature with HTML gets its text derived from the HTML, so the owner sees what recipients see; leave text out",
+        ));
+    }
+    // Every distinct change alerts the owner; repeating the same call does not.
+    let fingerprint = {
+        use sha2::{Digest, Sha256};
+        let mut hsh = Sha256::new();
+        let canon = json!([
+            name,
+            html,
+            text,
+            make_default,
+            for_address,
+            images
+                .as_ref()
+                .map(|v| v.iter().map(|i| (i.cid.clone(), util::hex(&Sha256::digest(&i.bytes)))).collect::<Vec<_>>()),
+        ]);
+        hsh.update(canon.to_string().as_bytes());
+        util::hex(&hsh.finalize()[..12])
+    };
+    let change = Change { name: name.clone(), html, text, images, derive_text: true };
     let mut out = cx
         .app
         .store
@@ -246,7 +274,7 @@ async fn set_signature(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError
     if let Some(o) = out.as_object_mut() {
         o.remove("text_bytes");
     }
-    alert(cx, &mb.alias, &mb.account_id, &name, false).await;
+    alert(cx, &mb.alias, &mb.account_id, &name, Some(&fingerprint)).await;
     let created = out["created"].as_bool() == Some(true);
     Ok(ToolOutput {
         extra: Vec::new(),
@@ -277,7 +305,7 @@ async fn delete_signature(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolEr
             "this mailbox has no signature by that name; list_signatures shows them",
         ));
     }
-    alert(cx, &mb.alias, &mb.account_id, &name, true).await;
+    alert(cx, &mb.alias, &mb.account_id, &name, None).await;
     Ok(ToolOutput {
         extra: Vec::new(),
         text: format!("Deleted signature '{name}' of {}.", mb.alias),
