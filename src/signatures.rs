@@ -527,8 +527,10 @@ pub fn text_from_html(html: &str) -> anyhow::Result<String> {
             let (bare, same) = if lower.starts_with("tel:") {
                 let digits = |t: &str| t.chars().filter(|c| c.is_ascii_digit() || *c == '+').collect::<String>();
                 let bare = &href[4..];
-                let only_number = shown.chars().all(|c| c.is_ascii_digit() || " +-()/.".contains(c));
-                (bare, only_number && digits(&shown) == digits(bare))
+                // Both sides must be nothing but a number: a target with '%', letters, ';' or ',' (dial codes,
+                // parameters, encodings) is always shown.
+                let number = |t: &str| !t.is_empty() && t.chars().all(|c| c.is_ascii_digit() || " +-()/.".contains(c));
+                (bare, number(&shown) && number(bare) && digits(&shown) == digits(bare))
             } else if lower.starts_with("mailto:") {
                 let bare = &href[7..];
                 (bare, shown.eq_ignore_ascii_case(bare))
@@ -980,6 +982,9 @@ mod tests {
             ("<a href=\"mailto:a@e.vil\">dominik@keyset.cloud a@e.vil</a>", "dominik@keyset.cloud a@e.vil <a@e.vil>"),
             ("<a href=\"tel:+4930666\">+49 30 666 oder 0800 1</a>", "+49 30 666 oder 0800 1 <+4930666>"),
             ("<a href=\"tel:+4930666\">+49 176 63236211</a>", "+49 176 63236211 <+4930666>"),
+            ("<a href=\"tel:+4930666;ext=9\">+49 30 666</a>", "+49 30 666 <+4930666;ext=9>"),
+            ("<a href=\"tel:+49%33%30666\">+49 30 666</a>", "+49 30 666 <+49%33%30666>"),
+            ("<a href=\"tel:+49,30666\">+49 30 666</a>", "+49 30 666 <+49,30666>"),
         ] {
             assert_eq!(text_from_html(html).unwrap(), shown, "{html}");
         }
