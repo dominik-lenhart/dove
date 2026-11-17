@@ -868,3 +868,20 @@ hosts or reference hardware.
   the text and names the HTML signature), and every call that changes a stored signature or default, and every deletion, alerts the owner (no deduplication
   keys; a call that changes nothing stays quiet). Text inside images cannot be checked (residual risk, documented). (f) The admin request line limit is
   1 MiB so a signature with its images fits through the socket.
+- A80. Search page strategy (2026-11-17; step 4 "search performance", first part; options 1 and 4 of
+  `docs/benchmarks.md` "Not fixed here"). (a) A newest-first page (`order_by` starts with `received_at`, spam/trash
+  excluded, no thread view) first counts each top-level indexed predicate (`from`/`to`/…, domains, `label`, text
+  fields, attachment names/types) in its own index, at most `PROBE_LIMIT + 1` = 1001 entries, without reading message
+  rows (`index::query::choose_strategy`). If one has at most 1000 entries it drives the page (`Driven`: `+m.gen`,
+  `+m.spam_trash` and `+m.id` on every other lookup leave only its rowid path; at most 1000 rows are fetched and
+  sorted). If all have more, or there is none, the page walks the date index in order (`Walk`: `INDEXED BY
+  messages_date` for one mailbox, `messages_recent` for several) and stops after `limit + 1` matches. Ids, other
+  orders, spam/trash and the thread view keep the planner's choice (`Planner`). (b) The strategies differ only in
+  access path: filter, order, seek and limit are the same SQL, so results and cursors are identical;
+  `tests/search_contract.rs::page_strategies_return_identical_pages` pages every strategy through a set of filters,
+  both directions and spam/trash. (c) Lookups inside `any`/`not` and labels qualified by mailbox (several lookups)
+  never drive. (d) The coverage counts for category and attachment text read every row of a mailbox before each query
+  that used them (over a second at 250k); index migration 7 adds partial indexes (`messages_category_unknown`,
+  `messages_att_incomplete`) and the queries use their exact expressions (`index::schema::*_COUNT`). (e) Not done
+  here: `count_only` still counts every match, and the thread view and `search_contacts` aggregate every match
+  (options 2 and 3).

@@ -5,6 +5,15 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 
 ## [Unreleased]
 
+### Changed
+
+- Searches for frequent values (unread mail in the inbox, a busy label or sender, common words, mail sent by the
+  mailbox itself) no longer fetch and sort every match: Dove counts each indexed condition first and either reads the
+  few matches or walks the mailbox newest first and stops after one page. At 50,000 messages the slowest of these went
+  from 80 to 100 ms to under 20 ms; results and page cursors are unchanged.
+- Searches and digests by category or attachment text no longer read the whole mailbox to check index coverage
+  first (over a second at 250,000 messages). The index gets two small indexes on upgrade.
+
 ## [0.17.0] - 2026-11-17
 
 ### Added

@@ -553,3 +553,10 @@ cargo fmt
   `draft_body::split` and the `own_drafts.composition` record; never search the text for `-- `. scraper sorts
   attributes, so tests of cleaned HTML must expect alphabetical order. `push_outbox` gets rows only for registered
   devices: tests of an alert without a device check `notifier.sent` and the `notifications` key instead.
+- 2026-11-17: Search pages pick an access path per query (`index::query::choose_strategy`, PLAN A80): `Driven(pos)`
+  pins the predicate at depth-first position `pos` by putting `+` on every other id lookup, `Walk` names the date index
+  with `INDEXED BY`. A new indexed predicate goes through `driver_subqueries` (one builder for the page SQL and the
+  probe); `page_strategies_return_identical_pages` must keep passing for it. SQLite reads an `IN (subquery)` filter
+  through a bloom filter without touching message rows, so a walk is cheap until a predicate needs a column; every
+  rowid fetch costs about 2 µs. To compare a branch with `main` in the benchmark, give each its own target dir: a
+  shared `CARGO_TARGET_DIR` across worktrees silently measured `main`'s binary twice.
