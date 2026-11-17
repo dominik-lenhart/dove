@@ -251,7 +251,7 @@ inside the untrusted-content envelope. Each call is one audit record; queries an
   and goes into the body only; the only header derived from the original is the subject, reduced to one clean line.
 - Reply mode (`reply_to_message_id` set): the draft is placed in that message's thread, `In-Reply-To` is set to the
   original `Message-ID`, `References` to the original `References` plus its `Message-ID`, and the subject defaults to
-  the original subject, preserving the threading subject. A caller requesting a different subject creates a new conversation, with no claim that threadId can force Gmail grouping. Add a real-account test covering an unchanged subject and a changed subject. Recipients are never inferred; the agent passes them.
+  the original subject, preserving the threading subject. A caller requesting a different subject creates a new conversation, with no claim that threadId can force Gmail grouping. Add a real-account test covering an unchanged subject and a changed subject. Recipients are never inferred unless the agent asks for it with `reply_recipients` (`sender` or `all`, PLAN A82): then they come from the original's Reply-To/From (To for own sent mail) and, for `all`, its To and Cc, minus the mailbox's own addresses.
 - Return `account`, `draft_id`, `message_id`, `thread_id` and an opaque `revision`. The canonical handoff is the server Drafts mailbox of the same Google account in Apple Mail. Gmail web is an optional fallback.
 - Before dispatch, durably insert a create-operation row keyed by (client_id, account_id, request_key), with a keyed hash of normalized inputs, state in_flight and no content. Retrying an existing key returns its stored result or outcome_unknown and never dispatches another create. Reusing a key with different inputs returns invalid_argument. Commit ownership, returned IDs and operation success in one transaction after confirmation. A crash after dispatch leaves an unknown outcome. Retain operation rows until explicit operator removal. A new key is a new intent; after an unknown result, the caller must verify the mailbox or obtain a new explicit creation instruction before creating again. Test disconnects and restart before local commit.
 - Dove MUST NOT add any header or text that reveals the project, client or agent to recipients. Ownership lives
@@ -647,6 +647,7 @@ Outbound allowlist (method, path pattern under `https://gmail.googleapis.com/gma
 | POST | `messages/{id}/trash` | `move_messages` to `trash` (needs `delete`), `delete_draft` |
 | POST | `messages/{id}/untrash` | `move_messages` out of Trash |
 | POST | `threads/{id}/modify` | Allowlisted for thread-level label changes (not used by the tools yet) |
+| POST | `labels` | `create_label` (labels.create); needs `gmail.modify` (PLAN A82). No label update or delete. |
 
 There is no `DELETE` and no `batchDelete`: Dove cannot delete permanently. Since 0.2, connects request `gmail.modify`
 as well (optional at the consent screen; without it organize/delete answer `account_unavailable` with
