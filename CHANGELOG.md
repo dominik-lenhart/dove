@@ -5,6 +5,8 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-11-17
+
 ### Changed
 
 - Searches for frequent values (unread mail in the inbox, a busy label or sender, common words, mail sent by the
@@ -478,7 +480,8 @@ First release.
   release only after verifying its minisign signature. The CLI hints at a new release at most once a day
   (`DOVE_NO_UPDATE_CHECK=1` turns it off); the server never checks for updates.
 
-[Unreleased]: https://github.com/dominik-lenhart/dove/compare/v0.17.0...HEAD
+[Unreleased]: https://github.com/dominik-lenhart/dove/compare/v0.18.0...HEAD
+[0.18.0]: https://github.com/dominik-lenhart/dove/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/dominik-lenhart/dove/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/dominik-lenhart/dove/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/dominik-lenhart/dove/compare/v0.14.0...v0.15.0
