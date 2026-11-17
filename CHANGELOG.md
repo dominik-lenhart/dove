@@ -5,6 +5,8 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-11-17
+
 ### Added
 
 - `create_label` creates a Gmail label or an IMAP folder (nested with `/`), so agents can file mail into new labels
@@ -518,7 +520,8 @@ First release.
   release only after verifying its minisign signature. The CLI hints at a new release at most once a day
   (`DOVE_NO_UPDATE_CHECK=1` turns it off); the server never checks for updates.
 
-[Unreleased]: https://github.com/dominik-lenhart/dove/compare/v0.19.0...HEAD
+[Unreleased]: https://github.com/dominik-lenhart/dove/compare/v0.20.0...HEAD
+[0.20.0]: https://github.com/dominik-lenhart/dove/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/dominik-lenhart/dove/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/dominik-lenhart/dove/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/dominik-lenhart/dove/compare/v0.16.0...v0.17.0
