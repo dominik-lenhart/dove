@@ -566,3 +566,13 @@ cargo fmt
   length of a `gen IN (..)` list, so plan tests run with one, two and five targets (`targets.iter().cycle()`). The
   thread view's walk (`index::query::walk_thread_heads`) must stay equal to the CTE:
   `thread_walk_matches_the_aggregate_query` pages both.
+- 2026-11-17: Admin app hardening (PLAN A83). The sign-in grace lives only in `auth::begin_stepup_then` and only for
+  `RequestsApprove` with the id the sign-in's `next` named; never widen it to other verbs or a time window. Tests sign
+  in with `next` by posting it to `/admin/login/finish` (`login_next` in `tests/admin_ui_e2e.rs`); the plain `login`
+  helper sends none, so older tests still see a step-up. Idle expiry is `store::SESSION_IDLE_SECS`; tests age
+  `admin_sessions.last_seen_at`. `sw.js` holds `"__VERSION__"` and `["__OFFLINE__"]` placeholders that `static_sw`
+  fills from `asset_version()` and `offline_assets()`; every offline asset must be in `ADMIN_PUBLIC_PATHS` or the
+  worker install fails. Dark mode is token-only: a new colour goes into `:root` and the dark media block, never as a
+  literal in a rule. To check pages visually, dump them from an `--ignored` harness test with `b.get(..).text`, point
+  the CSS link at a copy of `static/admin.css`, and screenshot `file://` pages in Playwright with
+  `emulateMedia({ colorScheme })`.

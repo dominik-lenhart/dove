@@ -174,10 +174,15 @@ async fn invitations_grants_redaction_rotation_and_revocation() {
         json!([{ "account": "info", "actions": "read,draft" }, { "account": "sales", "actions": "read" }])
     );
 
-    // Redaction is a plain write.
+    // Turning redaction on is a plain write; turning it off weakens a protection and needs the passkey (PLAN A83).
     let r = b.post_form("/admin/connections/agent/redaction", &[("enabled", "1")]).await;
     assert_eq!(r.status, 303, "{}", r.text);
     assert_eq!(h.admin(AdminRequest::ClientsShow { name: "agent".into() }).await.unwrap()["redact_secrets"], true);
+    let page = b.get("/admin/connections/agent").await.text;
+    assert!(page.contains("action=\"/admin/connections/agent/redaction\" data-stepup"), "{page}");
+    let to = redirect(&confirm(&mut b, &mut a, "/admin/connections/agent/redaction", &[("enabled", "0")]).await);
+    assert_eq!(to, "/admin/connections/agent?done=saved");
+    assert_eq!(h.admin(AdminRequest::ClientsShow { name: "agent".into() }).await.unwrap()["redact_secrets"], false);
 
     // Rotation shows a new token; the old one stops working.
     let to = redirect(&confirm(&mut b, &mut a, "/admin/connections/agent/rotate", &[]).await);
@@ -228,11 +233,14 @@ async fn imap_mailboxes_connect_and_are_managed_without_the_password_showing_up(
     let page = b.get(&to).await.text;
     assert!(page.contains("Mailbox connected.") && page.contains("Send-as addresses"), "{page}");
 
-    // Send-as address, signature, check, indexing, disable and enable.
-    let r = b.post_form("/admin/mailboxes/box/aliases", &[("do", "add"), ("address", "hello@imap.test")]).await;
-    assert_eq!(r.status, 303, "{}", r.text);
-    let r = b.post_form("/admin/mailboxes/box/signature", &[("for", ""), ("signature", "Best,\r\nBox")]).await;
-    assert_eq!(r.status, 303, "{}", r.text);
+    // Send-as address and signature change outgoing mail: both need the passkey (PLAN A83). Then check, indexing,
+    // disable and enable.
+    let alias = [("do", "add"), ("address", "hello@imap.test")];
+    let to = redirect(&confirm(&mut b, &mut a, "/admin/mailboxes/box/aliases", &alias).await);
+    assert_eq!(to, "/admin/mailboxes/box?done=added");
+    let sig = [("for", ""), ("signature", "Best,\r\nBox")];
+    let to = redirect(&confirm(&mut b, &mut a, "/admin/mailboxes/box/signature", &sig).await);
+    assert_eq!(to, "/admin/mailboxes/box?done=saved");
     let sig = h.admin(AdminRequest::AccountsSignatureShow { account: "box".into(), alias: None }).await.unwrap();
     assert_eq!(sig["signature"], "Best,\nBox");
     let page = b.get("/admin/mailboxes/box").await.text;

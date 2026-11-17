@@ -247,10 +247,10 @@ async fn signature_form(app: &Arc<App>, s: &WebSession, mailbox: &str, address: 
         None => "Signature".to_string(),
     };
     h!(
-        "<form class=\"sig\" method=\"post\" action=\"{}/signature\">{}<input type=\"hidden\" name=\"for\" value=\"{}\">\
+        "<form class=\"sig\" method=\"post\" action=\"{}/signature\" data-stepup>{}<input type=\"hidden\" name=\"for\" value=\"{}\">\
          <p class=\"field\"><label>{}<textarea name=\"signature\" rows=\"4\" maxlength=\"4000\">{}</textarea></label>\
          <span class=\"hint\">Plain text of the default signature (an HTML version stays). Leave empty to remove the default.</span></p>\
-         <button type=\"submit\" class=\"btn\">Save signature</button></form>",
+         <button type=\"submit\" class=\"btn\">Save signature</button><p class=\"status\" role=\"status\" aria-live=\"polite\"></p></form>",
         base(mailbox),
         csrf_input(s),
         address.unwrap_or("").to_string(),
@@ -304,9 +304,9 @@ async fn named_signatures(app: &Arc<App>, s: &WebSession, mailbox: &str) -> Mark
             Markup::default()
         } else {
             h!(
-                "<form method=\"post\" action=\"{}/signatures\">{}<input type=\"hidden\" name=\"do\" value=\"default\">\
-             <input type=\"hidden\" name=\"name\" value=\"{}\"><button type=\"submit\" class=\"btn\">Make default\
-             </button></form>",
+                "<form method=\"post\" action=\"{}/signatures\" data-stepup>{}<input type=\"hidden\" name=\"do\" \
+             value=\"default\"><input type=\"hidden\" name=\"name\" value=\"{}\"><button type=\"submit\" \
+             class=\"btn\">Make default</button><p class=\"status\" role=\"status\" aria-live=\"polite\"></p></form>",
                 base(mailbox),
                 csrf_input(s),
                 name.clone()
@@ -465,12 +465,12 @@ async fn detail_page(app: &Arc<App>, s: &WebSession, alias: &str, notice: Markup
         }));
         h!(
             "<section class=\"block\"><h2>Send-as addresses</h2><div class=\"rows\">{}</div>\
-             <form class=\"inline-form\" method=\"post\" action=\"{}/aliases\">{}<input type=\"hidden\" name=\"do\" \
-             value=\"add\"><div class=\"inline-fields\"><input name=\"address\" type=\"email\" required \
+             <form class=\"inline-form\" method=\"post\" action=\"{}/aliases\" data-stepup>{}\
+             <input type=\"hidden\" name=\"do\" value=\"add\"><div class=\"inline-fields\"><input name=\"address\" type=\"email\" required \
              placeholder=\"Address\" aria-label=\"Address\"><input name=\"name\" type=\"text\" placeholder=\"Name \
              (optional)\" aria-label=\"Name\"></div><label class=\"check\"><input type=\"checkbox\" name=\"envelope\" \
              value=\"1\"> <span>Use it as the SMTP sender too</span></label>\
-             <button type=\"submit\" class=\"btn\">Add address</button></form></section>",
+             <button type=\"submit\" class=\"btn\">Add address</button><p class=\"status\" role=\"status\" aria-live=\"polite\"></p></form></section>",
             if aliases.is_empty() {
                 Markup::lit("<p class=\"empty\">Drafts are sent from the mailbox's own address.</p>")
             } else {
@@ -609,6 +609,9 @@ pub async fn aliases(
         Some("remove") => (AdminRequest::AccountsAliasRemove { account: alias, address }, "deleted"),
         _ => return problem(&s, "Address", "unknown action", &b),
     };
+    if super::needs_step_up(&req) {
+        return begin_stepup(&app, &s, req, format!("{b}?done={done}")).await;
+    }
     match result(run_action(&app, &s, req).await) {
         Ok(_) => Redirect::to(&format!("{b}?done={done}")).into_response(),
         Err(e) => problem(&s, "Not changed", &e, &b),
@@ -630,6 +633,9 @@ pub async fn signatures(
         Some("delete") => (AdminRequest::AccountsSignatureDelete { account: alias, name }, "deleted"),
         _ => return problem(&s, "Signature", "unknown action", &b),
     };
+    if super::needs_step_up(&req) {
+        return begin_stepup(&app, &s, req, format!("{b}?done={done}")).await;
+    }
     match result(run_action(&app, &s, req).await) {
         Ok(_) => Redirect::to(&format!("{b}?done={done}")).into_response(),
         Err(e) => problem(&s, "Not changed", &e, &b),
@@ -647,8 +653,5 @@ pub async fn signature(
     let signature =
         f.iter().find(|(k, _)| k == "signature").map(|(_, v)| v.replace("\r\n", "\n")).filter(|v| !v.trim().is_empty());
     let req = AdminRequest::AccountsSignatureSet { account: alias, alias: field(&f, "for"), signature };
-    match result(run_action(&app, &s, req).await) {
-        Ok(_) => Redirect::to(&format!("{b}?done=saved")).into_response(),
-        Err(e) => problem(&s, "Not saved", &e, &b),
-    }
+    begin_stepup(&app, &s, req, format!("{b}?done=saved")).await
 }

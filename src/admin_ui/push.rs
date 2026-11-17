@@ -36,7 +36,7 @@ pub(super) async fn settings_block(app: &Arc<App>, s: &WebSession) -> Markup {
             "<form class=\"inline-form\" data-push-form data-push-key=\"{}\" hidden>\
              <div class=\"inline-fields\"><input name=\"name\" type=\"text\" required maxlength=\"64\" \
              placeholder=\"Device, e.g. iphone\" aria-label=\"Name of this device\" autocomplete=\"off\"></div>\
-             <button type=\"submit\" class=\"btn\">Turn on for this device</button>\
+             <button type=\"submit\" class=\"btn\" data-push-button>Turn on for this device</button>\
              <p class=\"status\" role=\"status\" aria-live=\"polite\"></p></form>",
             key
         ),
@@ -45,9 +45,10 @@ pub(super) async fn settings_block(app: &Arc<App>, s: &WebSession) -> Markup {
     h!(
         "<section class=\"block\" id=\"notifications\"><h2>Notifications</h2><p>Get a notification on your phone or \
          computer when an agent asks for something. It names the connection and what it asks for, nothing from your \
-         mail. Tapping it opens the request; approving still needs your passkey.</p>{}{}\
+         mail. Tapping it opens the request; approving still needs your passkey.</p>{}{}{}\
          <p class=\"hint\" data-push-hint>On iPhone and iPad, add Dove to the Home Screen first (Share, then Add to \
          Home Screen), open it from there and turn notifications on in its Settings.</p></section>",
+        super::pages::push_state(app, s, false).await,
         devices,
         form
     )
@@ -62,12 +63,13 @@ fn device_row(s: &WebSession, d: &Value) -> Markup {
         _ => Markup::lit("nothing sent yet"),
     };
     h!(
-        "<div class=\"row\"><span class=\"row-main\"><strong>{}</strong><span class=\"detail\">{} push, added {}, \
-         {}</span></span><span class=\"button-row\"><form class=\"inline-form\" method=\"post\" \
+        "<div class=\"row\" data-fingerprint=\"{}\"><span class=\"row-main\"><strong>{}</strong> <span class=\"chip go\" \
+         data-this-device hidden>This device</span><span class=\"detail\">{} push, added {}, {}</span></span><span class=\"button-row\"><form class=\"inline-form\" method=\"post\" \
          action=\"/admin/settings/push/{}/test\">{}<button type=\"submit\" class=\"btn small\">Test</button></form>\
          <form class=\"inline-form\" method=\"post\" action=\"/admin/settings/push/{}/remove\" \
          data-confirm=\"Stop notifications to {}?\">{}<button type=\"submit\" class=\"btn danger small\">Remove\
          </button></form></span></div>",
+        text(&d["fingerprint"]),
         text(&d["name"]),
         text(&d["service"]),
         time_el(&text(&d["created_at"])),
@@ -87,7 +89,8 @@ pub struct AddBody {
     subscription: crate::push::Subscription,
 }
 
-/// `POST /admin/settings/push` (JSON from `admin.js`): registers this browser's subscription.
+/// `POST /admin/settings/push` (JSON from `admin.js`): registers this browser's subscription after a passkey
+/// confirmation (a new device learns of every request, PLAN A83). Answers `{stepup}` for the script.
 pub async fn add(
     State(app): State<Arc<App>>,
     Extension(s): Extension<WebSession>,
@@ -97,10 +100,8 @@ pub async fn add(
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": "The browser sent an unexpected subscription." })))
             .into_response();
     };
-    match result(run_action(&app, &s, AdminRequest::PushAdd { name: b.name, subscription: b.subscription }).await) {
-        Ok(_) => Json(json!({ "redirect": "/admin/settings?done=push_on#notifications" })).into_response(),
-        Err(e) => (StatusCode::CONFLICT, Json(json!({ "error": e }))).into_response(),
-    }
+    let req = AdminRequest::PushAdd { name: b.name, subscription: b.subscription };
+    super::auth::begin_stepup(&app, &s, req, "/admin/settings?done=push_on#notifications".into()).await
 }
 
 /// `POST /admin/settings/push/{id}/test`.

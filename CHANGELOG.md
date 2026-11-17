@@ -5,6 +5,24 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 
 ## [Unreleased]
 
+### Added
+
+- Admin app: dark mode that follows the system setting, an offline page when the server cannot be reached, the
+  number of open requests as the app icon badge, and Requests and Settings shortcuts on the app icon.
+- Admin app: a notice when this device no longer gets notifications (iOS can drop them silently) or when no device
+  gets them at all, and a notice while only one passkey can sign in. Device rows mark "This device", and sessions
+  show which device and browser they belong to.
+
+### Changed
+
+- Admin app: opening a request from a notification needs one Face ID or passkey prompt instead of two. The sign-in
+  also confirms the approval of that one request for two minutes; everything else still asks again.
+- Admin app: adding a send-as address, setting or choosing a signature, turning secret redaction off and turning
+  notifications on for a device now ask for the passkey.
+- Admin app: sessions end after an hour without use.
+- Admin app: inputs no longer zoom the page on iPhone, buttons and links are easier to tap, a From line that repeats
+  its address shows it once, and days without calls are visible in the activity chart.
+
 ## [0.19.0] - 2026-11-17
 
 ### Changed

@@ -70,15 +70,39 @@ async fn a_new_request_pushes_to_every_device_encrypted_and_content_free() {
     let mut b = Browser::new(&fx.h);
     let mut a = ui::enrol(&fx.h, &mut b, "owner").await;
     ui::login(&mut b, &mut a).await;
+    // Without any device the overview says so (PLAN A83).
+    let over = b.get("/admin").await.text;
+    assert!(over.contains("No device gets notifications"), "{over}");
     let page = b.get("/admin/settings").await;
     let key = push::public_key(fx.h.app()).await.unwrap();
     assert!(page.text.contains(&format!("data-push-key=\"{key}\"")), "the settings page carries the VAPID key");
+    // A new device learns of every request, so registering one needs the passkey (PLAN A83).
     let r = b.post_json("/admin/settings/push", json!({ "name": "phone", "subscription": phone.json(&fx.svc) })).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let s = r.json()["stepup"].clone();
+    assert!(s.is_object(), "{}", r.text);
+    assert!(fx.devices().await.is_empty(), "nothing registered before the confirmation");
+    let ch = ui::b64d(&s["publicKey"]["challenge"]);
+    let r = ui::stepup_finish(&mut b, &s["id"], &a.assert(&ch)).await;
     assert_eq!(r.status, 200, "{}", r.text);
     assert_eq!(r.json()["redirect"], "/admin/settings?done=push_on#notifications");
     fx.add("laptop", &laptop).await.unwrap();
     let page = b.get("/admin/settings").await;
     assert!(page.text.contains("phone") && page.text.contains("laptop"), "both devices are listed");
+    // Each device row and the lost-subscription notice carry the endpoint fingerprint admin.js compares with.
+    let fp = |d: &Device| {
+        let e = d.subscription(&fx.svc).endpoint;
+        util::b64url(&aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, e.as_bytes()).as_ref()[..12])
+    };
+    assert!(page.text.contains(&format!("data-fingerprint=\"{}\"", fp(&phone))), "{}", page.text);
+    let over = b.get("/admin").await.text;
+    assert!(!over.contains("No device gets notifications"));
+    let lost = over.split("data-fingerprints=\"").nth(1).unwrap().split('"').next().unwrap();
+    let mut got: Vec<&str> = lost.split(' ').collect();
+    got.sort();
+    let mut want = vec![fp(&phone), fp(&laptop)];
+    want.sort();
+    assert_eq!(got, want);
 
     let id = fx.ask_access().await;
     let report = fx.deliver().await;
@@ -94,6 +118,7 @@ async fn a_new_request_pushes_to_every_device_encrypted_and_content_free() {
         assert_eq!(v["body"], "agent asks for access to billing");
         assert_eq!(v["url"], format!("/admin/requests/{id}"));
         assert_eq!(v["tag"], id);
+        assert_eq!(v["badge"], 1, "the app badge counts open requests");
         let text = String::from_utf8(plain).unwrap();
         assert!(!text.contains('@'), "no address reaches the lock screen: {text}");
         let hv = |n: &str| headers.get(n).unwrap().to_str().unwrap().to_string();
@@ -281,10 +306,25 @@ async fn the_app_files_are_public_and_signed_out_links_come_back() {
     assert_eq!(sw.status, 200);
     assert_eq!(sw.header("service-worker-allowed"), "/admin");
     assert!(sw.header("content-type").starts_with("text/javascript"));
-    assert!(sw.text.contains("showNotification"));
+    assert!(sw.text.contains("showNotification") && sw.text.contains("setAppBadge"));
+    // The worker caches exactly the offline page and the current assets, under the asset version (PLAN A83).
+    assert!(!sw.text.contains("__VERSION__") && !sw.text.contains("__OFFLINE__"), "{}", sw.text);
+    let v = dove::admin_ui::asset_version();
+    assert!(sw.text.contains(&format!("\"{v}\"")), "{}", sw.text);
+    let list = serde_json::to_string(&dove::admin_ui::offline_assets()).unwrap();
+    assert!(sw.text.contains(&list), "{}", sw.text);
+    for asset in dove::admin_ui::offline_assets() {
+        let r = anon.get(&asset).await;
+        assert_eq!(r.status, 200, "{asset} is public, or the worker cannot install");
+    }
+    let off = anon.get("/admin/offline").await;
+    assert!(off.text.contains("No connection") && !off.text.contains("dove-csrf"), "{}", off.text);
     let m = anon.get("/admin/manifest.webmanifest").await;
     assert_eq!(m.header("content-type"), "application/manifest+json");
     assert_eq!(m.json()["scope"], "/admin");
+    let urls: Vec<String> =
+        m.json()["shortcuts"].as_array().unwrap().iter().map(|s| s["url"].as_str().unwrap().to_string()).collect();
+    assert_eq!(urls, ["/admin/requests", "/admin/settings"]);
     for icon in ["/admin/static/icon-192.png", "/admin/static/icon-512.png"] {
         let r = anon.get(icon).await;
         assert_eq!((r.status, r.header("content-type").as_str()), (200, "image/png"), "{icon}");

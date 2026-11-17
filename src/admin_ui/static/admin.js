@@ -152,7 +152,9 @@
         subscription: { endpoint: j.endpoint, keys: { p256dh: j.keys.p256dh, auth: j.keys.auth } },
       });
       if (!r.ok) throw new Error(r.data.error || "Dove did not accept the subscription.");
-      window.location.assign(r.data.redirect || "/admin/settings");
+      // A new device learns of every request, so adding one needs the passkey.
+      say(st, "Confirm with your passkey…");
+      window.location.assign(await finishStepup(r.data, st) || "/admin/settings");
     } catch (e) {
       say(st, e.message || "Notifications could not be turned on.", "error");
       buttons.forEach(function (b) { b.disabled = false; });
@@ -168,7 +170,11 @@
       var o = await post("/admin/login/options", {});
       if (!o.ok) throw new Error(o.data.error || "Sign-in is not available.");
       var cred = await navigator.credentials.get({ publicKey: requestOptions(o.data.publicKey) });
-      var f = await post("/admin/login/finish", { id: o.data.id, credential: assertionJSON(cred) });
+      var body = { id: o.data.id, credential: assertionJSON(cred) };
+      // The page the browser came for: when it is a request from a notification, approving it right after this
+      // sign-in needs no second passkey prompt.
+      if (nextPath()) body.next = nextPath();
+      var f = await post("/admin/login/finish", body);
       if (!f.ok) throw new Error(f.data.error || "Sign-in failed.");
       say(st, "Signed in.", "ok");
       window.location.assign(nextPath() || f.data.redirect || "/admin");
@@ -207,6 +213,56 @@
     }
   }
 
+  // Finishes a confirmation the server started (`{stepup}`): the passkey signs the challenge and the server runs the
+  // stored action. Returns where to go next. An answer that is already `{redirect}` needed no prompt (the sign-in a
+  // notification led to counts for its request once).
+  async function finishStepup(data, st) {
+    if (data.redirect && !data.stepup) return data.redirect;
+    if (!data.stepup) throw new Error(data.error || "This action is not available.");
+    var cred = await navigator.credentials.get({ publicKey: requestOptions(data.stepup.publicKey) });
+    say(st, "Checking…");
+    var f = await post("/admin/stepup", { id: data.stepup.id, credential: assertionJSON(cred) });
+    if (!f.ok) throw new Error(f.data.error || "The confirmation failed. Nothing was changed.");
+    return f.data.redirect;
+  }
+
+  // The first 12 bytes of SHA-256(endpoint), base64url: how the server lists a device without its endpoint.
+  async function fingerprint(endpoint) {
+    var d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(endpoint));
+    return b64uEncode(d.slice(0, 12));
+  }
+
+  // Marks this browser's device in the settings list and warns when notifications were allowed here but the server
+  // no longer has this browser's subscription (iOS drops subscriptions; the push service then answers 410).
+  async function checkPush() {
+    var lost = document.querySelector("[data-push-lost]");
+    var rows = document.querySelectorAll("[data-fingerprint]");
+    if (!lost && !rows.length) return;
+    if (!pushSupported() || Notification.permission !== "granted" || !window.crypto || !crypto.subtle) return;
+    var reg = await navigator.serviceWorker.getRegistration("/admin");
+    var sub = reg && (await reg.pushManager.getSubscription());
+    var mine = sub ? await fingerprint(sub.endpoint) : null;
+    var listed = lost ? (lost.getAttribute("data-fingerprints") || "").split(" ").filter(Boolean) : [];
+    rows.forEach(function (r) {
+      if (r.getAttribute("data-fingerprint") === mine) {
+        listed.push(mine);
+        var chip = r.querySelector("[data-this-device]");
+        if (chip) chip.hidden = false;
+      }
+    });
+    if (lost && (!mine || listed.indexOf(mine) < 0)) lost.hidden = false;
+    var btn = document.querySelector("[data-push-button]");
+    if (btn && mine && listed.indexOf(mine) >= 0) btn.textContent = "Renew on this device";
+  }
+
+  // The app badge shows the waiting requests (installed app; Badging API where the browser has it).
+  function updateBadge() {
+    var el = document.querySelector("[data-pending-count]");
+    if (!el || !("setAppBadge" in navigator)) return;
+    var n = parseInt(el.getAttribute("data-pending-count"), 10) || 0;
+    (n > 0 ? navigator.setAppBadge(n) : navigator.clearAppBadge()).catch(function () {});
+  }
+
   // Forms that need a passkey confirmation: the server stores the exact action and answers with a challenge; the
   // passkey signs it; the server runs the stored action.
   async function stepup(form, submitter) {
@@ -218,12 +274,8 @@
     try {
       var data = new URLSearchParams(new FormData(form, submitter));
       var begin = await post(form.getAttribute("action"), data.toString(), true);
-      if (!begin.ok || !begin.data.stepup) throw new Error(begin.data.error || "This action is not available.");
-      var cred = await navigator.credentials.get({ publicKey: requestOptions(begin.data.stepup.publicKey) });
-      say(st, "Checking…");
-      var f = await post("/admin/stepup", { id: begin.data.stepup.id, credential: assertionJSON(cred) });
-      if (!f.ok) throw new Error(f.data.error || "The confirmation failed. Nothing was changed.");
-      window.location.assign(f.data.redirect || window.location.pathname);
+      if (!begin.ok) throw new Error(begin.data.error || "This action is not available.");
+      window.location.assign(await finishStepup(begin.data, st) || window.location.pathname);
     } catch (e) {
       say(st, cancelled(e) ? "Cancelled. Nothing was changed." : e.message, "error");
       buttons.forEach(function (b) { b.disabled = false; });
@@ -256,6 +308,9 @@
     // The service worker makes the admin installable and shows notifications. Registering it is harmless where
     // push is unsupported.
     if ("serviceWorker" in navigator) registerWorker().catch(function () {});
+
+    updateBadge();
+    checkPush().catch(function () {});
 
     var pushForm = document.querySelector("[data-push-form]");
     if (pushForm && pushSupported()) {

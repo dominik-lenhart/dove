@@ -272,9 +272,9 @@ pub async fn detail(
              <p class=\"hint\">Leave a mailbox empty to take it away. Saving removes temporary access of this \
              connection.</p><div class=\"actionbar\"><p class=\"status\" role=\"status\" aria-live=\"polite\"></p>\
              <button type=\"submit\" class=\"btn primary\">Save access</button></div></form></section>\
-             <section class=\"block\"><h2>Lists</h2><form method=\"post\" action=\"{}/redaction\">{}\
+             <section class=\"block\"><h2>Lists</h2><form method=\"post\" action=\"{}/redaction\"{}>{}\
              <input type=\"hidden\" name=\"enabled\" value=\"{}\"><p>{}</p><button type=\"submit\" class=\"btn\">{}\
-             </button></form></section>\
+             </button><p class=\"status\" role=\"status\" aria-live=\"polite\"></p></form></section>\
              <section class=\"block\"><h2>Token</h2><div class=\"button-row\">{}\
              <form method=\"post\" action=\"{}/revoke\" data-confirm=\"Revoke this connection? Its token stops working \
              at once and its open requests are cancelled.\">{}<button type=\"submit\" class=\"btn danger\">Revoke\
@@ -283,6 +283,8 @@ pub async fn detail(
             csrf_input(&s),
             matrix,
             base,
+            // Showing secrets again weakens a protection: it needs the passkey (PLAN A83).
+            if redaction { Markup::lit(" data-stepup") } else { Markup::default() },
             csrf_input(&s),
             if redaction { "0" } else { "1" },
             if redaction {
@@ -346,7 +348,11 @@ pub async fn redaction(
 ) -> Response {
     let back = format!("/admin/connections/{}", urlencode(&name));
     let enabled = field(&f, "enabled").as_deref() == Some("1");
-    match result(run_action(&app, &s, AdminRequest::ClientsSetRedaction { name, enabled }).await) {
+    let req = AdminRequest::ClientsSetRedaction { name, enabled };
+    if super::needs_step_up(&req) {
+        return super::auth::begin_stepup(&app, &s, req, format!("{back}?done=saved")).await;
+    }
+    match result(run_action(&app, &s, req).await) {
         Ok(_) => Redirect::to(&format!("{back}?done=saved")).into_response(),
         Err(e) => problem(&s, "Not saved", &e, &back),
     }

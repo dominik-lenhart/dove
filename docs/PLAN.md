@@ -57,10 +57,11 @@ hosts or reference hardware.
      rotating refresh with reuse detection, DCR (bounded, rate-limited, no authority), RFC 7009 revocation,
      pre-registered clients in config (`tests/oauth_e2e.rs`). Unverified: real ChatGPT and Claude hosts (AC23);
      host versions/settings are not recorded because no real host was available.
-   - [~] Admin web UI, part 1 (design 2026-11-14 §5, A74): `/admin` guard and gate, passkey enrolment and sign-in on
+   - [x] Admin web UI, part 1 (design 2026-11-14 §5, A74): `/admin` guard and gate, passkey enrolment and sign-in on
      Dove's own WebAuthn verifier, sessions, CSRF/Origin, step-up bound to the action, pages Overview, Requests,
      Audit, Settings, `dove admin passkey|sessions`, `dove tailscale setup --admin` (`tests/admin_ui_e2e.rs`,
-     `tests/admin_ui_logs.rs`, `tests/tailscale_e2e.rs`, unit tests with the W3C vectors).
+     `tests/admin_ui_logs.rs`, `tests/tailscale_e2e.rs`, unit tests with the W3C vectors). Deployed on the production
+     host since 0.12.0 with passkeys the owner enrolled.
    - [x] Admin web UI, part 2 (design 2026-11-14 §5.4, §4.6, A75): Connections, Mailboxes, Projects, Watches and
      sinks, settings additions (add passkey, rewrap, export, audit prune), one-time result page, `dove watches`,
      `[requests] notify_sink`, `dove tailscale setup --admin-only` (`tests/admin_ui_manage_e2e.rs`,
@@ -73,6 +74,11 @@ hosts or reference hardware.
    - [x] Health alerts over Web Push (design 2026-11-17, A77): every owner notification also pushes, a health watcher
      alerts on a stalled sync (and its recovery) and on low disk space, the Health page lists mailbox sync state
      (`tests/health_alerts_e2e.rs`).
+   - [x] Admin app hardening and dark mode (A83): step-up for outgoing identity, redaction off and new push devices,
+     one-hour idle sessions with device labels, sign-in grace for the notified approval, lost-subscription and
+     single-passkey notices, app badge, offline page, touch sizes, dark colour scheme (`tests/admin_ui_e2e.rs`,
+     `tests/admin_push_e2e.rs`, `tests/admin_ui_manage_e2e.rs`). Badge and offline page are unverified on a real
+     iPhone.
    - [x] Activity dashboard and audit search (design 2026-11-17, A78): overview chart and per-connection rows from the
      new read verb `AuditStats`, audit search with suggestions, failure and object filters, paging, hidden watch polls
      (`tests/admin_activity_e2e.rs`, `audit::tests`).
@@ -903,3 +909,21 @@ hosts or reference hardware.
   message row, the mailbox comes from `addrs.gen`. The candidate scans name their covering indexes (`INDEXED BY`):
   with five mailboxes the planner read the name branch through `addrs_addr` and fetched every row. (c) Still open:
   `count_only` counts every match.
+- A83. Admin app hardening (2026-11-17, review of the PWA). (a) Step-up also covers what changes mail under the
+  owner's name or weakens a protection: adding a send-as address, setting a signature or a default signature,
+  turning secret redaction off (on stays a plain write) and registering a push device (a device sees every request).
+  Removing an alias or a signature, and removing a device, stay plain writes: they only take something away. (b)
+  Sessions end after `SESSION_IDLE_SECS` = 1 hour without a request, besides the 12-hour absolute expiry;
+  `last_seen_at` is the clock, idle rows are deleted at the next sign-in and hidden from `sessions list`. (c)
+  Sessions store a coarse device label (`iPhone · Safari`, `auth::device_label`), never the User-Agent. (d) Sign-in
+  grace: a notification opens `/admin/requests/<id>`, the sign-in page sends that as `next`, and the passkey
+  assertion of that sign-in also confirms one approval of exactly that request in that session within 120 s
+  (`GRACE_TTL`, in-memory, single use, spent even when the approval fails). Any other verb, request or session
+  still needs its own assertion. Rejected: a general "recently authenticated" window, which would let any session
+  stolen in the first minutes approve anything. (e) Lost push subscriptions (iOS drops them silently) are detected in
+  the page: each device row carries the first 12 bytes of SHA-256(endpoint), admin.js compares the browser's current
+  subscription and shows a notice. No `pushsubscriptionchange` handler: the worker has no session or CSRF token to
+  re-register with. (f) Pushes carry the number of open requests as `badge`; the worker sets the app badge. (g) The
+  worker caches only `offline_assets()` (offline page, CSS, JS, font) under the asset version and answers a failed
+  navigation with `/admin/offline`; no page with data is ever cached. (h) Dark mode redefines the colour tokens under
+  `prefers-color-scheme: dark`; touch devices get 16 px inputs (no iOS zoom) and 44 px targets.

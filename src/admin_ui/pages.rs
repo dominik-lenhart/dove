@@ -128,7 +128,13 @@ pub async fn overview(State(app): State<Arc<App>>, Extension(s): Extension<WebSe
     let approved = result(run_action(&app, &s, AdminRequest::RequestsList { status: Some("approved".into()) }).await);
     let index = result(run_action(&app, &s, AdminRequest::IndexStatus { alias: None }).await);
     let stats = result(run_action(&app, &s, AdminRequest::AuditStats).await);
+    let passkeys = result(run_action(&app, &s, AdminRequest::PasskeysList).await);
     let health = app.admin_ui.health.lock().map(|h| h.clone()).unwrap_or(None);
+    let mut notices = Vec::new();
+    if passkeys.ok().and_then(|v| v.as_array().map(Vec::len)) == Some(1) {
+        notices.push(single_passkey_notice(true));
+    }
+    notices.push(push_state(&app, &s, true).await);
 
     let waiting = match &pending {
         Ok(v) => {
@@ -173,13 +179,15 @@ pub async fn overview(State(app): State<Arc<App>>, Extension(s): Extension<WebSe
         h!("<h1>{} requests wait for you</h1>", count)
     };
     let body = h!(
-        "{}<div class=\"grid\"><section class=\"block wide\"><h2>Waiting for a decision</h2>\
+        "{}{}{}<div class=\"grid\"><section class=\"block wide\"><h2>Waiting for a decision</h2>\
          <div class=\"rows\">{}</div><p><a href=\"/admin/requests\">All requests</a></p></section>\
          <section class=\"block\"><h2>Next sends</h2>{}</section>\
          <section class=\"block\"><h2>Health</h2>{}<p><a class=\"btn\" href=\"/admin/health\">Run checks</a></p>\
          </section><section class=\"block wide\"><h2>Agent activity</h2>{}</section>\
          <section class=\"block wide\"><h2>Mailboxes</h2>{}</section></div>",
         heading,
+        pending_count(count),
+        Markup::concat(notices),
         waiting,
         next,
         health,
@@ -190,6 +198,36 @@ pub async fn overview(State(app): State<Arc<App>>, Extension(s): Extension<WebSe
         mailboxes
     );
     page(&s, "Overview", Nav::Overview, body)
+}
+
+/// The number of waiting requests for `admin.js`, which shows it on the app icon (Badging API).
+pub(super) fn pending_count(n: usize) -> Markup {
+    h!("<span data-pending-count=\"{}\" hidden></span>", n)
+}
+
+/// Whether notifications reach anyone: a warning when push is set up but no device is registered, and the
+/// fingerprints of the registered devices, so `admin.js` can warn when this browser's own subscription is gone (iOS
+/// drops subscriptions; the push service then answers 410 and Dove forgets the device, PLAN A83).
+pub(super) async fn push_state(app: &Arc<App>, s: &WebSession, warn_none: bool) -> Markup {
+    if crate::push::public_key(app).await.is_err() {
+        return Markup::default();
+    }
+    let Ok(devices) = result(run_action(app, s, AdminRequest::PushList).await) else { return Markup::default() };
+    let prints: Vec<String> = devices.as_array().into_iter().flatten().map(|d| text(&d["fingerprint"])).collect();
+    let none = if warn_none && prints.is_empty() {
+        Markup::lit(
+            "<p class=\"notice warn\">No device gets notifications, so new requests wait unseen. \
+             <a href=\"/admin/settings#notifications\">Turn notifications on</a></p>",
+        )
+    } else {
+        Markup::default()
+    };
+    h!(
+        "{}<p class=\"notice warn\" data-push-lost data-fingerprints=\"{}\" hidden>This device no longer gets \
+         notifications. <a href=\"/admin/settings#notifications\">Turn them on again</a></p>",
+        none,
+        prints.join(" ")
+    )
 }
 
 /// The overview's activity block: three numbers, a 14-day bar chart (inline SVG; the CSP allows no inline styles) and
@@ -263,6 +301,18 @@ fn bar_chart(days: &[(String, i64, i64)]) -> Markup {
     let bars = days.iter().enumerate().map(|(i, (date, ok, failed))| {
         let x = i as i64 * W + 2;
         let (h_ok, h_failed) = (scale(*ok), scale(*failed));
+        if h_ok + h_failed == 0 {
+            // A quiet day still shows as a stub on the baseline, so the 14 days read as 14 days.
+            return h!(
+                "<g><title>{}: no calls</title><rect class=\"bar-hit\" x=\"{}\" y=\"0\" width=\"16\" \
+                 height=\"{}\"></rect><rect class=\"bar-empty\" x=\"{}\" y=\"{}\" width=\"16\" height=\"2\"></rect></g>",
+                date.clone(),
+                x,
+                H,
+                x,
+                H - 2
+            );
+        }
         h!(
             "<g><title>{}: {} ok, {} failed or refused</title>\
              <rect class=\"bar-hit\" x=\"{}\" y=\"0\" width=\"16\" height=\"{}\"></rect>\
@@ -551,8 +601,10 @@ pub async fn requests(
     } else {
         Markup::concat(rows.iter().map(|r| request_row(r)))
     };
+    let waiting = all.as_array().into_iter().flatten().filter(|r| r["status"] == "pending").count();
     let body = h!(
-        "<h1>Requests</h1><nav class=\"tabs\" aria-label=\"Requests\">{}</nav><div class=\"rows\">{}</div>",
+        "<h1>Requests</h1>{}<nav class=\"tabs\" aria-label=\"Requests\">{}</nav><div class=\"rows\">{}</div>",
+        pending_count(waiting),
         tabs,
         list
     );
@@ -860,7 +912,7 @@ fn letter(it: &Value, pending: bool) -> Markup {
         if v.is_empty() { Markup::default() } else { h!("<dt>{}</dt><dd>{}</dd>", k, v) }
     };
     let envelope = Markup::concat([
-        row("From", text(&it["from"])),
+        row("From", one_address(&text(&it["from"]))),
         row("To", list(&it["to"])),
         row("Cc", list(&it["cc"])),
         row("Bcc", list(&it["bcc"])),
@@ -998,6 +1050,17 @@ pub async fn request_cancel(
         Ok(_) => Redirect::to(&format!("{back}?done=stopped")).into_response(),
         Err(e) => problem(&s, "Not stopped", &e, &back),
     }
+}
+
+/// `Name <addr>` as is, but a bare address when the name only repeats it (`a@x <a@x>` shows as `a@x`).
+pub(super) fn one_address(from: &str) -> String {
+    if let Some((name, rest)) = from.rsplit_once(" <")
+        && let Some(addr) = rest.strip_suffix('>')
+        && name.trim().trim_matches('"').eq_ignore_ascii_case(addr.trim())
+    {
+        return addr.trim().to_string();
+    }
+    from.to_string()
 }
 
 pub(super) fn urlencode(s: &str) -> String {
@@ -1256,6 +1319,7 @@ pub async fn settings(
 ) -> Response {
     let passkeys = result(run_action(&app, &s, AdminRequest::PasskeysList).await);
     let sessions = result(run_action(&app, &s, AdminRequest::SessionsList).await);
+    let single = passkeys.as_ref().ok().and_then(|v| v.as_array().map(Vec::len)) == Some(1);
     let pk = match passkeys {
         Ok(v) => Markup::concat(v.as_array().into_iter().flatten().map(|p| {
             let name = text(&p["name"]);
@@ -1295,13 +1359,18 @@ pub async fn settings(
             } else {
                 Markup::default()
             };
+            let device = match x["device"].as_str() {
+                Some(d) => h!("{}, ", d),
+                None => Markup::default(),
+            };
             h!(
-                "<div class=\"row\"><span class=\"row-main\"><strong>{}</strong>{}<span class=\"detail\">signed in \
+                "<div class=\"row\"><span class=\"row-main\"><strong>{}</strong>{}<span class=\"detail\">{}signed in \
                  {}, active {}, ends {}</span></span><form method=\"post\" action=\"/admin/settings/sessions/revoke\">\
                  {}<input type=\"hidden\" name=\"id\" value=\"{}\"><button type=\"submit\" class=\"btn small\">\
                  End</button></form></div>",
                 text(&x["passkey"]),
                 this,
+                device,
                 time_el(&text(&x["created_at"])),
                 time_el(&text(&x["last_seen_at"])),
                 time_el(&text(&x["expires_at"])),
@@ -1312,7 +1381,7 @@ pub async fn settings(
         Err(e) => h!("<p class=\"notice error\">{}</p>", e),
     };
     let body = h!(
-        "{}<h1>Settings</h1><section class=\"block\"><h2>Passkeys</h2><div class=\"rows\">{}</div>\
+        "{}<h1>Settings</h1><section class=\"block\" id=\"passkeys\"><h2>Passkeys</h2>{}<div class=\"rows\">{}</div>\
          <form class=\"inline-form\" method=\"post\" action=\"/admin/settings/passkeys/add\" data-stepup>{}\
          <div class=\"inline-fields\"><input name=\"name\" type=\"text\" required maxlength=\"64\" \
          placeholder=\"Device, e.g. ipad\" aria-label=\"Name of the new passkey\" autocomplete=\"off\"></div>\
@@ -1330,6 +1399,7 @@ pub async fn settings(
          <section class=\"block\"><h2>Export</h2><p>Projects, connections and mailboxes as JSON, without any \
          secret.</p><p><a class=\"btn\" href=\"/admin/settings/export\" download>Download export</a></p></section>",
         done_notice(d.done.as_deref()),
+        if single { single_passkey_notice(false) } else { Markup::default() },
         pk,
         csrf_input(&s),
         super::push::settings_block(&app, &s).await,
@@ -1338,6 +1408,23 @@ pub async fn settings(
         csrf_input(&s)
     );
     page(&s, "Settings", Nav::Settings, body)
+}
+
+/// Shown while only one passkey exists: losing that device locks the owner out of the admin pages (PLAN A83).
+macro_rules! single_passkey_text {
+    () => {
+        "<p class=\"notice warn\">Only one passkey can sign in. If you lose this device, only <code>sudo dove admin \
+         passkey add</code> on the server gets you back in. Add a second passkey on another device, such as a Mac or \
+         a security key."
+    };
+}
+
+pub(super) fn single_passkey_notice(link: bool) -> Markup {
+    if link {
+        Markup::lit(concat!(single_passkey_text!(), " <a href=\"/admin/settings#passkeys\">Add a passkey</a></p>"))
+    } else {
+        Markup::lit(concat!(single_passkey_text!(), "</p>"))
+    }
 }
 
 pub async fn passkey_add(
@@ -1400,5 +1487,19 @@ pub async fn sessions_revoke(
         Ok(_) if own => auth::logout_redirect(),
         Ok(_) => Redirect::to("/admin/settings?done=revoked").into_response(),
         Err(e) => problem(&s, "Not ended", &e, "/admin/settings"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_from_that_repeats_its_address_shows_it_once() {
+        assert_eq!(one_address("a@x.test <a@x.test>"), "a@x.test");
+        assert_eq!(one_address("\"A@X.test\" <a@x.test>"), "a@x.test");
+        assert_eq!(one_address("Ann <a@x.test>"), "Ann <a@x.test>");
+        assert_eq!(one_address("a@x.test"), "a@x.test");
+        assert_eq!(one_address("b@x.test <a@x.test>"), "b@x.test <a@x.test>");
     }
 }
