@@ -544,3 +544,7 @@ cargo fmt
   drives the watcher in tests (the harness starts none); fake a stall with `UPDATE sync_state SET last_success_at = ..`
   through `app.index.write`. The fake push service and decrypting `Device` live in `tests/support/push.rs`. A mailbox
   synced in a test has a cached access token, so a reauth test needs a second, unsynced mailbox.
+- 2026-11-17: Audit aggregates (`audit::stats`, PLAN A78) are tested in `audit::tests` with `append_at` (records at a
+  chosen time); integration tests can only append at "now". The admin UI's chart is inline SVG with classes, never
+  `style=` (the CSP blocks inline styles); check layout changes by dumping a page from a harness test and opening it
+  with the static CSS in Playwright (`file://`), which is quicker than the TLS demo when no passkey flow is involved.

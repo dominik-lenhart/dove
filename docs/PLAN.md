@@ -73,6 +73,9 @@ hosts or reference hardware.
    - [x] Health alerts over Web Push (design 2026-11-17, A77): every owner notification also pushes, a health watcher
      alerts on a stalled sync (and its recovery) and on low disk space, the Health page lists mailbox sync state
      (`tests/health_alerts_e2e.rs`).
+   - [x] Activity dashboard and audit search (design 2026-11-17, A78): overview chart and per-connection rows from the
+     new read verb `AuditStats`, audit search with suggestions, failure and object filters, paging, hidden watch polls
+     (`tests/admin_activity_e2e.rs`, `audit::tests`).
 5. Hardening
    - [x] Fake Google server integration suite covering the automatable parts of AC1-AC21 (AC1, AC2, AC4, AC6, AC7,
      AC10, AC12, AC13, AC16, AC18 in `tests/mcp_e2e.rs`, `tests/connect_e2e.rs`; AC14, AC17, AC20 in
@@ -844,3 +847,10 @@ hosts or reference hardware.
   stalled. Recovery sends one "syncs again" alert. Mailboxes that need reconnecting are left to the reauth alert.
   (c) Low disk: below 1 GiB free (`statvfs`, unprivileged blocks) alerts once; it clears at 2 GiB, so a value
   hovering around the mark does not alert repeatedly. (d) No restore drill: Dove does not manage backups.
+- A78. Activity dashboard and audit search (2026-11-17; design 2026-11-17 "dashboard"). (a) Agent activity is the audit
+  records whose action is a tool in `tools::registry()`; admin and system records drop out without guessing at actor
+  names. (b) `list_watch_events` (`audit::POLL_TOOL`) is counted apart: in production it was 70 % of all records. The
+  search hides it unless "Include watch polls" is ticked or the action filter names it. (c) Days are UTC buckets of
+  `ts / 86400`; the chart is inline SVG because the CSP allows no inline styles. (d) `SearchFilter`'s new fields
+  (`failed`, `object`, `before`, `hide_polls`) are optional and skipped when unset, so CLI and service may differ in
+  version (A-learning 2026-11-14). The object filter matches an exact element of `object_ids` through `json_each`.

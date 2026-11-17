@@ -127,6 +127,7 @@ pub async fn overview(State(app): State<Arc<App>>, Extension(s): Extension<WebSe
     let pending = result(run_action(&app, &s, AdminRequest::RequestsList { status: Some("pending".into()) }).await);
     let approved = result(run_action(&app, &s, AdminRequest::RequestsList { status: Some("approved".into()) }).await);
     let index = result(run_action(&app, &s, AdminRequest::IndexStatus { alias: None }).await);
+    let stats = result(run_action(&app, &s, AdminRequest::AuditStats).await);
     let health = app.admin_ui.health.lock().map(|h| h.clone()).unwrap_or(None);
 
     let waiting = match &pending {
@@ -176,14 +177,129 @@ pub async fn overview(State(app): State<Arc<App>>, Extension(s): Extension<WebSe
          <div class=\"rows\">{}</div><p><a href=\"/admin/requests\">All requests</a></p></section>\
          <section class=\"block\"><h2>Next sends</h2>{}</section>\
          <section class=\"block\"><h2>Health</h2>{}<p><a class=\"btn\" href=\"/admin/health\">Run checks</a></p>\
-         </section><section class=\"block wide\"><h2>Mailboxes</h2>{}</section></div>",
+         </section><section class=\"block wide\"><h2>Agent activity</h2>{}</section>\
+         <section class=\"block wide\"><h2>Mailboxes</h2>{}</section></div>",
         heading,
         waiting,
         next,
         health,
+        match &stats {
+            Ok(v) => activity(v),
+            Err(e) => h!("<p class=\"notice error\">{}</p>", e),
+        },
         mailboxes
     );
     page(&s, "Overview", Nav::Overview, body)
+}
+
+/// The overview's activity block: three numbers, a 14-day bar chart (inline SVG; the CSP allows no inline styles) and
+/// one row per connection for 7 days. Watch polls are counted apart, they would bury everything else.
+fn activity(v: &Value) -> Markup {
+    let days: Vec<(String, i64, i64)> = v["days"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|d| (text(&d["date"]), d["ok"].as_i64().unwrap_or(0), d["failed"].as_i64().unwrap_or(0)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let clients: Vec<&Value> = v["clients"].as_array().map(|a| a.iter().collect()).unwrap_or_default();
+    let (today_ok, today_failed) = days.last().map(|d| (d.1, d.2)).unwrap_or((0, 0));
+    let writes: i64 = clients.iter().filter_map(|c| c["writes"].as_i64()).sum();
+    let metric =
+        |n: i64, label: &'static str| h!("<div class=\"metric\"><strong>{}</strong><span>{}</span></div>", n, label);
+    let metrics = h!(
+        "<div class=\"metrics\">{}{}{}</div>",
+        metric(today_ok + today_failed, "calls today"),
+        metric(today_failed, "failed or refused today"),
+        metric(writes, "writes in 7 days")
+    );
+    let chart = bar_chart(&days);
+    let rows = if clients.is_empty() {
+        Markup::lit("<p class=\"empty\">No agent has called Dove in the last 7 days.</p>")
+    } else {
+        let rows = clients.iter().map(|c| {
+            let actor = text(&c["actor"]);
+            let n = |k: &str| c[k].as_i64().unwrap_or(0);
+            let mut detail = vec![];
+            if n("calls") > 0 || n("polls") == 0 {
+                detail.push(format!("{} calls", n("calls")));
+            }
+            if n("failed") > 0 {
+                detail.push(format!("{} failed", n("failed")));
+            }
+            if n("writes") > 0 {
+                detail.push(format!("{} writes", n("writes")));
+            }
+            if n("polls") > 0 {
+                detail.push(format!("{} watch polls", n("polls")));
+            }
+            h!(
+                "<a class=\"row\" href=\"/admin/audit?since=7d&amp;actor={}\"><span class=\"row-main\"><strong>{}</strong>\
+                 <span class=\"detail\">{}</span></span><span class=\"row-meta\">{}</span></a>",
+                urlencode(&actor),
+                actor,
+                detail.join(" · "),
+                time_el(&util::rfc3339(n("last_ts")))
+            )
+        });
+        h!("<div class=\"rows\">{}</div>", Markup::concat(rows))
+    };
+    h!(
+        "{}{}<h3>Connections, last 7 days</h3>{}<p class=\"meta\">Tool calls by agents, without watch polls. Days are \
+         UTC. <a href=\"/admin/audit\">Search the audit log</a></p>",
+        metrics,
+        chart,
+        rows
+    )
+}
+
+/// Stacked bars per day: succeeded below, failed or refused on top. Each bar has a `<title>` with its numbers.
+fn bar_chart(days: &[(String, i64, i64)]) -> Markup {
+    const W: i64 = 20;
+    const H: i64 = 72;
+    let max = days.iter().map(|d| d.1 + d.2).max().unwrap_or(0).max(1);
+    let scale = |n: i64| if n == 0 { 0 } else { (n * H / max).max(1) };
+    let bars = days.iter().enumerate().map(|(i, (date, ok, failed))| {
+        let x = i as i64 * W + 2;
+        let (h_ok, h_failed) = (scale(*ok), scale(*failed));
+        h!(
+            "<g><title>{}: {} ok, {} failed or refused</title>\
+             <rect class=\"bar-hit\" x=\"{}\" y=\"0\" width=\"16\" height=\"{}\"></rect>\
+             <rect class=\"bar-ok\" x=\"{}\" y=\"{}\" width=\"16\" height=\"{}\"></rect>\
+             <rect class=\"bar-failed\" x=\"{}\" y=\"{}\" width=\"16\" height=\"{}\"></rect></g>",
+            date.clone(),
+            ok,
+            failed,
+            x,
+            H,
+            x,
+            H - h_ok,
+            h_ok,
+            x,
+            H - h_ok - h_failed,
+            h_failed
+        )
+    });
+    let date = |i: usize| days.get(i).map(|d| d.0.get(5..).unwrap_or_default().to_string()).unwrap_or_default();
+    let total: i64 = days.iter().map(|d| d.1 + d.2).sum();
+    h!(
+        "<div class=\"chart-wrap\"><svg class=\"chart\" viewBox=\"0 0 {} {}\" preserveAspectRatio=\"none\" \
+         role=\"img\" aria-label=\"{} agent calls in the last {} days, busiest day {}\">\
+         <line class=\"axis\" x1=\"0\" y1=\"{}\" x2=\"{}\" y2=\"{}\" vector-effect=\"non-scaling-stroke\"></line>\
+         {}</svg><div class=\"chart-axis\" aria-hidden=\"true\"><span>{}</span><span>{}</span></div></div>",
+        days.len() as i64 * W,
+        H,
+        total,
+        days.len(),
+        max,
+        H,
+        days.len() as i64 * W,
+        H,
+        Markup::concat(bars),
+        date(0),
+        date(days.len().saturating_sub(1))
+    )
 }
 
 fn request_row(r: &Value) -> Markup {
@@ -882,14 +998,49 @@ pub(super) fn urlencode(s: &str) -> String {
 
 // ------------------------------------------------------------------ Audit
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, Clone)]
 pub struct AuditQuery {
     actor: Option<String>,
     tool: Option<String>,
     account: Option<String>,
+    /// Empty for any, `failed` for anything but ok, else one result code.
     result: Option<String>,
     since: Option<String>,
+    object: Option<String>,
+    before: Option<i64>,
+    /// `1` includes watch polls.
+    polls: Option<String>,
 }
+
+impl AuditQuery {
+    /// This search as a link: `before` pages to older records, `set` replaces one filter (a value clicked in a row).
+    fn link(&self, before: Option<i64>, set: Option<(&'static str, &str)>) -> String {
+        let mut pairs: Vec<(&str, String)> = vec![];
+        let mut put = |k: &'static str, v: &Option<String>| {
+            if let Some(v) = nonempty(v) {
+                pairs.push((k, v));
+            }
+        };
+        put("actor", &self.actor);
+        put("tool", &self.tool);
+        put("account", &self.account);
+        put("result", &self.result);
+        put("since", &self.since);
+        put("object", &self.object);
+        put("polls", &self.polls);
+        if let Some((k, v)) = set {
+            pairs.retain(|(pk, _)| *pk != k);
+            pairs.push((k, v.to_string()));
+        }
+        if let Some(b) = before {
+            pairs.push(("before", b.to_string()));
+        }
+        let qs: Vec<String> = pairs.iter().map(|(k, v)| format!("{k}={}", urlencode(v))).collect();
+        format!("/admin/audit?{}", qs.join("&"))
+    }
+}
+
+const AUDIT_PAGE: i64 = 100;
 
 fn nonempty(v: &Option<String>) -> Option<String> {
     v.as_ref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
@@ -935,25 +1086,42 @@ pub async fn audit_verify(
 async fn audit_page(app: &Arc<App>, s: &WebSession, q: &AuditQuery, notice: Option<Markup>) -> Response {
     let since_key = q.since.clone().unwrap_or_else(|| "7d".into());
     let since_secs = SINCE.iter().find(|(k, _, _)| *k == since_key).map(|x| x.2).unwrap_or(7 * 86_400);
+    let result_sel = nonempty(&q.result).unwrap_or_default();
+    let polls = q.polls.as_deref() == Some("1");
     let filter = SearchFilter {
         actor: nonempty(&q.actor),
         tool: nonempty(&q.tool),
         account: nonempty(&q.account),
-        result_code: nonempty(&q.result),
+        result_code: (!result_sel.is_empty() && result_sel != "failed").then(|| result_sel.clone()),
+        failed: (result_sel == "failed").then_some(true),
+        object: nonempty(&q.object),
+        before: q.before,
+        hide_polls: (!polls).then_some(true),
         since: (since_secs > 0).then(|| util::now_unix() - since_secs),
-        limit: Some(200),
+        limit: Some(AUDIT_PAGE),
     };
     let rows = result(run_action(app, s, AdminRequest::AuditSearch { filter }).await);
-    let field = |name: &'static str, label: &'static str, value: &Option<String>, hint: &'static str| {
+    let values = result(run_action(app, s, AdminRequest::AuditStats).await).map(|v| v["values"].clone()).ok();
+    let suggestions = |id: &'static str, key: &str| {
+        let opts = values.as_ref().and_then(|v| v[key].as_array().cloned()).unwrap_or_default();
         h!(
-            "<label><span>{}</span><input name=\"{}\" value=\"{}\" placeholder=\"{}\" autocomplete=\"off\" \
-             autocapitalize=\"off\" spellcheck=\"false\"></label>",
-            label,
-            name,
-            value.clone().unwrap_or_default(),
-            hint
+            "<datalist id=\"{}\">{}</datalist>",
+            id,
+            Markup::concat(opts.iter().map(|o| h!("<option value=\"{}\"></option>", text(o))))
         )
     };
+    let field =
+        |name: &'static str, label: &'static str, value: &Option<String>, hint: &'static str, list: &'static str| {
+            h!(
+                "<label><span>{}</span><input name=\"{}\" value=\"{}\" placeholder=\"{}\"{} \
+             autocomplete=\"off\" autocapitalize=\"off\" spellcheck=\"false\"></label>",
+                label,
+                name,
+                value.clone().unwrap_or_default(),
+                hint,
+                if list.is_empty() { Markup::lit("") } else { h!(" list=\"{}\"", list) }
+            )
+        };
     let options = Markup::concat(SINCE.iter().map(|(k, label, _)| {
         if *k == since_key {
             h!("<option value=\"{}\" selected>{}</option>", *k, *label)
@@ -961,17 +1129,53 @@ async fn audit_page(app: &Arc<App>, s: &WebSession, q: &AuditQuery, notice: Opti
             h!("<option value=\"{}\">{}</option>", *k, *label)
         }
     }));
+    let mut results: Vec<(String, String)> =
+        vec![("".into(), "Any".into()), ("failed".into(), "Failed or refused".into())];
+    for r in values.as_ref().and_then(|v| v["results"].as_array().cloned()).unwrap_or_default() {
+        let r = text(&r);
+        results.push((r.clone(), r));
+    }
+    if !result_sel.is_empty() && !results.iter().any(|(v, _)| *v == result_sel) {
+        results.push((result_sel.clone(), result_sel.clone()));
+    }
+    let result_opts = Markup::concat(results.iter().map(|(v, label)| {
+        if *v == result_sel {
+            h!("<option value=\"{}\" selected>{}</option>", v.clone(), label.clone())
+        } else {
+            h!("<option value=\"{}\">{}</option>", v.clone(), label.clone())
+        }
+    }));
+    let polls_box = if polls {
+        Markup::lit("<input type=\"checkbox\" name=\"polls\" value=\"1\" checked>")
+    } else {
+        Markup::lit("<input type=\"checkbox\" name=\"polls\" value=\"1\">")
+    };
     let form = h!(
-        "<form class=\"filters\" method=\"get\" action=\"/admin/audit\">{}{}{}{}\
+        "<form class=\"filters\" method=\"get\" action=\"/admin/audit\">{}{}{}\
+         <label><span>Result</span><select name=\"result\">{}</select></label>{}\
          <label><span>Time</span><select name=\"since\">{}</select></label>\
+         <label class=\"check\">{}<span>Include watch polls</span></label>\
          <div class=\"filter-actions\"><button type=\"submit\" class=\"btn primary\">Search</button>\
-         <button type=\"submit\" class=\"btn\" formaction=\"/admin/audit/verify\">Verify chain</button></div></form>",
-        field("actor", "Actor", &q.actor, "web:phone, uid:1000, client name"),
-        field("tool", "Action", &q.tool, "send_draft, requests.approve"),
-        field("account", "Mailbox", &q.account, "alias"),
-        field("result", "Result", &q.result, "ok, forbidden, error"),
-        options
+         <a class=\"btn\" href=\"/admin/audit\">Clear</a>\
+         <button type=\"submit\" class=\"btn\" formaction=\"/admin/audit/verify\">Verify chain</button></div>\
+         {}{}{}</form>",
+        field("actor", "Actor", &q.actor, "connection, web:phone, uid:1000", "audit-actors"),
+        field("tool", "Action", &q.tool, "send_draft, requests.approve", "audit-actions"),
+        field("account", "Mailbox", &q.account, "alias", "audit-accounts"),
+        result_opts,
+        field("object", "Object id", &q.object, "request, draft or message id", ""),
+        options,
+        polls_box,
+        suggestions("audit-actors", "actors"),
+        suggestions("audit-actions", "actions"),
+        suggestions("audit-accounts", "accounts")
     );
+    let filtered = |key: &'static str, value: &str| -> Markup {
+        if value.is_empty() {
+            return Markup::lit("<span></span>");
+        }
+        h!("<a href=\"{}\">{}</a>", q.link(None, Some((key, value))), value.to_string())
+    };
     let list = match rows {
         Ok(v) => {
             let recs: Vec<&Value> = v.as_array().map(|a| a.iter().collect()).unwrap_or_default();
@@ -981,26 +1185,35 @@ async fn audit_page(app: &Arc<App>, s: &WebSession, q: &AuditQuery, notice: Opti
                 let rows = recs.iter().map(|r| {
                     let result = text(&r["result_code"]);
                     let chip = if result == "ok" { "done" } else { "bad" };
-                    let ids = list(&r["object_ids"]);
-                    let ip = text(&r["source_ip"]);
                     h!(
                         "<li class=\"audit-row\"><div class=\"audit-main\"><strong>{}</strong> \
                          <span class=\"chip {}\">{}</span></div><div class=\"audit-meta\"><span>{}</span>\
-                         <span>{}</span><span>{}</span><span>{}</span><span>{}</span></div></li>",
-                        text(&r["tool_or_action"]),
+                         {}{}<span>{}</span><span>{}</span></div></li>",
+                        filtered("tool", &text(&r["tool_or_action"])),
                         chip,
                         result,
                         time_el(&util::rfc3339(r["ts"].as_i64().unwrap_or(0))),
-                        text(&r["actor"]),
-                        text(&r["account_alias"]),
-                        ids,
-                        ip
+                        filtered("actor", &text(&r["actor"])),
+                        filtered("account", &text(&r["account_alias"])),
+                        list(&r["object_ids"]),
+                        text(&r["source_ip"])
                     )
                 });
+                let more = if recs.len() as i64 == AUDIT_PAGE {
+                    let last = recs.last().and_then(|r| r["seq"].as_i64());
+                    h!("<p><a class=\"btn\" href=\"{}\">Older records</a></p>", q.link(last, None))
+                } else {
+                    Markup::lit("")
+                };
+                let what = if q.before.is_some() { "older records" } else { "newest records" };
+                let hidden = if polls { "" } else { " Watch polls are hidden." };
                 h!(
-                    "<p class=\"meta\">{} newest records.</p><ol class=\"audit\">{}</ol>",
+                    "<p class=\"meta\">{} {}.{}</p><ol class=\"audit\">{}</ol>{}",
                     recs.len(),
-                    Markup::concat(rows)
+                    what,
+                    hidden,
+                    Markup::concat(rows),
+                    more
                 )
             }
         }

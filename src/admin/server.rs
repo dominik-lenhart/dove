@@ -292,6 +292,11 @@ async fn execute(call: &mut AdminCall<'_>, req: AdminRequest) -> anyhow::Result<
             call.read(move |c| Ok(json!(audit::tail(c, limit.unwrap_or(50).clamp(1, 10_000))?))).await
         }
         AuditSearch { filter } => call.read(move |c| Ok(json!(audit::search(c, &filter)?))).await,
+        AuditStats => {
+            let tools: Vec<(&'static str, bool)> =
+                crate::tools::registry().iter().map(|t| (t.name, t.read_only)).collect();
+            call.read(move |c| Ok(json!(audit::stats(c, util::now_unix(), &tools)?))).await
+        }
         AuditVerify => call.read(|c| Ok(json!(audit::verify(c)?))).await,
         AuditPrune => {
             let days = app.cfg.audit.retention_days;
