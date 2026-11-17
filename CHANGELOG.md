@@ -5,6 +5,8 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-11-17
+
 ### Added
 
 - Owner alerts now arrive as push notifications on every device that has notifications on: a mailbox that needs
@@ -435,7 +437,8 @@ First release.
   release only after verifying its minisign signature. The CLI hints at a new release at most once a day
   (`DOVE_NO_UPDATE_CHECK=1` turns it off); the server never checks for updates.
 
-[Unreleased]: https://github.com/dominik-lenhart/dove/compare/v0.14.0...HEAD
+[Unreleased]: https://github.com/dominik-lenhart/dove/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/dominik-lenhart/dove/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/dominik-lenhart/dove/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/dominik-lenhart/dove/compare/v0.12.2...v0.13.0
 [0.12.2]: https://github.com/dominik-lenhart/dove/compare/v0.12.1...v0.12.2
