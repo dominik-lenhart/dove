@@ -151,9 +151,10 @@ const ATTRS: &[&str] = &[
 ];
 
 /// CSS properties a signature may set, each with its own value rule ([`css_value_ok`]). Nothing that hides or moves
-/// content (`display`, `visibility`, `opacity`, `position`, `overflow`, `text-indent`, backgrounds, ...): the plain-text
+/// content (`display: none`, `visibility`, `opacity`, `position`, `overflow`, `text-indent`, backgrounds, ...): the plain-text
 /// version must show everything the HTML shows.
 const CSS: &[&str] = &[
+    "display",
     "color",
     "font-family",
     "font-size",
@@ -294,10 +295,30 @@ fn css_value_ok(prop: &str, value: &str) -> bool {
             (1..=4).contains(&n) && tokens().all(|t| length(t, 60.0))
         }
         "width" | "max-width" | "min-width" | "height" => length(value, 1200.0),
-        // Borders cannot hide text; their colour may be anything opaque, so only references and tricks are refused.
-        _ => !value
-            .char_indices()
-            .any(|(i, c)| c == '-' && value[i + 1..].starts_with(|n: char| n.is_ascii_digit() || n == '.')),
+        // A border: width up to 10px (or thin/medium/thick), a plain style, an opaque colour of any shade.
+        "border" | "border-top" | "border-right" | "border-bottom" | "border-left" => {
+            let n = tokens().count();
+            (1..=3).contains(&n)
+                && tokens().all(|t| {
+                    ["none", "solid", "dashed", "dotted", "double", "thin", "medium", "thick"].contains(&t)
+                        || length(t, 10.0)
+                        || opaque_color(t).is_some()
+                })
+        }
+        "border-radius" | "border-spacing" => (1..=4).contains(&tokens().count()) && tokens().all(|t| length(t, 30.0)),
+        "border-collapse" => ["collapse", "separate"].contains(&value),
+        // Only values that show the element (never `none`).
+        "display" => ["block", "inline", "inline-block", "table", "table-row", "table-cell"].contains(&value),
+        "font-weight" => {
+            ["normal", "bold", "bolder", "lighter"].contains(&value)
+                || value.parse::<u16>().is_ok_and(|w| (100..=900).contains(&w) && w % 100 == 0)
+        }
+        "font-style" => ["normal", "italic", "oblique"].contains(&value),
+        "text-decoration" => ["none", "underline", "line-through"].contains(&value),
+        "text-align" => ["left", "right", "center", "justify", "start", "end"].contains(&value),
+        // Font names: letters, digits, spaces, commas, quotes and '-'.
+        "font-family" => value.chars().all(|c| c.is_alphanumeric() || " ,'\"-".contains(c)),
+        _ => false,
     }
 }
 
@@ -498,14 +519,27 @@ pub fn text_from_html(html: &str) -> anyhow::Result<String> {
         if name == "a"
             && let Some(href) = el.value().attr("href")
         {
-            // Compared without spaces and separators, so "+49 176 1234" shows tel:+491761234.
-            let squash = |t: &str| {
-                t.chars().filter(|c| !c.is_whitespace() && !"-()/.".contains(*c)).collect::<String>().to_lowercase()
+            let shown = el.text().collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ");
+            let href = href.trim();
+            let lower = href.to_ascii_lowercase();
+            // The address is left out only when the text shows exactly it: the same digits (and '+') for a phone
+            // number, the same address for mail, the same URL without its scheme and final '/' for the web.
+            let (bare, same) = if lower.starts_with("tel:") {
+                let digits = |t: &str| t.chars().filter(|c| c.is_ascii_digit() || *c == '+').collect::<String>();
+                let bare = &href[4..];
+                let only_number = shown.chars().all(|c| c.is_ascii_digit() || " +-()/.".contains(c));
+                (bare, only_number && digits(&shown) == digits(bare))
+            } else if lower.starts_with("mailto:") {
+                let bare = &href[7..];
+                (bare, shown.eq_ignore_ascii_case(bare))
+            } else {
+                let strip = |t: &str| {
+                    let l = t.to_ascii_lowercase();
+                    l.trim_start_matches("https://").trim_start_matches("http://").trim_end_matches('/').to_string()
+                };
+                (href, strip(&shown) == strip(href))
             };
-            let shown = el.text().collect::<String>();
-            let bare = href.trim().trim_start_matches("mailto:").trim_start_matches("tel:");
-            let core = bare.trim_start_matches("https://").trim_start_matches("http://").trim_end_matches('/');
-            if !shown.trim().is_empty() && !squash(&shown).contains(&squash(core)) {
+            if !shown.is_empty() && !same {
                 stack.push(Ev::Push(format!(" <{bare}>")));
             }
         }
@@ -871,9 +905,16 @@ mod tests {
             "padding:9999px",
             "margin:0 0 0 -50px",
             "color:#000 !important",
+            "border:9999px solid #000",
+            "border:1px solid transparent",
+            "border-radius:500px",
+            "font-family:x</style>",
+            "text-decoration:blink",
+            "font-weight:1",
+            "unknown-prop:1px",
         ] {
             let kept = style(hidden).unwrap_or_default();
-            let expected = if hidden.starts_with("font-family") { "font-family:x" } else { "" };
+            let expected = if hidden.starts_with("font-family:x;") { "font-family:x" } else { "" };
             assert_eq!(kept, expected, "{hidden}");
         }
         // An element whose whole style is dropped loses the attribute.
@@ -887,7 +928,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, "<font>a</font><font color=\"#17171A\">b</font>cd");
-        let kept = "color:#b0b0b8;font-size:11px;vertical-align:-4px;padding-top:14px;line-height:1.5";
+        let kept = "color:#b0b0b8;font-size:11px;vertical-align:-4px;padding-top:14px;line-height:1.5;\
+                    border-left:2px solid #c00;font-family:'helvetica neue', arial, sans-serif;font-weight:600";
         assert_eq!(style(kept).as_deref(), Some(kept));
     }
 
@@ -931,6 +973,16 @@ mod tests {
         );
         let t = text_from_html("<a href=\"tel:+4917663236211\">+49 176 63236211</a>").unwrap();
         assert_eq!(t, "+49 176 63236211");
+        // A text that only contains the address, or names another one, shows the real target.
+        for (html, shown) in [
+            ("<a href=\"https://e.vil\">https://keyset.cloud?e.vil</a>", "https://keyset.cloud?e.vil <https://e.vil>"),
+            ("<a href=\"https://e.vil/\">E.VIL</a>", "E.VIL"),
+            ("<a href=\"mailto:a@e.vil\">dominik@keyset.cloud a@e.vil</a>", "dominik@keyset.cloud a@e.vil <a@e.vil>"),
+            ("<a href=\"tel:+4930666\">+49 30 666 oder 0800 1</a>", "+49 30 666 oder 0800 1 <+4930666>"),
+            ("<a href=\"tel:+4930666\">+49 176 63236211</a>", "+49 176 63236211 <+4930666>"),
+        ] {
+            assert_eq!(text_from_html(html).unwrap(), shown, "{html}");
+        }
     }
 
     #[test]
