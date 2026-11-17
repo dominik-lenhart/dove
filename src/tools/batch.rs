@@ -106,6 +106,12 @@ fn parse_items(args: &Value) -> Result<Vec<Item>, ToolError> {
                 // get_message with several ids is itself a batch.
                 return Err(ToolError::invalid("batch items read one message each; use ref or message_id"));
             }
+            // `page_token` names the cursor too (PLAN A82): the row budget and the item see the same arguments.
+            // Two different values stay as given and fail in the item itself.
+            let args = match op {
+                "search_messages" => super::lenient::page_alias(&args, "cursor").unwrap_or(args),
+                _ => args,
+            };
             Ok(Item { id: id.to_string(), op: op.to_string(), args })
         })
         .collect()
@@ -117,9 +123,7 @@ fn search_rows(cx: &ToolCx, args: &Value) -> u64 {
     if args.get("count_only").and_then(Value::as_bool) == Some(true) {
         return 0;
     }
-    // `page_token` names the cursor too (PLAN A82); two different values fail in the item itself.
-    let c = args.get("cursor").or_else(|| args.get("page_token")).and_then(Value::as_str);
-    if let Some(c) = c {
+    if let Some(c) = args.get("cursor").and_then(Value::as_str) {
         return cx.app.index.cursors.page_limit(c, &cx.client.client_id, cx.client.auth_epoch).unwrap_or(0) as u64;
     }
     args.get("limit").and_then(Value::as_u64).unwrap_or(DEFAULT_SEARCH_LIMIT)

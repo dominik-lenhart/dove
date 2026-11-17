@@ -1010,7 +1010,7 @@ async fn search_accepts_arguments_that_have_one_reading() {
         fx.h.ok(
             &fx.token,
             "batch_read",
-            json!({"items": [{"id": "a", "op": "search_messages", "args": {"page_token": cur}},
+            json!({"items": [{"id": "a", "op": "search_messages", "args": {"page_token": cur, "cursor": null}},
                              {"id": "b", "op": "search_messages", "args": {"accounts": ["info"], "limit": 98}}]}),
         )
         .await;
