@@ -483,6 +483,7 @@ pub fn needs_step_up(req: &AdminRequest) -> bool {
         | ClientsList
         | AuditTail { .. }
         | AuditSearch { .. }
+        | AuditStats
         | AuditVerify
         | AuditPrune
         | KeysRotate
@@ -559,6 +560,7 @@ pub const COVERAGE: &[(&str, Reach)] = &[
     ("ClientsInvite", Reach::Ui("/admin/connections/new")),
     ("AuditTail", Reach::Excluded("the Audit page's search with no filter shows the newest records (AuditSearch)")),
     ("AuditSearch", Reach::Ui("/admin/audit")),
+    ("AuditStats", Reach::Ui("/admin")),
     ("AuditVerify", Reach::Ui("/admin/audit/verify")),
     ("AuditPrune", Reach::Ui("/admin/audit/prune")),
     ("KeysRotate", Reach::Ui("/admin/settings/keys/rewrap")),

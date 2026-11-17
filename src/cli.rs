@@ -1346,7 +1346,7 @@ fn admin_request(cmd: Command) -> anyhow::Result<(AdminOpts, AdminRequest)> {
             AuditCmd::Search { actor, tool, account, result, limit, admin } => (
                 admin,
                 R::AuditSearch {
-                    filter: SearchFilter { actor, tool, account, result_code: result, since: None, limit },
+                    filter: SearchFilter { actor, tool, account, result_code: result, limit, ..Default::default() },
                 },
             ),
             AuditCmd::Verify { admin } => (admin, R::AuditVerify),

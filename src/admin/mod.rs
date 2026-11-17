@@ -174,6 +174,8 @@ pub enum AdminRequest {
     },
     AuditVerify,
     AuditPrune,
+    /// Agent activity per day and per connection, and the values in the log (the admin UI's overview and search).
+    AuditStats,
 
     KeysRotate,
     Doctor,
@@ -362,6 +364,7 @@ impl AdminRequest {
             AuditTail { .. } => ("audit.tail", None, None, vec![]),
             AuditSearch { .. } => ("audit.search", None, None, vec![]),
             AuditVerify => ("audit.verify", None, None, vec![]),
+            AuditStats => ("audit.stats", None, None, vec![]),
             AuditPrune => ("audit.prune_request", None, None, vec![]),
             KeysRotate => ("keys.rotate", None, None, vec![]),
             Doctor => ("doctor", None, None, vec![]),

@@ -5,6 +5,15 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 
 ## [Unreleased]
 
+### Added
+
+- The overview shows agent activity: calls today, failed or refused calls, writes in the last 7 days, a 14-day chart
+  of tool calls, and one row per connection (calls, failures, writes, watch polls, last call) that opens its audit
+  records.
+- The audit search suggests the actors, actions and mailboxes in the log, filters by "failed or refused" and by an
+  object id (request, draft or message id), pages to older records, and hides watch polls unless asked. A value in a
+  record opens the search for it.
+
 ## [0.15.0] - 2026-11-17
 
 ### Added

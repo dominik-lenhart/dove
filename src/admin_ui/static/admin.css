@@ -1372,3 +1372,63 @@ details.more > * + * {
 .button-row > .inline-form {
   flex-wrap: nowrap;
 }
+
+/* Overview: agent activity (inline SVG chart, design 2026-11-17). */
+.metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(8rem, 1fr));
+  gap: var(--ks-space-3);
+  margin: 0 var(--ks-space-5) var(--ks-space-4);
+}
+.metric {
+  display: grid;
+}
+.metric strong {
+  font-size: var(--ks-font-size-metric);
+  line-height: var(--ks-line-height-metric);
+  font-weight: var(--ks-font-weight-semibold);
+  font-variant-numeric: tabular-nums;
+}
+.metric span {
+  color: var(--ks-fg-muted);
+  font-size: var(--ks-font-size-caption);
+}
+.chart-wrap {
+  margin: 0 var(--ks-space-5) var(--ks-space-4);
+  max-width: 36rem;
+}
+.chart {
+  display: block;
+  width: 100%;
+  height: 8rem;
+}
+.chart .bar-ok {
+  fill: var(--ks-success-mark);
+}
+.chart .bar-failed {
+  fill: var(--ks-error-mark);
+}
+.chart .bar-hit {
+  fill: transparent;
+}
+.chart .axis {
+  stroke: var(--ks-border-subtle);
+}
+.chart-axis {
+  display: flex;
+  justify-content: space-between;
+  margin-top: var(--ks-space-1);
+  color: var(--ks-fg-muted);
+  font-size: var(--ks-font-size-caption);
+  font-variant-numeric: tabular-nums;
+}
+.block > h3 {
+  margin: var(--ks-space-2) var(--ks-space-5) var(--ks-space-2);
+  font-size: var(--ks-font-size-compact);
+  color: var(--ks-fg-muted);
+}
+.filters label.check {
+  display: flex;
+  align-items: center;
+  gap: var(--ks-space-2);
+}
