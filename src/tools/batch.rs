@@ -106,6 +106,12 @@ fn parse_items(args: &Value) -> Result<Vec<Item>, ToolError> {
                 // get_message with several ids is itself a batch.
                 return Err(ToolError::invalid("batch items read one message each; use ref or message_id"));
             }
+            // `page_token` names the cursor too (PLAN A82): the row budget and the item see the same arguments.
+            // Two different values stay as given and fail in the item itself.
+            let args = match op {
+                "search_messages" => super::lenient::page_alias(&args, "cursor").unwrap_or(args),
+                _ => args,
+            };
             Ok(Item { id: id.to_string(), op: op.to_string(), args })
         })
         .collect()

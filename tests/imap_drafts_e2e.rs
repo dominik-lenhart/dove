@@ -446,7 +446,8 @@ async fn list_and_get_drafts() {
     loop {
         let mut args = json!({ "account": "info", "own_only": false, "limit": 1 });
         if let Some(p) = &page {
-            args["page_token"] = json!(p);
+            // Every other page through `cursor`, the alias of page_token (PLAN A82).
+            args[if seen.len() % 2 == 0 { "page_token" } else { "cursor" }] = json!(p);
         }
         let v = h.ok(&token, "list_drafts", args).await;
         seen.extend(v["drafts"].as_array().unwrap().iter().map(|d| d["revision"].clone()));

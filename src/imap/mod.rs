@@ -26,7 +26,7 @@ use zeroize::Zeroizing;
 use crate::error::{ErrorCode, ToolError};
 
 pub use ids::ImapMsgId;
-pub use ops::{AppendFlag, GmLabel, Keyword, StoreFlag, UserLabel};
+pub use ops::{AppendFlag, GmLabel, Keyword, NewFolder, StoreFlag, UserLabel};
 pub use pool::ImapPool;
 pub use session::{
     AppendTarget, AppendUid, Changes, CopiedUid, FetchedMeta, FolderInfo, FolderStatus, GMAIL_CAP, IdleEvent,

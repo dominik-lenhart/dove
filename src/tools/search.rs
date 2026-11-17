@@ -114,6 +114,7 @@ fn input_schema() -> Value {
                 "dir": {"type": "string", "enum": ["asc", "desc"], "description": "Sort direction."}}}, "description": "Sort keys, at most 2; default newest first."},
             "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LIMIT, "default": DEFAULT_LIMIT, "description": "Most rows per page."},
             "cursor": {"type": "string", "description": "next_cursor of a previous result; pass alone."},
+            "page_token": {"type": "string", "description": "Same as cursor."},
             "count_only": {"type": "boolean", "description": "Return only the number of matches; excludes select, order_by, limit and cursor."},
             "coverage_policy": {"type": "string", "enum": ["allow_partial", "require_complete"], "description": "require_complete fails with index_incomplete when the index does not cover every mailbox; default allow_partial (count_only implies require_complete)."},
             "max_lag_seconds": {"type": "integer", "minimum": 0, "description": "Longest accepted age of the index checkpoint; with require_complete the default is 60."},
@@ -157,7 +158,6 @@ const SEARCH_HINTS: &[(&str, &str)] = &[
     ("max_results", "Use 'limit' (1 to 100)."),
     ("page_size", "Use 'limit' (1 to 100)."),
     ("top", "Use 'limit' (1 to 100)."),
-    ("page_token", "Use 'cursor': the next_cursor of the previous result, passed alone."),
     ("next_cursor", "Use 'cursor', passed alone."),
     ("page", "Use 'cursor': the next_cursor of the previous result, passed alone."),
     ("fields", "Use 'select'."),
@@ -170,6 +170,7 @@ const SEARCH_HINTS: &[(&str, &str)] = &[
 ];
 
 async fn search(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
+    let args = lenient::page_alias(&args, "cursor")?;
     if let Some(c) = opt_str(&args, "cursor")? {
         // Resume with the cursor only: the query, projection and order are bound to it.
         if let Some(o) = args.as_object().filter(|o| o.len() != 1) {

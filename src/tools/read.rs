@@ -63,7 +63,8 @@ pub fn defs() -> Vec<ToolDef> {
             description: "List the mailboxes this connection may use, with alias, address, status and allowed actions. Call it \
                           first: every other tool takes one of these aliases as `account`. Rights that were granted only \
                           for a limited time are listed under temporary, each with its expires_at. IMAP mailboxes you can \
-                          draft in also list from_addresses (the mailbox address and its send-as aliases).",
+                          draft in also list from_addresses (the mailbox address and its send-as aliases). Mailboxes you \
+                          can send from list the owner's send_policy when there is one (allow_domains, unknown_recipients).",
             capability: Capability::Read,
             read_only: true,
             destructive: false,
@@ -166,7 +167,8 @@ pub fn defs() -> Vec<ToolDef> {
                     "account": account_schema(),
                     "own_only": { "type": "boolean", "default": true, "description": "List only drafts this project created." },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 50, "default": 20, "description": "Most drafts per page." },
-                    "page_token": { "type": "string", "description": "next_page_token of the previous page." }
+                    "page_token": { "type": "string", "description": "next_page_token of the previous page." },
+                    "cursor": { "type": "string", "description": "Same as page_token." }
                 }, "required": ["account"], "additionalProperties": false })
             },
             output_schema: || {
@@ -426,6 +428,30 @@ async fn list_accounts(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError
     } else {
         cx.app.store.call(move |c| crate::identity::load_aliases_for(c, &drafting)).await?
     };
+    // Recipient rules (PLAN A82) of the mailboxes this connection may send from, so the agent knows them up front.
+    let sending: Vec<String> = cx
+        .client
+        .mailboxes
+        .iter()
+        .filter(|m| cx.client.allow_send && m.actions.has(Capability::Send))
+        .map(|m| m.account_id.clone())
+        .collect();
+    let policies: Vec<(String, crate::send_policy::SendPolicy)> = if sending.is_empty() {
+        Vec::new()
+    } else {
+        cx.app
+            .store
+            .call(move |c| {
+                let mut out = Vec::new();
+                for id in sending {
+                    if let Some(p) = crate::send_policy::load(c, &id)? {
+                        out.push((id, p));
+                    }
+                }
+                Ok(out)
+            })
+            .await?
+    };
     let accounts: Vec<Value> = cx
         .client
         .mailboxes
@@ -464,6 +490,9 @@ async fn list_accounts(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError
                         .map(|(_, a)| json!({ "address": a.address, "name": a.name })),
                 );
                 v["from_addresses"] = Value::Array(from);
+            }
+            if let Some((_, p)) = policies.iter().find(|(id, _)| *id == m.account_id) {
+                v["send_policy"] = p.to_json();
             }
             v
         })
@@ -869,6 +898,7 @@ pub async fn owned_drafts(cx: &ToolCx, account_id: &str) -> Result<Vec<(String, 
 }
 
 async fn list_drafts(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
+    let args = super::lenient::page_alias(&args, "page_token")?;
     only_keys(&args, &["account", "own_only", "limit", "page_token"])?;
     let mb = account_arg(cx, &args, Capability::Read)?;
     if mb.provider == crate::policy::Provider::Imap {

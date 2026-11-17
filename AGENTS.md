@@ -576,3 +576,11 @@ cargo fmt
   literal in a rule. To check pages visually, dump them from an `--ignored` harness test with `b.get(..).text`, point
   the CSS link at a copy of `static/admin.css`, and screenshot `file://` pages in Playwright with
   `emulateMedia({ colorScheme })`.
+- 2026-11-17: Agent features (PLAN A82). `RateLimiter::take_hourly` charges `cost.max(1)`, so a mutation to a zero-cost
+  take is equivalent; mutate the budget away entirely instead. `batch_read` must normalize item args before
+  `search_rows` charges rows (a `cursor: null` plus `page_token` once dodged the stored page size). The recipient rule
+  check lives in `send_policy::check`, called only for `SendAuth::Grant`, before `cx.commit()`; tests assert no
+  non-GET Gmail request, no SMTP command and the draft still `active` after a refusal. The fake IMAP server takes
+  `Opts { delimiter, .. }` and answers `CREATE` (NO for an existing name); the fake Google answers `POST labels` with
+  409 for a name that exists in any case. Domain rules need a dot: splitting the admin input on spaces turned
+  "not a domain" into three one-label domains.

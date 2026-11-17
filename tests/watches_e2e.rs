@@ -174,6 +174,21 @@ async fn gmail_history_sync_fires_each_kind_once() {
     assert_eq!((first["events"].as_array().unwrap().len(), first["has_more"].as_bool()), (3, Some(true)));
     let rest = h.ok(&fx.token, "list_watch_events", json!({ "cursor": first["next_cursor"] })).await;
     assert_eq!(rest["events"].as_array().unwrap().len(), 1);
+    // page_token names the same cursor (PLAN A82); two different values are refused.
+    let alias = h.ok(&fx.token, "list_watch_events", json!({ "page_token": first["next_cursor"] })).await;
+    assert_eq!(alias, rest);
+    let (is_err, v) = h
+        .call(
+            &fx.token,
+            "list_watch_events",
+            json!({ "page_token": first["next_cursor"], "cursor": rest["next_cursor"] }),
+        )
+        .await;
+    assert!(is_err);
+    assert_eq!(
+        (v["error"]["code"].as_str(), v["error"]["details"]["field"].as_str()),
+        (Some("invalid_argument"), Some("page_token"))
+    );
     let none = h.ok(&fx.token, "list_watch_events", json!({ "cursor": rest["next_cursor"] })).await;
     assert_eq!((none["events"].as_array().unwrap().len(), &none["next_cursor"]), (0, &rest["next_cursor"]));
     assert_eq!(h.err(&fx.token, "list_watch_events", json!({ "cursor": "garbage" })).await, "cursor_invalid");

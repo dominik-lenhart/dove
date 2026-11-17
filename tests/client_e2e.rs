@@ -821,7 +821,7 @@ async fn mcp_catalog_lists_every_tool_without_a_server() {
     // After negotiating 2025-06-18: every tool, including send and the requests tools that are off by default.
     assert_eq!(replies[2]["id"], 3);
     assert_eq!(names(&replies[2]), all);
-    for n in ["send_draft", "search_messages", "move_messages", "request_send"] {
+    for n in ["send_draft", "search_messages", "move_messages", "create_label", "request_send"] {
         assert!(all.iter().any(|a| a == n), "{n} missing");
     }
     for t in replies[2]["result"]["tools"].as_array().unwrap() {

@@ -62,8 +62,8 @@ pub fn defs() -> Vec<ToolDef> {
                 "Create a new draft, a threaded reply (reply_to_message_id, quotes the original by default) or a ",
                 "forward (forward_message_id or forward_ref, includes the original's attachments by default) in a ",
                 "mailbox's server Drafts. Attach files by reference to a message you can read (bytes stay on the ",
-                "server) or inline as base64: at most 10 per draft, 10 MiB in total by default. Recipients are never ",
-                "inferred. The sender's default signature goes below body_text and above any quote or forward block; ",
+                "server) or inline as base64: at most 10 per draft, 10 MiB in total by default. Recipients are only ",
+                "derived for replies with reply_recipients (\"sender\" or \"all\"; your own addresses are left out). The sender's default signature goes below body_text and above any quote or forward block; ",
                 "pass signature: \"<name>\" for another one of this mailbox (list_signatures) or false for none. A ",
                 "signature with HTML makes the draft HTML with a plain-text alternative and inline images. ",
                 "Generate a fresh UUID request_key per intent and reuse it only to retry the same request. ",
@@ -85,6 +85,7 @@ pub fn defs() -> Vec<ToolDef> {
                     "subject": { "type": "string", "description": "Subject line." },
                     "body_text": { "type": "string", "description": "Plain-text body (at most 500 KB)." },
                     "reply_to_message_id": { "type": "string", "description": "Make a threaded reply to this message of `account`." },
+                    "reply_recipients": { "type": "string", "enum": ["sender", "all"], "description": "Replies: derive recipients from the original. sender: its Reply-To or From (its To if you sent it); all: also its To and Cc as Cc. Your own addresses are removed; to/cc/bcc are added." },
                     "quote_original": { "type": "boolean", "description": "Replies: quote the original's text below body_text (default true when you have read on this mailbox)." },
                     "forward_message_id": { "type": "string", "description": "Forward this message of `account` (needs read)." },
                     "forward_ref": { "type": "string", "description": "Forward the message of this ref from search_messages (any mailbox you can read)." },
@@ -144,8 +145,9 @@ pub fn defs() -> Vec<ToolDef> {
                 "Send one existing draft this project created, unchanged since expected_revision (from get_draft or the ",
                 "last update_draft); a mismatch fails with draft_conflict. Only listed when the operator enabled ",
                 "sending and granted send on this mailbox; otherwise ask the owner with request_send, which also ",
-                "schedules. Accepts no recipients or content. outcome_unknown means the mail may have gone out: never ",
-                "retry it, check Sent."
+                "schedules. Accepts no recipients or content. The mailbox's send_policy (list_accounts) can refuse ",
+                "recipients with forbidden (details.reason recipient_not_allowed or recipients_unverified): then use ",
+                "request_send. outcome_unknown means the mail may have gone out: never retry it, check Sent."
             ),
             capability: Capability::Send,
             read_only: false,
@@ -283,6 +285,7 @@ async fn create_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError>
             "subject",
             "body_text",
             "reply_to_message_id",
+            "reply_recipients",
             "quote_original",
             "forward_message_id",
             "forward_ref",
@@ -314,6 +317,20 @@ async fn create_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError>
     let reply_to = match opt_str(&args, "reply_to_message_id")? {
         Some(id) if crate::gmail::gateway::valid_id(id) => Some(id.to_string()),
         Some(_) => return Err(ToolError::not_found()),
+        None => None,
+    };
+    let reply_recipients = match super::lenient::opt_enum(&args, "reply_recipients", &["sender", "all"])? {
+        Some(_) if reply_to.is_none() => {
+            return Err(ToolError::invalid_at(
+                "reply_recipients",
+                "applies to replies only (with reply_to_message_id)",
+            ));
+        }
+        Some(mode) => {
+            // Like quoting, deriving copies the original's addresses into a draft the caller can read back.
+            cx.client.authorize_id(Capability::Read, &mb.account_id)?;
+            Some(if mode == "all" { ReplyRecipients::All } else { ReplyRecipients::Sender })
+        }
         None => None,
     };
     let from_arg = match opt_str(&args, "from_address")? {
@@ -357,7 +374,7 @@ async fn create_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError>
     // Idempotency record (spec 5.3 create_draft): keyed by (client, account, request_key), no content.
     let canonical = json!({
         "to": fmt_addrs(&to), "cc": fmt_addrs(&cc), "bcc": fmt_addrs(&bcc), "subject": subject_arg,
-        "body": body, "reply": reply_to, "from": from_arg.as_ref().map(|a| a.email.clone()),
+        "body": body, "reply": reply_to, "reply_recipients": reply_recipients.map(ReplyRecipients::name), "from": from_arg.as_ref().map(|a| a.email.clone()),
         "attachments": attachments.iter().map(compose::AttachSpec::canonical).collect::<Vec<_>>(),
         "forward": forward, "include_attachments": include_attachments, "quote": quote, "signature": signature.canonical(),
     });
@@ -440,6 +457,7 @@ async fn create_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError>
         subject_arg,
         body,
         reply_to,
+        reply_recipients,
         quote,
         forward,
         include_attachments,
@@ -535,6 +553,8 @@ struct CreateInput {
     subject_arg: Option<String>,
     body: String,
     reply_to: Option<String>,
+    /// Derive recipients from the original (replies only).
+    reply_recipients: Option<ReplyRecipients>,
     quote: bool,
     /// (account id, message id) of the message to forward.
     forward: Option<(String, String)>,
@@ -543,6 +563,68 @@ struct CreateInput {
     from_arg: Option<Addr>,
     /// Which signature goes between body_text and the quote or forward block.
     signature: super::draft_body::SigChoice,
+}
+
+/// Which recipients `reply_recipients` derives from the original.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReplyRecipients {
+    Sender,
+    All,
+}
+
+impl ReplyRecipients {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Sender => "sender",
+            Self::All => "all",
+        }
+    }
+}
+
+/// An address taken from the original for a reply: a valid address, the display name kept only when it is one clean
+/// header line (it comes from untrusted mail).
+fn reply_addr(a: &Addr) -> Option<Addr> {
+    let email = mime::parse_address(&a.email).ok()?.email.to_lowercase();
+    let name =
+        a.name.as_deref().map(compose::one_line).filter(|n| !n.is_empty() && mime::validate_header_text(n).is_ok());
+    Some(Addr { email, name })
+}
+
+/// To and Cc of a reply with recipients derived from `orig` (PLAN A82). "sender": the original's Reply-To, else its
+/// From; for mail the mailbox sent itself (own From or `SENT` label) the original's To. "all" adds the original's To
+/// and Cc as Cc. Own addresses (`own`, any case) are removed from the derived lists, every address appears once, and
+/// explicit `to`/`cc`/`bcc` win: a derived address that is also given explicitly stays where the caller put it.
+fn derive_reply_recipients(
+    orig: &super::read::Fetched,
+    mode: ReplyRecipients,
+    own: &[&str],
+    to: Vec<Addr>,
+    cc: Vec<Addr>,
+    bcc: &[Addr],
+) -> (Vec<Addr>, Vec<Addr>) {
+    let p = &orig.parsed;
+    let is_own = |e: &str| own.iter().any(|o| o.eq_ignore_ascii_case(e));
+    let own_sent = orig.meta.labels.iter().any(|l| l == crate::index::query::SENT_LABEL)
+        || p.from.iter().any(|a| is_own(&a.email));
+    let derived_to: Vec<&Addr> = if own_sent {
+        p.to.iter().collect()
+    } else if !p.reply_to.is_empty() {
+        p.reply_to.iter().collect()
+    } else {
+        p.from.iter().collect()
+    };
+    let derived_cc: Vec<&Addr> = match mode {
+        ReplyRecipients::Sender => vec![],
+        ReplyRecipients::All => p.to.iter().chain(p.cc.iter()).collect(),
+    };
+    let mut seen: std::collections::HashSet<String> =
+        to.iter().chain(cc.iter()).chain(bcc.iter()).map(|a| a.email.to_lowercase()).collect();
+    let mut take = |list: Vec<&Addr>| -> Vec<Addr> {
+        list.into_iter().filter_map(reply_addr).filter(|a| !is_own(&a.email) && seen.insert(a.email.clone())).collect()
+    };
+    let new_to = take(derived_to);
+    let new_cc = take(derived_cc);
+    ([new_to, to].concat(), [new_cc, cc].concat())
 }
 
 /// Count and total size of a new draft's attachments, for the audit record (never names).
@@ -572,12 +654,13 @@ async fn dispatch_create(
     input: CreateInput,
 ) -> Result<(Created, AttachStats, super::draft_body::Composition), (ToolError, bool)> {
     let CreateInput {
-        to,
-        cc,
+        mut to,
+        mut cc,
         bcc,
         subject_arg,
         body,
         reply_to,
+        reply_recipients,
         quote,
         forward,
         include_attachments,
@@ -642,6 +725,17 @@ async fn dispatch_create(
             }
             // A different subject starts a new conversation; threadId cannot force grouping (spec 5.3).
             Some(_) => {}
+        }
+        if let Some(mode) = reply_recipients {
+            let own: Vec<&str> =
+                send_as.iter().map(|a| a.email.as_str()).chain(std::iter::once(mb.email.as_str())).collect();
+            (to, cc) = derive_reply_recipients(&orig, mode, &own, to, cc, &bcc);
+            if to.len() + cc.len() + bcc.len() > 50 {
+                return Err(pre(ToolError::invalid_at(
+                    "reply_recipients",
+                    "the reply would have more than 50 recipients in total; pass them explicitly instead",
+                )));
+            }
         }
         if quote {
             tail = compose::with_quote("", &orig);
@@ -1106,13 +1200,23 @@ pub(crate) async fn send_core(
         ));
     }
     // IMAP: fresh check, envelope and credentials are prepared before the send is claimed.
-    let imap = match mb.provider {
+    let (imap, recipients) = match mb.provider {
         Provider::Gmail => {
-            fresh_checked(cx, mb, &draft_id, &own, expected).await?;
-            None
+            let f = fresh_checked(cx, mb, &draft_id, &own, expected).await?;
+            let p = &f.parsed;
+            (None, p.to.iter().chain(&p.cc).chain(&p.bcc).map(|a| a.email.clone()).collect::<Vec<_>>())
         }
-        Provider::Imap => Some(super::drafts_imap::prepare_send(cx, mb, &own, expected).await?),
+        Provider::Imap => {
+            let p = super::drafts_imap::prepare_send(cx, mb, &own, expected).await?;
+            let r = p.recipients().to_vec();
+            (Some(p), r)
+        }
     };
+    // The owner's recipient rules bind sends the agent starts on its own; an approved request was seen by the owner
+    // (PLAN A82). Checked on the draft as it is on the server, before the claim and any upstream write.
+    if matches!(auth, SendAuth::Grant) {
+        crate::send_policy::check(&cx.app, &mb.account_id, mb.index_enabled, &recipients).await?;
+    }
 
     // Recheck policy immediately before dispatch from the durable store (spec 6.3).
     let (cid, aid) = (cx.client.client_id.clone(), mb.account_id.clone());

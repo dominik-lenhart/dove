@@ -87,6 +87,8 @@ pub enum GmailOp<'a> {
     UntrashMessage(&'a str),
     /// `POST threads/{id}/modify`.
     ModifyThread(&'a str),
+    /// `POST labels` (labels.create; needs `gmail.modify`).
+    CreateLabel,
 }
 
 /// Gmail ids are short URL-safe tokens. Anything else is rejected before a request is built.
@@ -115,6 +117,7 @@ impl GmailOp<'_> {
             GmailOp::TrashMessage(id) => (Method::POST, format!("messages/{}/trash", seg(id)?)),
             GmailOp::UntrashMessage(id) => (Method::POST, format!("messages/{}/untrash", seg(id)?)),
             GmailOp::ModifyThread(id) => (Method::POST, format!("threads/{}/modify", seg(id)?)),
+            GmailOp::CreateLabel => (Method::POST, "labels".into()),
         })
     }
 
@@ -137,6 +140,7 @@ impl GmailOp<'_> {
             GmailOp::TrashMessage(_) => "messages.trash",
             GmailOp::UntrashMessage(_) => "messages.untrash",
             GmailOp::ModifyThread(_) => "threads.modify",
+            GmailOp::CreateLabel => "labels.create",
         }
     }
 }
@@ -654,7 +658,8 @@ mod tests {
         assert_eq!((m, p.as_str()), (Method::POST, "drafts/send"));
     }
 
-    /// The organize/delete additions are exactly the five design entries; there is no DELETE anywhere.
+    /// The organize/delete additions are exactly the five design entries plus labels.create (PLAN A82); there is no
+    /// DELETE anywhere.
     #[test]
     fn organize_ops_are_exactly_allowlisted() {
         fn index(op: &GmailOp<'_>) -> usize {
@@ -676,6 +681,7 @@ mod tests {
                 GmailOp::TrashMessage(_) => 14,
                 GmailOp::UntrashMessage(_) => 15,
                 GmailOp::ModifyThread(_) => 16,
+                GmailOp::CreateLabel => 17,
             }
         }
         let ops = vec![
@@ -696,8 +702,9 @@ mod tests {
             (GmailOp::TrashMessage("m1"), "POST messages/m1/trash"),
             (GmailOp::UntrashMessage("m1"), "POST messages/m1/untrash"),
             (GmailOp::ModifyThread("t1"), "POST threads/t1/modify"),
+            (GmailOp::CreateLabel, "POST labels"),
         ];
-        let mut seen = [false; 17];
+        let mut seen = [false; 18];
         for (op, want) in &ops {
             seen[index(op)] = true;
             let (m, p) = op.method_path().unwrap();

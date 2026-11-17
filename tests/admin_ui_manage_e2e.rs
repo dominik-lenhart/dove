@@ -324,6 +324,41 @@ async fn projects_are_created_and_their_mailboxes_changed() {
     assert!(v["accounts"].as_array().unwrap().is_empty());
 }
 
+#[tokio::test]
+async fn sending_rules_are_saved_with_a_passkey() {
+    let h = start().await;
+    h.mailbox("info", "info@acme.test");
+    let (mut b, mut a) = signed_in(&h).await;
+    let page = b.get("/admin/mailboxes/info").await;
+    assert!(page.text.contains("Sending rules") && page.text.contains("value=\"allow\" checked"), "{}", page.text);
+    let fields = [("domains", "Kunde.de\r\npartner.test"), ("unknown_recipients", "refuse")];
+    // A typo is reported before the passkey prompt.
+    let r = b
+        .post_form("/admin/mailboxes/info/send-policy", &[("domains", "not a domain"), ("unknown_recipients", "allow")])
+        .await;
+    assert!(r.json().get("stepup").is_none() && r.text.contains("not a domain name"), "{}", r.text);
+    // Saving needs the confirmation; nothing changes without it.
+    let r = b.post_form("/admin/mailboxes/info/send-policy", &fields).await;
+    assert!(r.json()["stepup"].is_object(), "{}", r.text);
+    let shown = h.admin(AdminRequest::AccountsSendPolicyShow { account: "info".into() }).await.unwrap();
+    assert_eq!(shown["send_policy"]["unknown_recipients"], "allow");
+    assert_eq!(
+        redirect(&confirm(&mut b, &mut a, "/admin/mailboxes/info/send-policy", &fields).await),
+        "/admin/mailboxes/info?done=saved"
+    );
+    let shown = h.admin(AdminRequest::AccountsSendPolicyShow { account: "info".into() }).await.unwrap();
+    assert_eq!(
+        shown["send_policy"],
+        json!({ "allow_domains": ["kunde.de", "partner.test"], "unknown_recipients": "refuse" })
+    );
+    let page = b.get("/admin/mailboxes/info").await;
+    assert!(
+        page.text.contains("kunde.de\npartner.test</textarea>") && page.text.contains("value=\"refuse\" checked"),
+        "{}",
+        page.text
+    );
+}
+
 // ------------------------------------------------------------------ watches and sinks
 
 #[tokio::test]

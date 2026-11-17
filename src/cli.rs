@@ -274,6 +274,31 @@ pub enum AccountsCmd {
     /// Named signatures with HTML and inline images; agents pick one by name in create_draft.
     #[command(subcommand)]
     Signatures(SignaturesCmd),
+    /// Recipient rules for sends the agent starts itself (send_draft). Sends you approve with `dove requests approve`
+    /// are not checked.
+    #[command(subcommand, name = "send-policy")]
+    SendPolicy(SendPolicyCmd),
+}
+
+#[derive(Subcommand)]
+pub enum SendPolicyCmd {
+    /// Replace the rules. Without --allow-domain and with --unknown-recipients allow, the rules are removed.
+    Set {
+        mailbox: String,
+        /// Allowed recipient domain (subdomains included); repeat for several. None: any domain.
+        #[arg(long = "allow-domain")]
+        allow_domains: Vec<String>,
+        /// refuse: only addresses this mailbox has exchanged mail with (needs the index).
+        #[arg(long, value_parser = ["allow", "refuse"], default_value = "allow")]
+        unknown_recipients: String,
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
+    Show {
+        mailbox: String,
+        #[command(flatten)]
+        admin: AdminOpts,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1386,6 +1411,12 @@ fn admin_request(cmd: Command) -> anyhow::Result<(AdminOpts, AdminRequest)> {
                 SignatureCmd::Show { mailbox, alias, admin } => {
                     (admin, R::AccountsSignatureShow { account: mailbox, alias })
                 }
+            },
+            AccountsCmd::SendPolicy(c) => match c {
+                SendPolicyCmd::Set { mailbox, allow_domains, unknown_recipients, admin } => {
+                    (admin, R::AccountsSendPolicySet { account: mailbox, allow_domains, unknown_recipients })
+                }
+                SendPolicyCmd::Show { mailbox, admin } => (admin, R::AccountsSendPolicyShow { account: mailbox }),
             },
             AccountsCmd::Signatures(c) => match c {
                 SignaturesCmd::List { mailbox, html, admin } => {

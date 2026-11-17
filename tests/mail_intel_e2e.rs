@@ -672,6 +672,8 @@ async fn digest_groups_threads_pages_and_respects_scope() {
     assert_eq!((paged, pages), (full.clone(), 3));
     let first = d(json!({"since": since(30), "limit": 2})).await;
     let cur = first["next_cursor"].as_str().unwrap();
+    // page_token is the cursor's other name (PLAN A82).
+    assert_eq!(subjects(&d(json!({"page_token": cur})).await), subjects(&d(json!({"cursor": cur})).await));
     assert_eq!(
         fx.h.err(&fx.token, "digest", json!({"cursor": cur, "limit": 5})).await,
         "invalid_argument",
