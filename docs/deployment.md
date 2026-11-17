@@ -676,20 +676,41 @@ provider accepts that alias there. At send time the draft's `From` must still be
 removing an alias also stops existing drafts that use it from being sent. Addresses and names pass the same strict
 parsing as every other header value, so they cannot inject headers.
 
-**Signatures.** A signature is plain text (at most 4096 bytes), set by you, never by an agent, for a mailbox or for one
-of its aliases (IMAP aliases, or Gmail send-as addresses):
+**Signatures.** A mailbox has up to 20 named signatures (`behoerden`, `gastgeber`, ...; lowercase letters, digits and
+`-`). Each has a plain-text version (at most 4096 bytes, 30 lines) and optionally HTML with up to 6 inline images (PNG,
+JPEG or GIF, 512 KiB together). One signature is the mailbox's default, and an alias (IMAP alias or Gmail send-as
+address) can have its own default:
 
 ```sh
-dove accounts signature set work --file ~/signature.txt              # mailbox signature (--file - reads stdin)
-dove accounts signature set work --alias sales@example.com --file ~/sales.txt
-dove accounts signature set work --clear
-dove accounts signature show work
+dove accounts signatures set work behoerden --html behoerden.html --image keyset-logo=logo.png
+dove accounts signatures set work gastgeber --html gastgeber.html --image keyset-logo=logo.png \
+    --image keyset-banner=banner.png --text gastgeber.txt     # --text is optional: derived from the HTML
+dove accounts signatures list work [--html]
+dove accounts signatures default work gastgeber [--alias sales@example.com]   # --none removes that default
+dove accounts signatures delete work gastgeber
 ```
 
-`create_draft` appends `-- ` and the signature after `body_text`, before the quote of a reply or the block of a
-forward, using the signature of the address the mail is sent from (the alias's own, otherwise the mailbox's). The agent
-can pass `signature: false`. `update_draft` never adds a signature: it keeps what the draft already has, and a new
-`body_text` replaces the body as given.
+The HTML references its images as `cid:<name>` (the name after `--image`); every image must be used and every `cid:`
+must have an image. Dove cleans the HTML to a safe subset before storing it: layout tags (tables, `div`, `p`, `span`,
+`b`, `i`, `a`, `img`, `br`, ...), `style` without `url()`, `expression` or `@import`, links only to `https:`, `http:`,
+`mailto:` and `tel:`, images only `cid:` or `https:`; scripts, forms, iframes, event handlers and comments are dropped.
+Without `--text` the plain text is derived from the HTML: one line per line break, paragraph or cell, images left out.
+The first signature of a mailbox becomes its default. `dove accounts signature set|show` (singular, from 0.6) still
+works and edits the plain text of the default signature.
+
+`create_draft` puts the sender's default signature below `body_text`, as `-- ` plus the text, and above the quote of a
+reply or the block of a forward. The agent can pick another one with `signature: "<name>"` or none with
+`signature: false`. With an HTML signature the draft becomes `multipart/alternative` (the plain text and an HTML
+version of the same mail, signature and quote included) inside `multipart/related` with the images as inline parts,
+inside `multipart/mixed` when it has attachments. Dove records how it composed its own draft (signature name and byte
+lengths, no content): `update_draft`'s `body_text` replaces only the agent's text above the signature, the signature is
+rendered again from its current version, and `changes.signature` switches or removes it. `get_draft` shows that as
+`composition`.
+
+Agents can manage signatures themselves with `list_signatures` (any connection with `draft`) and `set_signature` /
+`delete_signature`, which need the `signatures` action on that mailbox. It is in no preset; grant it explicitly
+(`--grant work=drafter,signatures`). Every change by an agent sends you an alert (at most one per signature and day)
+and is audited with the signature's name, never its content.
 
 ### New IMAP mail (IDLE push)
 
@@ -736,6 +757,7 @@ secret store, not in a project file. Grants are explicit per mailbox. Actions:
 | `organize` | mark read/unread, star, add/remove labels (IMAP keywords), archive, move between folders, move out of Trash | `read` |
 | `delete` | move to Trash or Spam/Junk (also any folder below them), move out of Spam/Junk, and set or remove junk/not-junk keywords on IMAP (`$Junk`, `$NotJunk`, ...); never a permanent delete | `organize` |
 | `send` | `send_draft`, only with `allow_send = true` | `draft` |
+| `signatures` | `set_signature`, `delete_signature` (create, change and delete the mailbox's named signatures) | `draft` |
 
 Presets are shorthands: `reader` = `read`, `drafter` = `read,draft`, `assistant` = `read,draft,organize`, `full` =
 `read,draft,organize,delete`. Mix them with actions, for example `--grant work-info=assistant,send` or

@@ -75,7 +75,7 @@ pub fn defs() -> Vec<ToolDef> {
             title: "Ask for more access",
             description: concat!(
                 "Ask the owner for lasting or temporary rights on mailboxes of this project (to have one draft sent, use ",
-                "request_send instead): read, draft, organize, delete, send or a preset ",
+                "request_send instead): read, draft, organize, delete, send, signatures or a preset ",
                 "(reader, drafter, assistant, full), e.g. actions \"read,draft\". With duration_minutes (1 to 43200, ",
                 "30 days) the rights end on their own; without it the request is for a permanent grant. Nothing changes ",
                 "until the owner approves; the owner may shorten the time or leave out mailboxes. The owner tells you ",

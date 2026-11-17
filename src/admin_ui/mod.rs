@@ -95,6 +95,7 @@ pub const ADMIN_PATHS: &[&str] = &[
     "/admin/mailboxes/{alias}/index",
     "/admin/mailboxes/{alias}/aliases",
     "/admin/mailboxes/{alias}/signature",
+    "/admin/mailboxes/{alias}/signatures",
     "/admin/projects",
     "/admin/projects/{name}",
     "/admin/projects/{name}/accounts",
@@ -203,6 +204,7 @@ pub fn routes(app: Arc<App>) -> Router<Arc<App>> {
         .route("/admin/mailboxes/{alias}/index", post(mailboxes::index))
         .route("/admin/mailboxes/{alias}/aliases", post(mailboxes::aliases))
         .route("/admin/mailboxes/{alias}/signature", post(mailboxes::signature))
+        .route("/admin/mailboxes/{alias}/signatures", post(mailboxes::signatures))
         .route("/admin/projects", get(projects::list).post(projects::create))
         .route("/admin/projects/{name}", get(projects::detail))
         .route("/admin/projects/{name}/accounts", post(projects::accounts))
@@ -477,6 +479,10 @@ pub fn needs_step_up(req: &AdminRequest) -> bool {
         | AccountsAliasRemove { .. }
         | AccountsSignatureSet { .. }
         | AccountsSignatureShow { .. }
+        | AccountsSignaturesList { .. }
+        | AccountsSignaturePut { .. }
+        | AccountsSignatureDelete { .. }
+        | AccountsSignatureDefault { .. }
         | ClientsRevoke { .. }
         | ClientsShow { .. }
         | ClientsSetRedaction { .. }
@@ -550,6 +556,13 @@ pub const COVERAGE: &[(&str, Reach)] = &[
     ("AccountsAliasRemove", Reach::Ui("/admin/mailboxes/{alias}/aliases")),
     ("AccountsSignatureSet", Reach::Ui("/admin/mailboxes/{alias}/signature")),
     ("AccountsSignatureShow", Reach::Ui("/admin/mailboxes/{alias}")),
+    ("AccountsSignaturesList", Reach::Ui("/admin/mailboxes/{alias}")),
+    (
+        "AccountsSignaturePut",
+        Reach::Excluded("HTML and images are uploaded with the CLI or by an agent with the signatures permission"),
+    ),
+    ("AccountsSignatureDelete", Reach::Ui("/admin/mailboxes/{alias}/signatures")),
+    ("AccountsSignatureDefault", Reach::Ui("/admin/mailboxes/{alias}/signatures")),
     ("ClientsCreate", Reach::Ui("/admin/connections/new")),
     ("ClientsSetGrants", Reach::Ui("/admin/connections/{name}/grants")),
     ("ClientsRotate", Reach::Ui("/admin/connections/{name}/rotate")),

@@ -63,8 +63,9 @@ pub fn defs() -> Vec<ToolDef> {
                 "forward (forward_message_id or forward_ref, includes the original's attachments by default) in a ",
                 "mailbox's server Drafts. Attach files by reference to a message you can read (bytes stay on the ",
                 "server) or inline as base64: at most 10 per draft, 10 MiB in total by default. Recipients are never ",
-                "inferred. If the operator set a signature for the sender it is appended after body_text (before a ",
-                "quote or forward block) unless you pass signature: false; update_draft never adds it again. ",
+                "inferred. The sender's default signature goes below body_text and above any quote or forward block; ",
+                "pass signature: \"<name>\" for another one of this mailbox (list_signatures) or false for none. A ",
+                "signature with HTML makes the draft HTML with a plain-text alternative and inline images. ",
                 "Generate a fresh UUID request_key per intent and reuse it only to retry the same request. ",
                 "The owner reviews and sends it in their mail app unless send rights exist. Change it with update_draft; ",
                 "send it with send_draft when you have send rights, otherwise ask the owner with request_send."
@@ -90,7 +91,7 @@ pub fn defs() -> Vec<ToolDef> {
                     "include_attachments": { "type": "boolean", "description": "Forwards: attach the original's attachments (default true)." },
                     "attachments": attachments_schema(),
                     "from_address": { "type": "string", "description": "The mailbox address or one of its send-as aliases (list_accounts shows from_addresses for IMAP mailboxes; Gmail uses the account's send-as list)." },
-                    "signature": { "type": "boolean", "description": "Append the sender's signature after body_text (default true; nothing happens when none is set)." }
+                    "signature": { "type": ["boolean", "string"], "description": "true (default): the sender's default signature, if one is set; false: none; a name from list_signatures: that signature." }
                 }, "required": ["account", "request_key", "body_text"], "additionalProperties": false })
             },
             output_schema: || {
@@ -108,7 +109,9 @@ pub fn defs() -> Vec<ToolDef> {
                 "including attachments; changes.attachments replaces the whole list ([] removes all). ",
                 "Fails with draft_conflict if the draft changed elsewhere (for example saved in a mail app) or the ",
                 "revision is stale; re-read it with get_draft before trying again. Only drafts created by create_draft ",
-                "can be patched; for any other draft create a new one."
+                "can be patched; for any other draft create a new one. changes.body_text replaces only your text: the ",
+                "signature and the quote or forward block below it stay (get_draft's composition shows them); ",
+                "changes.signature switches or removes the signature."
             ),
             capability: Capability::Draft,
             read_only: false,
@@ -125,7 +128,8 @@ pub fn defs() -> Vec<ToolDef> {
                         "cc": r("New Cc list (email addresses, at most 50)."),
                         "bcc": r("New Bcc list (email addresses, at most 50)."),
                         "subject": { "type": "string", "description": "New subject line." },
-                        "body_text": { "type": "string", "description": "New plain-text body (at most 500 KB)." },
+                        "body_text": { "type": "string", "description": "New plain-text body above the signature and quote (at most 500 KB)." },
+                        "signature": { "type": ["boolean", "string"], "description": "true: the sender's default signature; false: none; a name from list_signatures: that one. Omitted: keep the current signature (re-rendered when body_text changes)." },
                         "attachments": attachments_schema()
                     }, "additionalProperties": false }
                 }, "required": ["account", "draft_id", "expected_revision", "changes"], "additionalProperties": false })
@@ -316,7 +320,7 @@ async fn create_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError>
         Some(f) => Some(mime::parse_address(f).map_err(|_| ToolError::invalid("invalid from_address"))?),
         None => None,
     };
-    let signature = opt_bool(&args, "signature", true)?;
+    let signature = super::draft_body::SigChoice::parse(args.get("signature"))?;
     // Every referenced message is authorized here, before any upstream call (identical not_found without read).
     let limit = cx.app.cfg.limits.draft_attachment_bytes;
     let attachments = compose::parse_attachments(cx, args.get("attachments"), limit)?.unwrap_or_default();
@@ -355,7 +359,7 @@ async fn create_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError>
         "to": fmt_addrs(&to), "cc": fmt_addrs(&cc), "bcc": fmt_addrs(&bcc), "subject": subject_arg,
         "body": body, "reply": reply_to, "from": from_arg.as_ref().map(|a| a.email.clone()),
         "attachments": attachments.iter().map(compose::AttachSpec::canonical).collect::<Vec<_>>(),
-        "forward": forward, "include_attachments": include_attachments, "quote": quote, "signature": signature,
+        "forward": forward, "include_attachments": include_attachments, "quote": quote, "signature": signature.canonical(),
     });
     let input_hash = cx.app.pepper.hash("create-op", &canonical.to_string());
     let (cid, aid, key) = (cx.client.client_id.clone(), mb.account_id.clone(), request_key.to_string());
@@ -446,7 +450,8 @@ async fn create_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError>
     let result = dispatch_create(cx, &mb, input).await;
     let (cid, aid, key) = (cx.client.client_id.clone(), mb.account_id.clone(), request_key.to_string());
     match result {
-        Ok((Created { draft_id, message_id, thread_id, content_hash }, stats)) => {
+        Ok((Created { draft_id, message_id, thread_id, content_hash }, stats, composition)) => {
+            let composition = serde_json::to_string(&composition).ok();
             let out = json!({ "account": mb.alias, "draft_id": draft_id, "message_id": message_id, "thread_id": thread_id, "revision": message_id });
             let (o2, pid, client_id) = (out.clone(), cx.client.project_id.clone(), cx.client.client_id.clone());
             let (d2, m2, t2) = (draft_id.clone(), message_id.clone(), thread_id.clone());
@@ -457,9 +462,9 @@ async fn create_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError>
                     let tx = c.transaction()?;
                     let now = util::now_unix();
                     tx.execute(
-                        "INSERT INTO own_drafts(account_id, draft_id, message_id, thread_id, project_id, client_id, created_at, updated_at, state, content_hash) \
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, 'active', ?8)",
-                        params![aid, d2, m2, t2, pid, client_id, now, content_hash],
+                        "INSERT INTO own_drafts(account_id, draft_id, message_id, thread_id, project_id, client_id, created_at, updated_at, state, content_hash, composition) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, 'active', ?8, ?9)",
+                        params![aid, d2, m2, t2, pid, client_id, now, content_hash, composition],
                     )?;
                     tx.execute(
                         "UPDATE create_operations SET state = 'succeeded', result_ids = ?1, updated_at = ?2 \
@@ -536,8 +541,8 @@ struct CreateInput {
     include_attachments: bool,
     attachments: Vec<compose::AttachSpec>,
     from_arg: Option<Addr>,
-    /// Append the sender's signature (when one is set).
-    signature: bool,
+    /// Which signature goes between body_text and the quote or forward block.
+    signature: super::draft_body::SigChoice,
 }
 
 /// Count and total size of a new draft's attachments, for the audit record (never names).
@@ -565,13 +570,13 @@ async fn dispatch_create(
     cx: &ToolCx,
     mb: &Mailbox,
     input: CreateInput,
-) -> Result<(Created, AttachStats), (ToolError, bool)> {
+) -> Result<(Created, AttachStats, super::draft_body::Composition), (ToolError, bool)> {
     let CreateInput {
         to,
         cc,
         bcc,
         subject_arg,
-        mut body,
+        body,
         reply_to,
         quote,
         forward,
@@ -606,19 +611,9 @@ async fn dispatch_create(
             .cloned()
             .unwrap_or(Addr { email: mb.email.clone(), name: None }),
     };
-    // The signature follows the agent's text and precedes any quote or forward block added below.
-    if signature {
-        let (aid, sender) = (mb.account_id.clone(), from.email.clone());
-        let sig = cx
-            .app
-            .store
-            .call(move |c| crate::identity::signature_for(c, &aid, &sender))
-            .await
-            .map_err(|e| pre(e.into()))?;
-        if let Some(sig) = sig {
-            body = crate::identity::with_signature(&body, &sig);
-        }
-    }
+    // The signature follows the agent's text and precedes any quote or forward block (design 2026-11-17).
+    let sig = resolve_signature(cx, mb, &signature, &from.email).await.map_err(pre)?;
+    let mut tail = String::new();
     let mut subject = subject_arg.clone().unwrap_or_default();
     let mut in_reply_to = None;
     let mut references = Vec::new();
@@ -649,7 +644,7 @@ async fn dispatch_create(
             Some(_) => {}
         }
         if quote {
-            body = compose::with_quote(&body, &orig);
+            tail = compose::with_quote("", &orig);
         }
     }
     if let Some((aid, mid)) = &forward {
@@ -658,7 +653,7 @@ async fn dispatch_create(
         if subject_arg.is_none() {
             subject = compose::forward_subject(orig.parsed.subject.as_deref());
         }
-        body = compose::with_forward(&body, &orig);
+        tail = compose::with_forward("", &orig);
         if include_attachments {
             files = compose::forward_attachments(&orig, limit).map_err(pre)?;
         }
@@ -666,6 +661,8 @@ async fn dispatch_create(
     let used = (files.len(), files.iter().map(|a| a.bytes.len()).sum());
     files.extend(compose::resolve(cx, attachments, limit, used).await.map_err(pre)?);
     let stats = AttachStats::of(&files);
+    let composed = super::draft_body::compose(&body, sig.as_ref(), tail.trim_matches('\n'));
+    drop(body);
     let fields = DraftFields {
         message_id: new_message_id(&from),
         from,
@@ -673,18 +670,20 @@ async fn dispatch_create(
         cc,
         bcc,
         subject,
-        body_text: body,
+        body_text: composed.text,
+        html: composed.html,
         in_reply_to,
         references,
         date: util::now_unix(),
         attachments: files,
     };
+    let composition = composed.composition;
     let raw = mime::build_draft(&fields).map_err(|e| pre(mime_err(e)))?;
     drop(fields);
     // From here on the draft may reach the provider: the rest runs to completion even if the call times out.
     cx.commit().map_err(pre)?;
     if mb.provider == Provider::Imap {
-        return super::drafts_imap::append_new(cx, mb, raw).await.map(|c| (c, stats));
+        return super::drafts_imap::append_new(cx, mb, raw).await.map(|c| (c, stats, composition));
     }
     let mut message = json!({ "raw": util::b64url(&raw) });
     if let Some(t) = &thread_id {
@@ -708,7 +707,31 @@ async fn dispatch_create(
         thread_id: thread.to_string(),
         content_hash: None,
     };
-    Ok((created, stats))
+    Ok((created, stats, composition))
+}
+
+/// The signature a create or update asked for: the sender's default, none, or a named one of this mailbox.
+pub(super) async fn resolve_signature(
+    cx: &ToolCx,
+    mb: &Mailbox,
+    choice: &super::draft_body::SigChoice,
+    from_email: &str,
+) -> Result<Option<crate::signatures::Signature>, ToolError> {
+    use super::draft_body::SigChoice;
+    let (aid, from) = (mb.account_id.clone(), from_email.to_string());
+    match choice.clone() {
+        SigChoice::None => Ok(None),
+        SigChoice::Default => Ok(cx.app.store.call(move |c| crate::signatures::default_for(c, &aid, &from)).await?),
+        SigChoice::Named(name) => {
+            let n = name.clone();
+            cx.app.store.call(move |c| crate::signatures::load(c, &aid, &n)).await?.map(Some).ok_or_else(|| {
+                ToolError::invalid_at(
+                    "signature",
+                    "this mailbox has no signature by that name; list_signatures shows them",
+                )
+            })
+        }
+    }
 }
 
 // ------------------------------------------------------------------ update / send common
@@ -718,24 +741,49 @@ pub(super) struct OwnRow {
     pub state: String,
     /// SHA-256 of the server's bytes (IMAP drafts only).
     pub content_hash: Option<Vec<u8>>,
+    /// How Dove composed the text (`draft_body::Composition` as JSON); None for drafts from before signatures.
+    pub composition: Option<String>,
 }
 
-async fn own_row(cx: &ToolCx, mb: &Mailbox, draft_id: &str) -> Result<OwnRow, ToolError> {
+impl OwnRow {
+    pub fn composition(&self) -> Option<super::draft_body::Composition> {
+        self.composition.as_deref().and_then(|c| serde_json::from_str(c).ok())
+    }
+}
+
+pub(super) async fn own_row(cx: &ToolCx, mb: &Mailbox, draft_id: &str) -> Result<OwnRow, ToolError> {
     let (aid, did, pid) = (mb.account_id.clone(), draft_id.to_string(), cx.client.project_id.clone());
     let row = cx
         .app
         .store
         .call(move |c| {
             Ok(c.query_row(
-                "SELECT message_id, state, content_hash FROM own_drafts WHERE account_id = ?1 AND draft_id = ?2 AND project_id = ?3",
+                "SELECT message_id, state, content_hash, composition FROM own_drafts WHERE account_id = ?1 AND draft_id = ?2 AND project_id = ?3",
                 params![aid, did, pid],
-                |r| Ok(OwnRow { message_id: r.get(0)?, state: r.get(1)?, content_hash: r.get(2)? }),
+                |r| Ok(OwnRow { message_id: r.get(0)?, state: r.get(1)?, content_hash: r.get(2)?, composition: r.get(3)? }),
             )
             .optional()?)
         })
         .await?;
     // Other projects' drafts and unknown drafts look the same (FR-P5).
     row.ok_or_else(ToolError::not_found)
+}
+
+/// For `get_draft` on an own, unchanged draft: which signature Dove put in and whether a quote or forward block
+/// follows it, so the agent knows what `changes.body_text` replaces. None for other drafts.
+pub(super) async fn composition_view(
+    cx: &ToolCx,
+    mb: &Mailbox,
+    draft_id: &str,
+    f: &super::read::Fetched,
+) -> Option<Value> {
+    let own = own_row(cx, mb, draft_id).await.ok()?;
+    let c = own.composition()?;
+    let fields = mime::read_draft_fields(&f.raw).ok()?;
+    let (_, _, tail) = super::draft_body::split(&fields.body_text, &c)?;
+    Some(
+        json!({ "signature": c.signature, "has_html": fields.html.is_some(), "quote_or_forward_below": !tail.is_empty() }),
+    )
 }
 
 /// Fresh read bypassing caches, then the two revision comparisons (spec 5.3).
@@ -784,7 +832,11 @@ async fn update_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError>
         .get("changes")
         .filter(|c| c.is_object())
         .ok_or_else(|| ToolError::invalid("'changes' must be an object"))?;
-    only_keys(changes, &["to", "cc", "bcc", "subject", "body_text", "attachments"])?;
+    only_keys(changes, &["to", "cc", "bcc", "subject", "body_text", "attachments", "signature"])?;
+    let sig_change = match changes.get("signature") {
+        None => None,
+        Some(v) => Some(super::draft_body::SigChoice::parse(Some(v))?),
+    };
     let to = changes.get("to").map(|_| addr_list(changes, "to")).transpose()?;
     let cc = changes.get("cc").map(|_| addr_list(changes, "cc")).transpose()?;
     let bcc = changes.get("bcc").map(|_| addr_list(changes, "bcc")).transpose()?;
@@ -828,6 +880,46 @@ async fn update_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError>
     }
     let mut fields =
         mime::read_draft_fields(&f.raw).map_err(|_| conflict(&f, "the draft has a structure Dove cannot preserve"))?;
+    // Body and signature: with a composition record, body_text replaces only the agent's text and the signature and
+    // quote or forward block are kept (the signature re-rendered from its current definition). Without one (drafts
+    // from before signatures) body_text replaces the whole text as before.
+    let mut composition = own.composition.clone();
+    if body.is_some() || sig_change.is_some() {
+        let (old_body, old_sig, tail) = match own.composition() {
+            Some(c) => {
+                let (b, _, t) = super::draft_body::split(&fields.body_text, &c)
+                    .ok_or_else(|| conflict(&f, "the draft's text is not what Dove wrote"))?;
+                (b.to_string(), c.signature, t.to_string())
+            }
+            None if fields.html.is_some() => {
+                return Err(conflict(&f, "the draft has parts Dove cannot preserve (HTML or inline parts)"));
+            }
+            None => (fields.body_text.clone(), None, String::new()),
+        };
+        let choice = match (sig_change, old_sig) {
+            (Some(c), _) => c,
+            (None, Some(name)) => super::draft_body::SigChoice::Named(name),
+            (None, None) => super::draft_body::SigChoice::None,
+        };
+        let named = changes.get("signature").is_some();
+        let sig = resolve_signature(cx, &mb, &choice, &fields.from.email).await.map_err(|e| match e.code {
+            ErrorCode::InvalidArgument if named => ToolError::invalid_at(
+                "changes.signature",
+                "this mailbox has no signature by that name; list_signatures shows them",
+            ),
+            ErrorCode::InvalidArgument => ToolError::invalid_at(
+                "changes.signature",
+                "the draft's signature no longer exists; pass false or another signature name",
+            ),
+            _ => e,
+        })?;
+        let new_body = body.clone().unwrap_or(old_body);
+        let composed = super::draft_body::compose(&new_body, sig.as_ref(), &tail);
+        fields.body_text = composed.text;
+        fields.html = composed.html;
+        composition = serde_json::to_string(&composed.composition).ok();
+    }
+
     match new_files {
         Some(files) => fields.attachments = files,
         // Kept attachments are rebuilt from the stored bytes, names and types re-checked like new ones.
@@ -851,9 +943,6 @@ async fn update_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError>
     if let Some(v) = subject {
         fields.subject = v;
     }
-    if let Some(v) = body {
-        fields.body_text = v;
-    }
     if fields.to.len() + fields.cc.len() + fields.bcc.len() > 50 {
         return Err(ToolError::invalid("at most 50 recipients in total"));
     }
@@ -861,8 +950,10 @@ async fn update_draft(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError>
     let raw = mime::build_draft(&fields).map_err(mime_err)?;
     cx.commit()?;
     let res = match imap_id {
-        None => gmail_update(cx, &mb, &draft_id, &f, raw).await,
-        Some(old) => super::drafts_imap::replace(cx, &mb, &draft_id, old, raw).await.map(|(r, t)| (r, json!(t))),
+        None => gmail_update(cx, &mb, &draft_id, &f, raw, composition).await,
+        Some(old) => {
+            super::drafts_imap::replace(cx, &mb, &draft_id, old, raw, composition).await.map(|(r, t)| (r, json!(t)))
+        }
     };
     let (aid, d2) = (mb.account_id.clone(), draft_id.clone());
     match res {
@@ -904,6 +995,7 @@ async fn gmail_update(
     draft_id: &str,
     f: &super::read::Fetched,
     raw: Vec<u8>,
+    composition: Option<String>,
 ) -> Result<(String, Value), ToolError> {
     let mut message = json!({ "raw": util::b64url(&raw) });
     if !f.meta.thread_id.is_empty() {
@@ -923,8 +1015,8 @@ async fn gmail_update(
         .store
         .call(move |c| {
             Ok(c.execute(
-                "UPDATE own_drafts SET message_id = ?1, updated_at = ?2 WHERE account_id = ?3 AND draft_id = ?4",
-                params![nr, util::now_unix(), aid, d2],
+                "UPDATE own_drafts SET message_id = ?1, updated_at = ?2, composition = ?5 WHERE account_id = ?3 AND draft_id = ?4",
+                params![nr, util::now_unix(), aid, d2, composition],
             )?)
         })
         .await;

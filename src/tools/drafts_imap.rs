@@ -270,6 +270,7 @@ pub(super) async fn replace(
     draft_id: &str,
     old: ImapMsgId,
     raw: Vec<u8>,
+    composition: Option<String>,
 ) -> Result<(String, String), ToolError> {
     let conn = Conn::load(cx, mb).await?;
     let drafts = drafts_folder(cx, &mb.account_id).await?;
@@ -292,9 +293,9 @@ pub(super) async fn replace(
         .store
         .call(move |c| {
             Ok(c.execute(
-                "UPDATE own_drafts SET message_id = ?1, content_hash = ?2, thread_id = ?3, updated_at = ?4 \
+                "UPDATE own_drafts SET message_id = ?1, content_hash = ?2, thread_id = ?3, updated_at = ?4, composition = ?8 \
                  WHERE account_id = ?5 AND draft_id = ?6 AND message_id = ?7 AND state = 'active'",
-                params![nid, h, t, util::now_unix(), aid, did, oid],
+                params![nid, h, t, util::now_unix(), aid, did, oid, composition],
             )?)
         })
         .await;
@@ -581,10 +582,14 @@ pub(super) async fn get_draft(cx: &ToolCx, mb: &Mailbox, args: &Value) -> Result
         if changed { " (changed outside Dove: human-owned, Dove will not edit it)" } else { "" },
         render(&msg)
     );
+    let composition = match own {
+        Some(_) if !changed => super::drafts::composition_view(cx, mb, &draft_id, &f).await,
+        _ => None,
+    };
     Ok(ToolOutput {
         extra: Vec::new(),
         structured: json!({ "account": mb.alias, "draft_id": draft_id, "revision": message_id, "owned": own.is_some(),
-                            "editable_by_dove": own.is_some() && !changed && f.parsed.is_draft_shape, "message": msg }),
+                            "editable_by_dove": own.is_some() && !changed && f.parsed.is_draft_shape, "composition": composition, "message": msg }),
         text,
         audit: AuditInfo {
             account: Some(mb.alias.clone()),

@@ -38,13 +38,14 @@ pub fn strings(v: &Value) -> Vec<String> {
     v.as_array().map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default()
 }
 
-/// The five grantable actions, in dependency order, with a short explanation.
+/// The grantable actions, in dependency order, with a short explanation.
 pub const ACTIONS: &[(&str, &str)] = &[
     ("read", "search and read mail"),
     ("draft", "write drafts"),
     ("organize", "label, archive, move"),
     ("delete", "move to trash or spam"),
     ("send", "send drafts"),
+    ("signatures", "create and change signatures"),
 ];
 
 /// Checkboxes for the actions, named `name`, with the ones in `checked` ticked. `send` only when `allow_send`.

@@ -20,11 +20,19 @@ pub enum Capability {
     Organize,
     Delete,
     Send,
+    /// Create, change and delete the mailbox's signatures (design 2026-11-17 "html signatures").
+    Signatures,
 }
 
 impl Capability {
-    pub const ALL: [Capability; 5] =
-        [Capability::Read, Capability::Draft, Capability::Organize, Capability::Delete, Capability::Send];
+    pub const ALL: [Capability; 6] = [
+        Capability::Read,
+        Capability::Draft,
+        Capability::Organize,
+        Capability::Delete,
+        Capability::Send,
+        Capability::Signatures,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -33,6 +41,7 @@ impl Capability {
             Capability::Organize => "organize",
             Capability::Delete => "delete",
             Capability::Send => "send",
+            Capability::Signatures => "signatures",
         }
     }
 }
@@ -45,10 +54,11 @@ pub struct Actions {
     pub organize: bool,
     pub delete: bool,
     pub send: bool,
+    pub signatures: bool,
 }
 
 /// Presets: input sugar for `--grant` and the approval page. Never stored, so a preset changed later never widens
-/// an existing grant. `send` is in none of them.
+/// an existing grant. `send` and `signatures` are in none of them.
 pub const PRESETS: &[(&str, &str)] = &[
     ("reader", "read"),
     ("drafter", "read,draft"),
@@ -64,7 +74,7 @@ impl Actions {
         for part in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
             if !a.set(part) {
                 return Err(format!(
-                    "unknown action '{}' (expected read, draft, organize, delete or send)",
+                    "unknown action '{}' (expected read, draft, organize, delete, send or signatures)",
                     part.chars().take(32).collect::<String>()
                 ));
             }
@@ -85,7 +95,7 @@ impl Actions {
                 }
             } else if !a.set(&word) {
                 return Err(format!(
-                    "unknown action or preset '{}' (actions: read, draft, organize, delete, send; presets: reader, \
+                    "unknown action or preset '{}' (actions: read, draft, organize, delete, send, signatures; presets: reader, \
                      drafter, assistant, full)",
                     part.chars().take(32).collect::<String>()
                 ));
@@ -107,12 +117,14 @@ impl Actions {
             "organize" => self.organize = true,
             "delete" => self.delete = true,
             "send" => self.send = true,
+            "signatures" => self.signatures = true,
             _ => return false,
         }
         true
     }
 
-    /// draft => read, organize => read, delete => organize, send => draft (FR-P2, design section 1).
+    /// draft => read, organize => read, delete => organize, send => draft (FR-P2, design section 1), signatures =>
+    /// draft (design 2026-11-17 "html signatures").
     fn validate(&self) -> Result<(), String> {
         if *self == Actions::default() {
             return Err("empty action list".into());
@@ -129,6 +141,9 @@ impl Actions {
         if self.send && !(self.read && self.draft) {
             return Err("send requires read and draft".into());
         }
+        if self.signatures && !self.draft {
+            return Err("signatures requires draft".into());
+        }
         Ok(())
     }
 
@@ -139,7 +154,8 @@ impl Actions {
         let organize = read && self.organize && other.organize;
         let delete = organize && self.delete && other.delete;
         let send = draft && self.send && other.send;
-        Actions { read, draft, organize, delete, send }
+        let signatures = draft && self.signatures && other.signatures;
+        Actions { read, draft, organize, delete, send, signatures }
     }
 
     /// Actions in either set (a base grant and temporary grants, design 2026-11-14 section 4.5), re-validated by the
@@ -152,6 +168,7 @@ impl Actions {
             organize: self.organize || other.organize,
             delete: self.delete || other.delete,
             send: self.send || other.send,
+            signatures: self.signatures || other.signatures,
         };
         if u.validate().is_ok() { u } else { Actions::default() }
     }
@@ -163,6 +180,7 @@ impl Actions {
             Capability::Organize => self.organize,
             Capability::Delete => self.delete,
             Capability::Send => self.send,
+            Capability::Signatures => self.signatures,
         }
     }
 }
@@ -524,6 +542,8 @@ mod tests {
         assert!(Actions::parse("organize").is_err());
         assert!(Actions::parse("read,delete").is_err());
         assert!(Actions::parse("read,organize,send").is_err());
+        assert_eq!(Actions::parse("signatures,draft,read").unwrap().to_string(), "read,draft,signatures");
+        assert!(Actions::parse("read,signatures").unwrap_err().contains("signatures requires draft"));
         // Stored lists never take presets.
         assert!(Actions::parse("full").is_err());
         assert!(Actions::parse("").is_err());
@@ -541,10 +561,12 @@ mod tests {
         assert_eq!(p("reader,organize").unwrap(), "read,organize");
         assert_eq!(p("Read, Draft").unwrap(), "read,draft");
         assert_eq!(p("read,draft,organize").unwrap(), "read,draft,organize");
-        // Send is in no preset.
+        // Send and signatures are in no preset.
         for (name, _) in PRESETS {
-            assert!(!Actions::parse_grant(name).unwrap().send, "{name}");
+            let a = Actions::parse_grant(name).unwrap();
+            assert!(!a.send && !a.signatures, "{name}");
         }
+        assert_eq!(p("drafter,signatures").unwrap(), "read,draft,signatures");
         let e = Actions::parse_grant("assistent").unwrap_err();
         assert!(e.contains("assistent") && e.contains("presets"), "{e}");
         assert!(Actions::parse_grant("reader,send").unwrap_err().contains("send requires"));

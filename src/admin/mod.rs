@@ -119,6 +119,35 @@ pub enum AdminRequest {
         account: String,
         alias: Option<String>,
     },
+    /// The mailbox's named signatures (design 2026-11-17 "html signatures").
+    AccountsSignaturesList {
+        account: String,
+        #[serde(default)]
+        include_html: bool,
+    },
+    /// Creates or changes named signature `name`; `None` fields keep their value, `images` replaces all images.
+    AccountsSignaturePut {
+        account: String,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        html: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        images: Option<Vec<SignatureImage>>,
+    },
+    AccountsSignatureDelete {
+        account: String,
+        name: String,
+    },
+    /// Makes `name` the default of the mailbox or of `alias` (a send-as address); `None` removes that default.
+    AccountsSignatureDefault {
+        account: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        alias: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
 
     ClientsCreate {
         name: String,
@@ -348,6 +377,19 @@ impl AdminRequest {
                 vec![],
             ),
             AccountsSignatureShow { account, .. } => ("accounts.signature_show", None, Some(account.clone()), vec![]),
+            AccountsSignaturesList { account, .. } => ("accounts.signatures_list", None, Some(account.clone()), vec![]),
+            AccountsSignaturePut { account, name, .. } => {
+                ("accounts.signature_put", None, Some(account.clone()), vec![format!("signature:{name}")])
+            }
+            AccountsSignatureDelete { account, name } => {
+                ("accounts.signature_delete", None, Some(account.clone()), vec![format!("signature:{name}")])
+            }
+            AccountsSignatureDefault { account, name, .. } => (
+                "accounts.signature_default",
+                None,
+                Some(account.clone()),
+                name.iter().map(|n| format!("signature:{n}")).collect(),
+            ),
             ClientsCreate { name, project, .. } => ("clients.create", Some(project.clone()), None, vec![name.clone()]),
             ClientsSetGrants { name, .. } => ("clients.set_grants", None, None, vec![name.clone()]),
             ClientsRotate { name } => ("clients.rotate", None, None, vec![name.clone()]),
@@ -424,5 +466,16 @@ impl AdminResponse {
     }
 }
 
-/// Maximum size of one admin request line.
-pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
+/// One inline image of [`AdminRequest::AccountsSignaturePut`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SignatureImage {
+    pub cid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    pub data_base64: String,
+}
+
+/// Maximum size of one admin request line: large enough for a signature with its images (512 KiB as base64 plus
+/// 64 KiB of HTML, JSON-escaped).
+pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;

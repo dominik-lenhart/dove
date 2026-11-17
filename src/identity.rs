@@ -25,8 +25,8 @@ pub const MAX_SIGNATURE_BYTES: usize = 4096;
 /// At most this many aliases per mailbox.
 pub const MAX_ALIASES: usize = 50;
 
-/// Address key of the mailbox's own (default) signature in `account_signatures`.
-const MAILBOX_SIGNATURE: &str = "";
+/// Address key of the mailbox's own default signature in `signature_defaults`.
+const MAILBOX_SIGNATURE: &str = crate::signatures::MAILBOX_DEFAULT;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Alias {
@@ -155,8 +155,8 @@ pub fn alias_remove(tx: &Transaction, mailbox: &str, address: &str) -> anyhow::R
     if n == 0 {
         bail!("{address} is not an alias of '{mailbox}'");
     }
-    // Its signature goes with it.
-    tx.execute("DELETE FROM account_signatures WHERE account_id = ?1 AND address = ?2", params![aid, address])?;
+    // Its default signature goes with it (the signature itself stays, it is the mailbox's).
+    tx.execute("DELETE FROM signature_defaults WHERE account_id = ?1 AND address = ?2", params![aid, address])?;
     Ok(json!({ "account": mailbox, "address": address, "removed": true }))
 }
 
@@ -165,7 +165,7 @@ pub fn alias_list(conn: &Connection, mailbox: &str) -> anyhow::Result<Value> {
     let email: String = conn.query_row("SELECT email FROM accounts WHERE id = ?1", [&aid], |r| r.get(0))?;
     let provider = provider_of(conn, &aid)?;
     let sigs: Vec<String> = {
-        let mut stmt = conn.prepare("SELECT address FROM account_signatures WHERE account_id = ?1")?;
+        let mut stmt = conn.prepare("SELECT address FROM signature_defaults WHERE account_id = ?1")?;
         stmt.query_map([&aid], |r| r.get(0))?.collect::<Result<_, _>>()?
     };
     let aliases: Vec<Value> = load_aliases(conn, &aid)?
@@ -181,7 +181,10 @@ pub fn alias_list(conn: &Connection, mailbox: &str) -> anyhow::Result<Value> {
 
 // ------------------------------------------------------------------ signatures
 
-/// Sets (`Some`) or clears (`None`) the signature of the mailbox, or of `alias` when given.
+/// The legacy plain-text verbs (`dove accounts signature set|show`) on top of named signatures (PLAN A79): the
+/// mailbox's text is signature `default`, an alias's is the signature that is its default (a new `alias-<n>` when it
+/// has none). Setting changes that signature's plain text (its HTML and images stay) and makes it the default;
+/// clearing removes the default.
 pub fn signature_set(
     tx: &Transaction,
     mailbox: &str,
@@ -190,19 +193,45 @@ pub fn signature_set(
 ) -> anyhow::Result<Value> {
     let aid = account_id(tx, mailbox)?;
     let key = signature_key(tx, &aid, mailbox, alias)?;
+    let current: Option<String> = tx
+        .query_row(
+            "SELECT s.name FROM signature_defaults d JOIN signatures s ON s.id = d.signature_id \
+             WHERE d.account_id = ?1 AND d.address = ?2",
+            params![aid, key],
+            |r| r.get(0),
+        )
+        .optional()?;
     match signature {
         Some(raw) => {
             let body = clean_signature(raw)?;
-            tx.execute(
-                "INSERT INTO account_signatures(account_id, address, body, updated_at) VALUES (?1, ?2, ?3, ?4) \
-                 ON CONFLICT(account_id, address) DO UPDATE SET body = excluded.body, updated_at = excluded.updated_at",
-                params![aid, key, body, util::now_unix()],
-            )?;
-            Ok(json!({ "account": mailbox, "alias": alias.map(|_| &key), "signature_bytes": body.len() }))
+            let name = match (current, alias) {
+                (Some(n), _) => n,
+                (None, None) => "default".to_string(),
+                (None, Some(_)) => {
+                    let mut n = 1;
+                    loop {
+                        let name = format!("alias-{n}");
+                        let taken: bool = tx.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM signatures WHERE account_id = ?1 AND name = ?2)",
+                            params![aid, name],
+                            |r| r.get(0),
+                        )?;
+                        if !taken {
+                            break name;
+                        }
+                        n += 1;
+                    }
+                }
+            };
+            let change =
+                crate::signatures::Change { name: name.clone(), html: None, text: Some(body.clone()), images: None };
+            crate::signatures::set(tx, mailbox, change, "operator")?;
+            crate::signatures::set_default(tx, mailbox, alias, Some(&name))?;
+            Ok(json!({ "account": mailbox, "alias": alias.map(|_| &key), "signature_bytes": body.len(), "name": name }))
         }
         None => {
             let n =
-                tx.execute("DELETE FROM account_signatures WHERE account_id = ?1 AND address = ?2", params![aid, key])?;
+                tx.execute("DELETE FROM signature_defaults WHERE account_id = ?1 AND address = ?2", params![aid, key])?;
             Ok(json!({ "account": mailbox, "alias": alias.map(|_| &key), "cleared": n > 0 }))
         }
     }
@@ -213,7 +242,8 @@ pub fn signature_show(conn: &Connection, mailbox: &str, alias: Option<&str>) -> 
     let key = signature_key(conn, &aid, mailbox, alias)?;
     let body: Option<String> = conn
         .query_row(
-            "SELECT body FROM account_signatures WHERE account_id = ?1 AND address = ?2",
+            "SELECT s.text FROM signature_defaults d JOIN signatures s ON s.id = d.signature_id \
+             WHERE d.account_id = ?1 AND d.address = ?2",
             params![aid, key],
             |r| r.get(0),
         )
@@ -221,10 +251,15 @@ pub fn signature_show(conn: &Connection, mailbox: &str, alias: Option<&str>) -> 
     Ok(json!({ "account": mailbox, "alias": alias.map(|_| &key), "signature": body }))
 }
 
-/// The `account_signatures.address` key for the mailbox (`''`) or one of its alias addresses. An IMAP alias must
+/// The `signature_defaults.address` key for the mailbox (`''`) or one of its alias addresses. An IMAP alias must
 /// exist; a Gmail send-as address cannot be checked without Google, so any valid address is accepted there and is
 /// simply unused until the agent sends from it.
-fn signature_key(conn: &Connection, aid: &str, mailbox: &str, alias: Option<&str>) -> anyhow::Result<String> {
+pub(crate) fn signature_key(
+    conn: &Connection,
+    aid: &str,
+    mailbox: &str,
+    alias: Option<&str>,
+) -> anyhow::Result<String> {
     let Some(alias) = alias else { return Ok(MAILBOX_SIGNATURE.to_string()) };
     let address = parse_bare_address(alias)?;
     let email: String = conn.query_row("SELECT email FROM accounts WHERE id = ?1", [aid], |r| r.get(0))?;
@@ -238,18 +273,6 @@ fn signature_key(conn: &Connection, aid: &str, mailbox: &str, alias: Option<&str
         }
     }
     Ok(address)
-}
-
-/// The signature to append for mail sent as `from_email`: the alias's own, else the mailbox's, else none.
-pub fn signature_for(conn: &Connection, account_id: &str, from_email: &str) -> anyhow::Result<Option<String>> {
-    let mut stmt = conn.prepare_cached("SELECT body FROM account_signatures WHERE account_id = ?1 AND address = ?2")?;
-    let from = from_email.to_lowercase();
-    for key in [from.as_str(), MAILBOX_SIGNATURE] {
-        if let Some(b) = stmt.query_row(params![account_id, key], |r| r.get::<_, String>(0)).optional()? {
-            return Ok(Some(b));
-        }
-    }
-    Ok(None)
 }
 
 /// Whether `from` is the mailbox address or one of its IMAP aliases, with the alias's display name when it has one.

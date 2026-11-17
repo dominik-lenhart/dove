@@ -164,7 +164,7 @@ async fn alias_admin_verbs_validate_and_list() {
     let left: i64 = h
         .app()
         .store
-        .call(|c| Ok(c.query_row("SELECT COUNT(*) FROM account_signatures", [], |r| r.get(0))?))
+        .call(|c| Ok(c.query_row("SELECT COUNT(*) FROM signature_defaults WHERE address <> ''", [], |r| r.get(0))?))
         .await
         .unwrap();
     assert_eq!(left, 0);
@@ -435,12 +435,13 @@ async fn signature_limits() {
 }
 
 #[tokio::test]
-async fn update_draft_never_appends_the_signature_again() {
+async fn update_draft_keeps_one_signature_below_a_new_body() {
     let Setup { h, u, token } = setup().await;
     set_signature(&h, "box", None, Some(SIG)).await.unwrap();
     set_signature(&h, "info", None, Some(SIG)).await.unwrap();
 
-    // IMAP: a change that does not touch the body keeps exactly one signature; a new body is stored as given.
+    // IMAP: a change that does not touch the body keeps exactly one signature; a new body replaces only the text
+    // above it (design 2026-11-17).
     let c = h.ok(&token, "create_draft", create_args("box", None)).await;
     let u1 = h
         .ok(
@@ -460,7 +461,7 @@ async fn update_draft_never_appends_the_signature_again() {
                     "changes": { "body_text": "Komplett neuer Text" } }),
         )
         .await;
-    assert_eq!(body_of(&imap_draft(&h, &u, &u2["revision"])).trim_end(), "Komplett neuer Text");
+    assert_eq!(body_of(&imap_draft(&h, &u, &u2["revision"])).trim_end(), format!("Komplett neuer Text\n\n-- \n{SIG}"));
 
     // Gmail: same.
     let c = h.ok(&token, "create_draft", create_args("info", None)).await;
@@ -480,7 +481,7 @@ async fn update_draft_never_appends_the_signature_again() {
                 "changes": { "body_text": "Anders" } }),
     )
     .await;
-    assert_eq!(body_of(&gmail_draft(&h, &c["draft_id"])).trim_end(), "Anders");
+    assert_eq!(body_of(&gmail_draft(&h, &c["draft_id"])).trim_end(), format!("Anders\n\n-- \n{SIG}"));
 }
 
 #[tokio::test]

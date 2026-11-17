@@ -519,6 +519,7 @@ fn approval_page(p: &Pending, rid: &str, inv: &invite::Invitation, allow_send: b
             (a.organize, "organize", true, "organize (read/unread, flags, labels, move, archive)"),
             (a.delete, "delete", false, "move to Trash"),
             (a.send && allow_send, "send", false, "send own drafts"),
+            (a.signatures, "signatures", false, "create and change signatures"),
         ] {
             if on {
                 rows.push_str(&format!(
@@ -826,14 +827,16 @@ async fn approve(
             for g in &inv.grants {
                 let id = &g.account_id;
                 let send = allow_send && checked(format!("send.{id}"));
+                let signatures = checked(format!("signatures.{id}"));
                 let a = match form.get(&format!("preset.{id}")).and_then(|p| Actions::preset(p)) {
-                    Some(p) => Actions { send, ..p },
+                    Some(p) => Actions { send, signatures, ..p },
                     None => Actions {
                         read: checked(format!("read.{id}")),
                         draft: checked(format!("draft.{id}")),
                         organize: checked(format!("organize.{id}")),
                         delete: checked(format!("delete.{id}")),
                         send,
+                        signatures,
                     },
                 };
                 selected.insert(g.account_id.clone(), a);
