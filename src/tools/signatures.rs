@@ -138,16 +138,9 @@ fn audit(alias: &str, name: &str) -> AuditInfo {
     }
 }
 
-/// Alerts the owner of a change (`fingerprint` of the call, deduplicated so an identical retry stays quiet) or a
-/// deletion (always).
-async fn alert(cx: &ToolCx, alias: &str, account_id: &str, name: &str, fingerprint: Option<&str>) {
-    let a = crate::notifier::Alert::signature_changed(alias, &cx.client.client_name, name, fingerprint.is_none());
-    match fingerprint {
-        Some(f) => {
-            let _ = cx.app.notifier.notify_once(&format!("signature:{account_id}:{name}:{f}"), a).await;
-        }
-        None => cx.app.notifier.send(a).await,
-    }
+/// Alerts the owner of an agent's change or deletion (no deduplication: the caller alerts only on real changes).
+async fn alert(cx: &ToolCx, alias: &str, name: &str, deleted: bool) {
+    cx.app.notifier.send(crate::notifier::Alert::signature_changed(alias, &cx.client.client_name, name, deleted)).await;
 }
 
 async fn list_signatures(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
@@ -238,23 +231,6 @@ async fn set_signature(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError
             "a signature with HTML gets its text derived from the HTML, so the owner sees what recipients see; leave text out",
         ));
     }
-    // Every distinct change alerts the owner; repeating the same call does not.
-    let fingerprint = {
-        use sha2::{Digest, Sha256};
-        let mut hsh = Sha256::new();
-        let canon = json!([
-            name,
-            html,
-            text,
-            make_default,
-            for_address,
-            images
-                .as_ref()
-                .map(|v| v.iter().map(|i| (i.cid.clone(), util::hex(&Sha256::digest(&i.bytes)))).collect::<Vec<_>>()),
-        ]);
-        hsh.update(canon.to_string().as_bytes());
-        util::hex(&hsh.finalize()[..12])
-    };
     let change = Change { name: name.clone(), html, text, images, derive_text: true };
     let mut out = cx
         .app
@@ -274,7 +250,10 @@ async fn set_signature(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError
     if let Some(o) = out.as_object_mut() {
         o.remove("text_bytes");
     }
-    alert(cx, &mb.alias, &mb.account_id, &name, Some(&fingerprint)).await;
+    // Every call that changes the stored signature or a default alerts the owner; a call that changes nothing does not.
+    if out["changed"] == true || out["default"]["changed"] == true {
+        alert(cx, &mb.alias, &name, false).await;
+    }
     let created = out["created"].as_bool() == Some(true);
     Ok(ToolOutput {
         extra: Vec::new(),
@@ -305,7 +284,7 @@ async fn delete_signature(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolEr
             "this mailbox has no signature by that name; list_signatures shows them",
         ));
     }
-    alert(cx, &mb.alias, &mb.account_id, &name, None).await;
+    alert(cx, &mb.alias, &name, true).await;
     Ok(ToolOutput {
         extra: Vec::new(),
         text: format!("Deleted signature '{name}' of {}.", mb.alias),

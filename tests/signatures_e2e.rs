@@ -587,7 +587,16 @@ async fn agent_changes_alert_the_owner_and_the_audit_holds_no_content() {
         .call(|c| Ok(c.query_row("SELECT count(*) FROM notifications WHERE key LIKE 'signature:%'", [], |r| r.get(0))?))
         .await
         .unwrap();
-    assert_eq!(pushes, 4, "one dedup key per distinct change");
+    assert_eq!(pushes, 0, "no deduplication keys: only calls that change nothing stay quiet");
+    // Reverting and applying the same content again alerts both times; a new default alerts too.
+    for html in ["<i>Andere Zeile</i>", "<b>Andere Zeile</b>"] {
+        f.h.ok(&f.writer, "set_signature", json!({ "account": "box", "name": "behoerden", "html": html })).await;
+    }
+    f.h.ok(&f.writer, "set_signature", json!({ "account": "box", "name": "x", "text": "x" })).await;
+    f.h.ok(&f.writer, "set_signature", json!({ "account": "box", "name": "x", "make_default": true })).await;
+    f.h.ok(&f.writer, "set_signature", json!({ "account": "box", "name": "x", "make_default": true })).await;
+    let n = f.h.app().notifier.sent.lock().unwrap().iter().filter(|m| m.contains("signature")).count();
+    assert_eq!(n, 5 + 2 + 2, "two reverts, one create, one default change; the repeated default stays quiet");
     f.h.ok(&f.drafter, "create_draft", create("box")).await;
     let hits: i64 =
         f.h.app()
@@ -616,7 +625,7 @@ async fn agent_changes_alert_the_owner_and_the_audit_holds_no_content() {
         })
         .await
         .unwrap();
-    assert_eq!(named, 4, "one audit record per call, identical retries included");
+    assert_eq!(named, 6, "one audit record per call, identical retries included");
 }
 
 #[tokio::test]

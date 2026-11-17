@@ -150,11 +150,98 @@ const ATTRS: &[&str] = &[
     "rowspan",
 ];
 
-fn safe_style(v: &str) -> bool {
-    let l = v.to_ascii_lowercase();
-    !["url(", "expression", "@import", "javascript:", "\\", "behavior", "-moz-binding", "<", ">"]
+/// CSS properties a signature may set. Nothing that hides or moves content (`display`, `visibility`, `opacity`,
+/// `position`, `overflow`, `max-height`, `text-indent`, ...): the plain-text version must show everything the HTML shows.
+const CSS: &[&str] = &[
+    "color",
+    "background-color",
+    "font-family",
+    "font-size",
+    "font-weight",
+    "font-style",
+    "text-decoration",
+    "text-align",
+    "vertical-align",
+    "line-height",
+    "letter-spacing",
+    "margin",
+    "margin-top",
+    "margin-right",
+    "margin-bottom",
+    "margin-left",
+    "padding",
+    "padding-top",
+    "padding-right",
+    "padding-bottom",
+    "padding-left",
+    "border",
+    "border-top",
+    "border-right",
+    "border-bottom",
+    "border-left",
+    "border-collapse",
+    "border-spacing",
+    "border-radius",
+    "width",
+    "max-width",
+    "min-width",
+    "height",
+];
+
+/// A readable font size: at least 9px, 7pt, 0.6em/rem or 60%, or a keyword from `x-small` up.
+fn readable_font_size(v: &str) -> bool {
+    if ["x-small", "small", "medium", "large", "x-large", "xx-large", "inherit"].contains(&v) {
+        return true;
+    }
+    let split = v.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(v.len());
+    let (num, unit) = v.split_at(split);
+    let Ok(n) = num.parse::<f64>() else { return false };
+    match unit {
+        "px" => n >= 9.0,
+        "pt" => n >= 7.0,
+        "em" | "rem" => n >= 0.6,
+        "%" => n >= 60.0,
+        _ => false,
+    }
+}
+
+/// Keeps the allowed declarations of a `style` value (None when nothing is left). Values never reference anything
+/// (`url(`, `expression`, `@import`, escapes), never go negative (no pulling text out of view) and colors are opaque.
+fn clean_style(v: &str) -> Option<String> {
+    let mut kept = Vec::new();
+    for decl in v.split(';') {
+        let Some((prop, value)) = decl.split_once(':') else { continue };
+        let prop = prop.trim().to_ascii_lowercase();
+        let value = value.trim().to_ascii_lowercase();
+        if !CSS.contains(&prop.as_str()) || value.is_empty() || value.len() > 200 {
+            continue;
+        }
+        let bad = [
+            "url(",
+            "expression",
+            "@import",
+            "javascript:",
+            "\\",
+            "behavior",
+            "-moz-binding",
+            "<",
+            ">",
+            "var(",
+            "calc(",
+        ]
         .iter()
-        .any(|bad| l.contains(bad))
+        .any(|b| value.contains(b));
+        let negative = value
+            .char_indices()
+            .any(|(i, c)| c == '-' && value[i + 1..].starts_with(|n: char| n.is_ascii_digit() || n == '.'));
+        let see_through = ["transparent", "rgba(", "hsla(", "#0000"].iter().any(|t| value.contains(t))
+            || (value.starts_with('#') && matches!(value.len(), 5 | 9));
+        let size_ok = prop != "font-size" || readable_font_size(&value);
+        if !bad && !negative && !see_through && size_ok {
+            kept.push(format!("{prop}:{value}"));
+        }
+    }
+    (!kept.is_empty()).then(|| kept.join(";"))
 }
 
 fn safe_href(v: &str) -> bool {
@@ -234,7 +321,14 @@ pub fn clean_html(raw: &str, cids: &BTreeSet<String>) -> anyhow::Result<(String,
                         bail!("an image source must be cid:<name> or an https address");
                     }
                 }
-                "style" => safe_style(v),
+                "style" => {
+                    if let Some(style) = clean_style(v) {
+                        out.push_str(" style=\"");
+                        out.push_str(&html_escape(&style));
+                        out.push('"');
+                    }
+                    false
+                }
                 a => ATTRS.contains(&a),
             };
             if keep {
@@ -452,8 +546,14 @@ pub fn set(tx: &Transaction, mailbox: &str, c: Change, actor: &str) -> anyhow::R
         "INSERT OR IGNORE INTO signature_defaults(account_id, address, signature_id) VALUES (?1, '', ?2)",
         params![aid, id],
     )? == 1;
+    // Whether what recipients get changed (an identical call changes nothing).
+    let changed = existing.as_ref().is_none_or(|e| {
+        let mut new: Vec<&Image> = images.iter().collect();
+        new.sort_by(|a, b| a.cid.cmp(&b.cid));
+        e.text != text || e.html != html || e.images.iter().collect::<Vec<_>>() != new
+    });
     Ok(json!({
-        "account": mailbox, "name": c.name, "created": existing.is_none(), "has_html": html.is_some(),
+        "account": mailbox, "name": c.name, "created": existing.is_none(), "changed": changed, "has_html": html.is_some(),
         "text_bytes": text.len(), "images": images.iter().map(|i| &i.cid).collect::<Vec<_>>(),
         "became_default": became_default,
     }))
@@ -469,6 +569,17 @@ pub fn set_default(
 ) -> anyhow::Result<Value> {
     let aid = account_id_of(tx, mailbox)?;
     let key = identity::signature_key(tx, &aid, mailbox, for_address)?;
+    let before: Option<i64> = tx
+        .query_row(
+            "SELECT signature_id FROM signature_defaults WHERE account_id = ?1 AND address = ?2",
+            params![aid, key],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let after = match name {
+        Some(n) => sig_id(tx, &aid, n)?,
+        None => None,
+    };
     match name {
         Some(n) => {
             let id = sig_id(tx, &aid, n)?.ok_or_else(|| anyhow!("'{mailbox}' has no signature '{}'", clip(n)))?;
@@ -482,7 +593,9 @@ pub fn set_default(
             tx.execute("DELETE FROM signature_defaults WHERE account_id = ?1 AND address = ?2", params![aid, key])?;
         }
     }
-    Ok(json!({ "account": mailbox, "for_address": for_address.map(|_| &key), "default": name }))
+    Ok(
+        json!({ "account": mailbox, "for_address": for_address.map(|_| &key), "default": name, "changed": before != after }),
+    )
 }
 
 /// Deletes a signature (and any default that pointed to it). Returns whether it existed.
@@ -593,7 +706,7 @@ mod tests {
             assert!(!out.contains(gone), "{gone} in {out}");
         }
         for kept in [
-            "<table cellpadding=\"0\" style=\"color:#17171A;font-size:14px\">",
+            "<table cellpadding=\"0\" style=\"color:#17171a;font-size:14px\">",
             // Attributes come out in the parser's (sorted) order.
             "<img alt=\"\" src=\"cid:keyset-logo\" style=\"border:0\" width=\"18\">",
             "<a href=\"https://keyset.cloud/\">keyset.cloud</a>",
@@ -616,6 +729,43 @@ mod tests {
         // Escaping survives the round trip: text and attribute values cannot break out.
         let (out, _) = clean_html(r#"<span title="a&quot;b">1 &lt; 2 &amp; <b>3</b></span>"#, &cids(&[])).unwrap();
         assert_eq!(out, "<span title=\"a&quot;b\">1 &lt; 2 &amp; <b>3</b></span>");
+    }
+
+    #[test]
+    fn styles_cannot_hide_or_move_text() {
+        let style = |s: &str| clean_style(s);
+        assert_eq!(
+            style("color:#333; font-size:13px; FONT-WEIGHT: bold; padding:0 8px; border-left:2px solid #c00")
+                .as_deref(),
+            Some("color:#333;font-size:13px;font-weight:bold;padding:0 8px;border-left:2px solid #c00")
+        );
+        for hidden in [
+            "display:none",
+            "visibility:hidden",
+            "opacity:0",
+            "font-size:0",
+            "font-size:1px",
+            "font-size:0.1em",
+            "font-size:xx-small",
+            "position:absolute;left:-9999px",
+            "margin-left:-9999px",
+            "text-indent:-9999px",
+            "max-height:0;overflow:hidden",
+            "color:transparent",
+            "color:rgba(0,0,0,0)",
+            "color:#0000",
+            "color:#ffffff00",
+            "width:calc(0px)",
+            "background-color:var(--x)",
+            "font-family:x;background:url(https://e.vil/p)",
+        ] {
+            let kept = style(hidden).unwrap_or_default();
+            let expected = if hidden.starts_with("font-family") { "font-family:x" } else { "" };
+            assert_eq!(kept, expected, "{hidden}");
+        }
+        // An element whose whole style is dropped loses the attribute.
+        let (out, _) = clean_html("<span style=\"display:none\">geheim</span>", &BTreeSet::new()).unwrap();
+        assert_eq!(out, "<span>geheim</span>");
     }
 
     #[test]

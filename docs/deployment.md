@@ -692,7 +692,9 @@ dove accounts signatures delete work gastgeber
 
 The HTML references its images as `cid:<name>` (the name after `--image`); every image must be used and every `cid:`
 must have an image. Dove cleans the HTML to a safe subset before storing it: layout tags (tables, `div`, `p`, `span`,
-`b`, `i`, `a`, `img`, `br`, ...), `style` without `url()`, `expression` or `@import`, links only to `https:`, `http:`,
+`b`, `i`, `a`, `img`, `br`, ...), inline `style` limited to colours, fonts (at least 9px), spacing, borders and sizes
+(nothing that hides or moves text: no `display`, `visibility`, `opacity`, `position`, negative values or transparent
+colours), links only to `https:`, `http:`,
 `mailto:` and `tel:`, images only `cid:` or `https:`; scripts, forms, iframes, event handlers and comments are dropped.
 Without `--text` the plain text is derived from the HTML: one line per line break, paragraph or cell, images left out.
 The first signature of a mailbox becomes its default. `dove accounts signature set|show` (singular, from 0.6) still
@@ -712,7 +714,8 @@ Agents can manage signatures themselves with `list_signatures` (any connection w
 (`--grant work=drafter,signatures`). For an agent, a signature with HTML always gets its text derived from the HTML, so
 the text you read (for example when approving a `request_send`, which also says when the mail goes out as HTML) says
 what recipients see. Every change by an agent sends you an alert (an identical retry does not) and is audited with the
-signature's name, never its content.
+signature's name, never its content. What an image shows cannot be checked: grant `signatures` only to agents you
+trust with your name, and look at the images in `dove accounts signatures list` after an alert.
 
 ### New IMAP mail (IDLE push)
 

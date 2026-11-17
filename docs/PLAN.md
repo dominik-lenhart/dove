@@ -856,12 +856,14 @@ hosts or reference hardware.
   version (A-learning 2026-11-14). The object filter matches an exact element of `object_ids` through `json_each`.
 - A79. Named HTML signatures (2026-11-17; design 2026-11-17 "html signatures"). (a) Tables `signatures`,
   `signature_images`, `signature_defaults` (address `''` = mailbox default); the old `account_signatures` rows become
-  `default` / `alias-<n>`. (b) HTML is re-serialized from an allowlist (`signatures::clean_html`, iterative walk), images
-  are recognized by their bytes (PNG, JPEG, GIF), at most 6 and 512 KiB, every `cid:` must have an image and every image
+  `default` / `alias-<n>`. (b) HTML is re-serialized from an allowlist (`signatures::clean_html`, iterative walk), inline CSS is
+  an allowlist of properties (nothing that hides or moves text, font size at least 9px, no negative values, opaque
+  colours), so the derived text shows what the HTML shows; images are recognized by their bytes (PNG, JPEG, GIF), at most 6 and 512 KiB, every `cid:` must have an image and every image
   must be used. (c) Layout `mixed[related[alternative[text, html], images], attachments]`; layers are left out when
   empty. (d) `own_drafts.composition` stores signature name and byte lengths, no content; `update_draft` splits Dove's
   own text by it and refuses (`draft_conflict`) when it does not fit. The signature is rendered again from its current
   version on every body or signature change. (e) Agents need the `signatures` action (requires `draft`, no preset) to
   change signatures; for agents the text of an HTML signature is always derived from the HTML (the send approval shows
-  the text and names the HTML signature), and every distinct change or deletion alerts the owner. (f) The admin request line limit is
+  the text and names the HTML signature), and every call that changes a stored signature or default, and every deletion, alerts the owner (no deduplication
+  keys; a call that changes nothing stays quiet). Text inside images cannot be checked (residual risk, documented). (f) The admin request line limit is
   1 MiB so a signature with its images fits through the socket.
