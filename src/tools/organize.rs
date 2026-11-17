@@ -1,4 +1,5 @@
-//! Organize tools: update_messages and move_messages (design 2026-11-13 sections 1 and 2).
+//! Organize tools: update_messages and move_messages (design 2026-11-13 sections 1 and 2), and create_label (PLAN
+//! A82).
 //!
 //! Both are write tools: detached, `cx.commit()` right before the first upstream write, one audit record with ids and
 //! counts. Every id gets its own result; unknown ids, ids of folders this mailbox does not have and stale ids are the
@@ -65,7 +66,7 @@ pub fn defs() -> Vec<ToolDef> {
             description: concat!(
                 "Mark messages read or unread, star or unstar them, and add or remove labels (Gmail user labels; IMAP ",
                 "keywords). Flags: UNREAD, STARRED. At most 100 ids per call; each id gets its own result. ",
-                "Labels must already exist on Gmail. IMAP keywords with junk or spam in the name ($Junk, $NotJunk) ",
+                "Gmail labels must already exist (create_label makes one). IMAP keywords with junk or spam in the name ($Junk, $NotJunk) ",
                 "train spam filters and need the delete permission. Changes can be undone with the opposite call (spam-filter ",
                 "training cannot). To move, archive or trash, use move_messages."
             ),
@@ -107,6 +108,35 @@ pub fn defs() -> Vec<ToolDef> {
             },
             output_schema: results_schema,
             handler: |cx, args| detached(cx, args, |cx, args| Box::pin(move_messages(cx, args))),
+        },
+        ToolDef {
+            name: "create_label",
+            title: "Create label",
+            description: concat!(
+                "Create a Gmail label or an IMAP folder, so update_messages and move_messages can use it. Nest with ",
+                "\"/\" (\"Kunden/Acme\"); on IMAP Dove uses the server's own separator. If a label or folder with this ",
+                "name already exists, it is returned with created: false. System names (INBOX, SENT, TRASH, ...) ",
+                "cannot be created. Counts as one change against the hourly organize budget. Not available for ",
+                "Gmail mailboxes connected over IMAP (create the label in Gmail there)."
+            ),
+            capability: Capability::Organize,
+            read_only: false,
+            destructive: false,
+            mail_content: false,
+            input_schema: || {
+                json!({ "type": "object", "properties": {
+                    "account": account_schema(),
+                    "name": { "type": "string", "maxLength": MAX_LABEL_NAME, "description": "Label or folder name, nested with \"/\"." }
+                }, "required": ["account", "name"], "additionalProperties": false })
+            },
+            output_schema: || {
+                object_schema(json!({
+                    "account": { "type": "string" },
+                    "label": { "type": "object", "properties": { "id": { "type": "string" }, "name": { "type": "string" } } },
+                    "created": { "type": "boolean" }
+                }))
+            },
+            handler: |cx, args| detached(cx, args, |cx, args| Box::pin(create_label(cx, args))),
         },
     ]
 }
@@ -317,7 +347,7 @@ fn user_label(map: &BTreeMap<String, (String, String)>, name: &str) -> Result<St
             name.chars().take(64).collect::<String>()
         ))),
         None => Err(ToolError::invalid(format!(
-            "unknown label '{}' (Dove does not create labels)",
+            "unknown label '{}'; create it with create_label first",
             name.chars().take(64).collect::<String>()
         ))),
     }
@@ -742,7 +772,7 @@ fn imap_target<'a>(folders: &'a [Folder], target: &Target) -> Result<&'a Folder,
                 })
                 .ok_or_else(|| {
                     ToolError::invalid(format!(
-                        "unknown folder '{}'; see list_labels",
+                        "unknown folder '{}'; see list_labels, or create it with create_label",
                         label.chars().take(64).collect::<String>()
                     ))
                 })
@@ -866,8 +896,12 @@ fn folder_by_label<'a>(folders: &'a [Folder], name: &str) -> Option<&'a Folder> 
 /// A user label for `X-GM-LABELS`: it must exist as a folder (Dove creates no labels) and not be a system folder.
 fn gmail_user_label(folders: &[Folder], name: &str) -> Result<GmLabel, ToolError> {
     let short = || mail::label_text(name).chars().take(64).collect::<String>();
-    let f = folder_by_label(folders, name)
-        .ok_or_else(|| ToolError::invalid(format!("unknown label '{}' (Dove does not create labels)", short())))?;
+    let f = folder_by_label(folders, name).ok_or_else(|| {
+        ToolError::invalid(format!(
+            "unknown label '{}'; create it in Gmail first (create_label does not work over IMAP)",
+            short()
+        ))
+    })?;
     if !is_gmail_user_label(f, folders) {
         return Err(ToolError::invalid(format!(
             "'{}' is a system label; use add_flags/remove_flags or move_messages",
@@ -1065,6 +1099,185 @@ async fn gmail_imap_move(
         }
     }
     Ok(outcomes.into_iter().map(|o| o.unwrap_or_else(|| Outcome::Failed(ToolError::internal()))).collect())
+}
+
+// ------------------------------------------------------------------ create_label (PLAN A82)
+
+/// Longest label name (Gmail's limit).
+const MAX_LABEL_NAME: usize = 225;
+
+/// Names that are Gmail system labels (`CATEGORY_*` too) or special folders: never created, in any case.
+const SYSTEM_LABEL_NAMES: &[&str] =
+    &["INBOX", "SENT", "TRASH", "SPAM", "DRAFT", "DRAFTS", "STARRED", "UNREAD", "IMPORTANT", "CHAT", "OUTBOX"];
+
+/// The label name an agent may create: trimmed, not empty, at most [`MAX_LABEL_NAME`] characters, no control
+/// characters, not a system label name.
+fn label_name_arg(args: &Value) -> Result<String, ToolError> {
+    let name = arg_str(args, "name")?.trim();
+    if name.is_empty() {
+        return Err(ToolError::invalid_at("name", "must not be empty"));
+    }
+    if name.chars().count() > MAX_LABEL_NAME {
+        return Err(ToolError::invalid_at("name", format!("must be at most {MAX_LABEL_NAME} characters")));
+    }
+    if name.chars().any(char::is_control) {
+        return Err(ToolError::invalid_at("name", "must not contain control characters"));
+    }
+    let upper = name.to_uppercase();
+    if SYSTEM_LABEL_NAMES.contains(&upper.as_str()) || upper.starts_with("CATEGORY_") {
+        return Err(ToolError::invalid_at("name", "is a system label; pick another name"));
+    }
+    Ok(name.to_string())
+}
+
+async fn create_label(cx: &ToolCx, args: Value) -> Result<ToolOutput, ToolError> {
+    only_keys(&args, &["account", "name"])?;
+    let mb = account_arg(cx, &args, Capability::Organize)?.clone();
+    let name = label_name_arg(&args)?;
+    if mb.provider == Provider::Imap && account::gmail_mode(&cx.app, &mb.account_id).await? {
+        return Err(ToolError::invalid(
+            "this Gmail mailbox is connected over IMAP, where labels are created in Gmail itself (web or app); \
+             create_label works for Gmail API and other IMAP mailboxes",
+        ));
+    }
+    // One unit of the hourly organize budget; given back when nothing can have changed.
+    let budget = Budget::take(cx, std::slice::from_ref(&name))?;
+    let r = match mb.provider {
+        Provider::Gmail => gmail_create_label(cx, &mb, &name).await,
+        Provider::Imap => imap_create_label(cx, &mb, &name).await,
+    };
+    let spent = match &r {
+        Ok(_) => Ok(vec![Outcome::Done { new_id: None, labels: None }]),
+        Err(e) if cx.committed() => Ok(vec![Outcome::Failed(e.clone())]),
+        Err(e) => Err(e.clone()),
+    };
+    let _ = budget.settle(cx, spent);
+    let ((id, label), created) = r?;
+    Ok(ToolOutput {
+        text: if created {
+            format!("Created label '{label}' in {}.", mb.alias)
+        } else {
+            format!("Label '{label}' already exists in {}.", mb.alias)
+        },
+        structured: json!({ "account": mb.alias, "label": { "id": id, "name": label }, "created": created }),
+        audit: AuditInfo {
+            account: Some(mb.alias.clone()),
+            result_count: Some(i64::from(created)),
+            ..Default::default()
+        },
+        extra: Vec::new(),
+    })
+}
+
+/// A Gmail user label whose name equals `name` ignoring case (Gmail's own uniqueness rule): (id, name).
+fn gmail_find_label(v: &Value, name: &str) -> Option<(String, String)> {
+    v["labels"].as_array()?.iter().find_map(|l| {
+        let (id, n) = (l["id"].as_str()?, l["name"].as_str()?);
+        n.to_lowercase().eq(&name.to_lowercase()).then(|| (id.to_string(), mail::label_text(n)))
+    })
+}
+
+async fn gmail_create_label(cx: &ToolCx, mb: &Mailbox, name: &str) -> Result<((String, String), bool), ToolError> {
+    require_gmail_modify(cx, mb).await?;
+    let list = || cx.app.google.call(&mb.account_id, || GmailOp::Labels, &[], None, Priority::Interactive, cx.deadline);
+    if let Some(found) = gmail_find_label(&list().await?, name) {
+        return Ok((found, false));
+    }
+    let body = json!({ "name": name, "labelListVisibility": "labelShow", "messageListVisibility": "show" });
+    cx.commit()?;
+    match gmail_write(cx, mb, || GmailOp::CreateLabel, &body).await {
+        Ok(v) => {
+            let id = v["id"].as_str().filter(|i| valid_id(i)).ok_or_else(|| {
+                ToolError::new(ErrorCode::OutcomeUnknown, "unexpected Gmail response; check list_labels")
+            })?;
+            Ok(((id.to_string(), mail::label_text(v["name"].as_str().unwrap_or(name))), true))
+        }
+        // A definitive refusal can mean someone created it meanwhile (Gmail answers 409): look again.
+        Err(e) if e.code != ErrorCode::OutcomeUnknown => {
+            match list().await.ok().and_then(|v| gmail_find_label(&v, name)) {
+                Some(found) => Ok((found, false)),
+                None => Err(e),
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// What one IMAP session found or did for `create_label`.
+enum ImapCreate {
+    /// The name cannot be a folder on this server (see [`crate::imap::NewFolder`]).
+    BadName,
+    Exists(crate::imap::NewFolder),
+    Created(crate::imap::NewFolder),
+    /// The server said no and the folder does not exist.
+    Refused,
+}
+
+async fn imap_create_label(cx: &ToolCx, mb: &Mailbox, name: &str) -> Result<((String, String), bool), ToolError> {
+    let bad_name = || {
+        ToolError::invalid_at(
+            "name",
+            "cannot be a folder name on this server: no empty levels, no '*' or '%', no leading '\\', no spaces \
+             around a level, and no level containing the server's separator",
+        )
+    };
+    // Checked once before any command with the usual separator, again in the session with the server's own.
+    if crate::imap::NewFolder::new(name, Some('/')).is_none() {
+        return Err(bad_name());
+    }
+    let name_owned = name.to_string();
+    cx.commit()?;
+    let (outcome, listed) = account::with_session(&cx.app, &mb.account_id, move |s| {
+        Box::pin(async move {
+            let before = s.list_folders().await?;
+            let delimiter = before.iter().find_map(|f| f.delimiter);
+            let Some(folder) = crate::imap::NewFolder::new(&name_owned, delimiter) else {
+                return Ok((ImapCreate::BadName, before));
+            };
+            let exists = |l: &[crate::imap::FolderInfo]| {
+                l.iter().any(|f| f.raw_name == folder.as_str() || f.raw_name.eq_ignore_ascii_case(folder.as_str()))
+            };
+            if exists(&before) {
+                return Ok((ImapCreate::Exists(folder), before));
+            }
+            let ok = s.create_folder(&folder).await?;
+            // A NO can mean someone created it meanwhile: the listing decides.
+            let after = s.list_folders().await?;
+            Ok(match (exists(&after), ok) {
+                (true, true) => (ImapCreate::Created(folder), after),
+                (true, false) => (ImapCreate::Exists(folder), after),
+                (false, _) => (ImapCreate::Refused, after),
+            })
+        })
+    })
+    .await?;
+    let (folder, created) = match outcome {
+        ImapCreate::BadName => return Err(bad_name()),
+        ImapCreate::Refused => return Err(ToolError::upstream("the mail server refused to create the folder")),
+        ImapCreate::Exists(f) => (f, false),
+        ImapCreate::Created(f) => (f, true),
+    };
+    // Recorded like list_labels does, so move_messages knows the folder at once.
+    let aid = mb.account_id.clone();
+    let folders = cx
+        .app
+        .store
+        .call(move |c| {
+            let tx = c.transaction()?;
+            account::upsert_folders(&tx, &aid, &listed, None)?;
+            tx.commit()?;
+            account::load_folders(c, &aid)
+        })
+        .await
+        .map_err(ToolError::from)?;
+    let wire = folder.as_str();
+    let label = folders
+        .iter()
+        .find(|f| f.name == wire)
+        .or_else(|| folders.iter().find(|f| f.name.eq_ignore_ascii_case(wire)))
+        .map(|f| mail::label_text(&f.name_utf8))
+        .unwrap_or_else(|| mail::label_text(&crate::imap::utf7::display_name(wire)));
+    Ok(((label.clone(), label), created))
 }
 
 #[cfg(test)]

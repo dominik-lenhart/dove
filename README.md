@@ -197,6 +197,7 @@ against remote callers and leaked tokens, not against your own agent's shell. De
 | `set_signature`, `delete_signature` | Create, change or delete a named signature; the owner is alerted | `signatures` |
 | `update_messages` | Mark read or unread, star, add or remove labels and keywords | `organize` |
 | `move_messages` | Archive, move to a folder or label, back to the inbox; to Trash or Spam only with `delete` | `organize` |
+| `create_label` | Create a Gmail label or an IMAP folder (existing ones are returned, not duplicated) | `organize` |
 | `send_draft` | Send a draft Dove created and nobody changed; off unless both send gates are open | `send` |
 
 Writes are revision-checked: once you edit a draft yourself, Dove never overwrites it. Watches belong to the token

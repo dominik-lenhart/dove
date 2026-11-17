@@ -4,7 +4,8 @@
 //! `\Seen` is never set by reading; `UID STORE` sets `\Deleted` and `UID EXPUNGE` runs only for an [`OwnDraftUid`]
 //! or a [`CopiedUid`] (the source of a confirmed copy); other flag changes take typed [`StoreFlag`]s, which cannot
 //! name `\Deleted`; Gmail label changes take typed [`GmLabel`]s (the inbox or an existing user label, PLAN A57);
-//! `APPEND` takes a mailbox the session resolved from its Drafts or Sent target. Nothing else can be produced.
+//! `APPEND` takes a mailbox the session resolved from its Drafts or Sent target; `CREATE` takes a [`NewFolder`] built
+//! from an agent's label name and the server's hierarchy delimiter (PLAN A82). Nothing else can be produced.
 
 use std::borrow::Cow;
 
@@ -29,6 +30,7 @@ pub const IMAP_VERBS: &[&str] = &[
     "UID SEARCH",
     "UID FETCH",
     "APPEND",
+    "CREATE",
     "UID STORE",
     "UID EXPUNGE",
     "UID MOVE",
@@ -122,6 +124,39 @@ impl UserLabel {
     }
 }
 
+/// The wire name of a folder `create_label` may create (PLAN A82): the agent's name split at `/`, each level
+/// encoded as modified UTF-7 and joined with the server's hierarchy delimiter. Refused: empty levels (`a//b`, a
+/// leading or trailing `/`), the LIST wildcards `*` and `%`, a leading `\`, control characters, a level that contains
+/// the server's delimiter (it would silently create another level), nesting on a server without hierarchy, and
+/// `INBOX` itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewFolder(String);
+
+impl NewFolder {
+    pub fn new(name: &str, delimiter: Option<char>) -> Option<Self> {
+        let levels: Vec<&str> = name.split('/').collect();
+        let ok_level = |l: &&str| {
+            !l.is_empty()
+                && l.trim() == *l
+                && !l.chars().any(|c| c.is_control() || matches!(c, '*' | '%'))
+                && !delimiter.is_some_and(|d| d != '/' && l.contains(d))
+        };
+        if name.starts_with('\\') || name.eq_ignore_ascii_case("INBOX") || !levels.iter().all(ok_level) {
+            return None;
+        }
+        let sep = match (delimiter, levels.len()) {
+            (Some(d), _) => d.to_string(),
+            (None, 1) => String::new(),
+            (None, _) => return None,
+        };
+        let wire = levels.iter().map(|l| super::utf7::encode(l)).collect::<Vec<_>>().join(&sep);
+        (1..=1000).contains(&wire.len()).then_some(Self(wire))
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 impl StoreFlag {
     fn wire(&self) -> &str {
         match self {
@@ -199,6 +234,8 @@ pub(crate) enum ImapOp<'a> {
         uids: &'a [u32],
         mailbox: &'a str,
     },
+    /// `CREATE <mailbox>` of a checked new folder name (`create_label`).
+    Create(&'a NewFolder),
     /// `\Deleted` on the sources of a confirmed copy (move without MOVE).
     UidStoreDeletedCopied(&'a [CopiedUid]),
     /// `UID EXPUNGE` of exactly the sources of a confirmed copy.
@@ -366,6 +403,7 @@ impl<'a> ImapOp<'a> {
             ImapOp::UidCopy { uids, mailbox: m } => {
                 ("UID COPY", vec![text(format!("UID COPY {} ", uid_set(uids))), mailbox(m)])
             }
+            ImapOp::Create(f) => ("CREATE", vec![text("CREATE "), mailbox(f.as_str())]),
             ImapOp::UidStoreDeletedCopied(c) => {
                 let uids: Vec<u32> = c.iter().map(CopiedUid::uid).collect();
                 ("UID STORE", vec![text(format!("UID STORE {} +FLAGS.SILENT (\\Deleted)", uid_set(&uids)))])
@@ -490,9 +528,10 @@ mod tests {
             ImapOp::UidStoreDeletedCopied(_) => 24,
             ImapOp::UidExpungeCopied(_) => 25,
             ImapOp::UidStoreGmLabels { .. } => 26,
+            ImapOp::Create(_) => 27,
         }
     }
-    const VARIANTS: usize = 27;
+    const VARIANTS: usize = 28;
 
     fn wire(c: &Command<'_>) -> String {
         c.parts
@@ -517,8 +556,10 @@ mod tests {
             GmLabel::User(UserLabel::new("Work").unwrap()),
             GmLabel::User(UserLabel::new("K\u{e4}se \"x\"").unwrap()),
         ];
+        let nf = NewFolder::new("Kunden/K\u{e4}se", Some('.')).unwrap();
         let samples = vec![
             ImapOp::Capability,
+            ImapOp::Create(&nf),
             ImapOp::Login { username: "u", password: "p\"a\\\u{df} w" },
             ImapOp::AuthenticatePlain { username: "u", password: "p" },
             ImapOp::StartTls,
@@ -613,6 +654,35 @@ mod tests {
             wire(&ImapOp::UidFetchMeta { uids: &[4], modseq: true, gm_labels: true }.render()),
             "UID FETCH 4 (UID FLAGS INTERNALDATE RFC822.SIZE MODSEQ X-GM-LABELS)"
         );
+    }
+
+    #[test]
+    fn new_folders_are_encoded_and_cannot_smuggle_syntax() {
+        let w = |n: &str, d: Option<char>| NewFolder::new(n, d).map(|f| f.0);
+        assert_eq!(w("Kunden/Acme", Some('/')).as_deref(), Some("Kunden/Acme"));
+        assert_eq!(w("Kunden/Acme", Some('.')).as_deref(), Some("Kunden.Acme"));
+        assert_eq!(w("K\u{e4}se", Some('/')).as_deref(), Some("K&AOQ-se"));
+        assert_eq!(w("Flat", None).as_deref(), Some("Flat"));
+        assert_eq!(w("a \"b\"", Some('/')).as_deref(), Some("a \"b\""));
+        for (bad, d) in [
+            ("", Some('/')),
+            ("a//b", Some('/')),
+            ("/a", Some('/')),
+            ("a/", Some('/')),
+            ("a/*", Some('/')),
+            ("50%", Some('/')),
+            ("a\r\nb", Some('/')),
+            ("\\Trash", Some('/')),
+            ("inbox", Some('/')),
+            ("v1.2", Some('.')),
+            ("a/b", None),
+            (" a", Some('/')),
+        ] {
+            assert!(NewFolder::new(bad, d).is_none(), "{bad:?} {d:?}");
+        }
+        // Quoted with escapes, or a literal when not printable ASCII: never ends the command early.
+        let f = NewFolder::new("a\" b", Some('/')).unwrap();
+        assert_eq!(wire(&ImapOp::Create(&f).render()), "CREATE \"a\\\" b\"");
     }
 
     #[test]

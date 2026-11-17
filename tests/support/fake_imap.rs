@@ -37,6 +37,7 @@ pub const IMAP_VERBS: &[&str] = &[
     "UID SEARCH",
     "UID FETCH",
     "APPEND",
+    "CREATE",
     "UID STORE",
     "UID EXPUNGE",
     "UID MOVE",
@@ -102,6 +103,8 @@ pub struct Opts {
     pub copyuid: bool,
     /// Gmail semantics and `X-GM-EXT-1` (module docs). Users are created with [`FakeImap::gmail_user`].
     pub gmail: bool,
+    /// Hierarchy delimiter in `LIST` replies.
+    pub delimiter: char,
 }
 
 /// How far past `UIDNEXT` the ranges of [`Opts::wide_vanished`] reach.
@@ -122,6 +125,7 @@ impl Default for Opts {
             move_cap: true,
             copyuid: true,
             gmail: false,
+            delimiter: '/',
         }
     }
 }
@@ -571,6 +575,11 @@ impl FakeImap {
                 .find(|m| m.uid == uid)
                 .map(|m| m.flags.iter().cloned().collect())
         })
+    }
+
+    /// Wire names of the user's folders, in creation order.
+    pub fn folder_wire_names(&self, user: &str) -> Vec<String> {
+        self.with(|st| st.users[user].folders.iter().map(|f| f.raw_name.clone()).collect())
     }
 
     pub fn uids(&self, user: &str, folder: &str) -> Vec<u32> {
@@ -1178,7 +1187,7 @@ fn handle(
                     Some(sp) if su => attrs.push(sp.clone()),
                     _ => {}
                 }
-                out.line(format!("* {verb} ({}) \"/\" \"{}\"", attrs.join(" "), f.raw_name));
+                out.line(format!("* {verb} ({}) \"{}\" \"{}\"", attrs.join(" "), s.opts.delimiter, f.raw_name));
             }
             out.line(ok("listed"));
         }
@@ -1211,6 +1220,19 @@ fn handle(
                 conn.selected = Some((name, ro));
                 out.line(format!("{tag} OK [{}] selected", if ro { "READ-ONLY" } else { "READ-WRITE" }));
             }
+        }
+        "CREATE" => {
+            // RFC 3501: an existing name is a NO; the name is created as sent (wire form).
+            let name = args.first().map(Tok::s).unwrap_or_default();
+            s.next_uidvalidity += 1;
+            let v = s.next_uidvalidity;
+            let user = s.users.get_mut(authed.as_ref().unwrap()).unwrap();
+            if name.is_empty() || user.folders.iter().any(|f| f.raw_name.eq_ignore_ascii_case(&name)) {
+                out.line(format!("{tag} NO [ALREADYEXISTS] mailbox exists"));
+                return (out.0, false);
+            }
+            user.folders.push(Folder::new(name, None, v));
+            out.line(ok("created"));
         }
         "APPEND" => {
             let name = args.first().map(Tok::s).unwrap_or_default();

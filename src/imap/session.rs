@@ -1200,6 +1200,21 @@ impl ImapSession {
         Ok(out)
     }
 
+    /// `CREATE` of a checked folder name. `Ok(true)`: created; `Ok(false)`: the server said no (the name may exist,
+    /// which the caller tells by listing again). A command that was sent but got no answer is
+    /// [`ImapError::OutcomeUnknown`].
+    /// Refused in Gmail mode before any command: there a folder is a label, which Dove leaves to Gmail itself.
+    pub async fn create_folder(&mut self, folder: &super::NewFolder) -> Result<bool, ImapError> {
+        if self.gmail {
+            return Err(ImapError::Protocol("no CREATE in Gmail mode"));
+        }
+        match self.write_simple(ImapOp::Create(folder)).await {
+            Ok(_) => Ok(true),
+            Err(ImapError::Missing) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
     /// `STATUS` without selecting: (messages, uidnext, uidvalidity).
     pub async fn status(&mut self, folder: &str) -> Result<FolderStatus, ImapError> {
         let d = self.simple(ImapOp::Status { mailbox: folder }, SMALL_LITERAL).await?;

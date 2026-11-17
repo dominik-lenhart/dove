@@ -696,6 +696,7 @@ impl Inner {
                         | ("POST", ["messages", _, "modify" | "trash" | "untrash"])
                         | ("POST", ["messages", "batchModify"])
                         | ("POST", ["threads", _, "modify"])
+                        | ("POST", ["labels"])
                 ) && segs.iter().all(|s| !s.is_empty())
             }
             _ => false,
@@ -876,6 +877,21 @@ fn gmail(mb: &mut Mailbox, c: &mut u64, method: &str, segs: &[&str], q: &Query, 
                 Some(m) => (200, json!({"id": id, "message": msg_json(m, full_raw(q.get("format")))})),
                 None => not_found(),
             }
+        }
+        ("POST", ["labels"]) => {
+            // labels.create: names are unique ignoring case and must not be a system label (409 like Gmail).
+            let v: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+            let Some(name) = v["name"].as_str().filter(|n| !n.is_empty()) else { return bad_request() };
+            let clash = SYSTEM_LABELS.iter().any(|l| l.eq_ignore_ascii_case(name))
+                || mb.user_labels.iter().any(|l| l.eq_ignore_ascii_case(name));
+            if clash {
+                return (
+                    409,
+                    json!({"error": {"code": 409, "message": "Label name exists or conflicts", "status": "ABORTED"}}),
+                );
+            }
+            mb.user_labels.push(name.to_string());
+            (200, json!({"id": format!("Label_{}", mb.user_labels.len()), "name": name, "type": "user"}))
         }
         ("POST", ["drafts"]) => {
             let Some((raw, thread)) = draft_body(body) else {
