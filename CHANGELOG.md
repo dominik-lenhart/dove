@@ -5,6 +5,14 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 
 ## [Unreleased]
 
+## [0.20.1] - 2026-11-18
+
+### Fixed
+
+- The "used from a new address" alert no longer fires on almost every session of Claude or ChatGPT connectors, whose
+  requests come from rotating addresses. It now alerts when a connection is used from a new network (IPv4 /16, IPv6
+  /32), at most once per connection a day; further new networks that day go to the service log only.
+
 ## [0.20.0] - 2026-11-17
 
 ### Added
@@ -520,7 +528,8 @@ First release.
   release only after verifying its minisign signature. The CLI hints at a new release at most once a day
   (`DOVE_NO_UPDATE_CHECK=1` turns it off); the server never checks for updates.
 
-[Unreleased]: https://github.com/dominik-lenhart/dove/compare/v0.20.0...HEAD
+[Unreleased]: https://github.com/dominik-lenhart/dove/compare/v0.20.1...HEAD
+[0.20.1]: https://github.com/dominik-lenhart/dove/compare/v0.20.0...v0.20.1
 [0.20.0]: https://github.com/dominik-lenhart/dove/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/dominik-lenhart/dove/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/dominik-lenhart/dove/compare/v0.17.0...v0.18.0

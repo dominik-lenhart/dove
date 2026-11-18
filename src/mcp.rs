@@ -242,13 +242,19 @@ async fn handle(State(app): State<Arc<App>>, req: Request) -> Response {
         Ok(b) => b,
         Err(_) => return (StatusCode::PAYLOAD_TOO_LARGE, "request too large").into_response(),
     };
-    if authed.new_ip {
+    if let Some(net) = authed.new_network {
         let app2 = app.clone();
         let (name, ipstr) = (ctx.client_name.clone(), ip.map(|i| i.to_string()).unwrap_or_default());
         tokio::spawn(async move {
+            let alert = crate::notifier::Alert::new_network(&name, &net.to_string(), &ipstr);
             let _ = app2
                 .notifier
-                .notify_once(&format!("newip:{name}:{ipstr}"), crate::notifier::Alert::new_ip(&name, &ipstr))
+                .notify_once_limited(
+                    &format!("newnet:{name}:{net}"),
+                    &format!("newnet:{name}"),
+                    crate::notifier::NEW_NETWORK_WINDOW_SECS,
+                    alert,
+                )
                 .await;
         });
     }
