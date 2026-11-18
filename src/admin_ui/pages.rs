@@ -492,7 +492,7 @@ pub async fn health(State(app): State<Arc<App>>, Extension(s): Extension<WebSess
             };
             h!(
                 "{}<p class=\"meta\">Dove alerts you when a mailbox needs reconnecting or has not synced for 2 hours, \
-                 when the disk is almost full, when a connection is used from a new address, and after a burst of \
+                 when the disk is almost full, when a connection is used from a new network, and after a burst of \
                  denied calls.</p>",
                 reach
             )

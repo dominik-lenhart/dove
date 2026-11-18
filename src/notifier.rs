@@ -8,12 +8,15 @@
 
 use std::sync::{Arc, Mutex};
 
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 use serde_json::json;
 
 use crate::push::{self, Text};
 use crate::store::Store;
 use crate::util;
+
+/// The new-network alert pushes at most once per connection within this window (PLAN A84).
+pub const NEW_NETWORK_WINDOW_SECS: i64 = 24 * 3600;
 
 /// One owner notification: `message` for the log and webhook, `push` for the lock screen.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,13 +51,14 @@ impl Alert {
         }
     }
 
-    /// A client's token was used from an address it had not used before. The address goes to the log only.
-    pub fn new_ip(client: &str, ip: &str) -> Self {
+    /// A client's token was used from a network ([`crate::policy::alert_network`]) it had not used before. The
+    /// network and the address go to the log only.
+    pub fn new_network(client: &str, network: &str, ip: &str) -> Self {
         Alert {
-            message: format!("Client '{client}' was used from a new IP address {ip}."),
+            message: format!("Client '{client}' was used from a new network {network} (address {ip})."),
             push: text(
-                "new address",
-                format!("{} was used from a new address", push::label(client)),
+                "new network",
+                format!("{} was used from a new network", push::label(client)),
                 page("connections", client),
             ),
         }
@@ -172,6 +176,53 @@ impl Notifier {
         Ok(first)
     }
 
+    /// Like [`Self::notify_once`], but pushes at most once per `group` within `window_secs`. An event inside the
+    /// window is still recorded under `key` (so it never alerts later) and goes to the log only. Returns whether the
+    /// alert was sent.
+    pub async fn notify_once_limited(
+        &self,
+        key: &str,
+        group: &str,
+        window_secs: i64,
+        alert: Alert,
+    ) -> anyhow::Result<bool> {
+        let (key_owned, group_key, push) = (key.to_string(), format!("limit:{group}"), alert.push.clone());
+        let outcome = self
+            .store
+            .call(move |c| {
+                let tx = c.transaction()?;
+                let now = util::now_unix();
+                let first = tx.execute(
+                    "INSERT OR IGNORE INTO notifications(key, last_sent_at) VALUES (?1, ?2)",
+                    params![key_owned, now],
+                )? == 1;
+                if !first {
+                    return Ok(None);
+                }
+                let last: Option<i64> = tx
+                    .query_row("SELECT last_sent_at FROM notifications WHERE key = ?1", [&group_key], |r| r.get(0))
+                    .optional()?;
+                let send = last.is_none_or(|t| now - t >= window_secs);
+                if send {
+                    tx.execute(
+                        "INSERT INTO notifications(key, last_sent_at) VALUES (?1, ?2) \
+                         ON CONFLICT(key) DO UPDATE SET last_sent_at = excluded.last_sent_at",
+                        params![group_key, now],
+                    )?;
+                    push::queue_text(&tx, "alert", None, &push, now)?;
+                }
+                tx.commit()?;
+                Ok(Some(send))
+            })
+            .await?;
+        match outcome {
+            Some(true) => self.announce(&alert.message).await,
+            Some(false) => tracing::info!(notification = alert.message, "owner notification suppressed (rate limit)"),
+            None => {}
+        }
+        Ok(outcome == Some(true))
+    }
+
     /// Allows the event `key` to notify again (for example after a successful reconnect). Returns whether it was open.
     pub async fn clear(&self, key: &str) -> anyhow::Result<bool> {
         let key = key.to_string();
@@ -227,9 +278,9 @@ mod tests {
     /// Lock-screen text never carries the IP, and paths that do not fit the service worker's pattern fall back.
     #[test]
     fn push_text_names_only_the_alias_or_client() {
-        let a = Alert::new_ip("claude-code", "203.0.113.7");
-        assert!(a.message.contains("203.0.113.7"));
-        assert!(!format!("{:?}", a.push).contains("203.0.113"), "{:?}", a.push);
+        let a = Alert::new_network("claude-code", "203.0.0.0/16", "203.0.113.7");
+        assert!(a.message.contains("203.0.113.7") && a.message.contains("203.0.0.0/16"));
+        assert!(!format!("{:?}", a.push).contains("203.0."), "{:?}", a.push);
         assert_eq!(a.push.url, "/admin/connections/claude-code");
         assert_eq!(Alert::reauth("info", "x").push.url, "/admin/mailboxes/info");
         assert_eq!(Alert::denial_burst("a/../b").push.url, "/admin/health");

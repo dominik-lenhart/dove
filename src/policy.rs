@@ -388,10 +388,20 @@ pub fn ip_allowed(cidrs_json: &str, ip: Option<IpAddr>) -> bool {
     cidrs.iter().filter_map(|c| c.parse::<ipnet::IpNet>().ok()).any(|net| net.contains(&ip))
 }
 
+/// The network an address counts as for the new-address alert (PLAN A84): IPv4 /16, IPv6 /32. Hosted connectors
+/// (Claude, ChatGPT) call from rotating addresses inside a few large blocks; comparing single addresses alerted on
+/// almost every session.
+pub fn alert_network(ip: IpAddr) -> ipnet::IpNet {
+    let ip = ip.to_canonical();
+    let len = if ip.is_ipv4() { 16 } else { 32 };
+    ipnet::IpNet::new(ip, len).expect("prefix length within range").trunc()
+}
+
 pub struct Authenticated {
     pub ctx: ClientCtx,
-    /// True when this IP was not seen before for this client (notifier input).
-    pub new_ip: bool,
+    /// The caller's network ([`alert_network`]) when it differs from the network of the client's previous request
+    /// (notifier input). None on the first request, without an address, or when the network is unchanged.
+    pub new_network: Option<ipnet::IpNet>,
 }
 
 /// Authenticates a bearer secret (client token or downstream OAuth access token) and loads the caller.
@@ -453,7 +463,11 @@ pub fn authenticate(
         return Ok(Err(AuthFailure::Unauthorized));
     }
     let ip_s = ip.map(|i| i.to_string());
-    let new_ip = last_ip.is_some() && ip_s.is_some() && last_ip != ip_s;
+    let last_net = last_ip.and_then(|l| l.parse::<IpAddr>().ok()).map(alert_network);
+    let new_network = match (ip.map(alert_network), last_net) {
+        (Some(net), Some(last)) if net != last => Some(net),
+        _ => None,
+    };
     conn.execute(
         "UPDATE clients SET last_used_at = ?1, last_ip = COALESCE(?2, last_ip) WHERE id = ?3",
         params![now, ip_s, client_id],
@@ -471,7 +485,7 @@ pub fn authenticate(
             allow_send,
             redact_secrets,
         },
-        new_ip,
+        new_network,
     }))
 }
 
@@ -525,6 +539,18 @@ pub fn current_epoch(conn: &Connection, client_id: &str) -> anyhow::Result<Optio
 
 #[cfg(test)]
 mod tests {
+
+    /// The alert network: IPv4 /16, IPv6 /32, and an IPv4-mapped IPv6 address counts as its IPv4 network.
+    #[test]
+    fn alert_network_groups_by_prefix() {
+        let n = |s: &str| alert_network(s.parse().unwrap()).to_string();
+        assert_eq!(n("160.79.104.5"), "160.79.0.0/16");
+        assert_eq!(n("160.79.111.200"), n("160.79.104.5"));
+        assert_ne!(n("160.80.0.1"), n("160.79.104.5"));
+        assert_eq!(n("2001:db8:ffff::2"), "2001:db8::/32");
+        assert_ne!(n("2001:db9::1"), n("2001:db8::1"));
+        assert_eq!(n("::ffff:203.0.113.7"), "203.0.0.0/16");
+    }
     use super::*;
 
     #[test]

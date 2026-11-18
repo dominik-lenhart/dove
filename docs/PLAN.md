@@ -79,6 +79,7 @@ hosts or reference hardware.
      single-passkey notices, app badge, offline page, touch sizes, dark colour scheme (`tests/admin_ui_e2e.rs`,
      `tests/admin_push_e2e.rs`, `tests/admin_ui_manage_e2e.rs`). Badge and offline page are unverified on a real
      iPhone.
+   - [x] New-address alert by network with a daily push limit (A84, `tests/health_alerts_e2e.rs`).
    - [x] Activity dashboard and audit search (design 2026-11-17, A78): overview chart and per-connection rows from the
      new read verb `AuditStats`, audit search with suggestions, failure and object filters, paging, hidden watch polls
      (`tests/admin_activity_e2e.rs`, `audit::tests`).
@@ -956,3 +957,11 @@ hosts or reference hardware.
   worker caches only `offline_assets()` (offline page, CSS, JS, font) under the asset version and answers a failed
   navigation with `/admin/offline`; no page with data is ever cached. (h) Dark mode redefines the colour tokens under
   `prefers-color-scheme: dark`; touch devices get 16 px inputs (no iOS zoom) and 44 px targets.
+- A84. New-address alert by network (2026-11-18, owner report: a push storm of "used from a new address"). Hosted
+  connectors (Claude, ChatGPT) call `/mcp` from rotating addresses inside a few large blocks, so comparing a client's
+  address with its previous one alerted on almost every session once alerts reached the phone (A77). The alert now
+  compares networks (`policy::alert_network`: IPv4 /16, IPv6 /32, IPv4-mapped counts as IPv4), records each new
+  network once per connection (`newnet:<client>:<net>`) and pushes at most once per connection within
+  `notifier::NEW_NETWORK_WINDOW_SECS` = 24 h (`Notifier::notify_once_limited`, group row `limit:newnet:<client>`); a
+  network seen inside the window is recorded and logged but never pushed later. A token taken to a different network
+  still alerts. Old `newip:*` rows stay and are unused (`tests/health_alerts_e2e.rs`).
