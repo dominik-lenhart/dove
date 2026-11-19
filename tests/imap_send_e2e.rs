@@ -256,8 +256,10 @@ async fn crash_in_sending_becomes_send_unknown() {
     assert_eq!(h.imap.uids(&u.user, "Drafts"), vec![uid_of(&rev)]);
 }
 
+/// A rejected SMTP login is a rejected login of the mailbox (PLAN A85): nothing is sent, the draft stays active, the
+/// mailbox is not marked yet, and no SMTP connection is opened while the pause runs. After it, the send goes through.
 #[tokio::test]
-async fn smtp_auth_failure_marks_reauth() {
+async fn smtp_auth_failure_pauses_sending() {
     let Setup { h, u, sender, .. } = setup().await;
     let (d, rev) = draft(&h, &sender).await;
     h.imap.smtp_fail_next("AUTH", SmtpFault::Reply(535));
@@ -269,14 +271,29 @@ async fn smtp_auth_failure_marks_reauth() {
         .call(move |c| Ok(c.query_row("SELECT status FROM accounts WHERE id = ?1", [aid], |r| r.get(0))?))
         .await
         .unwrap();
-    assert_eq!(status, "reauth_required");
-    let notes = h.app().notifier.sent.lock().unwrap().iter().filter(|m| m.contains("'info'")).count();
-    assert_eq!(notes, 1);
-    // Nothing was sent; the draft is back to active for after the reconnect.
+    assert_eq!(status, "active");
+    assert_eq!(h.app().notifier.sent.lock().unwrap().iter().filter(|m| m.contains("'info'")).count(), 0);
     assert!(h.imap.sent_mails().is_empty());
     assert_eq!(state(&h, &d).await.0, "active");
+    // The pause holds SMTP too: no connection at all.
+    let conns = h.imap.smtp_connections();
     assert_eq!(h.err(&sender, "send_draft", send_args(&d, &rev)).await, "account_unavailable");
-    assert_eq!(h.app().notifier.sent.lock().unwrap().iter().filter(|m| m.contains("'info'")).count(), 1);
+    assert_eq!(h.imap.smtp_connections(), conns);
+    assert!(h.imap.sent_mails().is_empty());
+    // Once the pause is over, the same draft sends.
+    h.app().imap.logins().backdate_for_tests(&u.account_id, 301);
+    h.ok(&sender, "send_draft", send_args(&d, &rev)).await;
+    assert_eq!(h.imap.sent_mails().len(), 1);
+    // The successful SMTP login ended the streak: a later rejection counts from one again.
+    let aid = u.account_id.clone();
+    let gen_id: i64 = h
+        .app()
+        .store
+        .call(move |c| Ok(c.query_row("SELECT grant_generation FROM accounts WHERE id = ?1", [aid], |r| r.get(0))?))
+        .await
+        .unwrap();
+    let verdict = h.app().imap.logins().failed(&u.account_id, gen_id, dove::util::now_unix());
+    assert!(matches!(verdict, dove::imap::login_guard::Verdict::Pause { failures: 1, .. }), "{verdict:?}");
 }
 
 #[tokio::test]

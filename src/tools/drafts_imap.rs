@@ -64,8 +64,8 @@ impl Conn {
         Ok(Self { account_id: mb.account_id.clone(), settings, creds })
     }
 
-    /// Runs `f` on a pooled session with the Drafts/Sent append targets set. An authentication failure marks the
-    /// account `reauth_required` (once per credential generation); the raw error goes back for classification.
+    /// Runs `f` on a pooled session with the Drafts/Sent append targets set. An authentication failure is recorded
+    /// (`account::auth_failed`); the raw error goes back for classification.
     async fn run<T, F>(&self, cx: &ToolCx, f: F) -> Result<T, ImapError>
     where
         F: for<'s> FnOnce(&'s mut ImapSession) -> SessionFuture<'s, T>,
@@ -74,13 +74,13 @@ impl Conn {
         let r = cx
             .app
             .imap
-            .with_session(&self.account_id, &self.settings.imap, &self.creds, move |s| {
+            .with_session(&self.account_id, self.settings.generation, &self.settings.imap, &self.creds, move |s| {
                 s.set_append_targets(drafts, sent);
                 f(s)
             })
             .await;
         if r.as_ref().err() == Some(&ImapError::Auth) {
-            account::mark_auth_failure(&cx.app, &self.account_id, self.settings.generation, &self.settings.alias).await;
+            account::auth_failed(&cx.app, &self.account_id, self.settings.generation, &self.settings.alias).await;
         }
         r
     }
@@ -254,7 +254,9 @@ pub(super) async fn delete(cx: &ToolCx, mb: &Mailbox, id: ImapMsgId) -> Result<(
     expunge_own(cx, &conn, id).await.map_err(|e| match e {
         // UIDVALIDITY changed or the Drafts folder is gone: the UID no longer names Dove's draft.
         ImapError::Missing => not_ours(None),
-        ImapError::NotDispatched | ImapError::Network | ImapError::Tls | ImapError::Auth => ToolError::from(e),
+        ImapError::NotDispatched | ImapError::Network | ImapError::Tls | ImapError::Auth | ImapError::LoginPaused => {
+            ToolError::from(e)
+        }
         _ => ToolError::new(ErrorCode::OutcomeUnknown, "the draft may or may not have been deleted; check Drafts"),
     })
 }
@@ -372,6 +374,10 @@ pub(super) async fn prepare_send(
 /// final `.` of `DATA`); every other error is definitive and leaves nothing sent.
 pub(super) async fn submit(cx: &ToolCx, mb: &Mailbox, p: &PreparedSend) -> Result<(), ToolError> {
     let s = &p.conn.settings;
+    // SMTP shares the mailbox's login pause (PLAN A85): nothing is submitted while it runs.
+    if cx.app.imap.logins().paused(&mb.account_id, s.generation, crate::util::now_unix()) {
+        return Err(ToolError::from(ImapError::LoginPaused));
+    }
     let creds = s.smtp_credentials(&p.conn.creds);
     let r = smtp::submit(
         cx.app.imap.connector(),
@@ -384,10 +390,13 @@ pub(super) async fn submit(cx: &ToolCx, mb: &Mailbox, p: &PreparedSend) -> Resul
     )
     .await;
     match r {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            cx.app.imap.logins().succeeded(&mb.account_id);
+            Ok(())
+        }
         Err(e) if e.kind == ImapError::OutcomeUnknown => Err(ToolError::from(ImapError::OutcomeUnknown)),
         Err(e) if e.kind == ImapError::Auth => {
-            account::mark_auth_failure(&cx.app, &mb.account_id, s.generation, &s.alias).await;
+            account::auth_failed(&cx.app, &mb.account_id, s.generation, &s.alias).await;
             Err(ToolError::unavailable())
         }
         Err(e) => {

@@ -152,7 +152,7 @@ async fn pool_background_work_leaves_interactive_slots() {
         let (pool, release, held_tx, ep) = (pool.clone(), release.clone(), held_tx.clone(), ep(f.imap_addr));
         holders.push(tokio::spawn(async move {
             let acct = format!("sync{i}");
-            pool.with_session_prio(&acct, &ep, &creds(PASS), Priority::Background, move |s| {
+            pool.with_session_prio(&acct, 0, &ep, &creds(PASS), Priority::Background, move |s| {
                 Box::pin(async move {
                     s.noop().await?;
                     let _ = held_tx.send(());
@@ -168,7 +168,7 @@ async fn pool_background_work_leaves_interactive_slots() {
     }
     let noop = |prio, acct: &'static str| {
         let (pool, ep) = (pool.clone(), ep(f.imap_addr));
-        async move { pool.with_session_prio(acct, &ep, &creds(PASS), prio, |s| Box::pin(s.noop())).await }
+        async move { pool.with_session_prio(acct, 0, &ep, &creds(PASS), prio, |s| Box::pin(s.noop())).await }
     };
     assert_eq!(noop(Priority::Background, "sync9").await.unwrap_err(), ImapError::NotDispatched);
     noop(Priority::Interactive, "agent").await.unwrap();
@@ -179,7 +179,7 @@ async fn pool_background_work_leaves_interactive_slots() {
 }
 
 async fn pool_fetch(pool: &ImapPool, f: &FakeImap, uid: u32) -> Result<Option<Vec<u8>>, ImapError> {
-    pool.with_session("acct", &ep(f.imap_addr), &creds(PASS), |s| {
+    pool.with_session("acct", 0, &ep(f.imap_addr), &creds(PASS), |s| {
         Box::pin(async move {
             s.select("INBOX", true).await?;
             s.fetch_raw(uid, 1 << 20).await

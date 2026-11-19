@@ -215,16 +215,24 @@ async fn connection(app: &Arc<App>, aid: &str, generation: i64, cancel: &Cancell
     if settings.generation != generation {
         return End::Stop;
     }
+    // A rejected login's pause (PLAN A85) holds IDLE too; the backoff checks again later.
+    if app.imap.logins().paused(aid, generation, util::now_unix()) {
+        return End::Retry;
+    }
     let timeout = app.imap.cmd_timeout();
     let connect = ImapSession::connect(app.imap.connector(), &settings.imap, &creds, timeout);
     let mut s = tokio::select! {
         _ = cancel.cancelled() => return End::Cancelled,
         r = connect => match r {
-            Ok(s) => s,
+            Ok(s) => {
+                app.imap.logins().succeeded(aid);
+                s
+            }
             Err(ImapError::Auth) => {
-                tracing::warn!("IMAP IDLE login rejected; the mailbox needs a reconnect");
-                account::mark_auth_failure(app, aid, settings.generation, &settings.alias).await;
-                return End::Stop;
+                if account::auth_failed(app, aid, settings.generation, &settings.alias).await {
+                    return End::Stop;
+                }
+                return End::Retry;
             }
             Err(ImapError::Capability(_)) => return End::Stop,
             Err(_) => return End::Retry,

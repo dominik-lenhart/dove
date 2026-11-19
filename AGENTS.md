@@ -584,3 +584,10 @@ cargo fmt
   `Opts { delimiter, .. }` and answers `CREATE` (NO for an existing name); the fake Google answers `POST labels` with
   409 for a name that exists in any case. Domain rules need a dot: splitting the admin input on spaces turned
   "not a domain" into three one-label domains.
+- 2026-11-19: IMAP reauth (PLAN A85): never mark an IMAP mailbox `reauth_required` directly; every rejected IMAP or SMTP
+  login goes through `imap::account::auth_failed`, which asks `app.imap.logins()` (`imap::login_guard`) and marks only
+  after 3 rejections over 30 minutes. A new login path must check `logins().paused(id, generation, now)` before it
+  connects and call `logins().succeeded(id)` after a login works. Tests age a streak with
+  `logins().backdate_for_tests(id, secs)`; the fake's `Fault::No` answers `NO [UNAVAILABLE]` (a network error, not a
+  rejection), so simulate a rejected login with `set_password` and restore `u.password` to let it pass again.
+  `ImapPool::evict` keeps the streak on purpose: a test that evicts pooled sessions does not reset the count.

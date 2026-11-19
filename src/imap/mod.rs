@@ -8,6 +8,7 @@
 pub mod account;
 pub mod connect;
 pub mod ids;
+pub mod login_guard;
 pub(crate) mod ops;
 pub mod pool;
 pub mod presets;
@@ -94,6 +95,9 @@ pub enum ImapError {
     /// The server rejected the credentials (`NO [AUTHENTICATIONFAILED]`, SMTP 535).
     #[error("authentication failed")]
     Auth,
+    /// No login was tried: an earlier one for this mailbox was rejected and its pause has not ended (PLAN A85).
+    #[error("login paused")]
+    LoginPaused,
     /// TLS handshake or certificate verification failed, or STARTTLS was refused.
     #[error("TLS failed")]
     Tls,
@@ -117,10 +121,11 @@ pub enum ImapError {
 }
 
 impl From<ImapError> for ToolError {
-    /// `Auth` maps to `account_unavailable`; the caller marks the account `reauth_required` (see `imap::account`).
+    /// `Auth` and `LoginPaused` map to `account_unavailable`; the caller records the rejected login, which marks the
+    /// account `reauth_required` once it persists (see `imap::account`, `imap::login_guard`).
     fn from(e: ImapError) -> Self {
         match e {
-            ImapError::Auth => ToolError::unavailable(),
+            ImapError::Auth | ImapError::LoginPaused => ToolError::unavailable(),
             ImapError::Missing => ToolError::not_found(),
             ImapError::Network | ImapError::NotDispatched => ToolError::upstream("the mail server is unreachable"),
             ImapError::Tls => ToolError::upstream("the TLS connection to the mail server failed"),

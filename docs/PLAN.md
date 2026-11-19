@@ -80,6 +80,8 @@ hosts or reference hardware.
      `tests/admin_push_e2e.rs`, `tests/admin_ui_manage_e2e.rs`). Badge and offline page are unverified on a real
      iPhone.
    - [x] New-address alert by network with a daily push limit (A84, `tests/health_alerts_e2e.rs`).
+   - [x] IMAP reauth only after rejections persist, with paused logins in between (A85, `imap::login_guard`,
+     `tests/imap_connect_e2e.rs`, `tests/imap_send_e2e.rs`, `tests/imap_idle_e2e.rs`).
    - [x] Activity dashboard and audit search (design 2026-11-17, A78): overview chart and per-connection rows from the
      new read verb `AuditStats`, audit search with suggestions, failure and object filters, paging, hidden watch polls
      (`tests/admin_activity_e2e.rs`, `audit::tests`).
@@ -965,3 +967,16 @@ hosts or reference hardware.
   `notifier::NEW_NETWORK_WINDOW_SECS` = 24 h (`Notifier::notify_once_limited`, group row `limit:newnet:<client>`); a
   network seen inside the window is recorded and logged but never pushed later. A token taken to a different network
   still alerts. Old `newip:*` rows stay and are unused (`tests/health_alerts_e2e.rs`).
+- A85. IMAP reauth after persistent rejections (2026-11-19, owner report: the iCloud mailbox went `reauth_required` on
+  2026-11-17 although its app password was unchanged and still valid; a reconnect with a new one fixed it). One
+  rejected IMAP or SMTP login used to mark the mailbox at once, but iCloud answers a valid password with
+  `NO [AUTHENTICATIONFAILED]` during trouble of its own, and server text is not logged, so the cause stays a likely
+  explanation, not a proven one. Now `imap::login_guard::LoginGuard` (in `ImapPool`) keeps one in-memory streak per
+  mailbox and credential generation: a rejection pauses new logins (`ImapError::LoginPaused`, agents see
+  `account_unavailable`) for 5, 10, then 15 minutes, and `account::auth_failed` marks `reauth_required` (same
+  generation fence and one notification as before) only when at least 3 logins over at least 30 minutes were rejected
+  with none successful in between. Any successful IMAP or SMTP login ends the streak. The pause also protects the
+  provider account from a burst of wrong-password logins (Apple can lock an Apple ID). The request pool, IDLE and SMTP
+  submission honour the pause; `accounts check` ignores it (the operator asked for a login) but counts. Pooled
+  sessions that are already logged in keep working. The streak lives in memory: a restart starts over, which delays a
+  reauth by at most one more streak. Gmail API mailboxes are unchanged (`invalid_grant` is definitive).

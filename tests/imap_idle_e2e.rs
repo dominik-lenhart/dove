@@ -1,6 +1,6 @@
 //! IMAP IDLE push and search freshness (`index::imap_idle`, owner request 2026-11-12): new INBOX mail is indexed within
-//! seconds without waiting for the poll; the IDLE connection reconnects after drops, stops with the account, marks
-//! reauth once on a rejected login, and falls back to polling on servers without IDLE; searches run one bounded INBOX
+//! seconds without waiting for the poll; the IDLE connection reconnects after drops, stops with the account, waits
+//! out the pause after a rejected login and stops at reauth, and falls back to polling on servers without IDLE; searches run one bounded INBOX
 //! check when IDLE is not healthy. Runs against the fake IMAP server with the real scheduler and IDLE supervisor.
 
 mod support;
@@ -286,23 +286,40 @@ async fn idle_stops_with_the_account_and_does_not_reconnect() {
     fx.h.imap.assert_only_allowlisted();
 }
 
-/// The password changes at the provider while IDLE runs: the reconnect's login fails once, the mailbox is marked
-/// `reauth_required` with one notification, and IDLE does not try again.
+/// The password changes at the provider while IDLE runs (PLAN A85): the reconnect's login is rejected once, the
+/// mailbox is not marked yet, and IDLE does not log in again while the pause runs. Once the rejections persist the
+/// mailbox is `reauth_required` with one notification, and IDLE stays off.
 #[tokio::test]
-async fn auth_failure_on_reconnect_marks_reauth_once_and_stops() {
+async fn auth_failure_on_reconnect_pauses_then_stops_at_reauth() {
     let mut fx = setup(Opts::default(), no_poll).await;
     fx.start_idle();
     fx.wait_idling().await;
     fx.h.imap.set_password(&fx.u.user, "changed-elsewhere");
     let mark = fx.h.imap.commands().len();
     fx.h.imap.kick_idle();
-    wait_for("reauth_required", Duration::from_secs(5), || async { fx.status().await == "reauth_required" }).await;
+    let logins = |fx: &Fx| fx.commands_since(mark).iter().filter(|c| c.starts_with("LOGIN")).count();
+    wait_for("the rejected login", Duration::from_secs(5), || async { logins(&fx) == 1 }).await;
     tokio::time::sleep(Duration::from_secs(4)).await;
-    let logins = fx.commands_since(mark).iter().filter(|c| c.starts_with("LOGIN")).count();
-    assert_eq!(logins, 1, "{:?}", fx.commands_since(mark));
-    let notes = fx.h.app().notifier.sent.lock().unwrap().iter().filter(|m| m.contains("'info'")).count();
-    assert_eq!(notes, 1);
+    assert_eq!(logins(&fx), 1, "{:?}", fx.commands_since(mark));
+    assert_eq!(fx.status().await, "active");
+    let notes = || fx.h.app().notifier.sent.lock().unwrap().iter().filter(|m| m.contains("'info'")).count();
+    assert_eq!(notes(), 0);
     assert_eq!((fx.h.imap.idling(), fx.healthy()), (0, false));
+
+    // Two more rejections over 30 minutes (here through the request pool) end the streak in a reauth.
+    let app = fx.h.app().clone();
+    // Sessions the pool logged in before the change still work; only new logins count.
+    app.imap.evict(&fx.u.account_id);
+    for _ in 0..2 {
+        app.imap.logins().backdate_for_tests(&fx.u.account_id, dove::imap::login_guard::REAUTH_AFTER_SECS);
+        dove::imap::account::with_session(&app, &fx.u.account_id, |s| Box::pin(s.noop())).await.unwrap_err();
+    }
+    assert_eq!(fx.status().await, "reauth_required");
+    assert_eq!(notes(), 1);
+    let before = logins(&fx);
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert_eq!(logins(&fx), before, "IDLE does not log in after the reauth");
+    assert_eq!(fx.h.imap.idling(), 0);
 }
 
 /// A server without IDLE is polled: new mail arrives through the poll, IDLE is never sent, and the supervisor does

@@ -1,5 +1,6 @@
-//! An IMAP account's settings, folders and credentials, and the reauth rule: an explicit authentication failure
-//! marks the account `reauth_required` once per credential generation (same fence and notification as Gmail).
+//! An IMAP account's settings, folders and credentials, and the reauth rule: a rejected login pauses new logins, and
+//! only a rejection that persists (`imap::login_guard`, PLAN A85) marks the account `reauth_required`, once per
+//! credential generation (same fence and notification as Gmail).
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
@@ -209,9 +210,22 @@ pub async fn gmail_mode(app: &App, account_id: &str) -> Result<bool, ToolError> 
     Ok(s.and_then(|s| serde_json::from_str::<ImapSettings>(&s).ok()).is_some_and(|s| s.gmail))
 }
 
-/// Marks `reauth_required` only while the credential generation is unchanged (a late failure for an old password
-/// cannot touch a newer one) and notifies the owner once per generation.
-pub async fn mark_auth_failure(app: &App, account_id: &str, generation: i64, alias: &str) {
+/// Records a rejected IMAP or SMTP login. Returns `true` when it marked the account `reauth_required`: the rejections
+/// persisted ([`super::login_guard`]) and the credential generation is unchanged (a late failure for an old password
+/// cannot touch a newer one). The owner is notified once per generation. Before that, new logins only pause.
+pub async fn auth_failed(app: &App, account_id: &str, generation: i64, alias: &str) -> bool {
+    match app.imap.logins().failed(account_id, generation, util::now_unix()) {
+        super::login_guard::Verdict::Reauth => {}
+        super::login_guard::Verdict::Stale => return false,
+        super::login_guard::Verdict::Pause { failures, retry_at } => {
+            tracing::warn!(
+                failures,
+                retry_in_secs = retry_at - util::now_unix(),
+                "IMAP/SMTP login rejected; pausing logins for this mailbox before asking for a reconnect"
+            );
+            return false;
+        }
+    }
     let id = account_id.to_string();
     let changed = app
         .store
@@ -226,6 +240,7 @@ pub async fn mark_auth_failure(app: &App, account_id: &str, generation: i64, ali
         .unwrap_or(0);
     app.imap.evict(account_id);
     if changed == 1 {
+        tracing::warn!("IMAP/SMTP logins kept being rejected; the mailbox needs a reconnect");
         let _ = app
             .notifier
             .notify_once(
@@ -233,18 +248,20 @@ pub async fn mark_auth_failure(app: &App, account_id: &str, generation: i64, ali
                 crate::notifier::Alert::reauth(
                     alias,
                     &format!(
-                        "rejected its password: run `dove accounts reconnect {alias}` with the current (app) password."
+                        "kept rejecting its password for 30 minutes: run `dove accounts reconnect {alias}` with the \
+                         current (app) password."
                     ),
                 ),
             )
             .await;
     }
+    changed == 1
 }
 
-/// Maps a wire error to a tool error, marking reauth on an authentication failure.
+/// Maps a wire error to a tool error, recording a rejected login.
 pub async fn tool_error(app: &App, settings: &ImapSettings, account_id: &str, e: ImapError) -> ToolError {
     if e == ImapError::Auth {
-        mark_auth_failure(app, account_id, settings.generation, &settings.alias).await;
+        auth_failed(app, account_id, settings.generation, &settings.alias).await;
     }
     ToolError::from(e)
 }
@@ -266,7 +283,7 @@ where
     let (drafts, sent, gmail) = (settings.drafts_folder.clone(), settings.sent_folder.clone(), settings.gmail);
     let r = app
         .imap
-        .with_session_prio(account_id, &settings.imap, &creds, prio, move |s| {
+        .with_session_prio(account_id, settings.generation, &settings.imap, &creds, prio, move |s| {
             s.set_append_targets(drafts, sent);
             s.set_gmail(gmail);
             f(s)

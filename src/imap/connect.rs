@@ -237,6 +237,7 @@ fn step_error(server: &str, ep: &ServerEndpoint, e: &ImapError) -> anyhow::Error
     let at = format!("{}:{}", ep.host, ep.port);
     match e {
         ImapError::Auth => anyhow!("{server} login failed at {at}: the server rejected the username or password"),
+        ImapError::LoginPaused => anyhow!("{server} login at {at} is paused after a rejected login; try again later"),
         ImapError::Tls => {
             anyhow!("{server} TLS failed at {at}: the certificate could not be verified or STARTTLS failed")
         }
@@ -496,8 +497,8 @@ pub async fn reconnect(call: &mut AdminCall<'_>, alias: &str, password: Zeroizin
     Ok(json!({ "account": alias, "provider": "imap", "status": "active", "generation": generation }))
 }
 
-/// `accounts check` for one active IMAP account: IMAP login + NOOP, SMTP login. An authentication failure marks
-/// the account `reauth_required`.
+/// `accounts check` for one active IMAP account: IMAP login + NOOP, SMTP login. It ignores a running login pause (the
+/// operator asked for a login now); a rejection is recorded like any other (PLAN A85), a full success ends the streak.
 pub async fn check(app: &Arc<App>, account_id: &str, alias: &str) -> Value {
     let (settings, creds) = match account::load(app, account_id).await {
         Ok(v) => v,
@@ -515,7 +516,9 @@ pub async fn check(app: &Arc<App>, account_id: &str, alias: &str) -> Value {
         .await
         .map_err(|e| e.kind);
     if imap.as_ref().err() == Some(&ImapError::Auth) || smtp.as_ref().err() == Some(&ImapError::Auth) {
-        account::mark_auth_failure(app, account_id, settings.generation, &settings.alias).await;
+        account::auth_failed(app, account_id, settings.generation, &settings.alias).await;
+    } else if imap.is_ok() && smtp.is_ok() {
+        app.imap.logins().succeeded(account_id);
     }
     let id = account_id.to_string();
     let status: String = app

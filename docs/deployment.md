@@ -611,6 +611,11 @@ dove accounts connect-imap own --email me@mail.example \
 - The server must support `UIDPLUS` (Dove refuses others at connect). `CONDSTORE`/`QRESYNC` make sync cheaper when
   present; without them Dove re-reads flags in bounded windows.
 - `accounts reconnect <alias>` asks for a new password and verifies it before replacing the stored one.
+- A rejected login does not mark the mailbox at once: some providers (iCloud) reject a valid app password for a few
+  minutes when they have trouble of their own. Dove pauses new logins for that mailbox (5, 10, then every 15 minutes;
+  agents get `account_unavailable` meanwhile) and marks it `reauth_required`, with one notification, only when at
+  least three logins over 30 minutes were rejected and none succeeded. One successful login ends the count, so a
+  passing rejection heals by itself. `accounts check` logs in even during a pause and counts like any other login.
 - Dove never deletes or moves mail in these mailboxes. It removes only drafts it wrote itself (the previous revision
   after `update_draft`, the draft after `send_draft`), and only after checking that the draft on the server is still
   byte-identical to what it wrote.
@@ -654,7 +659,8 @@ Dove recognises Gmail by its IMAP extension (`X-GM-EXT-1`) and puts the mailbox 
   mailbox can take a few days on that budget. Thread ids are Dove's own (References and subject), not Gmail's.
 - A label created in Gmail can take a short while to show up in `list_labels`: Gmail refreshes the folder list of an
   open IMAP connection lazily.
-- `accounts reconnect <alias>` takes a new app password. Revoking the app password at Google stops Dove at once.
+- `accounts reconnect <alias>` takes a new app password. Revoking the app password at Google stops Dove's next
+  login; the mailbox shows `reauth_required` after 30 minutes (see the pause rule above).
 
 ### Send-as aliases and signatures
 
@@ -727,8 +733,9 @@ connection per mailbox beyond the request pool (at most 2): some providers limit
 
 - IDLE is re-issued every `index.idle_renew_secs` (default and maximum 1500 s, 25 minutes).
 - A lost connection is re-established with exponential backoff and jitter (about 1 s, doubling up to 5 minutes).
-- If the server rejects the password on a reconnect, the mailbox is marked `reauth_required` once and the owner is
-  notified, exactly as for any other login. IDLE then stays off until `dove accounts reconnect <alias>`.
+- If the server rejects the password on a reconnect, IDLE waits out the login pause like every other login and
+  tries again. Once the mailbox is marked `reauth_required` (rejections for 30 minutes), IDLE stays off until
+  `dove accounts reconnect <alias>`.
 - Disabling or removing the mailbox, disabling its index, or reauth stops the connection within about a second.
 - Servers without IDLE are polled only. Logs say so once per start ("the mail server does not offer IDLE").
 - `index.imap_idle = false` turns push off for all mailboxes (polling and the search check below still work).

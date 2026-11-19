@@ -286,8 +286,25 @@ fn noop(s: &mut dove::imap::ImapSession) -> dove::imap::pool::SessionFuture<'_, 
     Box::pin(async move { s.noop().await })
 }
 
+/// Logins the fake server saw (LOGIN or AUTHENTICATE).
+fn logins(h: &Harness) -> usize {
+    h.imap.commands().iter().filter(|c| c.starts_with("LOGIN") || c.starts_with("AUTHENTICATE")).count()
+}
+
+fn notes(h: &Harness, alias: &str) -> usize {
+    let needle = format!("'{alias}'");
+    h.app().notifier.sent.lock().unwrap().iter().filter(|m| m.contains(&needle)).count()
+}
+
+/// Moves the mailbox's rejected-login streak `REAUTH_AFTER_SECS` into the past (its pause ends with it).
+fn age_streak(h: &Harness, account_id: &str) {
+    h.app().imap.logins().backdate_for_tests(account_id, dove::imap::login_guard::REAUTH_AFTER_SECS);
+}
+
+/// PLAN A85: a rejected login pauses new logins and does not mark the mailbox; only rejections that persist for
+/// 30 minutes (three logins, none successful) mark it `reauth_required`, once, with one notification.
 #[tokio::test]
-async fn auth_failure_marks_reauth_once() {
+async fn rejected_login_pauses_then_marks_reauth_once() {
     let h = Harness::start().await;
     let u = h.imap_mailbox("info", "info@example.org").await;
     h.project("p", &["info"]).await;
@@ -299,14 +316,27 @@ async fn auth_failure_marks_reauth_once() {
     // The password changes at the provider: the pooled session still works, a new login does not.
     h.imap.set_password(&u.user, "changed-elsewhere");
     app.imap.evict(&u.account_id);
+    let before = logins(&h);
     let e = dove::imap::account::with_session(&app, &u.account_id, noop).await.unwrap_err();
     assert_eq!(e.code.as_str(), "account_unavailable");
+    assert_eq!(logins(&h), before + 1);
+    assert_eq!(grant_row(&h, &u.account_id).await.2, "active");
+    assert_eq!(notes(&h, "info"), 0);
+    // While the pause runs, nothing logs in: neither Dove's own calls nor an agent's.
     let e = dove::imap::account::with_session(&app, &u.account_id, noop).await.unwrap_err();
     assert_eq!(e.code.as_str(), "account_unavailable");
-    let (_, _, status) = grant_row(&h, &u.account_id).await;
-    assert_eq!(status, "reauth_required");
-    let notes = app.notifier.sent.lock().unwrap().iter().filter(|m| m.contains("'info'")).count();
-    assert_eq!(notes, 1);
+    assert_eq!(h.err(&token, "list_labels", json!({ "account": "info" })).await, "account_unavailable");
+    assert_eq!(logins(&h), before + 1);
+
+    // Two more rejections, the last one 30 minutes after the first: now it is the password.
+    age_streak(&h, &u.account_id);
+    dove::imap::account::with_session(&app, &u.account_id, noop).await.unwrap_err();
+    assert_eq!(grant_row(&h, &u.account_id).await.2, "active");
+    age_streak(&h, &u.account_id);
+    dove::imap::account::with_session(&app, &u.account_id, noop).await.unwrap_err();
+    assert_eq!(logins(&h), before + 3);
+    assert_eq!(grant_row(&h, &u.account_id).await.2, "reauth_required");
+    assert_eq!(notes(&h, "info"), 1);
     let last_error: Option<String> = h
         .app()
         .store
@@ -317,17 +347,47 @@ async fn auth_failure_marks_reauth_once() {
     // Agents see the account as unavailable.
     assert_eq!(h.err(&token, "list_labels", json!({ "account": "info" })).await, "account_unavailable");
 
-    // After a reconnect, a late failure for the old generation cannot mark the new password.
+    // After a reconnect, late failures for the old generation cannot pause or mark the new password.
     h.admin(AdminRequest::AccountsReconnectImap {
         alias: "info".into(),
         password: Password(Zeroizing::new("changed-elsewhere".into())),
     })
     .await
     .unwrap();
-    dove::imap::account::mark_auth_failure(&app, &u.account_id, gen0, "info").await;
+    for _ in 0..3 {
+        dove::imap::account::auth_failed(&app, &u.account_id, gen0, "info").await;
+        age_streak(&h, &u.account_id);
+    }
     let (_, gen1, status) = grant_row(&h, &u.account_id).await;
     assert_eq!((gen1, status.as_str()), (gen0 + 1, "active"));
+    assert_eq!(notes(&h, "info"), 1);
     dove::imap::account::with_session(&app, &u.account_id, noop).await.unwrap();
+}
+
+/// The iCloud case behind PLAN A85: the provider rejects a correct password once. After the pause the next login
+/// works, the mailbox never needs a reconnect, and the successful login ends the streak (two later rejections, even
+/// 30 minutes apart, start counting from one again).
+#[tokio::test]
+async fn a_passing_rejection_heals_without_reconnect() {
+    let h = Harness::start().await;
+    let u = h.imap_mailbox("info", "info@example.org").await;
+    let app = h.app().clone();
+    app.imap.evict(&u.account_id);
+    h.imap.set_password(&u.user, "provider-hiccup");
+    let e = dove::imap::account::with_session(&app, &u.account_id, noop).await.unwrap_err();
+    assert_eq!(e.code.as_str(), "account_unavailable");
+    h.imap.set_password(&u.user, &u.password);
+    app.imap.logins().backdate_for_tests(&u.account_id, 301);
+    dove::imap::account::with_session(&app, &u.account_id, noop).await.unwrap();
+
+    // Without the reset these two would be the second and third rejection of a 30-minute streak.
+    app.imap.evict(&u.account_id);
+    h.imap.set_password(&u.user, "changed-elsewhere");
+    dove::imap::account::with_session(&app, &u.account_id, noop).await.unwrap_err();
+    age_streak(&h, &u.account_id);
+    dove::imap::account::with_session(&app, &u.account_id, noop).await.unwrap_err();
+    assert_eq!(grant_row(&h, &u.account_id).await.2, "active");
+    assert_eq!(notes(&h, "info"), 0);
 }
 
 #[tokio::test]
@@ -368,9 +428,21 @@ async fn accounts_check_logs_in_and_marks_reauth() {
     assert_eq!(v[0]["imap_ok"], true, "{v}");
     assert_eq!(v[0]["smtp_ok"], true, "{v}");
     assert!(h.imap.commands().iter().any(|c| c.contains("NOOP")));
+    // A rejected check is one rejection like any other, and a passing check ends the streak.
+    let check = || async { h.admin(AdminRequest::AccountsCheck { alias: Some("info".into()) }).await.unwrap() };
     h.imap.set_password(&u.user, "rotated");
-    let v = h.admin(AdminRequest::AccountsCheck { alias: Some("info".into()) }).await.unwrap();
-    assert_eq!(v[0]["imap_ok"], false, "{v}");
+    let v = check().await;
+    assert_eq!((v[0]["imap_ok"].clone(), v[0]["status"].clone()), (json!(false), json!("active")), "{v}");
+    h.imap.set_password(&u.user, &u.password);
+    assert_eq!(check().await[0]["imap_ok"], true);
+    // Two rejections 30 minutes apart count from one again; the operator's checks log in despite the pause.
+    h.imap.set_password(&u.user, "rotated");
+    let before = logins(&h);
+    check().await;
+    age_streak(&h, &u.account_id);
+    assert_eq!(check().await[0]["status"], "active");
+    let v = check().await;
+    assert_eq!(logins(&h), before + 3, "the check ignores the pause");
     assert_eq!(v[0]["status"], "reauth_required", "{v}");
 }
 

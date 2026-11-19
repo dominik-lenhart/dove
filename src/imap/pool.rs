@@ -4,6 +4,10 @@
 //!
 //! A session goes back to the pool only after a call succeeded. Any error drops it, so a half-read stream (lost
 //! connection mid-FETCH, timeout mid-literal) is never reused.
+//!
+//! New logins go through the [`LoginGuard`]: while a rejected login's pause runs, the pool opens no connection for that
+//! mailbox (`LoginPaused`), and a successful login ends the streak. Recording a rejection is the caller's job
+//! (`imap::account::auth_failed`), because only it can mark the account.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -14,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use super::login_guard::LoginGuard;
 use super::session::ImapSession;
 use super::{Credentials, ImapConnector, ImapError, ServerEndpoint};
 use crate::gmail::gateway::Priority;
@@ -43,6 +48,7 @@ pub struct ImapPool {
     background: Option<Arc<Semaphore>>,
     sems: Mutex<HashMap<String, Arc<Semaphore>>>,
     slots: Mutex<HashMap<String, Slot>>,
+    logins: LoginGuard,
     /// New connections opened (tests check that broken sessions are replaced).
     pub connects: AtomicU64,
 }
@@ -58,6 +64,7 @@ impl ImapPool {
             background: None,
             sems: Mutex::default(),
             slots: Mutex::default(),
+            logins: LoginGuard::default(),
             connects: AtomicU64::new(0),
         }
     }
@@ -83,7 +90,13 @@ impl ImapPool {
         self.cmd_timeout
     }
 
-    /// Drops every idle session of the account (reconnect, disable, removal).
+    /// Rejected-login streaks of every mailbox (PLAN A85).
+    pub fn logins(&self) -> &LoginGuard {
+        &self.logins
+    }
+
+    /// Drops every idle session of the account (reconnect, disable, removal). A rejected-login streak stays: a
+    /// reconnect's new credential generation is not paused by it, and a reauth already ended it.
     pub fn evict(&self, account_id: &str) {
         self.slots.lock().expect("lock").remove(account_id);
     }
@@ -119,9 +132,11 @@ impl ImapPool {
     }
 
     /// Runs `f` on a logged-in session for the account, reusing an idle one when its endpoint and user match.
+    /// `generation` is the credential generation of `creds` (it fences the login pause).
     pub async fn with_session<T, F>(
         &self,
         account_id: &str,
+        generation: i64,
         endpoint: &ServerEndpoint,
         creds: &Credentials,
         f: F,
@@ -129,13 +144,14 @@ impl ImapPool {
     where
         F: for<'s> FnOnce(&'s mut ImapSession) -> SessionFuture<'s, T>,
     {
-        self.with_session_prio(account_id, endpoint, creds, Priority::Interactive, f).await
+        self.with_session_prio(account_id, generation, endpoint, creds, Priority::Interactive, f).await
     }
 
     /// [`Self::with_session`] at a given priority: background work also holds a background slot.
     pub async fn with_session_prio<T, F>(
         &self,
         account_id: &str,
+        generation: i64,
         endpoint: &ServerEndpoint,
         creds: &Credentials,
         prio: Priority,
@@ -156,8 +172,13 @@ impl ImapPool {
         let mut session = match reused {
             Some(i) => i.session,
             None => {
+                if self.logins.paused(account_id, generation, crate::util::now_unix()) {
+                    return Err(ImapError::LoginPaused);
+                }
                 self.connects.fetch_add(1, Ordering::Relaxed);
-                ImapSession::connect(&self.connector, endpoint, creds, self.cmd_timeout).await?
+                let s = ImapSession::connect(&self.connector, endpoint, creds, self.cmd_timeout).await?;
+                self.logins.succeeded(account_id);
+                s
             }
         };
         let out = f(&mut session).await;
