@@ -5,6 +5,16 @@ and versions follow [Semantic Versioning](https://semver.org/) as described in [
 
 ## [Unreleased]
 
+## [0.20.2] - 2026-11-19
+
+### Fixed
+
+- An IMAP mailbox is no longer marked "needs reconnect" after a single rejected login. Some providers, iCloud among
+  them, briefly reject a valid app password when they have trouble of their own. Dove now pauses logins for that
+  mailbox (5, 10, then every 15 minutes) and asks for a reconnect only when logins keep being rejected for 30 minutes
+  with none succeeding. A rejection that passes heals by itself, and a wrong password no longer causes a burst of
+  login attempts at the provider.
+
 ## [0.20.1] - 2026-11-18
 
 ### Fixed
@@ -528,7 +538,8 @@ First release.
   release only after verifying its minisign signature. The CLI hints at a new release at most once a day
   (`DOVE_NO_UPDATE_CHECK=1` turns it off); the server never checks for updates.
 
-[Unreleased]: https://github.com/dominik-lenhart/dove/compare/v0.20.1...HEAD
+[Unreleased]: https://github.com/dominik-lenhart/dove/compare/v0.20.2...HEAD
+[0.20.2]: https://github.com/dominik-lenhart/dove/compare/v0.20.1...v0.20.2
 [0.20.1]: https://github.com/dominik-lenhart/dove/compare/v0.20.0...v0.20.1
 [0.20.0]: https://github.com/dominik-lenhart/dove/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/dominik-lenhart/dove/compare/v0.18.0...v0.19.0
