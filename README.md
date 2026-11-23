@@ -249,6 +249,9 @@ else exists. Full threat model: [`docs/spec.md`](docs/spec.md), section 6.
 | An agent shell trying to administer Dove: admin only over a Unix socket (Windows: named pipe) with an OS user check, when the agent runs as another OS user | What your model provider does with the mail an agent reads |
 | DNS rebinding, OAuth callback attacks, header injection into drafts, mail content in logs | Your mailbox provider's own account security |
 
+Why Dove is built this way (scoped tokens instead of shared credentials, drafts instead of a free-form send, an
+encrypted index, admin out of the agents' reach) and which alternatives were rejected: [`docs/design.md`](docs/design.md).
+
 For Gmail, note that Google's `gmail.compose` scope itself includes sending; Dove's send gates are a policy layer in
 front of it. Report vulnerabilities privately as described in [`SECURITY.md`](SECURITY.md).
 
@@ -293,6 +296,7 @@ What was checked on real systems is listed in the
 | | |
 | --- | --- |
 | [Deployment guide](docs/deployment.md) | install, configuration, proxies, Tailscale, mailboxes, Gmail, watches and sinks, backup, upgrades |
+| [Design decisions](docs/design.md) | why Dove works the way it does, and what was rejected |
 | [Specification](docs/spec.md) | tools, data model, threat model |
 | [Releasing](docs/releasing.md) | release process and verifying downloads |
 | [Security policy](SECURITY.md) | reporting vulnerabilities |
