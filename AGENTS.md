@@ -591,3 +591,7 @@ cargo fmt
   `logins().backdate_for_tests(id, secs)`; the fake's `Fault::No` answers `NO [UNAVAILABLE]` (a network error, not a
   rejection), so simulate a rejected login with `set_password` and restore `u.password` to let it pass again.
   `ImapPool::evict` keeps the streak on purpose: a test that evicts pooled sessions does not reset the count.
+- 2026-11-23: `deploy/nginx/dove-allowlist.py` is tested from `tests/allowlist_script.rs`, which loads the real script
+  with `python3 -I -B` and replaces `urllib.request.urlopen` in that process (a stub answer, or a failure when the test
+  passes `--no-openai`), so no test downloads the OpenAI list. A new refusal rule in the script needs a case in
+  `refused_openai_answers_keep_the_previous_allowlist`.

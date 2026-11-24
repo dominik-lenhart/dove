@@ -12,6 +12,7 @@ with a scoped token per agent, drafts instead of silent sends, and nothing ever 
 [![Release](https://img.shields.io/github/v/release/dominik-lenhart/dove?sort=semver)](https://github.com/dominik-lenhart/dove/releases)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Listed on mcpservers.org](https://mcpservers.org/badge.svg)](https://mcpservers.org/servers/dominik-lenhart/dove)
+[![dominik-lenhart/dove MCP server](https://glama.ai/mcp/servers/dominik-lenhart/dove/badges/score.svg)](https://glama.ai/mcp/servers/dominik-lenhart/dove)
 
 [Why Dove](#why-dove) · [Quickstart](#quickstart) · [What agents can do](#what-agents-can-do) · [Permissions](#permissions) ·
 [Security](#security-model) · [Deployment guide](docs/deployment.md)
@@ -249,6 +250,9 @@ else exists. Full threat model: [`docs/spec.md`](docs/spec.md), section 6.
 | An agent shell trying to administer Dove: admin only over a Unix socket (Windows: named pipe) with an OS user check, when the agent runs as another OS user | What your model provider does with the mail an agent reads |
 | DNS rebinding, OAuth callback attacks, header injection into drafts, mail content in logs | Your mailbox provider's own account security |
 
+Why Dove is built this way (scoped tokens instead of shared credentials, drafts instead of a free-form send, an
+encrypted index, admin out of the agents' reach) and which alternatives were rejected: [`docs/design.md`](docs/design.md).
+
 For Gmail, note that Google's `gmail.compose` scope itself includes sending; Dove's send gates are a policy layer in
 front of it. Report vulnerabilities privately as described in [`SECURITY.md`](SECURITY.md).
 
@@ -281,7 +285,8 @@ running against a real mailbox since the first release. Before you rely on it:
 | Gmail over IMAP (app password) | checked against a real account: connect, labels, search, digest, organize, Trash and back, drafts |
 | ChatGPT connector through the OAuth approval page | checked: approval, token refresh, `list_accounts`, `digest` and `search_messages` across 11 mailboxes, reading messages and threads |
 | iCloud over IMAP | checked: connect, index, search, read |
-| Claude web connector, iCloud drafts and send, very large mailboxes, benchmarks | open |
+| Ingest, disk, memory and search latency at 250k messages | measured on a synthetic corpus, see [benchmarks](docs/benchmarks.md) |
+| Claude web connector, iCloud drafts and send, a very large real mailbox | open |
 
 What was checked on real systems is listed in the
 [deployment guide](docs/deployment.md#what-has-been-verified); decisions and evidence are in
@@ -292,6 +297,7 @@ What was checked on real systems is listed in the
 | | |
 | --- | --- |
 | [Deployment guide](docs/deployment.md) | install, configuration, proxies, Tailscale, mailboxes, Gmail, watches and sinks, backup, upgrades |
+| [Design decisions](docs/design.md) | why Dove works the way it does, and what was rejected |
 | [Specification](docs/spec.md) | tools, data model, threat model |
 | [Releasing](docs/releasing.md) | release process and verifying downloads |
 | [Security policy](SECURITY.md) | reporting vulnerabilities |
