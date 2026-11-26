@@ -221,21 +221,23 @@ Grants are per token and per mailbox. Presets cover the usual cases, and you can
 | --- | --- | --- |
 | `reader` | `read` | search, read, attachments, contacts, digest, watches |
 | `drafter` | `read,draft` | create, edit and delete its own drafts |
-| `assistant` | `read,draft,organize` | mark read, star, label, archive, move between folders |
-| `full` | `read,draft,organize,delete` | move to Trash or Spam (recoverable) |
+| `assistant` | `read,draft,organize,signatures` | mark read, star, label, archive, move between folders; create and change signatures |
+| `full` | `read,draft,organize,delete,signatures` | move to Trash or Spam (recoverable) |
 
 - **`organize`** is reversible, so the approval page pre-selects it.
 - **`delete`** is opt-in: a steered agent could hide mail in Trash. It never deletes permanently; there is no tool
   for that.
-- **`signatures`** is in no preset either: a signature is text sent under the owner's name, so agents that may change
-  one need it granted explicitly, and every change alerts the owner.
+- **`signatures`** comes with `assistant` and `full`: a signature is text sent under the owner's name, so every change
+  by an agent alerts the owner. `drafter` can list and use signatures but not change them; add it there with
+  `drafter,signatures`.
 - **`send`** is in no preset. It needs an explicit grant on one mailbox *and* `allow_send = true` in the server
   configuration. It only sends drafts Dove created and nobody changed, never with recipients or content of its own,
   and never twice after an unknown outcome. Per mailbox you can also restrict whom an agent may send to on its own
   (`dove accounts send-policy set <mailbox> --allow-domain example.org --unknown-recipients refuse`, or "Sending
   rules" in the admin UI); refused sends point the agent at `request_send`.
 
-Presets are expanded when the token is created, so a later change to a preset never widens an existing token.
+Presets are expanded when the token is created, so a later change to a preset never widens an existing token
+(tokens created with `assistant` before it included `signatures` keep `read,draft,organize`).
 
 ## Security model
 

@@ -513,13 +513,13 @@ fn approval_page(p: &Pending, rid: &str, inv: &invite::Invitation, allow_send: b
              <label><input type=\"checkbox\" name=\"read.{id}\" checked> read</label>",
             html_escape(&g.alias)
         ));
-        // Defaults (design 2026-11-13): draft and organize on, delete and send off.
+        // Defaults match the assistant preset: draft, organize and signatures on, delete and send off.
         for (on, field, checked, label) in [
             (a.draft, "draft", true, "create and edit drafts"),
             (a.organize, "organize", true, "organize (read/unread, flags, labels, move, archive)"),
             (a.delete, "delete", false, "move to Trash"),
             (a.send && allow_send, "send", false, "send own drafts"),
-            (a.signatures, "signatures", false, "create and change signatures"),
+            (a.signatures, "signatures", true, "create and change signatures"),
         ] {
             if on {
                 rows.push_str(&format!(
@@ -829,7 +829,9 @@ async fn approve(
                 let send = allow_send && checked(format!("send.{id}"));
                 let signatures = checked(format!("signatures.{id}"));
                 let a = match form.get(&format!("preset.{id}")).and_then(|p| Actions::preset(p)) {
-                    Some(p) => Actions { send, signatures, ..p },
+                    // The preset decides, except that send stays a separate choice and the signatures box can
+                    // add signatures to a preset without them (drafter).
+                    Some(p) => Actions { send, signatures: p.signatures || signatures, ..p },
                     None => Actions {
                         read: checked(format!("read.{id}")),
                         draft: checked(format!("draft.{id}")),

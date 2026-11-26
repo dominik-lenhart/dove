@@ -80,11 +80,14 @@ async fn presets_expand_and_tools_follow_grants() {
     let full = h.token("acme", "full", vec![g("info", "full")]).await;
     let mixed = h.token("acme", "mixed", vec![g("info", "reader,organize")]).await;
     let legacy = h.token("acme", "legacy", vec![g("info", "read,draft")]).await;
+    // What `assistant` stored before it included signatures.
+    let old_assistant = h.token("acme", "old-assistant", vec![g("info", "read,draft,organize")]).await;
     // Stored expanded: presets never reach the store.
     assert_eq!(stored_actions(&h, "reader").await, "read");
     assert_eq!(stored_actions(&h, "drafter").await, "read,draft");
-    assert_eq!(stored_actions(&h, "assistant").await, "read,draft,organize");
-    assert_eq!(stored_actions(&h, "full").await, "read,draft,organize,delete");
+    assert_eq!(stored_actions(&h, "assistant").await, "read,draft,organize,signatures");
+    assert_eq!(stored_actions(&h, "full").await, "read,draft,organize,delete,signatures");
+    assert_eq!(stored_actions(&h, "old-assistant").await, "read,draft,organize");
     assert_eq!(stored_actions(&h, "mixed").await, "read,organize");
     assert_eq!(stored_actions(&h, "legacy").await, "read,draft");
 
@@ -93,6 +96,15 @@ async fn presets_expand_and_tools_follow_grants() {
     assert!(!has(&n, "update_messages") && !has(&n, "move_messages") && !has(&n, "delete_draft"));
     let n = h.tool_names(&drafter).await;
     assert!(has(&n, "delete_draft") && !has(&n, "update_messages"));
+    // Drafters list and use signatures; changing them comes with assistant and full.
+    assert!(has(&n, "list_signatures") && !has(&n, "set_signature") && !has(&n, "delete_signature"), "{n:?}");
+    for t in [&assistant, &full] {
+        let n = h.tool_names(t).await;
+        assert!(has(&n, "set_signature") && has(&n, "delete_signature"), "{n:?}");
+    }
+    // A token stored with the old assistant list keeps exactly that.
+    let n = h.tool_names(&old_assistant).await;
+    assert!(has(&n, "update_messages") && !has(&n, "set_signature"), "{n:?}");
     // An existing read,draft token keeps exactly what it had.
     let n = h.tool_names(&legacy).await;
     assert!(has(&n, "delete_draft") && !has(&n, "update_messages") && !has(&n, "move_messages"));
@@ -101,7 +113,7 @@ async fn presets_expand_and_tools_follow_grants() {
         assert!(has(&n, "update_messages") && has(&n, "move_messages"), "{n:?}");
     }
     let accounts = h.ok(&full, "list_accounts", json!({})).await;
-    assert_eq!(accounts["accounts"][0]["actions"], json!(["read", "draft", "organize", "delete"]));
+    assert_eq!(accounts["accounts"][0]["actions"], json!(["read", "draft", "organize", "delete", "signatures"]));
 
     let id = h.google.add_message(INFO, msg("a", &["INBOX", "UNREAD"]));
     let upd = json!({ "account": "info", "ids": [id], "remove_flags": ["UNREAD"] });

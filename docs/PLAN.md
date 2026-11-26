@@ -873,7 +873,7 @@ hosts or reference hardware.
   must be used. (c) Layout `mixed[related[alternative[text, html], images], attachments]`; layers are left out when
   empty. (d) `own_drafts.composition` stores signature name and byte lengths, no content; `update_draft` splits Dove's
   own text by it and refuses (`draft_conflict`) when it does not fit. The signature is rendered again from its current
-  version on every body or signature change. (e) Agents need the `signatures` action (requires `draft`, no preset) to
+  version on every body or signature change. (e) Agents need the `signatures` action (requires `draft`; in no preset until A86) to
   change signatures; for agents the text of an HTML signature is always derived from the HTML (the send approval shows
   the text and names the HTML signature), and every call that changes a stored signature or default, and every deletion, alerts the owner (no deduplication
   keys; a call that changes nothing stays quiet). Text inside images cannot be checked (residual risk, documented). (f) The admin request line limit is
@@ -980,3 +980,11 @@ hosts or reference hardware.
   submission honour the pause; `accounts check` ignores it (the operator asked for a login) but counts. Pooled
   sessions that are already logged in keep working. The streak lives in memory: a restart starts over, which delays a
   reauth by at most one more streak. Gmail API mailboxes are unchanged (`invalid_grant` is definitive).
+- A86. `signatures` in the `assistant` and `full` presets (2026-11-26, owner request: every connection that writes
+  drafts needed `signatures` added by hand, last `set-grants` on 2026-11-26). `assistant` = `read,draft,organize,
+  signatures`, `full` = `read,draft,organize,delete,signatures`, so each preset still includes the one before it;
+  `drafter` stays `read,draft` (it can list and use signatures, `list_signatures` needs only `draft`). This reverses
+  A79(e)'s "no preset": the safeguard is the owner alert on every change, not the grant. Presets are expanded when a
+  token, invitation or temporary grant is stored, so existing connections and open invitations keep their stored
+  list. The OAuth approval page pre-selects `signatures` (custom defaults equal `assistant`), and a chosen preset
+  keeps its signatures; the box only adds them to a preset without (drafter).
