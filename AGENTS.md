@@ -595,3 +595,7 @@ cargo fmt
   with `python3 -I -B` and replaces `urllib.request.urlopen` in that process (a stub answer, or a failure when the test
   passes `--no-openai`), so no test downloads the OpenAI list. A new refusal rule in the script needs a case in
   `refused_openai_answers_keep_the_previous_allowlist`.
+- 2026-11-26: Presets (`policy::PRESETS`) are expanded wherever a grant is stored (tokens, invitations, temporary
+  grants), so changing one never changes existing connections; each preset must include the one before it
+  (`presets_expand_and_mix` checks that). A changed preset touches the stored-action assertions in
+  `tests/organize_e2e.rs`, `tests/requests_access_e2e.rs` and the approval-page defaults in `tests/oauth_e2e.rs`.

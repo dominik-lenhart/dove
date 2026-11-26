@@ -314,7 +314,7 @@ async fn union_and_dependency_rules() {
     // Two temporary grants on one mailbox stay separate rows and unite as well.
     let id2 = fx.ask(json!([{ "account": "info", "actions": "full" }]), Some(5)).await;
     fx.approve(&id2, None, None).await.unwrap();
-    assert_eq!(fx.accounts().await, vec![pair("info", "read,draft,organize,delete")]);
+    assert_eq!(fx.accounts().await, vec![pair("info", "read,draft,organize,delete,signatures")]);
     fx.exec(&format!("UPDATE client_grant_extras SET expires_at = {} WHERE request_id = '{id2}'", util::now_unix()))
         .await;
     assert_eq!(fx.accounts().await, vec![pair("info", "read,draft,organize")]);
@@ -675,11 +675,14 @@ async fn operator_shortens_and_unticks() {
         .ask(json!([{ "account": "info", "actions": "read" }, { "account": "billing", "actions": "drafter" }]), None)
         .await;
     let shown = h.admin(AdminRequest::RequestsShow { id: id.clone() }).await.unwrap();
-    assert_eq!(shown["grants"][0]["has"], "read,draft,organize");
+    assert_eq!(shown["grants"][0]["has"], "read,draft,organize,signatures");
     let v = fx.approve(&id, None, None).await.unwrap();
     assert_eq!(v["status"], "done");
     assert_eq!(fx.grant_states(&id).await, vec!["granted", "granted"]);
-    assert_eq!(fx.base_grants().await, vec![pair("billing", "read,draft"), pair("info", "read,draft,organize")]);
+    assert_eq!(
+        fx.base_grants().await,
+        vec![pair("billing", "read,draft"), pair("info", "read,draft,organize,signatures")]
+    );
     assert_eq!(fx.extras().await, 0);
 }
 

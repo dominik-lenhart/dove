@@ -662,8 +662,9 @@ pub enum ClientsCmd {
         name: String,
         #[arg(long)]
         project: String,
-        /// alias=<actions or preset>, repeatable. Actions: read, draft, organize, delete, send, signatures. Presets: reader,
-        /// drafter, assistant, full (send is never in a preset: `work=assistant,send`).
+        /// alias=<actions or preset>, repeatable. Actions: read, draft, organize, delete, send, signatures. Presets:
+        /// reader (read), drafter (+draft), assistant (+organize, signatures), full (+delete). Send is never in a
+        /// preset: `work=assistant,send`.
         #[arg(long = "grant", required = true)]
         grants: Vec<String>,
         #[arg(long)]

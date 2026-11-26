@@ -717,8 +717,8 @@ rendered again from its current version, and `changes.signature` switches or rem
 `composition`.
 
 Agents can manage signatures themselves with `list_signatures` (any connection with `draft`) and `set_signature` /
-`delete_signature`, which need the `signatures` action on that mailbox. It is in no preset; grant it explicitly
-(`--grant work=drafter,signatures`). For an agent, a signature with HTML always gets its text derived from the HTML, so
+`delete_signature`, which need the `signatures` action on that mailbox. The `assistant` and `full` presets include it;
+with `drafter` grant it explicitly (`--grant work=drafter,signatures`). For an agent, a signature with HTML always gets its text derived from the HTML, so
 the text you read (for example when approving a `request_send`, which also says when the mail goes out as HTML) says
 what recipients see. Every change by an agent sends you an alert (an identical retry does not) and is audited with the
 signature's name, never its content. What an image shows cannot be checked: grant `signatures` only to agents you
@@ -772,10 +772,11 @@ secret store, not in a project file. Grants are explicit per mailbox. Actions:
 | `send` | `send_draft`, only with `allow_send = true` | `draft` |
 | `signatures` | `set_signature`, `delete_signature` (create, change and delete the mailbox's named signatures) | `draft` |
 
-Presets are shorthands: `reader` = `read`, `drafter` = `read,draft`, `assistant` = `read,draft,organize`, `full` =
-`read,draft,organize,delete`. Mix them with actions, for example `--grant work-info=assistant,send` or
+Presets are shorthands: `reader` = `read`, `drafter` = `read,draft`, `assistant` = `read,draft,organize,signatures`,
+`full` = `read,draft,organize,delete,signatures`. Mix them with actions, for example `--grant work-info=assistant,send` or
 `--grant work-info=reader,organize`. Unknown words are an error. Dove stores the expanded action list, so a token keeps
-exactly what it was given; tokens created before 0.2 keep their `read`/`draft`/`send` grants and gain nothing. Adding a
+exactly what it was given; tokens created before 0.2 keep their `read`/`draft`/`send` grants and gain nothing, and
+tokens created with `assistant` or `full` before those presets included `signatures` (2026-11-26) do not gain it. Adding a
 mailbox to a project gives existing tokens no new access. Other commands:
 `clients set-grants <name> --grant ...` (replaces the whole set atomically), `clients rotate <name>`,
 `clients revoke <name>`, `clients show <name>`, `clients list`, `projects list|show|remove-account`,
@@ -799,7 +800,8 @@ Instead of handing out a token, the operator can create a one-time invitation wi
 `dove mcp install --client claude-code --profile acme`, or enters it on the OAuth approval page of ChatGPT or Claude.
 `dove login --token-stdin` stores an existing `clients create` token instead. On the OAuth approval page the user
 can narrow the invitation per mailbox, never widen it: a preset selector (`custom` means the checkboxes decide) and
-checkboxes, with `read`, `draft` and `organize` pre-selected and `delete` and `send` off. `send` is only shown while
+checkboxes, with `read`, `draft`, `organize` and `signatures` pre-selected (the `assistant` preset) and `delete` and
+`send` off. `send` is only shown while
 `allow_send = true`.
 
 **Gmail mailboxes connected before 0.2** lack Google's `gmail.modify` permission, which `organize`, `delete` and

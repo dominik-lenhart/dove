@@ -1083,8 +1083,10 @@ async fn approval_page_presets_and_defaults() {
     let ids: Vec<String> =
         html.split("name=\"read.").skip(1).filter_map(|s| s.split('"').next()).map(String::from).collect();
     let (billing, info) = (&ids[0], &ids[1]);
-    // Defaults: organize on (with read and draft), delete and send off.
-    for (kind, checked) in [("read", true), ("draft", true), ("organize", true), ("delete", false), ("send", false)] {
+    // Defaults match the assistant preset: read, draft, organize and signatures on, delete and send off.
+    for (kind, checked) in
+        [("read", true), ("draft", true), ("organize", true), ("signatures", true), ("delete", false), ("send", false)]
+    {
         let tag = input_tag(&html, kind, info).unwrap_or_else(|| panic!("no {kind} box: {html}"));
         assert_eq!(tag.contains(" checked"), checked, "{kind}: {tag}");
     }
@@ -1120,7 +1122,10 @@ async fn approval_page_presets_and_defaults() {
     let at = tok["access_token"].as_str().unwrap();
     assert_eq!(
         actions_of(&o.h, at).await,
-        vec![("billing".into(), "read,draft,organize,send".into()), ("info".into(), "read,organize,delete".into())]
+        vec![
+            ("billing".into(), "read,draft,organize,send,signatures".into()),
+            ("info".into(), "read,organize,delete".into())
+        ]
     );
 
     // With sending switched off later, the page hides send and a forged send box grants nothing.
@@ -1144,7 +1149,7 @@ async fn approval_page_presets_and_defaults() {
     // A forged preset beyond the invitation is narrowed to it.
     assert_eq!(
         actions_of(&o.h, tok["access_token"].as_str().unwrap()).await,
-        vec![("info".into(), "read,draft,organize".into())]
+        vec![("info".into(), "read,draft,organize,signatures".into())]
     );
     // The forged send box is not stored either (list_accounts hides send anyway while sending is off).
     let stored: String =
@@ -1160,7 +1165,7 @@ async fn approval_page_presets_and_defaults() {
             })
             .await
             .unwrap();
-    assert_eq!(stored, "read,draft,organize");
+    assert_eq!(stored, "read,draft,organize,signatures");
 }
 
 /// `params` with its `redirect_uri` replaced.

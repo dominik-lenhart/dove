@@ -58,12 +58,14 @@ pub struct Actions {
 }
 
 /// Presets: input sugar for `--grant` and the approval page. Never stored, so a preset changed later never widens
-/// an existing grant. `send` and `signatures` are in none of them.
+/// an existing grant. Each includes the one before it. `send` is in none of them; `signatures` comes with
+/// `assistant` and `full` (2026-11-26: an agent that writes drafts for the owner keeps the signatures current, and
+/// every change alerts the owner), while `drafter` can list and use signatures but not change them.
 pub const PRESETS: &[(&str, &str)] = &[
     ("reader", "read"),
     ("drafter", "read,draft"),
-    ("assistant", "read,draft,organize"),
-    ("full", "read,draft,organize,delete"),
+    ("assistant", "read,draft,organize,signatures"),
+    ("full", "read,draft,organize,delete,signatures"),
 ];
 
 impl Actions {
@@ -580,17 +582,23 @@ mod tests {
         let p = |s: &str| Actions::parse_grant(s).map(|a| a.to_string());
         assert_eq!(p("reader").unwrap(), "read");
         assert_eq!(p("drafter").unwrap(), "read,draft");
-        assert_eq!(p("assistant").unwrap(), "read,draft,organize");
-        assert_eq!(p("full").unwrap(), "read,draft,organize,delete");
-        assert_eq!(p("assistant,send").unwrap(), "read,draft,organize,send");
-        assert_eq!(p("full,send").unwrap(), "read,draft,organize,delete,send");
+        assert_eq!(p("assistant").unwrap(), "read,draft,organize,signatures");
+        assert_eq!(p("full").unwrap(), "read,draft,organize,delete,signatures");
+        assert_eq!(p("assistant,send").unwrap(), "read,draft,organize,send,signatures");
+        assert_eq!(p("full,send").unwrap(), "read,draft,organize,delete,send,signatures");
         assert_eq!(p("reader,organize").unwrap(), "read,organize");
         assert_eq!(p("Read, Draft").unwrap(), "read,draft");
         assert_eq!(p("read,draft,organize").unwrap(), "read,draft,organize");
-        // Send and signatures are in no preset.
+        // Send is in no preset; signatures come with assistant and full, not with drafter.
         for (name, _) in PRESETS {
             let a = Actions::parse_grant(name).unwrap();
-            assert!(!a.send && !a.signatures, "{name}");
+            assert!(!a.send, "{name}");
+            assert_eq!(a.signatures, matches!(*name, "assistant" | "full"), "{name}");
+        }
+        // Each preset includes the one before it.
+        for w in PRESETS.windows(2) {
+            let (a, b) = (Actions::preset(w[0].0).unwrap(), Actions::preset(w[1].0).unwrap());
+            assert_eq!(a.intersect(&b), a, "{} within {}", w[0].0, w[1].0);
         }
         assert_eq!(p("drafter,signatures").unwrap(), "read,draft,signatures");
         let e = Actions::parse_grant("assistent").unwrap_err();
@@ -612,7 +620,7 @@ mod tests {
         assert_eq!(full.intersect(&no_read), Actions::default());
         let no_org = Actions::parse("read,draft,send").unwrap();
         let a = Actions { delete: true, ..full }.intersect(&Actions { organize: false, ..full });
-        assert_eq!(a.to_string(), "read,draft,send");
+        assert_eq!(a.to_string(), "read,draft,send,signatures");
         assert_eq!(full.intersect(&no_org).to_string(), "read,draft,send");
     }
 
